@@ -1,11 +1,18 @@
-## My Project
+## rabbitmq-stream-s3
 
-TODO: Fill this README out!
+This is an ongoing project for integrating RabbitMQ streams with S3 storage.
 
-Be sure to:
+## Prerequisites
 
-* Change the title in this README
-* Edit your repository description on GitHub
+This project currently requires specific development branches:
+
+* **rabbitmq-server**: `su_aws/replace_httpc_with_gun_fmt` branch
+* **osiris**: `md/log-reader-and-manifest` branch
+
+## Project Maturity
+
+rabbitmq-stream-s3 is not stable, with frequent changes in design and functionality.
+
 
 ## Security
 
