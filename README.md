@@ -11,7 +11,7 @@ rabbitmq-stream-s3 is not stable, with frequent changes in design and functional
 This project currently requires specific development branches of the `rabbitmq-server` and `osiris` repositories:
 
 ### rabbitmq-server
-Branch: `su_aws/replace_httpc_with_gun_fmt`
+Branch: `aws/streams-tiered-storage-dev`
 
 Contains changes needed for S3 integration.
 
@@ -29,7 +29,7 @@ cd rabbitmq-server
 ```
 2. **Switch to the required branch**
 ```
-git checkout su_aws/replace_httpc_with_gun_fmt
+git checkout aws/streams-tiered-storage-dev
 ```
 3. **Build with the stream-s3 plugin with the correct osiris branch**
 ```
