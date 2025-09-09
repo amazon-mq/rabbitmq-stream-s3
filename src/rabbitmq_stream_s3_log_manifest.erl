@@ -1,3 +1,6 @@
+%% Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+%% SPDX-License-Identifier: Apache-2.0
+
 -module(rabbitmq_stream_s3_log_manifest).
 
 %% TODO: this is just for testing.

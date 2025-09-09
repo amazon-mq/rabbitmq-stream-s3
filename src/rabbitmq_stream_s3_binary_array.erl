@@ -1,3 +1,6 @@
+%% Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+%% SPDX-License-Identifier: Apache-2.0
+
 -module(rabbitmq_stream_s3_binary_array).
 -moduledoc """
 Helper functions and routines for working with an array of fixed-size items

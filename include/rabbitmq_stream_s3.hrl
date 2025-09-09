@@ -1,3 +1,6 @@
+%% Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+%% SPDX-License-Identifier: Apache-2.0
+
 %% The index which is concatenated in with segment files.
 -define(REMOTE_IDX_VERSION, 1).
 -define(REMOTE_IDX_MAGIC, "OSII").

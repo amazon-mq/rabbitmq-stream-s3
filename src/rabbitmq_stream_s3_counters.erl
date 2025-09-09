@@ -1,3 +1,6 @@
+%% Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+%% SPDX-License-Identifier: Apache-2.0
+
 -module(rabbitmq_stream_s3_counters).
 
 -define(LOG_READER_RANGE_REQUESTS, 1).
