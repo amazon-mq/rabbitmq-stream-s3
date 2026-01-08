@@ -29,7 +29,11 @@
 }).
 
 %% records for the gen_server to handle:
--record(init_writer, {writer_ref :: writer_ref(), dir :: file:filename_all()}).
+-record(init_writer, {
+    pid :: pid(),
+    writer_ref :: writer_ref(),
+    dir :: file:filename_all()
+}).
 -record(get_manifest, {dir :: file:filename_all()}).
 -record(acceptor_overview, {dir :: file:filename_all()}).
 -record(task_completed, {task_pid :: pid(), event :: event()}).
@@ -59,7 +63,7 @@
 %% Need to be exported for `erlang:apply/3`.
 -export([start/0, format_osiris_event/1, execute_task/2]).
 
--export([get_manifest/1]).
+-export([get_manifest/1, get_fragment_trailer/2]).
 
 %% Useful to search module.
 -export([fragment_key/2, group_key/3, make_file_name/2, fragment_trailer_to_info/1]).
@@ -192,9 +196,32 @@ checksum(Checksum, Data) ->
 
 writer_manifest(#{dir := Dir, reference := Ref} = Config0) ->
     Config = Config0#{max_segment_size_bytes => ?MAX_SEGMENT_SIZE_BYTES},
-    Remote = gen_server:call(?SERVER, #init_writer{writer_ref = Ref, dir = Dir}),
-    ?LOG_DEBUG("Recovering manifest for stream ~ts", [Dir]),
-    Fragment = recover_manifest(Dir, Ref, Remote),
+    ok = gen_server:cast(?SERVER, #init_writer{pid = self(), writer_ref = Ref, dir = Dir}),
+    ?LOG_DEBUG("Recovering available fragments for stream ~ts", [Dir]),
+    %% Recover the current fragment information. To do this we scan through the
+    %% most recent index file and find the last fragment. While performing this
+    %% scan we also find the older fragments and notify the manifest server so
+    %% that it may upload them if it hasn't already done so.
+    Fragment =
+        case sorted_index_files_rev(Dir) of
+            [] ->
+                %% Empty stream, use default fragment.
+                %% TODO: is offset zero always correct here?
+                #fragment{segment_offset = 0, seq_no = 0};
+            [LastIdxFile | _] ->
+                %% TODO: handle LastIdxFile being empty / corrupted?
+                %% `osiris_log:first_and_last_seginfos0/1` does but this part runs after
+                %% the writer has cleaned up its log.
+                {Latest, Rest} = recover_fragments(LastIdxFile),
+                %% TODO: what if other fragments from other segments haven't been
+                %% uploaded yet? The manifest server should spawn a task to find
+                %% and upload those fragments.
+                _ = [
+                    gen_server:cast(?SERVER, #fragment_available{writer_ref = Ref, fragment = F})
+                 || F <- Rest
+                ],
+                Latest
+        end,
     Manifest = #manifest_writer{
         type = writer,
         writer_ref = Ref,
@@ -202,19 +229,9 @@ writer_manifest(#{dir := Dir, reference := Ref} = Config0) ->
     },
     {Manifest, Config}.
 
-recover_manifest(_Dir, _Ref, _RemoteManifest) ->
-    %% TODO:
-    %% * Examine the currently active segment in order to reconstruct the
-    %%   pending fragment information.
-    %% * Examine the last fragment uploaded to the remote manifest. Send
-    %%   `#fragment{}`s to the manifest server for any completed fragments
-    %%   in the local log which weren't yet uploaded (or their upload failed).
-    #fragment{segment_offset = 0, seq_no = 0}.
-
-recover_fragments(File) ->
-    ?LOG_DEBUG("Recovering fragments from segment file ~ts", [File]),
-    SegmentOffset = segment_file_offset(File),
-    IdxFile = iolist_to_binary(string:replace(File, ".segment", ".index", trailing)),
+recover_fragments(IdxFile) ->
+    ?LOG_DEBUG("Recovering fragments from index file ~ts", [IdxFile]),
+    SegmentOffset = index_file_offset(IdxFile),
     %% TODO: we should be reading in smaller chunks with pread.
     {ok, <<_:?IDX_HEADER_B/binary, IdxArray/binary>>} = file:read_file(IdxFile),
     recover_fragments(
@@ -234,6 +251,8 @@ recover_fragments(
     Fragments0,
     IdxArray
 ) ->
+    %% NOTE: all indexes in this function are chunk indexes. `FragmentBoundary`
+    %% is a chunk index.
     FragmentBoundary = rabbitmq_stream_s3_binary_array:partition_point(
         fun(<<_ChId:64, _Ts:64, _E:64, FilePos:32/unsigned, _ChT:8>>) ->
             Threshold0 > FilePos
@@ -353,9 +372,6 @@ start_link() ->
 init([]) ->
     {ok, #?MODULE{}}.
 
-handle_call(#init_writer{writer_ref = WriterRef, dir = Dir}, {Pid, Tag}, State) ->
-    Event = #writer_spawned{pid = Pid, reply_tag = Tag, writer_ref = WriterRef, dir = Dir},
-    evolve_event(Event, State);
 handle_call(#get_manifest{dir = Dir}, From, State) ->
     %% TODO: this is too simplistic. Reading from the root manifest should be
     %% done within the server. And then the server should give a spec to
@@ -369,6 +385,9 @@ handle_call(Request, From, State) ->
     ?LOG_INFO(?MODULE_STRING " received unexpected call from ~p: ~W", [From, Request, 10]),
     {noreply, State}.
 
+handle_cast(#init_writer{pid = Pid, writer_ref = WriterRef, dir = Dir}, State) ->
+    Event = #writer_spawned{pid = Pid, writer_ref = WriterRef, dir = Dir},
+    evolve_event(Event, State);
 handle_cast(
     #task_completed{task_pid = TaskPid, event = Event},
     #?MODULE{tasks = Tasks0} = State0
@@ -440,6 +459,10 @@ segment_file_offset(File) ->
     <<Digits:20/binary, ".segment">> = iolist_to_binary(filename:basename(File)),
     binary_to_integer(Digits).
 
+index_file_offset(File) ->
+    <<Digits:20/binary, ".index">> = iolist_to_binary(filename:basename(File)),
+    binary_to_integer(Digits).
+
 -spec evolve_event(event(), #?MODULE{}) -> {noreply, #?MODULE{}}.
 evolve_event(Event, #?MODULE{machine = MacState0} = State0) ->
     {MacState, Effects} = rabbitmq_stream_s3_log_manifest_machine:apply(
@@ -461,7 +484,7 @@ apply_effect(#upload_manifest{} = Event, State) ->
     spawn_task(Event, State);
 apply_effect(#rebalance_manifest{} = Event, State) ->
     spawn_task(Event, State);
-apply_effect(#download_manifest{} = Event, State) ->
+apply_effect(#resolve_manifest{} = Event, State) ->
     spawn_task(Event, State).
 
 spawn_task(Effect, #?MODULE{tasks = Tasks0} = State0) ->
@@ -647,7 +670,7 @@ execute_task(#upload_manifest{
         ok = rabbitmq_aws:close_connection(Handle)
     end,
     #manifest_uploaded{dir = Dir};
-execute_task(#download_manifest{dir = Dir}) ->
+execute_task(#resolve_manifest{dir = Dir}) ->
     {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
     {ok, Handle} = rabbitmq_aws:open_connection("s3"),
     Key = manifest_key(Dir),
@@ -668,7 +691,41 @@ execute_task(#download_manifest{dir = Dir}) ->
         after
             ok = rabbitmq_aws:close_connection(Handle)
         end,
-    #manifest_downloaded{dir = Dir, manifest = Manifest}.
+    resolve_manifest_tail(Dir, Manifest).
+
+resolve_manifest_tail(Dir, #manifest{entries = <<>>} = Manifest0) ->
+    #manifest_resolved{dir = Dir, manifest = Manifest0};
+resolve_manifest_tail(Dir, undefined) ->
+    #manifest_resolved{dir = Dir, manifest = undefined};
+resolve_manifest_tail(Dir, #manifest{entries = Entries} = Manifest) ->
+    ?ENTRY(Offset, _, _, _, _, _) = rabbitmq_stream_s3_binary_array:last(?ENTRY_B, Entries),
+    {ok, #fragment_info{offset = Offset, next_offset = NextOffset}} = get_fragment_trailer(
+        Dir,
+        Offset
+    ),
+    resolve_manifest_tail(NextOffset, Dir, Manifest).
+
+resolve_manifest_tail(
+    NextOffset0,
+    Dir,
+    #manifest{entries = Entries0, total_size = TotalSize0} = Manifest0
+) ->
+    case get_fragment_trailer(Dir, NextOffset0) of
+        {ok, #fragment_info{
+            offset = NextOffset0,
+            next_offset = NextOffset,
+            timestamp = Ts,
+            size = Size,
+            seq_no = SeqNo
+        }} ->
+            Entries =
+                <<Entries0/binary,
+                    (?ENTRY(NextOffset0, Ts, ?MANIFEST_KIND_FRAGMENT, Size, SeqNo, <<>>))/binary>>,
+            Manifest = Manifest0#manifest{entries = Entries, total_size = TotalSize0 + Size},
+            resolve_manifest_tail(NextOffset, Dir, Manifest);
+        {error, not_found} ->
+            #manifest_resolved{dir = Dir, manifest = Manifest0}
+    end.
 
 group_extension(?MANIFEST_KIND_GROUP) -> "group";
 group_extension(?MANIFEST_KIND_KILO_GROUP) -> "kgroup";
@@ -680,6 +737,24 @@ group_header(?MANIFEST_KIND_KILO_GROUP) ->
     <<?MANIFEST_KILO_GROUP_MAGIC, ?MANIFEST_KILO_GROUP_VERSION:32/unsigned>>;
 group_header(?MANIFEST_KIND_MEGA_GROUP) ->
     <<?MANIFEST_MEGA_GROUP_MAGIC, ?MANIFEST_MEGA_GROUP_VERSION:32/unsigned>>.
+
+get_fragment_trailer(Dir, FragmentOffset) ->
+    {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
+    {ok, Handle} = rabbitmq_aws:open_connection("s3"),
+    Key = rabbitmq_stream_s3_log_manifest:fragment_key(Dir, FragmentOffset),
+    ?LOG_DEBUG("Looking up key ~ts (~ts)", [Key, ?FUNCTION_NAME]),
+    try
+        rabbitmq_stream_s3_api:get_object_with_range(
+            Handle, Bucket, Key, -?FRAGMENT_TRAILER_B, []
+        )
+    of
+        {ok, Data} ->
+            {ok, rabbitmq_stream_s3_log_manifest:fragment_trailer_to_info(Data)};
+        {error, _} = Err ->
+            Err
+    after
+        ok = rabbitmq_aws:close_connection(Handle)
+    end.
 
 -spec fragment_trailer_to_info(binary()) -> #fragment_info{}.
 fragment_trailer_to_info(
@@ -839,6 +914,20 @@ list_dir(Dir) ->
         {ok, Files} ->
             [list_to_binary(F) || F <- Files]
     end.
+
+%% sorted_index_files(Dir) ->
+%%     index_files(Dir, fun lists:sort/1).
+
+sorted_index_files_rev(Dir) ->
+    index_files(Dir, fun(Files) ->
+        lists:sort(fun erlang:'>'/2, Files)
+    end).
+
+index_files(Dir, SortFun) ->
+    SortFun([
+        filename:join(Dir, F)
+     || <<_:20/binary, ".index">> = F <- list_dir(Dir)
+    ]).
 
 setup_credentials_and_region() ->
     AccessKey = application:get_env(rabbitmq_stream_s3, aws_access_key, undefined),

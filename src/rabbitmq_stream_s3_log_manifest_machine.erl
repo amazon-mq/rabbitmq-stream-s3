@@ -28,7 +28,7 @@ for the log manifest server to execute.
     commit_offset = -1 :: osiris:offset() | -1,
     %% List of segments in ascending offset order which have been rolled and
     %% are awaiting upload.
-    uncommitted_fragments = [] :: [#fragment{}],
+    available_fragments = [] :: [#fragment{}],
     %% List of fragments in ascending offset order which have been uploaded
     %% successfully but have not yet been applied to the manifest.
     uploaded_fragments = [] :: [#fragment_info{}],
@@ -86,9 +86,9 @@ apply(
     #?MODULE{writers = Writers0} = State0
 ) ->
     case Writers0 of
-        #{WriterRef := #writer{uncommitted_fragments = Fragments0} = Writer0} ->
-            Fragments = [Fragment | Fragments0],
-            Writer = Writer0#writer{uncommitted_fragments = Fragments},
+        #{WriterRef := #writer{available_fragments = Fragments0} = Writer0} ->
+            Fragments = add_available_fragment(Fragment, Fragments0),
+            Writer = Writer0#writer{available_fragments = Fragments},
             State = State0#?MODULE{writers = Writers0#{WriterRef := Writer}},
             {State, []};
         _ ->
@@ -97,33 +97,49 @@ apply(
 apply(
     _Meta,
     #commit_offset_increased{writer_ref = WriterRef, offset = Offset},
-    #?MODULE{writers = Writers0} = State0
+    #?MODULE{writers = Writers0, manifests = Manifests} = State0
 ) ->
     case Writers0 of
         #{
             WriterRef := #writer{
                 pid = Pid,
                 dir = Dir,
-                uncommitted_fragments = Uncommitted0
+                available_fragments = Available
             } = Writer0
         } ->
-            {Committed, Uncommitted} = lists:splitwith(
-                fun(#fragment{last_offset = LastOffset}) -> LastOffset < Offset end, Uncommitted0
-            ),
-            Effects = lists:foldl(
-                fun(Fragment, Acc) ->
-                    [#upload_fragment{writer_ref = WriterRef, dir = Dir, fragment = Fragment} | Acc]
-                end,
-                [#register_offset_listener{writer_pid = Pid, offset = Offset + 1}],
-                Committed
-            ),
-            Writer = Writer0#writer{
-                commit_offset = Offset,
-                uncommitted_fragments = Uncommitted
-            },
-            Writers = Writers0#{WriterRef := Writer},
-            State = State0#?MODULE{writers = Writers},
-            {State, Effects};
+            Effects0 = [#register_offset_listener{writer_pid = Pid, offset = Offset + 1}],
+            case Manifests of
+                #{Dir := {pending, _Requesters}} ->
+                    %% Wait until the manifest is resolved to upload fragments
+                    %% so that we avoid uploading something which already
+                    %% exists in the remote tier.
+                    Writer = Writer0#writer{commit_offset = Offset},
+                    {State0#?MODULE{writers = Writers0#{WriterRef := Writer}}, Effects0};
+                #{Dir := _} ->
+                    {Uncommitted, Committed} = lists:splitwith(
+                        fun(#fragment{last_offset = LastOffset}) -> LastOffset > Offset end,
+                        Available
+                    ),
+                    Effects = lists:foldl(
+                        fun(Fragment, Acc) ->
+                            [
+                                #upload_fragment{
+                                    writer_ref = WriterRef, dir = Dir, fragment = Fragment
+                                }
+                                | Acc
+                            ]
+                        end,
+                        Effects0,
+                        Committed
+                    ),
+                    Writer = Writer0#writer{
+                        commit_offset = Offset,
+                        available_fragments = Uncommitted
+                    },
+                    Writers = Writers0#{WriterRef := Writer},
+                    State = State0#?MODULE{writers = Writers},
+                    {State, Effects}
+            end;
         _ ->
             {State0, []}
     end;
@@ -202,19 +218,18 @@ apply(
             {State0, []}
     end;
 apply(
-    Meta,
-    #writer_spawned{pid = Pid, reply_tag = Tag, writer_ref = WriterRef, dir = Dir},
-    State0
+    _Meta,
+    #writer_spawned{pid = Pid, writer_ref = WriterRef, dir = Dir},
+    #?MODULE{writers = Writers0, manifests = Manifests0} = State0
 ) ->
-    %% For writers and readers we want to send the manifest. Then for writers
-    %% we also want to track the new #writer{} and register the first offset
-    %% listener.
-    ManifestRequested = #manifest_requested{dir = Dir, requester = {Pid, Tag}},
-    {State1, Effects0} = apply(Meta, ManifestRequested, State0),
-    #?MODULE{writers = Writers0} = State1,
     Writers = Writers0#{WriterRef => #writer{pid = Pid, dir = Dir}},
-    Effects = [#register_offset_listener{writer_pid = Pid, offset = -1} | Effects0],
-    {State1#?MODULE{writers = Writers}, Effects};
+    Manifests = Manifests0#{Dir => {pending, []}},
+    State = State0#?MODULE{writers = Writers, manifests = Manifests},
+    Effects = [
+        #register_offset_listener{writer_pid = Pid, offset = -1},
+        #resolve_manifest{dir = Dir}
+    ],
+    {State, Effects};
 apply(
     _Meta,
     #manifest_requested{dir = Dir, requester = Requester},
@@ -227,24 +242,76 @@ apply(
             Manifests = Manifests0#{Dir := {pending, [Requester | Requesters]}},
             {State0#?MODULE{manifests = Manifests}, []};
         _ ->
-            DownloadManifest = #download_manifest{dir = Dir},
+            ResolveManifest = #resolve_manifest{dir = Dir},
             Manifests = Manifests0#{Dir => {pending, [Requester]}},
-            {State0#?MODULE{manifests = Manifests}, [DownloadManifest]}
+            {State0#?MODULE{manifests = Manifests}, [ResolveManifest]}
     end;
 apply(
     _Meta,
-    #manifest_downloaded{dir = Dir, manifest = Manifest},
-    #?MODULE{manifests = Manifests0} = State0
+    #manifest_resolved{dir = Dir, manifest = Manifest},
+    #?MODULE{writers = Writers0, manifests = Manifests0} = State0
 ) ->
     case Manifests0 of
         #{Dir := {pending, Requesters}} ->
-            Manifests = Manifests0#{Dir := {Manifest, {last_uploaded, 0}}},
-            Effects = lists:foldl(
+            %% NOTE: `Requesters` is in reverse order.
+            Effects0 = lists:foldl(
                 fun(R, Acc) -> [#reply{to = R, response = Manifest} | Acc] end,
                 [],
                 Requesters
             ),
-            {State0#?MODULE{manifests = Manifests}, Effects};
+            State1 = State0#?MODULE{
+                manifests = Manifests0#{Dir := {Manifest, {last_uploaded, 0}}}
+            },
+            %% THOUGHT: keep a lookup map for `Dir => WriterRef`?
+            case [{Ref, W} || Ref := #writer{dir = D} = W <- Writers0, D =:= Dir] of
+                [
+                    {WriterRef,
+                        #writer{commit_offset = CommitOffset, available_fragments = Available0} =
+                            Writer0}
+                ] when Manifest =/= undefined ->
+                    LastOffsetInManifest =
+                        case
+                            rabbitmq_stream_s3_binary_array:last(
+                                ?ENTRY_B, Manifest#manifest.entries
+                            )
+                        of
+                            ?ENTRY(O, _, _, _, _, _) ->
+                                O;
+                            undefined ->
+                                -1
+                        end,
+                    Available = lists:filter(
+                        fun(#fragment{first_offset = Offset}) ->
+                            Offset > LastOffsetInManifest
+                        end,
+                        Available0
+                    ),
+                    {Uncommitted, Committed} = lists:splitwith(
+                        fun(#fragment{last_offset = Offset}) ->
+                            Offset > CommitOffset
+                        end,
+                        Available
+                    ),
+                    Effects = lists:foldl(
+                        fun(Fragment, Acc) ->
+                            [
+                                #upload_fragment{
+                                    writer_ref = WriterRef,
+                                    dir = Dir,
+                                    fragment = Fragment
+                                }
+                                | Acc
+                            ]
+                        end,
+                        Effects0,
+                        Committed
+                    ),
+                    Writer = Writer0#writer{available_fragments = Uncommitted},
+                    State = State1#?MODULE{writers = Writers0#{WriterRef := Writer}},
+                    {State, Effects};
+                _ ->
+                    {State1, Effects0}
+            end;
         _ ->
             {State0, []}
     end;
@@ -401,3 +468,41 @@ apply_infos_to_manifest(
                 ?ENTRY(Offset, Ts, ?MANIFEST_KIND_FRAGMENT, Size, SeqNo, <<>>)/binary>>
     },
     apply_infos_to_manifest(Rest, Manifest, {last_uploaded, NumUpdates}, Dir, Effects).
+
+-doc """
+Add a fragment to the list of available fragments.
+
+Available fragments are stored in sorted order, descending.
+""".
+-spec add_available_fragment(#fragment{}, [#fragment{}]) -> [#fragment{}].
+add_available_fragment(F, []) ->
+    [F];
+add_available_fragment(
+    #fragment{first_offset = O1} = F, [#fragment{first_offset = O2} | _] = Fs
+) when O1 > O2 ->
+    [F | Fs];
+add_available_fragment(F, [Head | Rest]) ->
+    %% non-fast-lane: the fragment needs to be inserted in sorted order within
+    %% the list rather than prepended.
+    add_available_fragment(F, Rest, [Head]).
+
+add_available_fragment(
+    #fragment{first_offset = O1} = F, [#fragment{first_offset = O2} = Head | Rest], Acc
+) when O1 < O2 ->
+    add_available_fragment(F, Rest, [Head | Acc]);
+add_available_fragment(F, Fs, Acc) ->
+    lists:reverse(Acc, [F | Fs]).
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+add_available_fragment_test() ->
+    %% `add_available_fragment/2` keeps the fragments ordered descending by
+    %% first offset.
+    Fragments = [#fragment{first_offset = N} || N <- lists:seq(1, 5)],
+    Expected = lists:reverse(Fragments),
+    ?assertEqual(Expected, lists:foldl(fun add_available_fragment/2, [], Fragments)),
+    ?assertEqual(Expected, lists:foldr(fun add_available_fragment/2, [], Fragments)),
+    ok.
+
+-endif.

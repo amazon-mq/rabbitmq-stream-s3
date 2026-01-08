@@ -122,6 +122,9 @@
     %% Entries array:
     Entries/binary
 >>).
+%% THOUGHT: keep NextOffset in the entries array? 8 more bytes but it lets us
+%% avoid a trailer lookup when resolving the manifest.
+%% Maybe keeping just the next_offset on the overall manifest is enough.
 -define(ENTRY(Offset, Timestamp, Kind, Size, SeqNo, Rest), <<
     Offset:64/unsigned,
     Timestamp:64/signed,
@@ -184,7 +187,9 @@
 %% Events.
 
 %% The writer has written enough data and the given fragment is ready to be
-%% handed off to the manifest.
+%% handed off to the manifest. This is also emitted when a writer starts up
+%% as it scans through the current segment and finds existing fragments - the
+%% manifest server applies these idempotently.
 -record(fragment_available, {writer_ref :: writer_ref(), fragment :: #fragment{}}).
 %% The writer notified the manifest that the commit offset has moved forward.
 -record(commit_offset_increased, {writer_ref :: writer_ref(), offset :: osiris:offset()}).
@@ -192,10 +197,9 @@
 -record(manifest_uploaded, {dir :: file:filename_all()}).
 -record(manifest_rebalanced, {dir :: file:filename_all(), manifest :: #manifest{}}).
 -record(manifest_requested, {requester :: gen_server:from(), dir :: file:filename_all()}).
--record(manifest_downloaded, {dir :: file:filename_all(), manifest :: #manifest{} | undefined}).
+-record(manifest_resolved, {dir :: file:filename_all(), manifest :: #manifest{} | undefined}).
 -record(writer_spawned, {
     pid :: pid(),
-    reply_tag :: gen_server:reply_tag(),
     writer_ref :: writer_ref(),
     dir :: file:filename_all()
 }).
@@ -207,7 +211,7 @@
     | #manifest_uploaded{}
     | #manifest_rebalanced{}
     | #manifest_requested{}
-    | #manifest_downloaded{}
+    | #manifest_resolved{}
     | #writer_spawned{}.
 
 %% Effects.
@@ -225,13 +229,15 @@
     rebalanced :: rabbitmq_stream_s3_log_manifest_entry:entries(),
     manifest :: #manifest{}
 }).
--record(download_manifest, {dir :: file:filename_all()}).
+%% Download the manifest from the remote tier and also check the tail of the
+%% last fragment to see if fragments have been uploaded but not yet applied.
+-record(resolve_manifest, {dir :: file:filename_all()}).
 -record(reply, {to :: gen_server:from(), response :: term()}).
 
 -type effect() ::
-    #download_manifest{}
-    | #rebalance_manifest{}
+    #rebalance_manifest{}
     | #register_offset_listener{}
     | #reply{}
+    | #resolve_manifest{}
     | #upload_fragment{}
     | #upload_manifest{}.

@@ -586,7 +586,7 @@ find_fragment_for_offset(Offset, Entries, Dir) ->
         ?MANIFEST_KIND_FRAGMENT ->
             ?LOG_DEBUG("Searching for offset ~b within fragment ~b", [Offset, EntryOffset]),
             %% TODO: pass in size now that we have it.
-            {ok, #fragment_info{index_start_pos = IdxStartPos}} = fragment_trailer(
+            {ok, #fragment_info{index_start_pos = IdxStartPos}} = rabbitmq_stream_s3_log_manifest:get_fragment_trailer(
                 Dir, EntryOffset
             ),
             Index = index_data(Dir, EntryOffset, IdxStartPos),
@@ -628,24 +628,6 @@ find_fragment_for_offset(Offset, Entries, Dir) ->
 
 saturating_decr(0) -> 0;
 saturating_decr(N) -> N - 1.
-
-fragment_trailer(Dir, FragmentOffset) ->
-    {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
-    {ok, Handle} = rabbitmq_aws:open_connection("s3"),
-    Key = rabbitmq_stream_s3_log_manifest:fragment_key(Dir, FragmentOffset),
-    ?LOG_DEBUG("Looking up key ~ts (~ts)", [Key, ?FUNCTION_NAME]),
-    try
-        rabbitmq_stream_s3_api:get_object_with_range(
-            Handle, Bucket, Key, -?FRAGMENT_TRAILER_B, [{timeout, ?READ_TIMEOUT}]
-        )
-    of
-        {ok, Data} ->
-            {ok, rabbitmq_stream_s3_log_manifest:fragment_trailer_to_info(Data)};
-        {error, _} = Err ->
-            Err
-    after
-        ok = rabbitmq_aws:close_connection(Handle)
-    end.
 
 index_data(Dir, FragmentOffset, StartPos) ->
     {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
