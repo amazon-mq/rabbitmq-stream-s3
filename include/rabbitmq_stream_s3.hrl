@@ -109,22 +109,26 @@
 -define(MANIFEST_KIND_MEGA_GROUP, 3).
 
 %% The root and all groups have the same header.
-%% magic (4) + version (4) + offset (8) + timestamp (8) + size (9) = 33
--define(MANIFEST_HEADER_SIZE, 33).
+%% * magic (4)
+%% * version (4)
+%% * first offset (8)
+%% * first timestamp (8)
+%% * next offset (8)
+%% * size (9)
+%% = 41 bytes
+-define(MANIFEST_HEADER_SIZE, 41).
 
--define(MANIFEST(FirstOffset, FirstTimestamp, TotalSize, Entries), <<
+-define(MANIFEST(FirstOffset, FirstTimestamp, NextOffset, TotalSize, Entries), <<
     ?MANIFEST_ROOT_MAGIC,
     ?MANIFEST_ROOT_VERSION:32/unsigned,
     FirstOffset:64/unsigned,
     FirstTimestamp:64/signed,
+    NextOffset:64/unsigned,
     0:2/unsigned,
     TotalSize:70/unsigned,
     %% Entries array:
     Entries/binary
 >>).
-%% THOUGHT: keep NextOffset in the entries array? 8 more bytes but it lets us
-%% avoid a trailer lookup when resolving the manifest.
-%% Maybe keeping just the next_offset on the overall manifest is enough.
 -define(ENTRY(Offset, Timestamp, Kind, Size, SeqNo, Rest), <<
     Offset:64/unsigned,
     Timestamp:64/signed,
@@ -138,6 +142,7 @@
 -record(manifest, {
     first_offset :: osiris:offset(),
     first_timestamp :: osiris:timestamp(),
+    next_offset :: osiris:offset(),
     total_size :: non_neg_integer(),
     entries :: binary()
 }).

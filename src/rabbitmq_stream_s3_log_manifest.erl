@@ -644,13 +644,17 @@ execute_task(#rebalance_manifest{
 execute_task(#upload_manifest{
     dir = Dir,
     manifest = #manifest{
-        first_offset = Offset, first_timestamp = Ts, total_size = Size, entries = Entries
+        first_offset = Offset,
+        first_timestamp = Ts,
+        next_offset = NextOffset,
+        total_size = Size,
+        entries = Entries
     }
 }) ->
     {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
     {ok, Handle} = rabbitmq_aws:open_connection("s3"),
     Key = manifest_key(Dir),
-    Data = [?MANIFEST(Offset, Ts, Size, <<>>), Entries],
+    Data = [?MANIFEST(Offset, Ts, NextOffset, Size, <<>>), Entries],
 
     try
         ?LOG_INFO("Uploading manifest for '~tp'", [Dir]),
@@ -676,11 +680,12 @@ execute_task(#resolve_manifest{dir = Dir}) ->
     Key = manifest_key(Dir),
     Manifest =
         try rabbitmq_stream_s3_api:get_object(Handle, Bucket, Key) of
-            {ok, ?MANIFEST(FirstOffset, FirstTimestamp, TotalSize, Entries) = Data} ->
+            {ok, ?MANIFEST(FirstOffset, FirstTimestamp, NextOffset, TotalSize, Entries) = Data} ->
                 rabbitmq_stream_s3_counters:manifest_read(byte_size(Data)),
                 #manifest{
                     first_offset = FirstOffset,
                     first_timestamp = FirstTimestamp,
+                    next_offset = NextOffset,
                     total_size = TotalSize,
                     entries = Entries
                 };
@@ -697,18 +702,13 @@ resolve_manifest_tail(Dir, #manifest{entries = <<>>} = Manifest0) ->
     #manifest_resolved{dir = Dir, manifest = Manifest0};
 resolve_manifest_tail(Dir, undefined) ->
     #manifest_resolved{dir = Dir, manifest = undefined};
-resolve_manifest_tail(Dir, #manifest{entries = Entries} = Manifest) ->
-    ?ENTRY(Offset, _, _, _, _, _) = rabbitmq_stream_s3_binary_array:last(?ENTRY_B, Entries),
-    {ok, #fragment_info{offset = Offset, next_offset = NextOffset}} = get_fragment_trailer(
-        Dir,
-        Offset
-    ),
-    resolve_manifest_tail(NextOffset, Dir, Manifest).
-
 resolve_manifest_tail(
-    NextOffset0,
     Dir,
-    #manifest{entries = Entries0, total_size = TotalSize0} = Manifest0
+    #manifest{
+        next_offset = NextOffset0,
+        entries = Entries0,
+        total_size = TotalSize0
+    } = Manifest0
 ) ->
     case get_fragment_trailer(Dir, NextOffset0) of
         {ok, #fragment_info{
@@ -721,8 +721,12 @@ resolve_manifest_tail(
             Entries =
                 <<Entries0/binary,
                     (?ENTRY(NextOffset0, Ts, ?MANIFEST_KIND_FRAGMENT, Size, SeqNo, <<>>))/binary>>,
-            Manifest = Manifest0#manifest{entries = Entries, total_size = TotalSize0 + Size},
-            resolve_manifest_tail(NextOffset, Dir, Manifest);
+            Manifest = Manifest0#manifest{
+                next_offset = NextOffset,
+                total_size = TotalSize0 + Size,
+                entries = Entries
+            },
+            resolve_manifest_tail(Dir, Manifest);
         {error, not_found} ->
             #manifest_resolved{dir = Dir, manifest = Manifest0}
     end.

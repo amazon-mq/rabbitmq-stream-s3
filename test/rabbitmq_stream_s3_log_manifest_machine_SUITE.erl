@@ -237,10 +237,18 @@ fragment_to_info(#fragment{
     }.
 
 fragments_to_manifest([
-    #fragment{first_offset = Offset, first_timestamp = Ts, size = Size, seq_no = SeqNo} | Rest
+    #fragment{
+        first_offset = Offset,
+        next_offset = NextOffset,
+        first_timestamp = Ts,
+        size = Size,
+        seq_no = SeqNo
+    }
+    | Rest
 ]) ->
     fragments_to_manifest(Rest, #manifest{
         first_offset = Offset,
+        next_offset = NextOffset,
         first_timestamp = Ts,
         total_size = Size,
         entries = ?ENTRY(Offset, Ts, ?MANIFEST_KIND_FRAGMENT, Size, SeqNo, <<>>)
@@ -249,10 +257,20 @@ fragments_to_manifest([
 fragments_to_manifest([], Manifest) ->
     Manifest;
 fragments_to_manifest(
-    [#fragment{first_offset = Offset, first_timestamp = Ts, size = Size, seq_no = SeqNo} | Rest],
+    [
+        #fragment{
+            first_offset = Offset,
+            next_offset = NextOffset,
+            first_timestamp = Ts,
+            size = Size,
+            seq_no = SeqNo
+        }
+        | Rest
+    ],
     #manifest{total_size = TotalSize0, entries = Entries0} = Manifest0
 ) ->
     Manifest = Manifest0#manifest{
+        next_offset = NextOffset,
         total_size = TotalSize0 + Size,
         entries =
             <<Entries0/binary,

@@ -425,7 +425,16 @@ apply_infos_to_manifest([], Manifest, UploadStatus, _Dir, Effects) ->
     ?LOG_DEBUG("Skipping upload of manifest with status ~w", [UploadStatus]),
     {Manifest, UploadStatus, Effects};
 apply_infos_to_manifest(
-    [#fragment_info{offset = Offset, timestamp = Ts, seq_no = SeqNo, size = Size} | Rest],
+    [
+        #fragment_info{
+            offset = Offset,
+            timestamp = Ts,
+            next_offset = NextOffset,
+            seq_no = SeqNo,
+            size = Size
+        }
+        | Rest
+    ],
     undefined,
     UploadStatus0,
     Dir,
@@ -436,6 +445,7 @@ apply_infos_to_manifest(
     Manifest = #manifest{
         first_offset = Offset,
         first_timestamp = Ts,
+        next_offset = NextOffset,
         total_size = Size,
         entries = ?ENTRY(Offset, Ts, ?MANIFEST_KIND_FRAGMENT, Size, SeqNo, <<>>)
     },
@@ -447,7 +457,16 @@ apply_infos_to_manifest([Fragment | Rest], Manifest, {uploading, Pending0}, Dir,
     %% application once the current upload completes.
     apply_infos_to_manifest(Rest, Manifest, {uploading, [Fragment | Pending0]}, Dir, Effects);
 apply_infos_to_manifest(
-    [#fragment_info{offset = Offset, timestamp = Ts, seq_no = SeqNo, size = Size} | Rest],
+    [
+        #fragment_info{
+            offset = Offset,
+            next_offset = NextOffset,
+            timestamp = Ts,
+            seq_no = SeqNo,
+            size = Size
+        }
+        | Rest
+    ],
     #manifest{total_size = TotalSize0, entries = Entries0} = Manifest0,
     {last_uploaded, NumUpdates0},
     Dir,
@@ -462,6 +481,7 @@ apply_infos_to_manifest(
                 NumUpdates0 + 1
         end,
     Manifest = Manifest0#manifest{
+        next_offset = NextOffset,
         total_size = TotalSize0 + Size,
         entries =
             <<Entries0/binary,
