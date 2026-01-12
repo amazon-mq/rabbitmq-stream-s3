@@ -12,6 +12,7 @@
 -include("include/rabbitmq_stream_s3.hrl").
 
 -define(SERVER, ?MODULE).
+-define(LAST_TIERED_OFFSET_TABLE, rabbitmq_stream_s3_log_manifest_last_tiered_offset).
 
 -behaviour(osiris_log_manifest).
 -behaviour(gen_server).
@@ -195,7 +196,12 @@ checksum(Checksum, Data) ->
     erlang:crc32(Checksum, Data).
 
 writer_manifest(#{dir := Dir, reference := Ref} = Config0) ->
-    Config = Config0#{max_segment_size_bytes => ?MAX_SEGMENT_SIZE_BYTES},
+    %% TODO: apply original retention settings to the remote tier.
+    _ = maps:get(retention, Config0, []),
+    Config = Config0#{
+        max_segment_size_bytes => ?MAX_SEGMENT_SIZE_BYTES,
+        retention => [{'fun', local_retention_fun(Dir)}]
+    },
     ok = gen_server:cast(?SERVER, #init_writer{pid = self(), writer_ref = Ref, dir = Dir}),
     ?LOG_DEBUG("Recovering available fragments for stream ~ts", [Dir]),
     %% Recover the current fragment information. To do this we scan through the
@@ -370,6 +376,10 @@ start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
 init([]) ->
+    %% Table keyed by stream directory. This is used for local retention:
+    %% segments with all offsets less than or equal to the last tiered offset
+    %% can be deleted by retention since they are stored in the remote tier.
+    _ = ets:new(?LAST_TIERED_OFFSET_TABLE, [named_table]),
     {ok, #?MODULE{}}.
 
 handle_call(#get_manifest{dir = Dir}, From, State) ->
@@ -477,6 +487,9 @@ apply_effect(#reply{to = To, response = Response}, State) ->
     State;
 apply_effect(#register_offset_listener{writer_pid = Pid, offset = Offset}, State) ->
     ok = osiris:register_offset_listener(Pid, Offset, {?MODULE, format_osiris_event, []}),
+    State;
+apply_effect(#set_last_tiered_offset{dir = Dir, offset = Offset}, State) ->
+    _ = ets:update_element(?LAST_TIERED_OFFSET_TABLE, Dir, {2, Offset}, {Dir, Offset}),
     State;
 apply_effect(#upload_fragment{} = Event, State) ->
     spawn_task(Event, State);
@@ -951,3 +964,106 @@ maybe_setup_region(Region) -> rabbitmq_aws:set_region(Region).
 -spec metadata() -> rabbitmq_stream_s3_log_manifest_machine:metadata().
 metadata() ->
     #{time => erlang:monotonic_time()}.
+
+-spec local_retention_fun(file:filename_all()) -> osiris:retention_fun().
+local_retention_fun(Dir) ->
+    fun(IdxFiles) ->
+        try ets:lookup_element(?LAST_TIERED_OFFSET_TABLE, Dir, 2) of
+            LastTieredOffset ->
+                eval_local_retention(IdxFiles, LastTieredOffset)
+        catch
+            error:badarg ->
+                {[], IdxFiles}
+        end
+    end.
+
+-spec eval_local_retention(IdxFiles :: [file:filename_all()], osiris:offset()) ->
+    {ToDelete :: [file:filename_all()], ToKeep :: [file:filename_all(), ...]}.
+eval_local_retention(IdxFiles, LastTieredOffset) ->
+    %% Always keep the current active segment no matter what the last tiered
+    %% offset is.
+    eval_local_retention(lists:reverse(IdxFiles), LastTieredOffset, [], []).
+
+eval_local_retention([], _LastTieredOffset, ToDelete, ToKeep) ->
+    %% Always keep the current active segment no matter what the last tiered
+    %% offset is.
+    {lists:reverse(ToDelete), ToKeep};
+eval_local_retention([IdxFile | Rest], LastTieredOffset, ToDelete, ToKeep) ->
+    Offset = binary_to_integer(filename:basename(IdxFile, <<".index">>)),
+    case Offset > LastTieredOffset of
+        true ->
+            eval_local_retention(Rest, LastTieredOffset, ToDelete, [IdxFile | ToKeep]);
+        false ->
+            {lists:reverse(Rest), [IdxFile | ToKeep]}
+    end.
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+eval_local_retention_test() ->
+    IdxFiles = [
+        <<"/data/00000000000000000000.index">>,
+        <<"/data/00000000000000000100.index">>,
+        <<"/data/00000000000000000200.index">>,
+        <<"/data/00000000000000000300.index">>,
+        <<"/data/00000000000000000400.index">>
+    ],
+    ?assertEqual(
+        {
+            [
+                <<"/data/00000000000000000000.index">>,
+                <<"/data/00000000000000000100.index">>
+            ],
+            [
+                <<"/data/00000000000000000200.index">>,
+                <<"/data/00000000000000000300.index">>,
+                <<"/data/00000000000000000400.index">>
+            ]
+        },
+        eval_local_retention(IdxFiles, 250)
+    ),
+    %% Always keep the current segment:
+    ?assertEqual(
+        {
+            [
+                <<"/data/00000000000000000000.index">>,
+                <<"/data/00000000000000000100.index">>,
+                <<"/data/00000000000000000200.index">>,
+                <<"/data/00000000000000000300.index">>
+            ],
+            [
+                <<"/data/00000000000000000400.index">>
+            ]
+        },
+        eval_local_retention(IdxFiles, 450)
+    ),
+    ?assertEqual(
+        {
+            [
+                <<"/data/00000000000000000000.index">>,
+                <<"/data/00000000000000000100.index">>,
+                <<"/data/00000000000000000200.index">>
+            ],
+            [
+                <<"/data/00000000000000000300.index">>,
+                <<"/data/00000000000000000400.index">>
+            ]
+        },
+        eval_local_retention(IdxFiles, 300)
+    ),
+    ?assertEqual(
+        {
+            [],
+            [
+                <<"/data/00000000000000000000.index">>,
+                <<"/data/00000000000000000100.index">>,
+                <<"/data/00000000000000000200.index">>,
+                <<"/data/00000000000000000300.index">>,
+                <<"/data/00000000000000000400.index">>
+            ]
+        },
+        eval_local_retention(IdxFiles, 0)
+    ),
+    ok.
+
+-endif.

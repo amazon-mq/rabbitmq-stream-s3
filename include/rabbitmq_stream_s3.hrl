@@ -238,11 +238,13 @@
 %% last fragment to see if fragments have been uploaded but not yet applied.
 -record(resolve_manifest, {dir :: file:filename_all()}).
 -record(reply, {to :: gen_server:from(), response :: term()}).
+-record(set_last_tiered_offset, {dir :: file:filename_all(), offset :: osiris:offset()}).
 
 -type effect() ::
     #rebalance_manifest{}
     | #register_offset_listener{}
     | #reply{}
     | #resolve_manifest{}
+    | #set_last_tiered_offset{}
     | #upload_fragment{}
     | #upload_manifest{}.

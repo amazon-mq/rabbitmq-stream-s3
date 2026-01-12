@@ -164,13 +164,20 @@ apply(
                 #manifest{} -> ok;
                 undefined -> ok
             end,
-            {Manifest, UploadStatus, Effects} = apply_infos_to_manifest(
+            {Manifest, UploadStatus, Effects0} = apply_infos_to_manifest(
                 Finished, Manifest0, UploadStatus0, Dir
             ),
             Writer = Writer0#writer{
                 uploaded_fragments = Pending,
                 next_tiered_offset = NTO
             },
+            Effects =
+                case NTO of
+                    NTO0 ->
+                        Effects0;
+                    _ ->
+                        [#set_last_tiered_offset{dir = Dir, offset = NTO - 1} | Effects0]
+                end,
             State = State0#?MODULE{
                 writers = Writers0#{WriterRef := Writer},
                 manifests = Manifests0#{Dir := {Manifest, UploadStatus}}

@@ -118,7 +118,13 @@ out_of_order_fragment_uploads(Config) ->
     %% Once the first fragment has finished uploading then the manifest is
     %% updated for all fragments.
     {_Mac4, Effects4} = ?MAC:apply(?META(), Up1, Mac3),
-    ?assertMatch([#upload_manifest{manifest = #manifest{first_offset = 0}}], Effects4),
+    ?assertMatch(
+        [
+            #set_last_tiered_offset{offset = 59},
+            #upload_manifest{manifest = #manifest{first_offset = 0}}
+        ],
+        Effects4
+    ),
     ok.
 
 recover_uploaded_fragments(Config) ->
@@ -148,7 +154,10 @@ recover_uploaded_fragments(Config) ->
     %% only sees 1 complete its upload.
     {_Mac3, Effects3} = ?MAC:apply(?META(), Up1, Mac2),
     ?assertMatch(
-        [#upload_manifest{manifest = #manifest{first_offset = 0, total_size = 1}}],
+        [
+            #set_last_tiered_offset{offset = 19},
+            #upload_manifest{manifest = #manifest{first_offset = 0, total_size = 1}}
+        ],
         Effects3
     ),
 
