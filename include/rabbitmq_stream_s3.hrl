@@ -1,6 +1,11 @@
 %% Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 %% SPDX-License-Identifier: Apache-2.0
 
+%% Prefer binaries for filenames. This is a subtype of file:filename_all().
+%% Binaries represent ASCII in a much more compact fashion than lists.
+-type filename() :: binary().
+-type directory() :: binary().
+
 %% Segment and fragment file header size. 4 bytes for the magic and 4 bytes for
 %% the version.
 -define(SEGMENT_HEADER_B, 8).
@@ -199,14 +204,14 @@
 %% The writer notified the manifest that the commit offset has moved forward.
 -record(commit_offset_increased, {writer_ref :: writer_ref(), offset :: osiris:offset()}).
 -record(fragment_uploaded, {writer_ref :: writer_ref(), info :: #fragment_info{}}).
--record(manifest_uploaded, {dir :: file:filename_all()}).
--record(manifest_rebalanced, {dir :: file:filename_all(), manifest :: #manifest{}}).
--record(manifest_requested, {requester :: gen_server:from(), dir :: file:filename_all()}).
--record(manifest_resolved, {dir :: file:filename_all(), manifest :: #manifest{} | undefined}).
+-record(manifest_uploaded, {dir :: directory()}).
+-record(manifest_rebalanced, {dir :: directory(), manifest :: #manifest{}}).
+-record(manifest_requested, {requester :: gen_server:from(), dir :: directory()}).
+-record(manifest_resolved, {dir :: directory(), manifest :: #manifest{} | undefined}).
 -record(writer_spawned, {
     pid :: pid(),
     writer_ref :: writer_ref(),
-    dir :: file:filename_all()
+    dir :: directory()
 }).
 
 -type event() ::
@@ -222,12 +227,12 @@
 %% Effects.
 
 -record(upload_fragment, {
-    writer_ref :: writer_ref(), dir :: file:filename_all(), fragment :: #fragment{}
+    writer_ref :: writer_ref(), dir :: directory(), fragment :: #fragment{}
 }).
 -record(register_offset_listener, {writer_pid :: pid(), offset :: osiris:offset() | -1}).
--record(upload_manifest, {dir :: file:filename_all(), manifest :: #manifest{}}).
+-record(upload_manifest, {dir :: directory(), manifest :: #manifest{}}).
 -record(rebalance_manifest, {
-    dir :: file:filename_all(),
+    dir :: directory(),
     kind :: rabbitmq_stream_s3_log_manifest_entry:kind(),
     size :: pos_integer(),
     new_group :: rabbitmq_stream_s3_log_manifest_entry:entries(),
@@ -236,9 +241,9 @@
 }).
 %% Download the manifest from the remote tier and also check the tail of the
 %% last fragment to see if fragments have been uploaded but not yet applied.
--record(resolve_manifest, {dir :: file:filename_all()}).
+-record(resolve_manifest, {dir :: directory()}).
 -record(reply, {to :: gen_server:from(), response :: term()}).
--record(set_last_tiered_offset, {dir :: file:filename_all(), offset :: osiris:offset()}).
+-record(set_last_tiered_offset, {dir :: directory(), offset :: osiris:offset()}).
 
 -type effect() ::
     #rebalance_manifest{}

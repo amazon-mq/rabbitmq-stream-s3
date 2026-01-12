@@ -15,7 +15,7 @@
 
 -record(remote, {
     pid :: pid(),
-    dir :: file:filename_all(),
+    dir :: directory(),
     transport :: tcp | ssl,
     next_offset :: osiris:offset(),
     shared :: atomics:atomics_ref(),
@@ -561,7 +561,7 @@ convert_remote_to_local(#?MODULE{
 -spec find_fragment_for_offset(
     osiris:offset(),
     #manifest{} | rabbitmq_stream_s3_binary_array:array(),
-    file:filename_all()
+    directory()
 ) ->
     {ok, ChunkId :: osiris:offset(), byte_offset(), Fragment :: osiris:offset()}.
 find_fragment_for_offset(Offset, #manifest{entries = Entries}, Dir) ->

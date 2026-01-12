@@ -33,10 +33,10 @@
 -record(init_writer, {
     pid :: pid(),
     writer_ref :: writer_ref(),
-    dir :: file:filename_all()
+    dir :: directory()
 }).
--record(get_manifest, {dir :: file:filename_all()}).
--record(acceptor_overview, {dir :: file:filename_all()}).
+-record(get_manifest, {dir :: directory()}).
+-record(acceptor_overview, {dir :: directory()}).
 -record(task_completed, {task_pid :: pid(), event :: event()}).
 
 %% osiris_log_manifest
@@ -91,7 +91,7 @@ start() ->
     ok = rabbitmq_stream_s3_counters:init(),
     rabbit_sup:start_child(?MODULE).
 
--spec get_manifest(file:filename_all()) -> #manifest{} | undefined.
+-spec get_manifest(directory()) -> #manifest{} | undefined.
 get_manifest(Dir) ->
     gen_server:call(?SERVER, #get_manifest{dir = Dir}, infinity).
 
@@ -195,7 +195,8 @@ checksum(undefined, _) ->
 checksum(Checksum, Data) ->
     erlang:crc32(Checksum, Data).
 
-writer_manifest(#{dir := Dir, reference := Ref} = Config0) ->
+writer_manifest(#{dir := Dir0, reference := Ref} = Config0) ->
+    Dir = list_to_binary(Dir0),
     %% TODO: apply original retention settings to the remote tier.
     _ = maps:get(retention, Config0, []),
     Config = Config0#{
@@ -965,7 +966,7 @@ maybe_setup_region(Region) -> rabbitmq_aws:set_region(Region).
 metadata() ->
     #{time => erlang:monotonic_time()}.
 
--spec local_retention_fun(file:filename_all()) -> osiris:retention_fun().
+-spec local_retention_fun(directory()) -> osiris:retention_fun().
 local_retention_fun(Dir) ->
     fun(IdxFiles) ->
         try ets:lookup_element(?LAST_TIERED_OFFSET_TABLE, Dir, 2) of
@@ -977,8 +978,8 @@ local_retention_fun(Dir) ->
         end
     end.
 
--spec eval_local_retention(IdxFiles :: [file:filename_all()], osiris:offset()) ->
-    {ToDelete :: [file:filename_all()], ToKeep :: [file:filename_all(), ...]}.
+-spec eval_local_retention(IdxFiles :: [filename()], osiris:offset()) ->
+    {ToDelete :: [filename()], ToKeep :: [filename(), ...]}.
 eval_local_retention(IdxFiles, LastTieredOffset) ->
     %% Always keep the current active segment no matter what the last tiered
     %% offset is.

@@ -22,7 +22,7 @@ for the log manifest server to execute.
     %% Pid of the osiris_writer process. Used to attach offset listeners.
     pid :: pid(),
     %% Local dir of the log.
-    dir :: file:filename_all(),
+    dir :: directory(),
     %% Current commit offset (updated by offset listener notifications) known
     %% to the manifest - this can lag behind the actual commit offset.
     commit_offset = -1 :: osiris:offset() | -1,
@@ -47,7 +47,7 @@ for the log manifest server to execute.
 -record(?MODULE, {
     writers = #{} :: #{writer_ref() => #writer{}},
     manifests = #{} :: #{
-        file:filename_all() =>
+        directory() =>
             {#manifest{} | undefined, upload_status()}
             | {pending, [gen_server:from()]}
     }
@@ -70,7 +70,7 @@ Create a default, empty machine state.
 -spec new() -> state().
 new() -> #?MODULE{}.
 
--spec get_manifest(Dir :: file:filename_all(), state()) -> #manifest{} | undefined.
+-spec get_manifest(Dir :: directory(), state()) -> #manifest{} | undefined.
 get_manifest(Dir, #?MODULE{manifests = Manifests}) ->
     maps:get(Dir, Manifests, undefined).
 
@@ -380,7 +380,7 @@ This function also evaluates whether the manifest should be rebalanced and/or
 uploaded to the remote tier.
 """.
 -spec apply_infos_to_manifest(
-    [#fragment_info{}], #manifest{} | undefined, upload_status(), file:filename_all()
+    [#fragment_info{}], #manifest{} | undefined, upload_status(), directory()
 ) ->
     {#manifest{}, upload_status(), [effect()]}.
 apply_infos_to_manifest(Infos, Manifest, UploadStatus, Dir) ->
