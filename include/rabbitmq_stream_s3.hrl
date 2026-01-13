@@ -174,8 +174,11 @@
 
 %% rabbitmq_stream_s3_log_manifest_machine types:
 
-%% Set by `rabbit_stream_queue:make_stream_conf/1'.
--type writer_ref() :: rabbit_amqqueue:name().
+%% An opaque identifier for a stream which uniquely identifies the stream even
+%% across nodes. `rabbit_stream_queue:make_stream_conf/1' makes this a
+%% `rabbit_amqqueue:name()' but it can be any term. This corresponds to the
+%% `reference' field of `osiris:config()'.
+-type stream_id() :: term().
 
 -record(fragment, {
     segment_offset :: osiris:offset(),
@@ -200,18 +203,37 @@
 %% handed off to the manifest. This is also emitted when a writer starts up
 %% as it scans through the current segment and finds existing fragments - the
 %% manifest server applies these idempotently.
--record(fragment_available, {writer_ref :: writer_ref(), fragment :: #fragment{}}).
+-record(fragment_available, {
+    stream :: stream_id(),
+    fragment :: #fragment{}
+}).
 %% The writer notified the manifest that the commit offset has moved forward.
--record(commit_offset_increased, {writer_ref :: writer_ref(), offset :: osiris:offset()}).
--record(fragment_uploaded, {writer_ref :: writer_ref(), info :: #fragment_info{}}).
--record(manifest_uploaded, {dir :: directory()}).
--record(manifest_rebalanced, {dir :: directory(), manifest :: #manifest{}}).
--record(manifest_requested, {requester :: gen_server:from(), dir :: directory()}).
--record(manifest_resolved, {dir :: directory(), manifest :: #manifest{} | undefined}).
+-record(commit_offset_increased, {
+    stream :: stream_id(),
+    offset :: osiris:offset()
+}).
+-record(fragment_uploaded, {
+    stream :: stream_id(),
+    info :: #fragment_info{}
+}).
+-record(manifest_uploaded, {stream :: stream_id()}).
+-record(manifest_rebalanced, {
+    stream :: stream_id(),
+    manifest :: #manifest{}
+}).
+-record(manifest_requested, {
+    stream :: stream_id(),
+    dir :: directory(),
+    requester :: gen_server:from()
+}).
+-record(manifest_resolved, {
+    stream :: stream_id(),
+    manifest :: #manifest{} | undefined
+}).
 -record(writer_spawned, {
-    pid :: pid(),
-    writer_ref :: writer_ref(),
-    dir :: directory()
+    stream :: stream_id(),
+    dir :: directory(),
+    pid :: pid()
 }).
 
 -type event() ::
@@ -226,12 +248,22 @@
 
 %% Effects.
 
--record(upload_fragment, {
-    writer_ref :: writer_ref(), dir :: directory(), fragment :: #fragment{}
+-record(register_offset_listener, {
+    writer_pid :: pid(),
+    offset :: osiris:offset() | -1
 }).
--record(register_offset_listener, {writer_pid :: pid(), offset :: osiris:offset() | -1}).
--record(upload_manifest, {dir :: directory(), manifest :: #manifest{}}).
+-record(upload_fragment, {
+    stream :: stream_id(),
+    dir :: directory(),
+    fragment :: #fragment{}
+}).
+-record(upload_manifest, {
+    stream :: stream_id(),
+    dir :: directory(),
+    manifest :: #manifest{}
+}).
 -record(rebalance_manifest, {
+    stream :: stream_id(),
     dir :: directory(),
     kind :: rabbitmq_stream_s3_log_manifest_entry:kind(),
     size :: pos_integer(),
@@ -241,9 +273,16 @@
 }).
 %% Download the manifest from the remote tier and also check the tail of the
 %% last fragment to see if fragments have been uploaded but not yet applied.
--record(resolve_manifest, {dir :: directory()}).
+-record(resolve_manifest, {
+    stream :: stream_id(),
+    dir :: directory()
+}).
 -record(reply, {to :: gen_server:from(), response :: term()}).
--record(set_last_tiered_offset, {dir :: directory(), offset :: osiris:offset()}).
+-record(set_last_tiered_offset, {
+    writer_pid :: pid(),
+    stream :: stream_id(),
+    offset :: osiris:offset()
+}).
 
 -type effect() ::
     #rebalance_manifest{}

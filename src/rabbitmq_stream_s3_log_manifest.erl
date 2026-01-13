@@ -17,34 +17,45 @@
 -behaviour(osiris_log_manifest).
 -behaviour(gen_server).
 
--record(manifest_writer, {
+-record(log_writer, {
     type :: writer | acceptor,
+    stream :: stream_id(),
     %% Only defined for writers:
-    writer_ref :: writer_ref() | undefined,
     fragment :: #fragment{} | undefined
 }).
 
 -record(?MODULE, {
     machine = rabbitmq_stream_s3_log_manifest_machine:new() :: rabbitmq_stream_s3_log_manifest_machine:state(),
-    tasks = #{} :: #{pid() => effect()}
+    tasks = #{} :: #{pid() => effect()},
+    offset_listeners = #{} :: #{
+        stream_id() => [{pid(), osiris:offset() | -1}] | osiris:offset() | -1
+    }
 }).
 
 %% records for the gen_server to handle:
 -record(init_writer, {
     pid :: pid(),
-    writer_ref :: writer_ref(),
+    stream :: stream_id(),
+    dir :: directory()
+}).
+-record(init_acceptor, {
+    pid :: pid(),
+    writer_pid :: pid(),
+    stream :: stream_id(),
     dir :: directory()
 }).
 -record(get_manifest, {dir :: directory()}).
--record(acceptor_overview, {dir :: directory()}).
 -record(task_completed, {task_pid :: pid(), event :: event()}).
+-record(register_last_tiered_offset_listener, {
+    pid :: pid(),
+    stream :: stream_id(),
+    offset :: osiris:offset() | -1
+}).
 
 %% osiris_log_manifest
 -export([
-    writer_manifest/1,
-    acceptor_manifest/2,
+    init_manifest/2,
     overview/1,
-    recover_tracking/3,
     handle_event/2,
     close_manifest/1,
     delete/1
@@ -64,7 +75,7 @@
 %% Need to be exported for `erlang:apply/3`.
 -export([start/0, format_osiris_event/1, execute_task/2]).
 
--export([get_manifest/1, get_fragment_trailer/2]).
+-export([get_manifest/1, get_fragment_trailer/2, register_last_tiered_offset_listener/3]).
 
 %% Useful to search module.
 -export([fragment_key/2, group_key/3, make_file_name/2, fragment_trailer_to_info/1]).
@@ -95,13 +106,22 @@ start() ->
 get_manifest(Dir) ->
     gen_server:call(?SERVER, #get_manifest{dir = Dir}, infinity).
 
+-spec register_last_tiered_offset_listener({?MODULE, node()}, stream_id(), osiris:offset() | -1) ->
+    ok.
+register_last_tiered_offset_listener(ServerId, Stream, Offset) ->
+    gen_server:cast(ServerId, #register_last_tiered_offset_listener{
+        pid = self(),
+        stream = Stream,
+        offset = Offset
+    }).
+
 %%----------------------------------------------------------------------------
 
-handle_event(_Event, #manifest_writer{type = acceptor} = Manifest) ->
+handle_event(_Event, #log_writer{type = acceptor} = Manifest) ->
     Manifest;
 handle_event(
     {segment_opened, RolledSegment, NewSegment},
-    #manifest_writer{writer_ref = WriterRef, fragment = Fragment0} = Manifest0
+    #log_writer{stream = Stream, fragment = Fragment0} = Manifest0
 ) ->
     Fragment =
         %% Submit the fragment for the rolled segment (if there actually is one) to
@@ -123,16 +143,16 @@ handle_event(
                     _ ->
                         ok = gen_server:cast(
                             ?SERVER,
-                            #fragment_available{writer_ref = WriterRef, fragment = Fragment0}
+                            #fragment_available{stream = Stream, fragment = Fragment0}
                         )
                 end,
                 #fragment{segment_offset = segment_file_offset(NewSegment)}
         end,
-    Manifest0#manifest_writer{fragment = Fragment};
+    Manifest0#log_writer{fragment = Fragment};
 handle_event(
     {chunk_written, #{id := ChId, timestamp := Ts, num := NumRecords, size := ChunkSize}, Chunk},
-    #manifest_writer{
-        writer_ref = WriterRef,
+    #log_writer{
+        stream = Stream,
         fragment =
             #fragment{
                 segment_offset = SegmentOffset,
@@ -174,7 +194,7 @@ handle_event(
                 %% Roll over the fragment.
                 ok = gen_server:cast(
                     ?SERVER,
-                    #fragment_available{writer_ref = WriterRef, fragment = Fragment2}
+                    #fragment_available{stream = Stream, fragment = Fragment2}
                 ),
                 #fragment{
                     segment_offset = SegmentOffset,
@@ -185,8 +205,8 @@ handle_event(
             false ->
                 Fragment2
         end,
-    Manifest0#manifest_writer{fragment = Fragment};
-handle_event({retention_updated, _Retention}, #manifest_writer{} = Manifest) ->
+    Manifest0#log_writer{fragment = Fragment};
+handle_event({retention_updated, _Retention}, #log_writer{} = Manifest) ->
     %% TODO
     Manifest.
 
@@ -195,15 +215,28 @@ checksum(undefined, _) ->
 checksum(Checksum, Data) ->
     erlang:crc32(Checksum, Data).
 
-writer_manifest(#{dir := Dir0, reference := Ref} = Config0) ->
+init_manifest(#{dir := Dir0, reference := Stream, leader_pid := LeaderPid} = Config0, acceptor) ->
+    Dir = list_to_binary(Dir0),
+    Config = Config0#{
+        max_segment_size_bytes => ?MAX_SEGMENT_SIZE_BYTES,
+        retention => [{'fun', local_retention_fun(Stream)}]
+    },
+    ok = gen_server:cast(?SERVER, #init_acceptor{
+        pid = self(),
+        writer_pid = LeaderPid,
+        stream = Stream,
+        dir = Dir
+    }),
+    {Config, #log_writer{type = acceptor, stream = Stream}};
+init_manifest(#{dir := Dir0, reference := Stream} = Config0, writer) ->
     Dir = list_to_binary(Dir0),
     %% TODO: apply original retention settings to the remote tier.
     _ = maps:get(retention, Config0, []),
     Config = Config0#{
         max_segment_size_bytes => ?MAX_SEGMENT_SIZE_BYTES,
-        retention => [{'fun', local_retention_fun(Dir)}]
+        retention => [{'fun', local_retention_fun(Stream)}]
     },
-    ok = gen_server:cast(?SERVER, #init_writer{pid = self(), writer_ref = Ref, dir = Dir}),
+    ok = gen_server:cast(?SERVER, #init_writer{pid = self(), stream = Stream, dir = Dir}),
     ?LOG_DEBUG("Recovering available fragments for stream ~ts", [Dir]),
     %% Recover the current fragment information. To do this we scan through the
     %% most recent index file and find the last fragment. While performing this
@@ -224,17 +257,17 @@ writer_manifest(#{dir := Dir0, reference := Ref} = Config0) ->
                 %% uploaded yet? The manifest server should spawn a task to find
                 %% and upload those fragments.
                 _ = [
-                    gen_server:cast(?SERVER, #fragment_available{writer_ref = Ref, fragment = F})
+                    gen_server:cast(?SERVER, #fragment_available{stream = Stream, fragment = F})
                  || F <- Rest
                 ],
                 Latest
         end,
-    Manifest = #manifest_writer{
+    Manifest = #log_writer{
         type = writer,
-        writer_ref = Ref,
+        stream = Stream,
         fragment = Fragment
     },
-    {Manifest, Config}.
+    {Config, Manifest}.
 
 recover_fragments(IdxFile) ->
     ?LOG_DEBUG("Recovering fragments from index file ~ts", [IdxFile]),
@@ -318,48 +351,15 @@ recover_fragments(
     end.
 
 overview(Dir) ->
-    LocalOverview = osiris_log:overview(Dir),
-    ?LOG_DEBUG("Local overview: ~w", [LocalOverview]),
-    case LocalOverview of
-        #{range := empty} ->
-            %% If the stream is empty there's nothing to do.
-            %% TODO: could a stream be entirely uploaded to the remote tier?
-            LocalOverview;
-        #{range := {LocalFrom, LocalTo}} ->
-            ?LOG_DEBUG("local range ~w", [{LocalFrom, LocalTo}]),
-            Info = gen_server:call(?SERVER, #acceptor_overview{dir = Dir}, infinity),
-            maps:merge(LocalOverview, Info)
-    end.
+    %% TODO: adjust the lower end of the range from the local overview to
+    %% move up to the offset of the oldest segment which is not yet fully
+    %% uploaded to the remote tier. (Also see the local retention function,
+    %% it should be nearly the same calculation.) This could make replication
+    %% to a new member quicker. To do this we need to be able to look up from
+    %% `Dir => WriterRef`.
+    osiris_log:overview(Dir).
 
-recover_tracking(Trk0, SegmentFile, #manifest_writer{}) ->
-    %% TODO: we must check if the segment file is sparse. If it is, we need to
-    %% recover tracking from the remote tier. See how this function is defined
-    %% in osiris_log: we need to read through the chunks and use
-    %% `osiris_tracking:init/2` on snapshot-type chunks and
-    %% `osiris_tracking:append_trailer/3` on tracking delta chunks or any
-    %% user chunks with trailers. We should be able to reuse the gen_server
-    %% from this module to perform the necessary reads.
-    osiris_log:recover_tracking(Trk0, SegmentFile, undefined).
-
-acceptor_manifest(Overview0, #{dir := Dir, epoch := Epoch} = Config0) ->
-    ?LOG_DEBUG("acceptor got remote overview: ~w", [Overview0]),
-    Config = Config0#{max_segment_size_bytes => ?MAX_SEGMENT_SIZE_BYTES},
-    case list_dir(Dir) of
-        [] ->
-            case Overview0 of
-                #{last_tiered_fragment_offset := LTFO, last_tiered_segment_offset := LTSO} ->
-                    create_sparse_segment(Dir, Epoch, LTSO, LTFO),
-                    ok;
-                _ ->
-                    ok
-            end,
-            Manifest = #manifest_writer{type = acceptor},
-            {Manifest, Config};
-        _ ->
-            exit(replica_local_log_has_data)
-    end.
-
-close_manifest(#manifest_writer{}) ->
+close_manifest(#log_writer{}) ->
     %% TODO: unregister writers with the server.
     ok.
 
@@ -377,9 +377,9 @@ start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
 init([]) ->
-    %% Table keyed by stream directory. This is used for local retention:
-    %% segments with all offsets less than or equal to the last tiered offset
-    %% can be deleted by retention since they are stored in the remote tier.
+    %% Table keyed by stream ID. This is used for local retention: segments
+    %% with all offsets less than or equal to the last tiered offset can be
+    %% deleted by retention since they are stored in the remote tier.
     _ = ets:new(?LAST_TIERED_OFFSET_TABLE, [named_table]),
     {ok, #?MODULE{}}.
 
@@ -389,16 +389,34 @@ handle_call(#get_manifest{dir = Dir}, From, State) ->
     %% readers to find anything within branches.
     Event = #manifest_requested{dir = Dir, requester = From},
     evolve_event(Event, State);
-handle_call(#acceptor_overview{dir = Dir}, _From, #?MODULE{machine = MacState} = State) ->
-    Manifest = rabbitmq_stream_s3_log_manifest_machine:get_manifest(Dir, MacState),
-    {reply, acceptor_overview(Manifest), State};
 handle_call(Request, From, State) ->
     ?LOG_INFO(?MODULE_STRING " received unexpected call from ~p: ~W", [From, Request, 10]),
     {noreply, State}.
 
-handle_cast(#init_writer{pid = Pid, writer_ref = WriterRef, dir = Dir}, State) ->
-    Event = #writer_spawned{pid = Pid, writer_ref = WriterRef, dir = Dir},
+handle_cast(#init_writer{pid = Pid, stream = StreamId, dir = Dir}, State) ->
+    Event = #writer_spawned{pid = Pid, stream = StreamId, dir = Dir},
     evolve_event(Event, State);
+handle_cast(
+    #init_acceptor{writer_pid = WriterPid, stream = StreamId},
+    #?MODULE{offset_listeners = L0} = State0
+) ->
+    %% Subscribe to updates to the last-tiered-offset for this stream.
+    ok = register_last_tiered_offset_listener({?MODULE, node(WriterPid)}, StreamId, -1),
+    State = State0#?MODULE{offset_listeners = L0#{StreamId => -1}},
+    {noreply, State};
+handle_cast(
+    #register_last_tiered_offset_listener{pid = Pid, stream = StreamId, offset = Offset},
+    #?MODULE{offset_listeners = OffsetListeners0} = State0
+) ->
+    Listeners =
+        case OffsetListeners0 of
+            #{StreamId := Listeners0} when is_list(Listeners0) ->
+                [{Pid, Offset} | Listeners0];
+            _ ->
+                [{Pid, Offset}]
+        end,
+    State = State0#?MODULE{offset_listeners = OffsetListeners0#{StreamId => Listeners}},
+    {noreply, State};
 handle_cast(
     #task_completed{task_pid = TaskPid, event = Event},
     #?MODULE{tasks = Tasks0} = State0
@@ -413,9 +431,11 @@ handle_cast(Message, State) ->
     ?LOG_DEBUG(?MODULE_STRING " received unexpected cast: ~W", [Message, 10]),
     {noreply, State}.
 
-handle_info({osiris_offset, WriterRef, Offset}, State) ->
-    Event = #commit_offset_increased{writer_ref = WriterRef, offset = Offset},
+handle_info({osiris_offset, Stream, Offset}, State) ->
+    Event = #commit_offset_increased{stream = Stream, offset = Offset},
     evolve_event(Event, State);
+handle_info(#set_last_tiered_offset{} = Effect, State) ->
+    {noreply, apply_effect(Effect, State)};
 handle_info({'DOWN', _MRef, process, Pid, Reason}, #?MODULE{tasks = Tasks0} = State0) ->
     case maps:take(Pid, Tasks0) of
         {_Effect, Tasks} ->
@@ -489,9 +509,40 @@ apply_effect(#reply{to = To, response = Response}, State) ->
 apply_effect(#register_offset_listener{writer_pid = Pid, offset = Offset}, State) ->
     ok = osiris:register_offset_listener(Pid, Offset, {?MODULE, format_osiris_event, []}),
     State;
-apply_effect(#set_last_tiered_offset{dir = Dir, offset = Offset}, State) ->
-    _ = ets:update_element(?LAST_TIERED_OFFSET_TABLE, Dir, {2, Offset}, {Dir, Offset}),
-    State;
+apply_effect(
+    #set_last_tiered_offset{
+        writer_pid = WriterPid,
+        stream = StreamId,
+        offset = Offset
+    } = Effect,
+    #?MODULE{offset_listeners = L0} = State0
+) ->
+    _ = ets:update_element(
+        ?LAST_TIERED_OFFSET_TABLE,
+        StreamId,
+        {2, Offset},
+        {StreamId, Offset}
+    ),
+    case L0 of
+        #{StreamId := Listeners0} when is_list(Listeners0) ->
+            {Notify, Listeners} = lists:partition(fun({_Pid, O}) -> O =< Offset end, Listeners0),
+            _ = [Pid ! Effect || {Pid, _} <- Notify],
+            L =
+                case Listeners of
+                    [] ->
+                        maps:remove(StreamId, L0);
+                    [_ | _] ->
+                        L0#{StreamId := Listeners}
+                end,
+            State0#?MODULE{offset_listeners = L};
+        #{StreamId := RequestedOffset} when is_integer(RequestedOffset) ->
+            ok = register_last_tiered_offset_listener(
+                {?MODULE, node(WriterPid)}, StreamId, Offset + 1
+            ),
+            State0#?MODULE{offset_listeners = L0#{StreamId := Offset + 1}};
+        _ ->
+            State0
+    end;
 apply_effect(#upload_fragment{} = Event, State) ->
     spawn_task(Event, State);
 apply_effect(#upload_manifest{} = Event, State) ->
@@ -513,7 +564,7 @@ execute_task(Effect, ManifestServer) ->
     gen_server:cast(ManifestServer, #task_completed{task_pid = self(), event = Event}).
 
 execute_task(#upload_fragment{
-    writer_ref = WriterRef,
+    stream = Stream,
     dir = Dir,
     fragment =
         #fragment{
@@ -612,11 +663,12 @@ execute_task(#upload_fragment{
         %% TODO: update counters for fragments.
         rabbitmq_stream_s3_counters:segment_uploaded(UploadSize),
 
-        #fragment_uploaded{writer_ref = WriterRef, info = FragmentInfo}
+        #fragment_uploaded{stream = Stream, info = FragmentInfo}
     after
         ok = rabbitmq_aws:close_connection(Handle)
     end;
 execute_task(#rebalance_manifest{
+    stream = StreamId,
     dir = Dir,
     kind = GroupKind,
     size = GroupSize,
@@ -654,8 +706,9 @@ execute_task(#rebalance_manifest{
         ok = rabbitmq_aws:close_connection(Handle)
     end,
     Manifest = Manifest0#manifest{entries = RebalancedEntries},
-    #manifest_rebalanced{dir = Dir, manifest = Manifest};
+    #manifest_rebalanced{stream = StreamId, manifest = Manifest};
 execute_task(#upload_manifest{
+    stream = StreamId,
     dir = Dir,
     manifest = #manifest{
         first_offset = Offset,
@@ -687,12 +740,12 @@ execute_task(#upload_manifest{
     after
         ok = rabbitmq_aws:close_connection(Handle)
     end,
-    #manifest_uploaded{dir = Dir};
-execute_task(#resolve_manifest{dir = Dir}) ->
+    #manifest_uploaded{stream = StreamId};
+execute_task(#resolve_manifest{stream = StreamId, dir = Dir}) ->
     {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
     {ok, Handle} = rabbitmq_aws:open_connection("s3"),
     Key = manifest_key(Dir),
-    Manifest =
+    Manifest0 =
         try rabbitmq_stream_s3_api:get_object(Handle, Bucket, Key) of
             {ok, ?MANIFEST(FirstOffset, FirstTimestamp, NextOffset, TotalSize, Entries) = Data} ->
                 rabbitmq_stream_s3_counters:manifest_read(byte_size(Data)),
@@ -710,12 +763,15 @@ execute_task(#resolve_manifest{dir = Dir}) ->
         after
             ok = rabbitmq_aws:close_connection(Handle)
         end,
-    resolve_manifest_tail(Dir, Manifest).
+    #manifest_resolved{
+        stream = StreamId,
+        manifest = resolve_manifest_tail(Dir, Manifest0)
+    }.
 
-resolve_manifest_tail(Dir, #manifest{entries = <<>>} = Manifest0) ->
-    #manifest_resolved{dir = Dir, manifest = Manifest0};
-resolve_manifest_tail(Dir, undefined) ->
-    #manifest_resolved{dir = Dir, manifest = undefined};
+resolve_manifest_tail(_Dir, #manifest{entries = <<>>} = Manifest0) ->
+    Manifest0;
+resolve_manifest_tail(_Dir, undefined) ->
+    undefined;
 resolve_manifest_tail(
     Dir,
     #manifest{
@@ -742,7 +798,7 @@ resolve_manifest_tail(
             },
             resolve_manifest_tail(Dir, Manifest);
         {error, not_found} ->
-            #manifest_resolved{dir = Dir, manifest = Manifest0}
+            Manifest0
     end.
 
 group_extension(?MANIFEST_KIND_GROUP) -> "group";
@@ -800,131 +856,6 @@ fragment_trailer_to_info(
         index_size = IdxSize
     }.
 
-acceptor_overview(undefined) ->
-    #{};
-acceptor_overview(#manifest{entries = <<>>}) ->
-    %% I suppose that this can be empty when the entire stream expires.
-    %% TODO: delete the manifest from the remote tier then instead? Err we
-    %% probably need to keep the last offset.
-    #{};
-acceptor_overview(#manifest{entries = Entries}) ->
-    SegmentStart = rabbitmq_stream_s3_binary_array:rfind(
-        fun(?ENTRY(_O, _T, _K, _S, SeqNo, _)) ->
-            SeqNo =:= 0
-        end,
-        ?ENTRY_B,
-        Entries
-    ),
-    %% NOTE: this cannot be `undefined` because we will only delete entire
-    %% segments via retention.
-    ?assert(is_integer(SegmentStart)),
-    ?ENTRY(LTSO, _, _, _, _, _) = rabbitmq_stream_s3_binary_array:at(
-        SegmentStart, ?ENTRY_B, Entries
-    ),
-    ?ENTRY(LTFO, _, _, _, _, _) = rabbitmq_stream_s3_binary_array:last(?ENTRY_B, Entries),
-    %% Hmm. So with eventual consistency. The uploaded fragments can outrun
-    %% the segment. So we should be prepared for this to change.
-    #{
-        last_tiered_segment_offset => LTSO,
-        last_tiered_fragment_offset => LTFO
-    }.
-
-create_sparse_segment(Dir, Epoch, LTSO, LTFO) ->
-    ok = filelib:ensure_dir(Dir),
-    case file:make_dir(Dir) of
-        ok ->
-            ok;
-        {error, eexist} ->
-            ok;
-        Err ->
-            throw(Err)
-    end,
-
-    %% TODO: what if LTSO and LTFO are the same? Probably doesn't make much
-    %% difference in our strategy actually.
-    SegmentFile = filename:join(Dir, make_file_name(LTSO, "segment")),
-    IndexFile = filename:join(Dir, make_file_name(LTSO, "index")),
-    ?LOG_DEBUG("Creating sparse fragment up to last-tiered-fragment ~b in ~ts", [LTFO, SegmentFile]),
-
-    {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
-    StartFragmentKey = fragment_key(Dir, LTSO),
-    LastFragmentKey = fragment_key(Dir, LTFO),
-
-    {ok, SegFd} = file:open(SegmentFile, [read, write, raw, binary]),
-    {ok, IdxFd} = file:open(IndexFile, [read, write, raw, binary]),
-    {ok, Handle} = rabbitmq_aws:open_connection("s3"),
-    try
-        %% A sparse segment needs a few things to be valid.
-        %% * First: the log header and the first chunk's header. We don't
-        %%   need the first chunk, just its header.
-        {ok, FirstChunkHeader} = rabbitmq_stream_s3_api:get_object_with_range(
-            Handle,
-            Bucket,
-            StartFragmentKey,
-            {?SEGMENT_HEADER_B, ?SEGMENT_HEADER_B + ?CHUNK_HEADER_B}
-        ),
-        ?LOG_DEBUG("Writing segment header with first chunk ~w", [FirstChunkHeader]),
-        ok = file:write(SegFd, [?SEGMENT_HEADER, FirstChunkHeader]),
-
-        {ok, TrailingFragmentData} = rabbitmq_stream_s3_api:get_object_with_range(
-            Handle,
-            Bucket,
-            LastFragmentKey,
-            -(?INDEX_RECORD_B + ?FRAGMENT_TRAILER_B)
-        ),
-        ?LOG_DEBUG("Read trailing fragment data ~w", [TrailingFragmentData]),
-        <<LastIdxRecord:?INDEX_RECORD_B/binary, FragmentTrailer:?FRAGMENT_TRAILER_B/binary>> =
-            TrailingFragmentData,
-        #fragment_info{
-            segment_start_pos = SegmentStartPos,
-            num_chunks_in_segment = NumChunksInSegment,
-            size = FragmentDataSize,
-            index_size = IdxSize
-        } = fragment_trailer_to_info(FragmentTrailer),
-        %% * Second: we need to know where to seek in order to make the
-        %%   file sparse.
-        ?INDEX_RECORD(LastIdxOffs, LastIdxTs, FragmentFilePos) = LastIdxRecord,
-        SegmentFilePos = SegmentStartPos + FragmentFilePos,
-        ?LOG_DEBUG("Moving seg fd to ~w", [SegmentFilePos]),
-        {ok, _} = file:position(SegFd, SegmentFilePos),
-        %% * Third: we need the last index record at the correct position.
-        NumChunksInFragment = (IdxSize div ?INDEX_RECORD_B),
-        LastIdxRecordPos =
-            ?IDX_HEADER_B +
-                %% `-1` because we're writing the last index record.
-                ?INDEX_RECORD_SIZE_B * (NumChunksInSegment + NumChunksInFragment - 1),
-        ?LOG_DEBUG("Moving idx fd to ~w", [LastIdxRecordPos]),
-        {ok, _} = file:position(IdxFd, LastIdxRecordPos),
-        ok = file:write(IdxFd, <<
-            LastIdxOffs:64/unsigned,
-            LastIdxTs:64/signed,
-            Epoch:64/unsigned,
-            SegmentFilePos:32/unsigned,
-            %% Faked. TODO: I'm pretty sure this is unused in osiris.
-            %% Should we add it (.e. by adding it to the trailer?). We
-            %% could store the epoch in the trailer too. No need to store
-            %% all this info per-chunk in the remote tier.
-            %% Also it's in the chunk header so we could parse that (though
-            %% it's nice that we don't currently).
-            (_ChType = 0):8/unsigned
-        >>),
-        %% * Fourth: we need to put the last chunk into the segment file.
-        {ok, LastChunkData} = rabbitmq_stream_s3_api:get_object_with_range(
-            Handle,
-            Bucket,
-            LastFragmentKey,
-            {FragmentFilePos, FragmentDataSize + ?SEGMENT_HEADER_B}
-        ),
-        ?LOG_DEBUG("Read ~b bytes (~b - ~b) of last chunk data: ~W", [
-            byte_size(LastChunkData), FragmentFilePos, FragmentDataSize, LastChunkData, 10
-        ]),
-        ok = file:write(SegFd, LastChunkData)
-    after
-        ok = rabbitmq_aws:close_connection(Handle),
-        ok = file:close(SegFd),
-        ok = file:close(IdxFd)
-    end.
-
 list_dir(Dir) ->
     case prim_file:list_dir(Dir) of
         {error, enoent} ->
@@ -966,10 +897,10 @@ maybe_setup_region(Region) -> rabbitmq_aws:set_region(Region).
 metadata() ->
     #{time => erlang:monotonic_time()}.
 
--spec local_retention_fun(directory()) -> osiris:retention_fun().
-local_retention_fun(Dir) ->
+-spec local_retention_fun(stream_id()) -> osiris:retention_fun().
+local_retention_fun(Stream) ->
     fun(IdxFiles) ->
-        try ets:lookup_element(?LAST_TIERED_OFFSET_TABLE, Dir, 2) of
+        try ets:lookup_element(?LAST_TIERED_OFFSET_TABLE, Stream, 2) of
             LastTieredOffset ->
                 eval_local_retention(IdxFiles, LastTieredOffset)
         catch

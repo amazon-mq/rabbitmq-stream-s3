@@ -19,6 +19,7 @@ all() ->
     [
         spawn_writer,
         simultaneous_manifest_requests,
+        spawn_writer_after_readers,
         out_of_order_fragment_uploads,
         recover_uploaded_fragments
     ].
@@ -29,20 +30,21 @@ spawn_writer(Config) ->
     Dir = get_config(Config, priv_dir),
     Mac0 = ?MAC:new(),
     Pid = self(),
+    StreamId = erlang:make_ref(),
     Event1 = #writer_spawned{
+        stream = StreamId,
         pid = Pid,
-        writer_ref = rabbit_misc:r(<<"/">>, queue, <<"sq">>),
         dir = Dir
     },
     {Mac1, Effects1} = ?MAC:apply(?META(), Event1, Mac0),
     ?assertEqual(
         [
-            #register_offset_listener{writer_pid = Pid, offset = -1},
-            #resolve_manifest{dir = Dir}
+            #resolve_manifest{stream = StreamId, dir = Dir},
+            #register_offset_listener{writer_pid = Pid, offset = -1}
         ],
         Effects1
     ),
-    Event2 = #manifest_resolved{dir = Dir, manifest = undefined},
+    Event2 = #manifest_resolved{stream = Dir, manifest = undefined},
     {_Mac2, Effects2} = ?MAC:apply(?META(), Event2, Mac1),
     ?assertEqual([], Effects2),
     ok.
@@ -55,9 +57,10 @@ simultaneous_manifest_requests(Config) ->
 
     Dir = get_config(Config, priv_dir),
     WriterPid = self(),
+    StreamId = erlang:make_ref(),
     Event1 = #writer_spawned{
+        stream = StreamId,
         pid = WriterPid,
-        writer_ref = rabbit_misc:r(<<"/">>, queue, <<"sq">>),
         dir = Dir
     },
 
@@ -65,21 +68,21 @@ simultaneous_manifest_requests(Config) ->
     %% downloaded.
     Pid1 = spawn(fun() -> ok end),
     From1 = {Pid1, erlang:make_ref()},
-    Event2 = #manifest_requested{requester = From1, dir = Dir},
+    Event2 = #manifest_requested{stream = StreamId, dir = Dir, requester = From1},
     Pid2 = spawn(fun() -> ok end),
     From2 = {Pid2, erlang:make_ref()},
-    Event3 = #manifest_requested{requester = From2, dir = Dir},
+    Event3 = #manifest_requested{stream = StreamId, dir = Dir, requester = From2},
 
     {Mac1, Effects1} = handle_events(?META(), [Event1, Event2, Event3], ?MAC:new()),
-    ?assertEqual(
+    ?assertMatch(
         [
-            #register_offset_listener{writer_pid = WriterPid, offset = -1},
-            #resolve_manifest{dir = Dir}
+            #resolve_manifest{stream = StreamId},
+            #register_offset_listener{}
         ],
         Effects1
     ),
 
-    Event4 = #manifest_resolved{dir = Dir, manifest = undefined},
+    Event4 = #manifest_resolved{stream = StreamId, manifest = undefined},
     {_Mac2, Effects2} = ?MAC:apply(?META(), Event4, Mac1),
     ?assertEqual(
         [
@@ -90,25 +93,65 @@ simultaneous_manifest_requests(Config) ->
     ),
     ok.
 
+spawn_writer_after_readers(Config) ->
+    %% A writer could hypothetically start up after readers have requested the
+    %% manifest. The manifest should only be resolved once.
+
+    Dir = get_config(Config, priv_dir),
+    WriterPid = self(),
+    StreamId = erlang:make_ref(),
+    Pid1 = spawn(fun() -> ok end),
+    From1 = {Pid1, erlang:make_ref()},
+    ManifestRequested1 = #manifest_requested{stream = StreamId, dir = Dir, requester = From1},
+    Pid2 = spawn(fun() -> ok end),
+    From2 = {Pid2, erlang:make_ref()},
+    ManifestRequested2 = #manifest_requested{stream = StreamId, dir = Dir, requester = From2},
+    {Mac1, Effects1} = handle_events(
+        ?META(),
+        [ManifestRequested1, ManifestRequested2],
+        ?MAC:new()
+    ),
+    ?assertEqual([#resolve_manifest{stream = StreamId, dir = Dir}], Effects1),
+
+    WriterSpawned = #writer_spawned{
+        stream = StreamId,
+        pid = WriterPid,
+        dir = Dir
+    },
+    {Mac2, Effects2} = ?MAC:apply(?META(), WriterSpawned, Mac1),
+    ?assertEqual([#register_offset_listener{writer_pid = WriterPid, offset = -1}], Effects2),
+
+    ManifestResolved = #manifest_resolved{stream = StreamId, manifest = undefined},
+    {_Mac3, Effects3} = ?MAC:apply(?META(), ManifestResolved, Mac2),
+    ?assertEqual(
+        [
+            #reply{to = From1, response = undefined},
+            #reply{to = From2, response = undefined}
+        ],
+        Effects3
+    ),
+
+    ok.
+
 out_of_order_fragment_uploads(Config) ->
-    {Mac0, Ref} = setup_writer(Config),
+    {Mac0, StreamId} = setup_writer(Config),
     Fragments = [fragment(From, To) || {From, To} <- [{0, 19}, {20, 39}, {40, 59}]],
-    FragmentsAvailable = [#fragment_available{writer_ref = Ref, fragment = F} || F <- Fragments],
+    FragmentsAvailable = [#fragment_available{stream = StreamId, fragment = F} || F <- Fragments],
     {Mac1, Effects1} = handle_events(?META(), FragmentsAvailable, Mac0),
     ?assertEqual([], Effects1),
-    Event1 = #commit_offset_increased{writer_ref = Ref, offset = 60},
+    Event1 = #commit_offset_increased{stream = StreamId, offset = 60},
     {Mac2, Effects2} = ?MAC:apply(?META(), Event1, Mac1),
     ?assertMatch(
         [
-            #upload_fragment{writer_ref = Ref, fragment = #fragment{first_offset = 0}},
-            #upload_fragment{writer_ref = Ref, fragment = #fragment{first_offset = 20}},
-            #upload_fragment{writer_ref = Ref, fragment = #fragment{first_offset = 40}},
+            #upload_fragment{stream = StreamId, fragment = #fragment{first_offset = 0}},
+            #upload_fragment{stream = StreamId, fragment = #fragment{first_offset = 20}},
+            #upload_fragment{stream = StreamId, fragment = #fragment{first_offset = 40}},
             #register_offset_listener{}
         ],
         Effects2
     ),
     [Up1, Up2, Up3] = [
-        #fragment_uploaded{writer_ref = Ref, info = fragment_to_info(F)}
+        #fragment_uploaded{stream = StreamId, info = fragment_to_info(F)}
      || F <- Fragments
     ],
     {Mac3, Effects3} = handle_events(?META(), [Up2, Up3], Mac2),
@@ -121,7 +164,7 @@ out_of_order_fragment_uploads(Config) ->
     ?assertMatch(
         [
             #set_last_tiered_offset{offset = 59},
-            #upload_manifest{manifest = #manifest{first_offset = 0}}
+            #upload_manifest{stream = StreamId, manifest = #manifest{first_offset = 0}}
         ],
         Effects4
     ),
@@ -131,23 +174,23 @@ recover_uploaded_fragments(Config) ->
     %% The writer uploads fragments but the updated manifest is not yet
     %% uploaded. When restarting, the writer resolve the full manifest and
     %% upload it.
-    {Mac0, Ref} = setup_writer(Config),
+    {Mac0, StreamId} = setup_writer(Config),
     [F1, F2, _F3] = Fragments = [fragment(From, To) || {From, To} <- [{0, 19}, {20, 39}, {40, 59}]],
-    FragmentsAvailable = [#fragment_available{writer_ref = Ref, fragment = F} || F <- Fragments],
+    FragmentsAvailable = [#fragment_available{stream = StreamId, fragment = F} || F <- Fragments],
     {Mac1, Effects1} = handle_events(?META(), FragmentsAvailable, Mac0),
     ?assertEqual([], Effects1),
-    COI1 = #commit_offset_increased{writer_ref = Ref, offset = 40},
+    COI1 = #commit_offset_increased{stream = StreamId, offset = 40},
     {Mac2, Effects2} = ?MAC:apply(?META(), COI1, Mac1),
     ?assertMatch(
         [
-            #upload_fragment{writer_ref = Ref, fragment = #fragment{first_offset = 0}},
-            #upload_fragment{writer_ref = Ref, fragment = #fragment{first_offset = 20}},
+            #upload_fragment{stream = StreamId, fragment = #fragment{first_offset = 0}},
+            #upload_fragment{stream = StreamId, fragment = #fragment{first_offset = 20}},
             #register_offset_listener{}
         ],
         Effects2
     ),
     [Up1, _Up2, Up3] = [
-        #fragment_uploaded{writer_ref = Ref, info = fragment_to_info(F)}
+        #fragment_uploaded{stream = StreamId, info = fragment_to_info(F)}
      || F <- Fragments
     ],
     %% Say that 1 and 2 are uploaded but before the reboot the manifest server
@@ -169,26 +212,29 @@ recover_uploaded_fragments(Config) ->
     Pid = self(),
     Dir = get_config(Config, priv_dir),
     WriterSpawned = #writer_spawned{
+        stream = StreamId,
         pid = Pid,
-        writer_ref = Ref,
         dir = Dir
     },
     {Mac4, Effects4} = ?MAC:apply(?META(), WriterSpawned, ?MAC:new()),
-    ?assertMatch([#register_offset_listener{}, #resolve_manifest{dir = Dir}], Effects4),
+    ?assertMatch([#resolve_manifest{stream = StreamId}, #register_offset_listener{}], Effects4),
     %% The existing local fragments are sent to the manifest server as
     %% available.
     {Mac5, Effects5} = handle_events(?META(), FragmentsAvailable, Mac4),
     ?assertEqual([], Effects5),
     %% Before the manifest is resolved, the commit offset increases.
-    COI2 = #commit_offset_increased{writer_ref = Ref, offset = 60},
+    COI2 = #commit_offset_increased{stream = StreamId, offset = 60},
     {Mac6, Effects6} = ?MAC:apply(?META(), COI2, Mac5),
     ?assertMatch([#register_offset_listener{}], Effects6),
-    ManifestResolved = #manifest_resolved{dir = Dir, manifest = fragments_to_manifest([F1, F2])},
+    ManifestResolved = #manifest_resolved{
+        stream = StreamId,
+        manifest = fragments_to_manifest([F1, F2])
+    },
     {Mac7, Effects7} = ?MAC:apply(?META(), ManifestResolved, Mac6),
     %% The last fragment is now eligible for upload since the commit offset
     %% increased.
     ?assertMatch(
-        [#upload_fragment{writer_ref = Ref, fragment = #fragment{first_offset = 40}}],
+        [#upload_fragment{stream = StreamId, fragment = #fragment{first_offset = 40}}],
         Effects7
     ),
     {_Mac8, Effects8} = ?MAC:apply(?META(), Up3, Mac7),
@@ -200,15 +246,15 @@ recover_uploaded_fragments(Config) ->
 setup_writer(Config) ->
     Dir = get_config(Config, priv_dir),
     Pid = self(),
-    WriterRef = rabbit_misc:r(<<"/">>, queue, <<"sq">>),
+    StreamId = erlang:make_ref(),
     Event1 = #writer_spawned{
+        stream = StreamId,
         pid = Pid,
-        writer_ref = WriterRef,
         dir = Dir
     },
-    Event2 = #manifest_resolved{dir = Dir, manifest = undefined},
+    Event2 = #manifest_resolved{stream = StreamId, manifest = undefined},
     {Mac, _} = handle_events(?META(), [Event1, Event2], ?MAC:new()),
-    {Mac, WriterRef}.
+    {Mac, StreamId}.
 
 handle_events(Meta, Events, Mac) ->
     handle_events(Meta, Events, Mac, []).
