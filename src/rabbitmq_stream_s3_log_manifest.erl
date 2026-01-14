@@ -44,7 +44,7 @@
     stream :: stream_id(),
     dir :: directory()
 }).
--record(get_manifest, {dir :: directory()}).
+-record(get_manifest, {stream :: stream_id(), dir :: directory()}).
 -record(task_completed, {task_pid :: pid(), event :: event()}).
 -record(register_last_tiered_offset_listener, {
     pid :: pid(),
@@ -75,7 +75,7 @@
 %% Need to be exported for `erlang:apply/3`.
 -export([start/0, format_osiris_event/1, execute_task/2]).
 
--export([get_manifest/1, get_fragment_trailer/2, register_last_tiered_offset_listener/3]).
+-export([get_manifest/2, get_fragment_trailer/2, register_last_tiered_offset_listener/3]).
 
 %% Useful to search module.
 -export([fragment_key/2, group_key/3, make_file_name/2, fragment_trailer_to_info/1]).
@@ -102,9 +102,9 @@ start() ->
     ok = rabbitmq_stream_s3_counters:init(),
     rabbit_sup:start_child(?MODULE).
 
--spec get_manifest(directory()) -> #manifest{} | undefined.
-get_manifest(Dir) ->
-    gen_server:call(?SERVER, #get_manifest{dir = Dir}, infinity).
+-spec get_manifest(stream_id(), directory()) -> #manifest{} | undefined.
+get_manifest(StreamId, Dir) ->
+    gen_server:call(?SERVER, #get_manifest{stream = StreamId, dir = Dir}, infinity).
 
 -spec register_last_tiered_offset_listener({?MODULE, node()}, stream_id(), osiris:offset() | -1) ->
     ok.
@@ -383,11 +383,11 @@ init([]) ->
     _ = ets:new(?LAST_TIERED_OFFSET_TABLE, [named_table]),
     {ok, #?MODULE{}}.
 
-handle_call(#get_manifest{dir = Dir}, From, State) ->
+handle_call(#get_manifest{stream = StreamId, dir = Dir}, From, State) ->
     %% TODO: this is too simplistic. Reading from the root manifest should be
     %% done within the server. And then the server should give a spec to
     %% readers to find anything within branches.
-    Event = #manifest_requested{dir = Dir, requester = From},
+    Event = #manifest_requested{stream = StreamId, dir = Dir, requester = From},
     evolve_event(Event, State);
 handle_call(Request, From, State) ->
     ?LOG_INFO(?MODULE_STRING " received unexpected call from ~p: ~W", [From, Request, 10]),

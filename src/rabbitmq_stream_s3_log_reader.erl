@@ -73,9 +73,12 @@
 %%% osiris_log_reader callbacks
 %%%===================================================================
 
-init_offset_reader(first, #{dir := Dir, shared := Shared} = Config) ->
+init_offset_reader(OffsetSpec, #{dir := Dir0} = Config0) ->
+    init_offset_reader0(OffsetSpec, Config0#{dir := list_to_binary(Dir0)}).
+
+init_offset_reader0(first, #{reference := StreamId, dir := Dir, shared := Shared} = Config) ->
     LocalFirstOffset = osiris_log_shared:first_chunk_id(Shared),
-    case rabbitmq_stream_s3_log_manifest:get_manifest(Dir) of
+    case rabbitmq_stream_s3_log_manifest:get_manifest(StreamId, Dir) of
         #manifest{first_offset = RemoteFirstOffset} when RemoteFirstOffset < LocalFirstOffset ->
             ?LOG_DEBUG(
                 "Attaching remote reader at first offset ~b pos ~b for spec 'first'",
@@ -85,7 +88,9 @@ init_offset_reader(first, #{dir := Dir, shared := Shared} = Config) ->
         _ ->
             init_local_reader(first, Config)
     end;
-init_offset_reader(Offset, #{dir := Dir} = Config) when is_integer(Offset) ->
+init_offset_reader0(Offset, #{reference := StreamId, dir := Dir} = Config) when
+    is_integer(Offset)
+->
     ?LOG_DEBUG(?MODULE_STRING ":~ts/2 finding offset ~b", [?FUNCTION_NAME, Offset]),
     case init_local_reader({abs, Offset}, Config) of
         {ok, _} = Ok ->
@@ -100,7 +105,7 @@ init_offset_reader(Offset, #{dir := Dir} = Config) when is_integer(Offset) ->
             ?LOG_DEBUG("offset ~b is not local (local range ~w), trying the remote tier", [
                 Offset, Range
             ]),
-            case rabbitmq_stream_s3_log_manifest:get_manifest(Dir) of
+            case rabbitmq_stream_s3_log_manifest:get_manifest(StreamId, Dir) of
                 undefined ->
                     init_local_reader(next, Config);
                 #manifest{first_offset = FirstOffset} when Offset < FirstOffset ->
@@ -116,7 +121,7 @@ init_offset_reader(Offset, #{dir := Dir} = Config) when is_integer(Offset) ->
         {error, _} = Err ->
             Err
     end;
-init_offset_reader(OffsetSpec, Config) ->
+init_offset_reader0(OffsetSpec, Config) ->
     %% TODO: implement the other offset specs
     init_local_reader(OffsetSpec, Config).
 
@@ -135,18 +140,7 @@ close(#?MODULE{mode = #remote{pid = Pid}}) ->
 close(#?MODULE{mode = Local}) ->
     ok = osiris_log:close(Local).
 
-send_file(
-    Socket,
-    #?MODULE{
-        mode =
-            #remote{
-                pid = Pid,
-                transport = Transport,
-                chunk_selector = ChunkSelector
-            } = Remote0
-    } = State0,
-    Callback
-) ->
+send_file(Socket, #?MODULE{mode = #remote{} = Remote0} = State0, Callback) ->
     case read_header(Remote0) of
         {ok,
             #{
@@ -156,7 +150,11 @@ send_file(
                 next_position := NextPosition,
                 header_data := HeaderData
             } = Header,
-            Remote1} ->
+            #remote{
+                pid = Pid,
+                transport = Transport,
+                chunk_selector = ChunkSelector
+            } = Remote1} ->
             {ToSkip, ToSend} = select_amount_to_send(ChunkSelector, Header),
             DataPos = Position + ?CHUNK_HEADER_B + ToSkip,
             PrefixData = Callback(Header, ToSend + byte_size(HeaderData)),
@@ -193,7 +191,7 @@ send_file(Socket, #?MODULE{mode = Local0} = State0, Callback) ->
             Err
     end.
 
-chunk_iterator(#?MODULE{mode = #remote{pid = Pid} = Remote0} = State0, Credit, _PrevIter) ->
+chunk_iterator(#?MODULE{mode = #remote{} = Remote0} = State0, Credit, _PrevIter) ->
     case read_header(Remote0) of
         {ok,
             #{
@@ -204,7 +202,7 @@ chunk_iterator(#?MODULE{mode = #remote{pid = Pid} = Remote0} = State0, Credit, _
                 filter_size := FilterSize,
                 data_size := DataSize
             } = Header,
-            Remote1} ->
+            #remote{pid = Pid} = Remote1} ->
             DataPos = Position + ?CHUNK_HEADER_B + FilterSize,
             {ok, Data} = gen_server:call(Pid, {read, DataPos, DataSize, within_chunk}),
             Iter = #remote_iterator{
@@ -314,7 +312,7 @@ terminate(_Reason, #state{connection = Connection}) ->
 
 format_status(#{state := #state{buffer = Buffer} = State0} = Status0) ->
     %% Avoid formatting the buffer - it can be large.
-    Size = iolist_to_binary(io_lib:format("~b bytes", [byte_size(Buffer)])),
+    Size = <<(integer_to_binary(byte_size(Buffer)))/binary, " bytes">>,
     Status0#{state := State0#state{buffer = Size}}.
 
 code_change(_, _, State) ->
@@ -397,8 +395,13 @@ read_header(#remote{shared = Shared, next_offset = NextOffset} = Remote) ->
     end.
 
 read_header1(
-    #remote{pid = Pid0, dir = Dir, position = Position, next_offset = NextChId, shared = Shared} =
-        Remote0
+    #remote{
+        pid = Pid0,
+        dir = Dir,
+        position = Position,
+        next_offset = NextChId,
+        shared = Shared
+    } = Remote0
 ) ->
     %% Over-read the chunk header so that the filter (if it exists) is always
     %% included in the binary. Reading from the remote tier takes time, so
@@ -501,11 +504,15 @@ is_chunk_selected(_ChunkSelector, _ChunkType) ->
     false.
 
 select_amount_to_send(user_data, #{
-    type := ?CHNK_USER, filter_size := FilterSize, data_size := DataSize
+    type := ?CHNK_USER,
+    filter_size := FilterSize,
+    data_size := DataSize
 }) ->
     {FilterSize, DataSize};
 select_amount_to_send(_ChunkSelector, #{
-    filter_size := FilterSize, data_size := DataSize, trailer_size := TrailerSize
+    filter_size := FilterSize,
+    data_size := DataSize,
+    trailer_size := TrailerSize
 }) ->
     {FilterSize, DataSize + TrailerSize}.
 
@@ -518,7 +525,10 @@ init_local_reader(OffsetSpec, Config) ->
     end.
 
 init_remote_reader(
-    Fragment, Position, Offset, #{dir := Dir, options := Options, shared := Shared} = Config
+    Fragment,
+    Position,
+    Offset,
+    #{dir := Dir, options := Options, shared := Shared} = Config
 ) ->
     Filter =
         case Options of
@@ -551,7 +561,8 @@ init_remote_reader(
     end.
 
 convert_remote_to_local(#?MODULE{
-    config = Config, mode = #remote{pid = Pid, next_offset = NextOffset}
+    config = Config,
+    mode = #remote{pid = Pid, next_offset = NextOffset}
 }) ->
     ?LOG_DEBUG("Converting to local reader at offset ~b", [NextOffset]),
     ok = gen_server:cast(Pid, close),
@@ -607,7 +618,7 @@ find_fragment_for_offset(Offset, Entries, Dir) ->
                     Pos
                 ]
             ),
-            ?LOG_DEBUG("Attaching to offset ~b, pos ~b, fragment ~ts", [Offset, Pos, EntryOffset]),
+            ?LOG_DEBUG("Attaching to offset ~b, pos ~b, fragment ~b", [Offset, Pos, EntryOffset]),
             {ok, ChunkId, Pos, EntryOffset};
         _ ->
             %% Download the group and search recursively within that.
