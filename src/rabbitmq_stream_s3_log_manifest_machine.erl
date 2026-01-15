@@ -26,6 +26,7 @@ for the log manifest server to execute.
 -record(stream, {
     %% PID of the osiris_writer process. Used to attach offset listeners.
     writer_pid :: pid() | undefined,
+    replica_nodes = [] :: [node()],
     %% Directory of the local copy of the log.
     dir :: directory(),
     %% Most up-to-date known copy of the manifest, if there is one, or a list
@@ -230,16 +231,18 @@ apply(
     end;
 apply(
     _Meta,
-    #writer_spawned{pid = Pid, stream = StreamId, dir = Dir},
+    #writer_spawned{pid = Pid, stream = StreamId, dir = Dir, replica_nodes = ReplicaNodes},
     #?MODULE{streams = Streams0} = State0
 ) ->
     Effects0 = [#register_offset_listener{writer_pid = Pid, offset = -1}],
     case Streams0 of
         #{StreamId := #stream{} = Stream0} ->
-            Streams = Streams0#{StreamId := Stream0#stream{writer_pid = Pid}},
+            Stream = Stream0#stream{writer_pid = Pid, dir = Dir, replica_nodes = ReplicaNodes},
+            Streams = Streams0#{StreamId := Stream},
             {State0#?MODULE{streams = Streams}, Effects0};
         _ ->
-            Streams = Streams0#{StreamId => #stream{writer_pid = Pid, dir = Dir}},
+            Stream = #stream{writer_pid = Pid, dir = Dir, replica_nodes = ReplicaNodes},
+            Streams = Streams0#{StreamId => Stream},
             Effects = [#resolve_manifest{stream = StreamId, dir = Dir} | Effects0],
             {State0#?MODULE{streams = Streams}, Effects}
     end;

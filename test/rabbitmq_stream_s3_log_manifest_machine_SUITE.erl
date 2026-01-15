@@ -27,7 +27,7 @@ all() ->
 %%----------------------------------------------------------------------------
 
 spawn_writer(Config) ->
-    Dir = get_config(Config, priv_dir),
+    Dir = directory(Config),
     Mac0 = ?MAC:new(),
     Pid = self(),
     StreamId = erlang:make_ref(),
@@ -55,7 +55,7 @@ simultaneous_manifest_requests(Config) ->
     %% download of the manifest should be shared between any processes which
     %% request it without duplicate downloads effects.
 
-    Dir = get_config(Config, priv_dir),
+    Dir = directory(Config),
     WriterPid = self(),
     StreamId = erlang:make_ref(),
     Event1 = #writer_spawned{
@@ -97,7 +97,7 @@ spawn_writer_after_readers(Config) ->
     %% A writer could hypothetically start up after readers have requested the
     %% manifest. The manifest should only be resolved once.
 
-    Dir = get_config(Config, priv_dir),
+    Dir = directory(Config),
     WriterPid = self(),
     StreamId = erlang:make_ref(),
     Pid1 = spawn(fun() -> ok end),
@@ -210,7 +210,7 @@ recover_uploaded_fragments(Config) ->
     %% what has been uploaded (fragments 1 and 2 now) and
 
     Pid = self(),
-    Dir = get_config(Config, priv_dir),
+    Dir = directory(Config),
     WriterSpawned = #writer_spawned{
         stream = StreamId,
         pid = Pid,
@@ -244,7 +244,7 @@ recover_uploaded_fragments(Config) ->
 %%----------------------------------------------------------------------------
 
 setup_writer(Config) ->
-    Dir = get_config(Config, priv_dir),
+    Dir = directory(Config),
     Pid = self(),
     StreamId = erlang:make_ref(),
     Event1 = #writer_spawned{
@@ -332,3 +332,6 @@ fragments_to_manifest(
                 (?ENTRY(Offset, Ts, ?MANIFEST_KIND_FRAGMENT, Size, SeqNo, <<>>))/binary>>
     },
     fragments_to_manifest(Rest, Manifest).
+
+directory(Config) ->
+    list_to_binary(get_config(Config, priv_dir)).

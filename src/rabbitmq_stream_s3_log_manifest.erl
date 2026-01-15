@@ -36,7 +36,10 @@
 -record(init_writer, {
     pid :: pid(),
     stream :: stream_id(),
-    dir :: directory()
+    dir :: directory(),
+    %% Corresponds to the `replica_nodes` key passed in `osiris:config()` for
+    %% writers.
+    replica_nodes :: [node()]
 }).
 -record(init_acceptor, {
     pid :: pid(),
@@ -228,7 +231,7 @@ init_manifest(#{dir := Dir0, reference := Stream, leader_pid := LeaderPid} = Con
         dir = Dir
     }),
     {Config, #log_writer{type = acceptor, stream = Stream}};
-init_manifest(#{dir := Dir0, reference := Stream} = Config0, writer) ->
+init_manifest(#{dir := Dir0, reference := Stream, replica_nodes := ReplicaNodes} = Config0, writer) ->
     Dir = list_to_binary(Dir0),
     %% TODO: apply original retention settings to the remote tier.
     _ = maps:get(retention, Config0, []),
@@ -236,7 +239,12 @@ init_manifest(#{dir := Dir0, reference := Stream} = Config0, writer) ->
         max_segment_size_bytes => ?MAX_SEGMENT_SIZE_BYTES,
         retention => [{'fun', local_retention_fun(Stream)}]
     },
-    ok = gen_server:cast(?SERVER, #init_writer{pid = self(), stream = Stream, dir = Dir}),
+    ok = gen_server:cast(?SERVER, #init_writer{
+        pid = self(),
+        stream = Stream,
+        dir = Dir,
+        replica_nodes = ReplicaNodes
+    }),
     ?LOG_DEBUG("Recovering available fragments for stream ~ts", [Dir]),
     %% Recover the current fragment information. To do this we scan through the
     %% most recent index file and find the last fragment. While performing this
@@ -393,8 +401,11 @@ handle_call(Request, From, State) ->
     ?LOG_INFO(?MODULE_STRING " received unexpected call from ~p: ~W", [From, Request, 10]),
     {noreply, State}.
 
-handle_cast(#init_writer{pid = Pid, stream = StreamId, dir = Dir}, State) ->
-    Event = #writer_spawned{pid = Pid, stream = StreamId, dir = Dir},
+handle_cast(
+    #init_writer{pid = Pid, stream = StreamId, dir = Dir, replica_nodes = ReplicaNodes},
+    State
+) ->
+    Event = #writer_spawned{pid = Pid, stream = StreamId, dir = Dir, replica_nodes = ReplicaNodes},
     evolve_event(Event, State);
 handle_cast(
     #init_acceptor{writer_pid = WriterPid, stream = StreamId},

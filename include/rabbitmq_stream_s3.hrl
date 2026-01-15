@@ -233,7 +233,8 @@
 -record(writer_spawned, {
     stream :: stream_id(),
     dir :: directory(),
-    pid :: pid()
+    pid :: pid(),
+    replica_nodes = [] :: [node()]
 }).
 
 -type event() ::
