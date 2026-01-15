@@ -28,13 +28,14 @@ for the log manifest server to execute.
     writer_pid :: pid() | undefined,
     replica_nodes = [] :: [node()],
     %% Directory of the local copy of the log.
-    dir :: directory(),
+    %% This could be undefined for a stream until a writer or acceptor starts
+    %% on this node. This field is used to add information to effects like
+    %% `upload_fragment{}' which act on local files.
+    dir :: directory() | undefined,
     %% Most up-to-date known copy of the manifest, if there is one, or a list
     %% of callers waiting for it to be resolved.
     manifest = {pending, []} :: #manifest{} | undefined | {pending, [gen_server:from()]},
     upload_status = {last_uploaded, 0} :: upload_status(),
-    %% %% TODO: use this?
-    %% offset_listeners = [] :: [],
     %% Current commit offset (updated by offset listener notifications) known
     %% to the manifest - this can lag behind the actual commit offset.
     commit_offset = -1 :: osiris:offset() | -1,
@@ -243,12 +244,12 @@ apply(
         _ ->
             Stream = #stream{writer_pid = Pid, dir = Dir, replica_nodes = ReplicaNodes},
             Streams = Streams0#{StreamId => Stream},
-            Effects = [#resolve_manifest{stream = StreamId, dir = Dir} | Effects0],
+            Effects = [#resolve_manifest{stream = StreamId} | Effects0],
             {State0#?MODULE{streams = Streams}, Effects}
     end;
 apply(
     _Meta,
-    #manifest_requested{stream = StreamId, dir = Dir, requester = Requester},
+    #manifest_requested{stream = StreamId, requester = Requester},
     #?MODULE{streams = Streams0} = State0
 ) ->
     case Streams0 of
@@ -259,9 +260,9 @@ apply(
         #{StreamId := #stream{manifest = Manifest}} ->
             {State0, [#reply{to = Requester, response = Manifest}]};
         _ ->
-            Stream = #stream{dir = Dir, manifest = {pending, [Requester]}},
+            Stream = #stream{manifest = {pending, [Requester]}},
             State = State0#?MODULE{streams = Streams0#{StreamId => Stream}},
-            {State, [#resolve_manifest{stream = StreamId, dir = Dir}]}
+            {State, [#resolve_manifest{stream = StreamId}]}
     end;
 apply(
     _Meta,
@@ -397,7 +398,6 @@ apply_infos_to_manifest(
     [],
     StreamId,
     #stream{
-        dir = Dir,
         manifest = #manifest{entries = Entries} = Manifest,
         upload_status = {last_uploaded, _} = UploadStatus0
     } = Stream0,
@@ -417,7 +417,6 @@ apply_infos_to_manifest(
             ]),
             Rebalance = #rebalance_manifest{
                 stream = StreamId,
-                dir = Dir,
                 kind = GroupKind,
                 size = GroupSize,
                 new_group = Group,
@@ -434,7 +433,6 @@ apply_infos_to_manifest(
     [],
     StreamId,
     #stream{
-        dir = Dir,
         manifest = Manifest,
         upload_status = {last_uploaded, NumUpdates}
     } = Stream0,
@@ -453,7 +451,7 @@ apply_infos_to_manifest(
             ])
     end,
     Stream = Stream0#stream{upload_status = {uploading, []}},
-    Upload = #upload_manifest{stream = StreamId, dir = Dir, manifest = Manifest},
+    Upload = #upload_manifest{stream = StreamId, manifest = Manifest},
     {Stream, [Upload | Effects0]};
 apply_infos_to_manifest([], _StreamId, #stream{upload_status = UploadStatus} = Stream, Effects) ->
     %% The manifest is currently being uploaded, or there are no updates

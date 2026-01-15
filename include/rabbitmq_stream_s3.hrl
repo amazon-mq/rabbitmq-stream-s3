@@ -174,11 +174,17 @@
 
 %% rabbitmq_stream_s3_log_manifest_machine types:
 
-%% An opaque identifier for a stream which uniquely identifies the stream even
-%% across nodes. `rabbit_stream_queue:make_stream_conf/1' makes this a
-%% `rabbit_amqqueue:name()' but it can be any term. This corresponds to the
-%% `reference' field of `osiris:config()'.
--type stream_id() :: term().
+%% The name of a stream. This is a unique identifier for an incarnation of a
+%% stream, meaning that it will not be identical if you delete a stream queue
+%% and recreate it. RabbitMQ sets these to be the vhost name, stream name and
+%% creation timestamp, concatenated with "_".
+-type stream_id() :: binary().
+
+%% An opaque term used to identify a logical stream. This is set to be the
+%% stream queue's `amqqueue:name()' by RabbitMQ. This term is only used for
+%% the `{osiris_offset, stream_reference(), osiris:offset()}' message sent
+%% by Osiris.
+-type stream_reference() :: term().
 
 -record(fragment, {
     segment_offset :: osiris:offset(),
@@ -223,7 +229,6 @@
 }).
 -record(manifest_requested, {
     stream :: stream_id(),
-    dir :: directory(),
     requester :: gen_server:from()
 }).
 -record(manifest_resolved, {
@@ -232,6 +237,7 @@
 }).
 -record(writer_spawned, {
     stream :: stream_id(),
+    reference :: stream_reference(),
     dir :: directory(),
     pid :: pid(),
     replica_nodes = [] :: [node()]
@@ -260,12 +266,10 @@
 }).
 -record(upload_manifest, {
     stream :: stream_id(),
-    dir :: directory(),
     manifest :: #manifest{}
 }).
 -record(rebalance_manifest, {
     stream :: stream_id(),
-    dir :: directory(),
     kind :: rabbitmq_stream_s3_log_manifest_entry:kind(),
     size :: pos_integer(),
     new_group :: rabbitmq_stream_s3_log_manifest_entry:entries(),
@@ -274,10 +278,7 @@
 }).
 %% Download the manifest from the remote tier and also check the tail of the
 %% last fragment to see if fragments have been uploaded but not yet applied.
--record(resolve_manifest, {
-    stream :: stream_id(),
-    dir :: directory()
-}).
+-record(resolve_manifest, {stream :: stream_id()}).
 -record(reply, {to :: gen_server:from(), response :: term()}).
 -record(set_last_tiered_offset, {
     writer_pid :: pid(),

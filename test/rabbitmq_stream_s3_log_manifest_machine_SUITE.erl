@@ -39,7 +39,7 @@ spawn_writer(Config) ->
     {Mac1, Effects1} = ?MAC:apply(?META(), Event1, Mac0),
     ?assertEqual(
         [
-            #resolve_manifest{stream = StreamId, dir = Dir},
+            #resolve_manifest{stream = StreamId},
             #register_offset_listener{writer_pid = Pid, offset = -1}
         ],
         Effects1
@@ -68,10 +68,10 @@ simultaneous_manifest_requests(Config) ->
     %% downloaded.
     Pid1 = spawn(fun() -> ok end),
     From1 = {Pid1, erlang:make_ref()},
-    Event2 = #manifest_requested{stream = StreamId, dir = Dir, requester = From1},
+    Event2 = #manifest_requested{stream = StreamId, requester = From1},
     Pid2 = spawn(fun() -> ok end),
     From2 = {Pid2, erlang:make_ref()},
-    Event3 = #manifest_requested{stream = StreamId, dir = Dir, requester = From2},
+    Event3 = #manifest_requested{stream = StreamId, requester = From2},
 
     {Mac1, Effects1} = handle_events(?META(), [Event1, Event2, Event3], ?MAC:new()),
     ?assertMatch(
@@ -102,16 +102,16 @@ spawn_writer_after_readers(Config) ->
     StreamId = erlang:make_ref(),
     Pid1 = spawn(fun() -> ok end),
     From1 = {Pid1, erlang:make_ref()},
-    ManifestRequested1 = #manifest_requested{stream = StreamId, dir = Dir, requester = From1},
+    ManifestRequested1 = #manifest_requested{stream = StreamId, requester = From1},
     Pid2 = spawn(fun() -> ok end),
     From2 = {Pid2, erlang:make_ref()},
-    ManifestRequested2 = #manifest_requested{stream = StreamId, dir = Dir, requester = From2},
+    ManifestRequested2 = #manifest_requested{stream = StreamId, requester = From2},
     {Mac1, Effects1} = handle_events(
         ?META(),
         [ManifestRequested1, ManifestRequested2],
         ?MAC:new()
     ),
-    ?assertEqual([#resolve_manifest{stream = StreamId, dir = Dir}], Effects1),
+    ?assertEqual([#resolve_manifest{stream = StreamId}], Effects1),
 
     WriterSpawned = #writer_spawned{
         stream = StreamId,

@@ -27,6 +27,7 @@
 -record(?MODULE, {
     machine = rabbitmq_stream_s3_log_manifest_machine:new() :: rabbitmq_stream_s3_log_manifest_machine:state(),
     tasks = #{} :: #{pid() => effect()},
+    references = #{} :: #{stream_reference() => stream_id()},
     offset_listeners = #{} :: #{
         stream_id() => [{pid(), osiris:offset() | -1}] | osiris:offset() | -1
     }
@@ -36,6 +37,7 @@
 -record(init_writer, {
     pid :: pid(),
     stream :: stream_id(),
+    reference :: stream_reference(),
     dir :: directory(),
     %% Corresponds to the `replica_nodes` key passed in `osiris:config()` for
     %% writers.
@@ -45,9 +47,10 @@
     pid :: pid(),
     writer_pid :: pid(),
     stream :: stream_id(),
+    reference :: stream_reference(),
     dir :: directory()
 }).
--record(get_manifest, {stream :: stream_id(), dir :: directory()}).
+-record(get_manifest, {stream :: stream_id()}).
 -record(task_completed, {task_pid :: pid(), event :: event()}).
 -record(register_last_tiered_offset_listener, {
     pid :: pid(),
@@ -78,7 +81,7 @@
 %% Need to be exported for `erlang:apply/3`.
 -export([start/0, format_osiris_event/1, execute_task/2]).
 
--export([get_manifest/2, get_fragment_trailer/2, register_last_tiered_offset_listener/3]).
+-export([get_manifest/1, get_fragment_trailer/2, register_last_tiered_offset_listener/3]).
 
 %% Useful to search module.
 -export([fragment_key/2, group_key/3, make_file_name/2, fragment_trailer_to_info/1]).
@@ -105,9 +108,9 @@ start() ->
     ok = rabbitmq_stream_s3_counters:init(),
     rabbit_sup:start_child(?MODULE).
 
--spec get_manifest(stream_id(), directory()) -> #manifest{} | undefined.
-get_manifest(StreamId, Dir) ->
-    gen_server:call(?SERVER, #get_manifest{stream = StreamId, dir = Dir}, infinity).
+-spec get_manifest(stream_id()) -> #manifest{} | undefined.
+get_manifest(StreamId) ->
+    gen_server:call(?SERVER, #get_manifest{stream = StreamId}, infinity).
 
 -spec register_last_tiered_offset_listener({?MODULE, node()}, stream_id(), osiris:offset() | -1) ->
     ok.
@@ -218,30 +221,50 @@ checksum(undefined, _) ->
 checksum(Checksum, Data) ->
     erlang:crc32(Checksum, Data).
 
-init_manifest(#{dir := Dir0, reference := Stream, leader_pid := LeaderPid} = Config0, acceptor) ->
+init_manifest(
+    #{
+        dir := Dir0,
+        name := StreamId0,
+        reference := Reference,
+        leader_pid := LeaderPid
+    } = Config0,
+    acceptor
+) ->
+    StreamId = iolist_to_binary(StreamId0),
     Dir = list_to_binary(Dir0),
     Config = Config0#{
         max_segment_size_bytes => ?MAX_SEGMENT_SIZE_BYTES,
-        retention => [{'fun', local_retention_fun(Stream)}]
+        retention => [{'fun', local_retention_fun(StreamId)}]
     },
     ok = gen_server:cast(?SERVER, #init_acceptor{
         pid = self(),
         writer_pid = LeaderPid,
-        stream = Stream,
+        stream = StreamId,
+        reference = Reference,
         dir = Dir
     }),
-    {Config, #log_writer{type = acceptor, stream = Stream}};
-init_manifest(#{dir := Dir0, reference := Stream, replica_nodes := ReplicaNodes} = Config0, writer) ->
+    {Config, #log_writer{type = acceptor, stream = StreamId}};
+init_manifest(
+    #{
+        dir := Dir0,
+        name := StreamId0,
+        reference := Reference,
+        replica_nodes := ReplicaNodes
+    } = Config0,
+    writer
+) ->
+    StreamId = iolist_to_binary(StreamId0),
     Dir = list_to_binary(Dir0),
     %% TODO: apply original retention settings to the remote tier.
     _ = maps:get(retention, Config0, []),
     Config = Config0#{
         max_segment_size_bytes => ?MAX_SEGMENT_SIZE_BYTES,
-        retention => [{'fun', local_retention_fun(Stream)}]
+        retention => [{'fun', local_retention_fun(StreamId)}]
     },
     ok = gen_server:cast(?SERVER, #init_writer{
         pid = self(),
-        stream = Stream,
+        stream = StreamId,
+        reference = Reference,
         dir = Dir,
         replica_nodes = ReplicaNodes
     }),
@@ -265,14 +288,17 @@ init_manifest(#{dir := Dir0, reference := Stream, replica_nodes := ReplicaNodes}
                 %% uploaded yet? The manifest server should spawn a task to find
                 %% and upload those fragments.
                 _ = [
-                    gen_server:cast(?SERVER, #fragment_available{stream = Stream, fragment = F})
+                    gen_server:cast(?SERVER, #fragment_available{
+                        stream = StreamId,
+                        fragment = F
+                    })
                  || F <- Rest
                 ],
                 Latest
         end,
     Manifest = #log_writer{
         type = writer,
-        stream = Stream,
+        stream = StreamId,
         fragment = Fragment
     },
     {Config, Manifest}.
@@ -363,8 +389,8 @@ overview(Dir) ->
     %% move up to the offset of the oldest segment which is not yet fully
     %% uploaded to the remote tier. (Also see the local retention function,
     %% it should be nearly the same calculation.) This could make replication
-    %% to a new member quicker. To do this we need to be able to look up from
-    %% `Dir => WriterRef`.
+    %% to a new member quicker.
+    _StreamId = iolist_to_binary(filename:basename(Dir)),
     osiris_log:overview(Dir).
 
 close_manifest(#log_writer{}) ->
@@ -391,29 +417,39 @@ init([]) ->
     _ = ets:new(?LAST_TIERED_OFFSET_TABLE, [named_table]),
     {ok, #?MODULE{}}.
 
-handle_call(#get_manifest{stream = StreamId, dir = Dir}, From, State) ->
+handle_call(#get_manifest{stream = StreamId}, From, State) ->
     %% TODO: this is too simplistic. Reading from the root manifest should be
     %% done within the server. And then the server should give a spec to
     %% readers to find anything within branches.
-    Event = #manifest_requested{stream = StreamId, dir = Dir, requester = From},
+    Event = #manifest_requested{stream = StreamId, requester = From},
     evolve_event(Event, State);
 handle_call(Request, From, State) ->
     ?LOG_INFO(?MODULE_STRING " received unexpected call from ~p: ~W", [From, Request, 10]),
     {noreply, State}.
 
 handle_cast(
-    #init_writer{pid = Pid, stream = StreamId, dir = Dir, replica_nodes = ReplicaNodes},
-    State
+    #init_writer{
+        pid = Pid,
+        stream = StreamId,
+        reference = Reference,
+        dir = Dir,
+        replica_nodes = ReplicaNodes
+    },
+    #?MODULE{references = References0} = State0
 ) ->
+    State1 = State0#?MODULE{references = References0#{Reference => StreamId}},
     Event = #writer_spawned{pid = Pid, stream = StreamId, dir = Dir, replica_nodes = ReplicaNodes},
-    evolve_event(Event, State);
+    evolve_event(Event, State1);
 handle_cast(
-    #init_acceptor{writer_pid = WriterPid, stream = StreamId},
-    #?MODULE{offset_listeners = L0} = State0
+    #init_acceptor{writer_pid = WriterPid, stream = StreamId, reference = Reference},
+    #?MODULE{references = References0, offset_listeners = L0} = State0
 ) ->
     %% Subscribe to updates to the last-tiered-offset for this stream.
     ok = register_last_tiered_offset_listener({?MODULE, node(WriterPid)}, StreamId, -1),
-    State = State0#?MODULE{offset_listeners = L0#{StreamId => -1}},
+    State = State0#?MODULE{
+        references = References0#{Reference => StreamId},
+        offset_listeners = L0#{StreamId => -1}
+    },
     {noreply, State};
 handle_cast(
     #register_last_tiered_offset_listener{pid = Pid, stream = StreamId, offset = Offset},
@@ -442,9 +478,14 @@ handle_cast(Message, State) ->
     ?LOG_DEBUG(?MODULE_STRING " received unexpected cast: ~W", [Message, 10]),
     {noreply, State}.
 
-handle_info({osiris_offset, Stream, Offset}, State) ->
-    Event = #commit_offset_increased{stream = Stream, offset = Offset},
-    evolve_event(Event, State);
+handle_info({osiris_offset, Reference, Offset}, #?MODULE{references = References} = State) ->
+    case References of
+        #{Reference := StreamId} ->
+            Event = #commit_offset_increased{stream = StreamId, offset = Offset},
+            evolve_event(Event, State);
+        _ ->
+            {noreply, State}
+    end;
 handle_info(#set_last_tiered_offset{} = Effect, State) ->
     {noreply, apply_effect(Effect, State)};
 handle_info({'DOWN', _MRef, process, Pid, Reason}, #?MODULE{tasks = Tasks0} = State0) ->
@@ -476,34 +517,44 @@ code_change(_OldVsn, State, _Extra) ->
 format_osiris_event(Event) ->
     Event.
 
-%% Copied from osiris (but removed the flatten).
-make_file_name(N, Suff) ->
-    iolist_to_binary(io_lib:format("~20..0B.~s", [N, Suff])).
+-spec make_file_name(osiris:offset(), Suffix :: binary()) -> filename().
+make_file_name(Offset, Suffix) when is_integer(Offset) andalso is_binary(Suffix) ->
+    <<(iolist_to_binary(io_lib:format("~20..0B", [Offset])))/binary, ".", Suffix/binary>>.
 
-manifest_key(Dir) ->
-    manifest_key(Dir, <<"manifest">>).
+-spec manifest_key(stream_id()) -> binary().
+manifest_key(StreamId) when is_binary(StreamId) ->
+    manifest_key(StreamId, <<"manifest">>).
 
-manifest_key(Dir, Filename) ->
-    StreamName = filename:basename(Dir),
-    iolist_to_binary([<<"rabbitmq/stream/">>, StreamName, <<"/metadata/">>, Filename]).
+-spec manifest_key(stream_id(), filename()) -> binary().
+manifest_key(StreamId, Filename) when is_binary(StreamId) andalso is_binary(Filename) ->
+    <<"rabbitmq/stream/", StreamId/binary, "/metadata/", Filename/binary>>.
 
-group_key(Dir, Kind, Offset) ->
-    manifest_key(Dir, make_file_name(Offset, group_extension(Kind))).
+-spec group_key(stream_id(), rabbitmq_stream_s3_log_manifest_entry:kind(), osiris:offset()) ->
+    binary().
+group_key(StreamId, Kind, Offset) ->
+    manifest_key(StreamId, make_file_name(Offset, group_extension(Kind))).
 
-stream_data_key(Dir, File) ->
-    StreamName = filename:basename(Dir),
-    iolist_to_binary([<<"rabbitmq/stream/">>, StreamName, <<"/data/">>, File]).
+-spec stream_data_key(stream_id(), filename()) -> binary().
+stream_data_key(StreamId, Filename) when is_binary(StreamId) andalso is_binary(Filename) ->
+    <<"rabbitmq/stream/", StreamId/binary, "/data/", Filename/binary>>.
 
-fragment_key(Dir, Offset) ->
-    stream_data_key(Dir, make_file_name(Offset, "fragment")).
+-spec fragment_key(stream_id(), osiris:offset()) -> binary().
+fragment_key(StreamId, Offset) when is_binary(StreamId) andalso is_integer(Offset) ->
+    stream_data_key(StreamId, make_file_name(Offset, <<"fragment">>)).
 
-segment_file_offset(File) ->
-    <<Digits:20/binary, ".segment">> = iolist_to_binary(filename:basename(File)),
-    binary_to_integer(Digits).
+-spec segment_file_offset(file:filename_all()) -> osiris:offset().
+segment_file_offset(Filename) ->
+    filename_offset(filename:basename(Filename, <<".segment">>)).
 
-index_file_offset(File) ->
-    <<Digits:20/binary, ".index">> = iolist_to_binary(filename:basename(File)),
-    binary_to_integer(Digits).
+-spec index_file_offset(file:filename_all()) -> osiris:offset().
+index_file_offset(Filename) ->
+    filename_offset(filename:basename(Filename, <<".index">>)).
+
+-spec filename_offset(file:filename_all()) -> osiris:offset().
+filename_offset(Basename) when is_binary(Basename) ->
+    binary_to_integer(Basename);
+filename_offset(Basename) when is_list(Basename) ->
+    list_to_integer(Basename).
 
 -spec evolve_event(event(), #?MODULE{}) -> {noreply, #?MODULE{}}.
 evolve_event(Event, #?MODULE{machine = MacState0} = State0) ->
@@ -575,7 +626,7 @@ execute_task(Effect, ManifestServer) ->
     gen_server:cast(ManifestServer, #task_completed{task_pid = self(), event = Event}).
 
 execute_task(#upload_fragment{
-    stream = Stream,
+    stream = StreamId,
     dir = Dir,
     fragment =
         #fragment{
@@ -593,13 +644,13 @@ execute_task(#upload_fragment{
     Timeout = application:get_env(rabbitmq_stream_s3, segment_upload_timeout, 45_000),
     {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
     {ok, Handle} = rabbitmq_aws:open_connection("s3"),
-    FragmentFilename = make_file_name(FragmentOffset, "fragment"),
-    SegmentFilename = make_file_name(SegmentOffset, "segment"),
-    IndexFilename = make_file_name(SegmentOffset, "index"),
-    Key = fragment_key(Dir, FragmentOffset),
-    ?LOG_INFO(
-        "Starting upload of ~ts (~b of ~ts, next offset ~b, in ~ts): ~w", [
-            FragmentFilename, SeqNo, SegmentFilename, NextOffset, Dir, Fragment
+    FragmentFilename = make_file_name(FragmentOffset, <<"fragment">>),
+    SegmentFilename = make_file_name(SegmentOffset, <<"segment">>),
+    IndexFilename = make_file_name(SegmentOffset, <<"index">>),
+    Key = fragment_key(StreamId, FragmentOffset),
+    ?LOG_DEBUG(
+        "Starting upload of ~ts (~b of ~ts, next offset ~b of ~ts): ~w", [
+            FragmentFilename, SeqNo, SegmentFilename, NextOffset, StreamId, Fragment
         ]
     ),
 
@@ -668,19 +719,18 @@ execute_task(#upload_fragment{
             end,
             millisecond
         ),
-        ?LOG_INFO("Uploaded ~ts of ~ts in ~b msec (~b bytes)", [
+        ?LOG_DEBUG("Uploaded ~ts of ~ts in ~b msec (~b bytes)", [
             FragmentFilename, SegmentFilename, UploadMSec, UploadSize
         ]),
         %% TODO: update counters for fragments.
         rabbitmq_stream_s3_counters:segment_uploaded(UploadSize),
 
-        #fragment_uploaded{stream = Stream, info = FragmentInfo}
+        #fragment_uploaded{stream = StreamId, info = FragmentInfo}
     after
         ok = rabbitmq_aws:close_connection(Handle)
     end;
 execute_task(#rebalance_manifest{
     stream = StreamId,
-    dir = Dir,
     kind = GroupKind,
     size = GroupSize,
     new_group = GroupEntries,
@@ -690,7 +740,7 @@ execute_task(#rebalance_manifest{
     {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
     Ext = group_extension(GroupKind),
     ?ENTRY(GroupOffset, Ts, _, _, _, _) = GroupEntries,
-    Key = manifest_key(Dir, make_file_name(GroupOffset, group_extension(GroupKind))),
+    Key = manifest_key(StreamId, make_file_name(GroupOffset, group_extension(GroupKind))),
     Data = [
         group_header(GroupKind),
         <<GroupOffset:64/unsigned, Ts:64/signed, 0:2/signed, GroupSize:70/unsigned>>,
@@ -699,7 +749,7 @@ execute_task(#rebalance_manifest{
 
     {ok, Handle} = rabbitmq_aws:open_connection("s3"),
     try
-        ?LOG_INFO("rebalancing: adding a ~ts to the manifest for '~tp'", [Ext, Dir]),
+        ?LOG_DEBUG("rebalancing: adding a ~ts to the manifest for '~tp'", [Ext, StreamId]),
         {UploadMsec, ok} = timer:tc(
             fun() ->
                 ok = rabbitmq_stream_s3_api:put_object(Handle, Bucket, Key, Data)
@@ -707,8 +757,8 @@ execute_task(#rebalance_manifest{
             millisecond
         ),
         DataSize = iolist_size(Data),
-        ?LOG_INFO("Uploaded ~ts for '~tp' in ~b msec (~b bytes)", [
-            Ext, Dir, UploadMsec, DataSize
+        ?LOG_DEBUG("Uploaded ~ts for '~tp' in ~b msec (~b bytes)", [
+            Ext, StreamId, UploadMsec, DataSize
         ]),
         %% TODO: counters per group kind.
         %% rabbitmq_stream_s3_counters:manifest_written(Size),
@@ -720,7 +770,6 @@ execute_task(#rebalance_manifest{
     #manifest_rebalanced{stream = StreamId, manifest = Manifest};
 execute_task(#upload_manifest{
     stream = StreamId,
-    dir = Dir,
     manifest = #manifest{
         first_offset = Offset,
         first_timestamp = Ts,
@@ -731,11 +780,11 @@ execute_task(#upload_manifest{
 }) ->
     {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
     {ok, Handle} = rabbitmq_aws:open_connection("s3"),
-    Key = manifest_key(Dir),
+    Key = manifest_key(StreamId),
     Data = [?MANIFEST(Offset, Ts, NextOffset, Size, <<>>), Entries],
 
     try
-        ?LOG_INFO("Uploading manifest for '~tp'", [Dir]),
+        ?LOG_DEBUG("Uploading manifest for '~tp'", [StreamId]),
         {UploadMsec, ok} = timer:tc(
             fun() ->
                 ok = rabbitmq_stream_s3_api:put_object(Handle, Bucket, Key, Data)
@@ -743,8 +792,8 @@ execute_task(#upload_manifest{
             millisecond
         ),
         ManifestSize = iolist_size(Data),
-        ?LOG_INFO("Uploaded manifest for '~tp' in ~b msec (~b bytes)", [
-            Dir, UploadMsec, ManifestSize
+        ?LOG_DEBUG("Uploaded manifest for '~tp' in ~b msec (~b bytes)", [
+            StreamId, UploadMsec, ManifestSize
         ]),
         rabbitmq_stream_s3_counters:manifest_written(ManifestSize),
         ok
@@ -752,10 +801,10 @@ execute_task(#upload_manifest{
         ok = rabbitmq_aws:close_connection(Handle)
     end,
     #manifest_uploaded{stream = StreamId};
-execute_task(#resolve_manifest{stream = StreamId, dir = Dir}) ->
+execute_task(#resolve_manifest{stream = StreamId}) ->
     {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
     {ok, Handle} = rabbitmq_aws:open_connection("s3"),
-    Key = manifest_key(Dir),
+    Key = manifest_key(StreamId),
     Manifest0 =
         try rabbitmq_stream_s3_api:get_object(Handle, Bucket, Key) of
             {ok, ?MANIFEST(FirstOffset, FirstTimestamp, NextOffset, TotalSize, Entries) = Data} ->
@@ -776,22 +825,22 @@ execute_task(#resolve_manifest{stream = StreamId, dir = Dir}) ->
         end,
     #manifest_resolved{
         stream = StreamId,
-        manifest = resolve_manifest_tail(Dir, Manifest0)
+        manifest = resolve_manifest_tail(StreamId, Manifest0)
     }.
 
-resolve_manifest_tail(_Dir, #manifest{entries = <<>>} = Manifest0) ->
+resolve_manifest_tail(_StreamId, #manifest{entries = <<>>} = Manifest0) ->
     Manifest0;
-resolve_manifest_tail(_Dir, undefined) ->
+resolve_manifest_tail(_StreamId, undefined) ->
     undefined;
 resolve_manifest_tail(
-    Dir,
+    StreamId,
     #manifest{
         next_offset = NextOffset0,
         entries = Entries0,
         total_size = TotalSize0
     } = Manifest0
 ) ->
-    case get_fragment_trailer(Dir, NextOffset0) of
+    case get_fragment_trailer(StreamId, NextOffset0) of
         {ok, #fragment_info{
             offset = NextOffset0,
             next_offset = NextOffset,
@@ -807,14 +856,14 @@ resolve_manifest_tail(
                 total_size = TotalSize0 + Size,
                 entries = Entries
             },
-            resolve_manifest_tail(Dir, Manifest);
+            resolve_manifest_tail(StreamId, Manifest);
         {error, not_found} ->
             Manifest0
     end.
 
-group_extension(?MANIFEST_KIND_GROUP) -> "group";
-group_extension(?MANIFEST_KIND_KILO_GROUP) -> "kgroup";
-group_extension(?MANIFEST_KIND_MEGA_GROUP) -> "mgroup".
+group_extension(?MANIFEST_KIND_GROUP) -> <<"group">>;
+group_extension(?MANIFEST_KIND_KILO_GROUP) -> <<"kgroup">>;
+group_extension(?MANIFEST_KIND_MEGA_GROUP) -> <<"mgroup">>.
 
 group_header(?MANIFEST_KIND_GROUP) ->
     <<?MANIFEST_GROUP_MAGIC, ?MANIFEST_GROUP_VERSION:32/unsigned>>;
@@ -823,10 +872,10 @@ group_header(?MANIFEST_KIND_KILO_GROUP) ->
 group_header(?MANIFEST_KIND_MEGA_GROUP) ->
     <<?MANIFEST_MEGA_GROUP_MAGIC, ?MANIFEST_MEGA_GROUP_VERSION:32/unsigned>>.
 
-get_fragment_trailer(Dir, FragmentOffset) ->
+get_fragment_trailer(StreamId, FragmentOffset) ->
     {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
     {ok, Handle} = rabbitmq_aws:open_connection("s3"),
-    Key = rabbitmq_stream_s3_log_manifest:fragment_key(Dir, FragmentOffset),
+    Key = rabbitmq_stream_s3_log_manifest:fragment_key(StreamId, FragmentOffset),
     ?LOG_DEBUG("Looking up key ~ts (~ts)", [Key, ?FUNCTION_NAME]),
     try
         rabbitmq_stream_s3_api:get_object_with_range(
