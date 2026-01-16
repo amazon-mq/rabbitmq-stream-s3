@@ -27,10 +27,7 @@
 -record(?MODULE, {
     machine = rabbitmq_stream_s3_log_manifest_machine:new() :: rabbitmq_stream_s3_log_manifest_machine:state(),
     tasks = #{} :: #{pid() => effect()},
-    references = #{} :: #{stream_reference() => stream_id()},
-    offset_listeners = #{} :: #{
-        stream_id() => [{pid(), osiris:offset() | -1}] | osiris:offset() | -1
-    }
+    references = #{} :: #{stream_reference() => stream_id()}
 }).
 
 %% records for the gen_server to handle:
@@ -52,11 +49,6 @@
 }).
 -record(get_manifest, {stream :: stream_id()}).
 -record(task_completed, {task_pid :: pid(), event :: event()}).
--record(register_last_tiered_offset_listener, {
-    pid :: pid(),
-    stream :: stream_id(),
-    offset :: osiris:offset() | -1
-}).
 
 %% osiris_log_manifest
 -export([
@@ -81,7 +73,7 @@
 %% Need to be exported for `erlang:apply/3`.
 -export([start/0, format_osiris_event/1, execute_task/2]).
 
--export([get_manifest/1, get_fragment_trailer/2, register_last_tiered_offset_listener/3]).
+-export([get_manifest/1, get_fragment_trailer/2]).
 
 %% Useful to search module.
 -export([fragment_key/2, group_key/3, make_file_name/2, fragment_trailer_to_info/1]).
@@ -111,15 +103,6 @@ start() ->
 -spec get_manifest(stream_id()) -> #manifest{} | undefined.
 get_manifest(StreamId) ->
     gen_server:call(?SERVER, #get_manifest{stream = StreamId}, infinity).
-
--spec register_last_tiered_offset_listener({?MODULE, node()}, stream_id(), osiris:offset() | -1) ->
-    ok.
-register_last_tiered_offset_listener(ServerId, Stream, Offset) ->
-    gen_server:cast(ServerId, #register_last_tiered_offset_listener{
-        pid = self(),
-        stream = Stream,
-        offset = Offset
-    }).
 
 %%----------------------------------------------------------------------------
 
@@ -442,28 +425,16 @@ handle_cast(
     evolve_event(Event, State1);
 handle_cast(
     #init_acceptor{writer_pid = WriterPid, stream = StreamId, reference = Reference},
-    #?MODULE{references = References0, offset_listeners = L0} = State0
+    #?MODULE{references = References0} = State0
 ) ->
-    %% Subscribe to updates to the last-tiered-offset for this stream.
-    ok = register_last_tiered_offset_listener({?MODULE, node(WriterPid)}, StreamId, -1),
-    State = State0#?MODULE{
-        references = References0#{Reference => StreamId},
-        offset_listeners = L0#{StreamId => -1}
-    },
+    ok = gen_server:cast({?SERVER, node(WriterPid)}, #manifest_requested{
+        stream = StreamId,
+        requester = self()
+    }),
+    State = State0#?MODULE{references = References0#{Reference => StreamId}},
     {noreply, State};
-handle_cast(
-    #register_last_tiered_offset_listener{pid = Pid, stream = StreamId, offset = Offset},
-    #?MODULE{offset_listeners = OffsetListeners0} = State0
-) ->
-    Listeners =
-        case OffsetListeners0 of
-            #{StreamId := Listeners0} when is_list(Listeners0) ->
-                [{Pid, Offset} | Listeners0];
-            _ ->
-                [{Pid, Offset}]
-        end,
-    State = State0#?MODULE{offset_listeners = OffsetListeners0#{StreamId => Listeners}},
-    {noreply, State};
+handle_cast(#manifest_requested{} = Event, State) ->
+    evolve_event(Event, State);
 handle_cast(
     #task_completed{task_pid = TaskPid, event = Event},
     #?MODULE{tasks = Tasks0} = State0
@@ -488,6 +459,10 @@ handle_info({osiris_offset, Reference, Offset}, #?MODULE{references = References
     end;
 handle_info(#set_last_tiered_offset{} = Effect, State) ->
     {noreply, apply_effect(Effect, State)};
+handle_info(#manifest_resolved{} = Event, State) ->
+    evolve_event(Event, State);
+handle_info(#fragments_applied{} = Event, State) ->
+    evolve_event(Event, State);
 handle_info({'DOWN', _MRef, process, Pid, Reason}, #?MODULE{tasks = Tasks0} = State0) ->
     case maps:take(Pid, Tasks0) of
         {_Effect, Tasks} ->
@@ -568,43 +543,20 @@ evolve_event(Event, #?MODULE{machine = MacState0} = State0) ->
 apply_effect(#reply{to = To, response = Response}, State) ->
     ok = gen_server:reply(To, Response),
     State;
+apply_effect(#send{to = Pid, message = Message, options = Options}, State) ->
+    _ = erlang:send(Pid, Message, Options),
+    State;
 apply_effect(#register_offset_listener{writer_pid = Pid, offset = Offset}, State) ->
     ok = osiris:register_offset_listener(Pid, Offset, {?MODULE, format_osiris_event, []}),
     State;
-apply_effect(
-    #set_last_tiered_offset{
-        writer_pid = WriterPid,
-        stream = StreamId,
-        offset = Offset
-    } = Effect,
-    #?MODULE{offset_listeners = L0} = State0
-) ->
+apply_effect(#set_last_tiered_offset{stream = StreamId, offset = Offset}, State) ->
     _ = ets:update_element(
         ?LAST_TIERED_OFFSET_TABLE,
         StreamId,
         {2, Offset},
         {StreamId, Offset}
     ),
-    case L0 of
-        #{StreamId := Listeners0} when is_list(Listeners0) ->
-            {Notify, Listeners} = lists:partition(fun({_Pid, O}) -> O =< Offset end, Listeners0),
-            _ = [Pid ! Effect || {Pid, _} <- Notify],
-            L =
-                case Listeners of
-                    [] ->
-                        maps:remove(StreamId, L0);
-                    [_ | _] ->
-                        L0#{StreamId := Listeners}
-                end,
-            State0#?MODULE{offset_listeners = L};
-        #{StreamId := RequestedOffset} when is_integer(RequestedOffset) ->
-            ok = register_last_tiered_offset_listener(
-                {?MODULE, node(WriterPid)}, StreamId, Offset + 1
-            ),
-            State0#?MODULE{offset_listeners = L0#{StreamId := Offset + 1}};
-        _ ->
-            State0
-    end;
+    State;
 apply_effect(#upload_fragment{} = Event, State) ->
     spawn_task(Event, State);
 apply_effect(#upload_manifest{} = Event, State) ->

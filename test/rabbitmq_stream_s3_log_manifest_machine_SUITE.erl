@@ -21,7 +21,8 @@ all() ->
         simultaneous_manifest_requests,
         spawn_writer_after_readers,
         out_of_order_fragment_uploads,
-        recover_uploaded_fragments
+        recover_uploaded_fragments,
+        manifest_replication
     ].
 
 %%----------------------------------------------------------------------------
@@ -84,10 +85,11 @@ simultaneous_manifest_requests(Config) ->
 
     Event4 = #manifest_resolved{stream = StreamId, manifest = #manifest{}},
     {_Mac2, Effects2} = ?MAC:apply(?META(), Event4, Mac1),
-    ?assertEqual(
+    ?assertMatch(
         [
             #reply{to = From1, response = #manifest{}},
-            #reply{to = From2, response = #manifest{}}
+            #reply{to = From2, response = #manifest{}},
+            #set_last_tiered_offset{offset = -1}
         ],
         Effects2
     ),
@@ -123,10 +125,11 @@ spawn_writer_after_readers(Config) ->
 
     ManifestResolved = #manifest_resolved{stream = StreamId, manifest = #manifest{}},
     {_Mac3, Effects3} = ?MAC:apply(?META(), ManifestResolved, Mac2),
-    ?assertEqual(
+    ?assertMatch(
         [
             #reply{to = From1, response = #manifest{}},
-            #reply{to = From2, response = #manifest{}}
+            #reply{to = From2, response = #manifest{}},
+            #set_last_tiered_offset{offset = -1}
         ],
         Effects3
     ),
@@ -234,10 +237,78 @@ recover_uploaded_fragments(Config) ->
     %% The last fragment is now eligible for upload since the commit offset
     %% increased.
     ?assertMatch(
-        [#upload_fragment{stream = StreamId, fragment = #fragment{first_offset = 40}}],
+        [
+            #upload_fragment{stream = StreamId, fragment = #fragment{first_offset = 40}},
+            #set_last_tiered_offset{offset = 39}
+        ],
         Effects7
     ),
     {_Mac8, Effects8} = ?MAC:apply(?META(), Up3, Mac7),
+    ?assertMatch([#set_last_tiered_offset{offset = 59}], Effects8),
+    ok.
+
+manifest_replication(Config) ->
+    Dir = directory(Config),
+    WriterPid = self(),
+    ReplicaPid = spawn(fun() -> ok end),
+    ReplicaNode = 'rabbit@replica',
+    StreamId = erlang:make_ref(),
+    WriterSpawned = #writer_spawned{
+        stream = StreamId,
+        pid = WriterPid,
+        dir = Dir,
+        replica_nodes = [ReplicaNode]
+    },
+    {Writer1, Effects1} = ?MAC:apply(?META(), WriterSpawned, ?MAC:new()),
+    ?assertMatch([#resolve_manifest{}, #register_offset_listener{}], Effects1),
+    %% Replica manifest server requests the manifest from the writer when the
+    %% acceptor initializes.
+    ManifestRequested = #manifest_requested{stream = StreamId, requester = ReplicaPid},
+    {Writer2, Effects2} = ?MAC:apply(?META(), ManifestRequested, Writer1),
+    ?assertEqual([], Effects2),
+    %% Once the manifest is resolved, the writer will forward it to the
+    %% replica which requested it.
+    ManifestResolved = #manifest_resolved{stream = StreamId, manifest = #manifest{}},
+    {Writer3, Effects3} = ?MAC:apply(?META(), ManifestResolved, Writer2),
+    ?assertMatch(
+        [
+            #send{to = ReplicaPid, message = ManifestResolved},
+            #set_last_tiered_offset{offset = -1}
+        ],
+        Effects3
+    ),
+    {Replica1, Effects4} = ?MAC:apply(?META(), ManifestResolved, ?MAC:new()),
+    ?assertEqual([], Effects4),
+    %% Now when fragments are fully uploaded and applied to the manifest, the
+    %% acceptor will get notifications that fragments were applied.
+    Fragments = [fragment(From, To) || {From, To} <- [{0, 19}, {20, 39}, {40, 59}]],
+    FragmentsAvailable = [#fragment_available{stream = StreamId, fragment = F} || F <- Fragments],
+    CommitOffsetIncreased = #commit_offset_increased{stream = StreamId, offset = 60},
+    {Writer4, Effects5} = handle_events(
+        ?META(), FragmentsAvailable ++ [CommitOffsetIncreased], Writer3
+    ),
+    ?assertMatch(
+        [#upload_fragment{}, #upload_fragment{}, #upload_fragment{}, #register_offset_listener{}],
+        Effects5
+    ),
+    Infos = [fragment_to_info(F) || F <- Fragments],
+    Uploaded0 = [#fragment_uploaded{stream = StreamId, info = I} || I <- Infos],
+    %% HACK: reverse the uploaded events so that they're all applied to the
+    %% manifest at once.
+    Uploaded = lists:reverse(Uploaded0),
+    {Writer5, Effects6} = handle_events(?META(), Uploaded, Writer4),
+    FragmentsApplied = #fragments_applied{stream = StreamId, fragments = Infos},
+    ?assertMatch(
+        [
+            #send{to = {_, ReplicaNode}, message = FragmentsApplied},
+            #set_last_tiered_offset{offset = 59},
+            #upload_manifest{}
+        ],
+        Effects6
+    ),
+    {_Writer6, Effects7} = ?MAC:apply(?META(), #manifest_uploaded{stream = StreamId}, Writer5),
+    ?assertEqual([], Effects7),
+    {_Replica2, Effects8} = ?MAC:apply(?META(), FragmentsApplied, Replica1),
     ?assertMatch([#set_last_tiered_offset{offset = 59}], Effects8),
     ok.
 

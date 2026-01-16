@@ -246,7 +246,7 @@
 }).
 -record(manifest_requested, {
     stream :: stream_id(),
-    requester :: gen_server:from()
+    requester :: gen_server:from() | pid()
 }).
 -record(manifest_resolved, {
     stream :: stream_id(),
@@ -259,15 +259,20 @@
     pid :: pid(),
     replica_nodes = [] :: [node()]
 }).
+-record(fragments_applied, {
+    stream :: stream_id(),
+    fragments :: [#fragment_info{}]
+}).
 
 -type event() ::
-    #fragment_available{}
-    | #commit_offset_increased{}
+    #commit_offset_increased{}
+    | #fragment_available{}
     | #fragment_uploaded{}
-    | #manifest_uploaded{}
+    | #fragments_applied{}
     | #manifest_rebalanced{}
     | #manifest_requested{}
     | #manifest_resolved{}
+    | #manifest_uploaded{}
     | #writer_spawned{}.
 
 %% Effects.
@@ -298,9 +303,14 @@
 -record(resolve_manifest, {stream :: stream_id()}).
 -record(reply, {to :: gen_server:from(), response :: term()}).
 -record(set_last_tiered_offset, {
-    writer_pid :: pid(),
     stream :: stream_id(),
-    offset :: osiris:offset()
+    offset :: osiris:offset() | -1
+}).
+-record(send, {
+    to :: pid() | {atom(), node()},
+    message :: term(),
+    %% See `erlang:send/3`.
+    options = [] :: [nosuspend | noconnect | priority]
 }).
 
 -type effect() ::
@@ -308,6 +318,7 @@
     | #register_offset_listener{}
     | #reply{}
     | #resolve_manifest{}
+    | #send{}
     | #set_last_tiered_offset{}
     | #upload_fragment{}
     | #upload_manifest{}.

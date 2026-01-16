@@ -18,6 +18,8 @@ for the log manifest server to execute.
 
 -include("include/rabbitmq_stream_s3.hrl").
 
+-define(SERVER, rabbitmq_stream_s3_log_manifest).
+
 %% NOTE: Pending is reversed.
 -type upload_status() ::
     {uploading, Pending :: [#fragment_info{}]}
@@ -28,13 +30,13 @@ for the log manifest server to execute.
     writer_pid :: pid() | undefined,
     replica_nodes = [] :: [node()],
     %% Directory of the local copy of the log.
-    %% This could be undefined for a stream until a writer or acceptor starts
-    %% on this node. This field is used to add information to effects like
-    %% `upload_fragment{}' which act on local files.
+    %% This is undefined unless there is a local writer. This field is used to
+    %% add information to effects like `upload_fragment{}' which act on local
+    %% files.
     dir :: directory() | undefined,
     %% Most up-to-date known copy of the manifest, if there is one, or a list
     %% of callers waiting for it to be resolved.
-    manifest = {pending, []} :: #manifest{} | {pending, [gen_server:from()]},
+    manifest = {pending, []} :: #manifest{} | {pending, [gen_server:from() | pid()]},
     upload_status = {last_uploaded, 0} :: upload_status(),
     %% Current commit offset (updated by offset listener notifications) known
     %% to the manifest - this can lag behind the actual commit offset.
@@ -158,7 +160,8 @@ apply(
         #{
             StreamId := #stream{
                 manifest = #manifest{next_offset = NTO0} = Manifest0,
-                uploaded_fragments = Uploaded0
+                uploaded_fragments = Uploaded0,
+                replica_nodes = ReplicaNodes
             } = Stream0
         } ->
             Uploaded1 = insert_info(Info, Uploaded0),
@@ -169,21 +172,44 @@ apply(
             {Stream, Effects0} = apply_infos_to_manifest(Finished, StreamId, Stream1),
             %% assertion: the finished fragments were applied up to the
             %% next-tiered-offset we expected from split_uploaded_infos/2.
+            %% TODO: this assertion is not currently correct. We should
+            %% refactor out the `{uploading, [#fragment_info{}]}` uploading
+            %% status so that we always apply uploaded fragments to the local
+            %% copy eagerly.
             #stream{manifest = #manifest{next_offset = NTO}} = Stream,
             Effects =
                 case NTO of
                     NTO0 ->
                         Effects0;
                     _ ->
-                        [
-                            #set_last_tiered_offset{
-                                writer_pid = self(),
-                                stream = StreamId,
-                                offset = NTO - 1
-                            }
-                            | Effects0
-                        ]
+                        SetLTO = #set_last_tiered_offset{stream = StreamId, offset = NTO - 1},
+                        lists:foldl(
+                            fun(Node, Acc) ->
+                                Event = #fragments_applied{stream = StreamId, fragments = Finished},
+                                Effect = #send{
+                                    to = {?SERVER, Node},
+                                    message = Event,
+                                    options = [noconnect]
+                                },
+                                [Effect | Acc]
+                            end,
+                            [SetLTO | Effects0],
+                            ReplicaNodes
+                        )
                 end,
+            State = State0#?MODULE{streams = Streams0#{StreamId := Stream}},
+            {State, Effects};
+        _ ->
+            {State0, []}
+    end;
+apply(
+    _Meta,
+    #fragments_applied{stream = StreamId, fragments = Fragments},
+    #?MODULE{streams = Streams0} = State0
+) ->
+    case Streams0 of
+        #{StreamId := #stream{} = Stream0} ->
+            {Stream, Effects} = apply_infos_to_replica_manifest(Fragments, StreamId, Stream0),
             State = State0#?MODULE{streams = Streams0#{StreamId := Stream}},
             {State, Effects};
         _ ->
@@ -248,7 +274,15 @@ apply(
 ) ->
     case Streams0 of
         #{StreamId := #stream{manifest = #manifest{} = Manifest}} ->
-            {State0, [#reply{to = Requester, response = Manifest}]};
+            Reply =
+                case Requester of
+                    {_, _} ->
+                        #reply{to = Requester, response = Manifest};
+                    _ when is_pid(Requester) ->
+                        Message = #manifest_resolved{stream = StreamId, manifest = Manifest},
+                        #send{to = Requester, message = Message}
+                end,
+            {State0, [Reply]};
         #{StreamId := #stream{manifest = {pending, Requesters0}} = Stream0} ->
             Stream = Stream0#stream{manifest = {pending, [Requester | Requesters0]}},
             State = State0#?MODULE{streams = Streams0#{StreamId := Stream}},
@@ -262,8 +296,8 @@ apply(
     _Meta,
     #manifest_resolved{
         stream = StreamId,
-        manifest = #manifest{entries = Entries} = Manifest
-    },
+        manifest = #manifest{next_offset = NTO, entries = Entries} = Manifest
+    } = Event,
     #?MODULE{streams = Streams0} = State0
 ) ->
     case Streams0 of
@@ -275,10 +309,16 @@ apply(
                 available_fragments = Available0
             } = Stream0
         } ->
+            SetLTO = #set_last_tiered_offset{stream = StreamId, offset = NTO - 1},
             %% NOTE: `Requesters` is in reverse order.
             Effects0 = lists:foldl(
-                fun(R, Acc) -> [#reply{to = R, response = Manifest} | Acc] end,
-                [],
+                fun
+                    ({_, _} = R, Acc) ->
+                        [#reply{to = R, response = Manifest} | Acc];
+                    (Pid, Acc) when is_pid(Pid) ->
+                        [#send{to = Pid, message = Event} | Acc]
+                end,
+                [SetLTO],
                 Requesters
             ),
             LastOffsetInManifest =
@@ -302,14 +342,7 @@ apply(
             ),
             Effects = lists:foldl(
                 fun(Fragment, Acc) ->
-                    [
-                        #upload_fragment{
-                            stream = StreamId,
-                            dir = Dir,
-                            fragment = Fragment
-                        }
-                        | Acc
-                    ]
+                    [#upload_fragment{stream = StreamId, dir = Dir, fragment = Fragment} | Acc]
                 end,
                 Effects0,
                 Committed
@@ -322,7 +355,9 @@ apply(
             State = State0#?MODULE{streams = Streams0#{StreamId := Stream}},
             {State, Effects};
         _ ->
-            {State0, []}
+            Stream = #stream{manifest = Manifest},
+            State = State0#?MODULE{streams = Streams0#{StreamId => Stream}},
+            {State, []}
     end;
 apply(_Meta, Event, State) ->
     ?LOG_WARNING(?MODULE_STRING " dropped unknown event ~W", [Event, 15]),
@@ -553,6 +588,76 @@ add_available_fragment(
 add_available_fragment(F, Fs, Acc) ->
     lists:reverse(Acc, [F | Fs]).
 
+-doc """
+Add the sorted list of fragment infos to the replica copy of a manifest.
+
+This is similar to applying fragments to the writer's manifest but it does not
+trigger rebalancing. If a fragments arrive out of order or a fragment is
+dropped, the replica requests an updated copy of the manifest from the writer.
+""".
+-spec apply_infos_to_replica_manifest([#fragment_info{}], stream_id(), #stream{}) ->
+    {#stream{}, [effect()]}.
+apply_infos_to_replica_manifest(Infos, StreamId, Stream) ->
+    apply_infos_to_replica_manifest(Infos, StreamId, Stream, []).
+
+apply_infos_to_replica_manifest([], _StreamId, Stream, Effects) ->
+    {Stream, Effects};
+apply_infos_to_replica_manifest(
+    [
+        #fragment_info{
+            offset = Offset,
+            next_offset = NextOffset,
+            timestamp = Ts,
+            seq_no = SeqNo,
+            size = Size
+        }
+        | Rest
+    ],
+    StreamId,
+    #stream{
+        manifest =
+            #manifest{
+                next_offset = Offset,
+                total_size = TotalSize0,
+                entries = Entries0
+            } = Manifest0
+    } = Stream0,
+    Effects0
+) ->
+    %% Common-case: the infos are in order and there was no data loss.
+    %% Update the manifest in-place. The manifest could be fully empty here
+    %% so we may need to set the first offset and timestamp:
+    Manifest1 =
+        case Offset of
+            0 ->
+                Manifest0#manifest{first_offset = Offset, first_timestamp = Ts};
+            _ ->
+                Manifest0
+        end,
+    Manifest = Manifest1#manifest{
+        next_offset = NextOffset,
+        total_size = TotalSize0 + Size,
+        entries =
+            <<Entries0/binary,
+                ?ENTRY(Offset, Ts, ?MANIFEST_KIND_FRAGMENT, Size, SeqNo, <<>>)/binary>>
+    },
+    Stream = Stream0#stream{manifest = Manifest},
+    SetLTO = #set_last_tiered_offset{stream = StreamId, offset = NextOffset - 1},
+    Effects =
+        case Effects0 of
+            [#set_last_tiered_offset{stream = StreamId} | Effects1] ->
+                [SetLTO | Effects1];
+            _ ->
+                [SetLTO | Effects0]
+        end,
+    apply_infos_to_replica_manifest(Rest, StreamId, Stream, Effects);
+apply_infos_to_replica_manifest([_ | _], StreamId, #stream{} = Stream0, Effects0) ->
+    %% Sad path: a fragment info is missing. Refresh the manifest from the
+    %% writer.
+    Effect = #manifest_requested{stream = StreamId, requester = self()},
+    Stream = Stream0#stream{manifest = {pending, []}},
+    {Stream, [Effect | Effects0]}.
+
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
@@ -563,6 +668,42 @@ add_available_fragment_test() ->
     Expected = lists:reverse(Fragments),
     ?assertEqual(Expected, lists:foldl(fun add_available_fragment/2, [], Fragments)),
     ?assertEqual(Expected, lists:foldr(fun add_available_fragment/2, [], Fragments)),
+    ok.
+
+apply_infos_to_replica_manifest_test() ->
+    StreamId = erlang:make_ref(),
+    Stream = #stream{manifest = #manifest{}},
+    Ts = erlang:system_time(millisecond),
+    [I1, I2, I3] =
+        Infos = [
+            #fragment_info{
+                offset = N * 20,
+                timestamp = Ts + N,
+                next_offset = N * 20 + 20,
+                seq_no = N,
+                size = 200
+            }
+         || N <- lists:seq(0, 2)
+        ],
+    ?assertMatch(
+        {
+            #stream{manifest = #manifest{first_timestamp = Ts, next_offset = 60}},
+            [#set_last_tiered_offset{offset = 59}]
+        },
+        apply_infos_to_replica_manifest(Infos, StreamId, Stream)
+    ),
+    %% Any missing fragments will trigger a new manifest request:
+    ?assertMatch(
+        {
+            #stream{manifest = {pending, []}},
+            [#manifest_requested{}, #set_last_tiered_offset{offset = 19}]
+        },
+        apply_infos_to_replica_manifest([I1, I3], StreamId, Stream)
+    ),
+    ?assertMatch(
+        {#stream{manifest = {pending, []}}, [#manifest_requested{}]},
+        apply_infos_to_replica_manifest([I2, I3], StreamId, Stream)
+    ),
     ok.
 
 -endif.
