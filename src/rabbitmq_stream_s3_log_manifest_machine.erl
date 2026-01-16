@@ -34,7 +34,7 @@ for the log manifest server to execute.
     dir :: directory() | undefined,
     %% Most up-to-date known copy of the manifest, if there is one, or a list
     %% of callers waiting for it to be resolved.
-    manifest = {pending, []} :: #manifest{} | undefined | {pending, [gen_server:from()]},
+    manifest = {pending, []} :: #manifest{} | {pending, [gen_server:from()]},
     upload_status = {last_uploaded, 0} :: upload_status(),
     %% Current commit offset (updated by offset listener notifications) known
     %% to the manifest - this can lag behind the actual commit offset.
@@ -44,12 +44,7 @@ for the log manifest server to execute.
     available_fragments = [] :: [#fragment{}],
     %% List of fragments in ascending offset order which have been uploaded
     %% successfully but have not yet been applied to the manifest.
-    uploaded_fragments = [] :: [#fragment_info{}],
-    %% The next offset that should be uploaded.
-    %% All offsets under this have been tiered without any "holes" in the
-    %% remote log. TODO: is zero the correct default here? What if the entire
-    %% local log is truncated away?
-    next_tiered_offset = 0 :: osiris:offset()
+    uploaded_fragments = [] :: [#fragment_info{}]
 }).
 
 -record(?MODULE, {
@@ -162,20 +157,19 @@ apply(
     case Streams0 of
         #{
             StreamId := #stream{
-                manifest = Manifest0,
-                uploaded_fragments = Uploaded0,
-                next_tiered_offset = NTO0
+                manifest = #manifest{next_offset = NTO0} = Manifest0,
+                uploaded_fragments = Uploaded0
             } = Stream0
         } ->
             Uploaded1 = insert_info(Info, Uploaded0),
             {NTO, Pending, Finished} = split_uploaded_infos(NTO0, Uploaded1),
             %% assertion: the manifest can't be pending download here.
-            case Manifest0 of
-                #manifest{} -> ok;
-                undefined -> ok
-            end,
-            Stream1 = Stream0#stream{next_tiered_offset = NTO, uploaded_fragments = Pending},
+            #manifest{} = Manifest0,
+            Stream1 = Stream0#stream{uploaded_fragments = Pending},
             {Stream, Effects0} = apply_infos_to_manifest(Finished, StreamId, Stream1),
+            %% assertion: the finished fragments were applied up to the
+            %% next-tiered-offset we expected from split_uploaded_infos/2.
+            #stream{manifest = #manifest{next_offset = NTO}} = Stream,
             Effects =
                 case NTO of
                     NTO0 ->
@@ -253,12 +247,12 @@ apply(
     #?MODULE{streams = Streams0} = State0
 ) ->
     case Streams0 of
+        #{StreamId := #stream{manifest = #manifest{} = Manifest}} ->
+            {State0, [#reply{to = Requester, response = Manifest}]};
         #{StreamId := #stream{manifest = {pending, Requesters0}} = Stream0} ->
             Stream = Stream0#stream{manifest = {pending, [Requester | Requesters0]}},
             State = State0#?MODULE{streams = Streams0#{StreamId := Stream}},
             {State, []};
-        #{StreamId := #stream{manifest = Manifest}} ->
-            {State0, [#reply{to = Requester, response = Manifest}]};
         _ ->
             Stream = #stream{manifest = {pending, [Requester]}},
             State = State0#?MODULE{streams = Streams0#{StreamId => Stream}},
@@ -266,7 +260,10 @@ apply(
     end;
 apply(
     _Meta,
-    #manifest_resolved{stream = StreamId, manifest = Manifest},
+    #manifest_resolved{
+        stream = StreamId,
+        manifest = #manifest{entries = Entries} = Manifest
+    },
     #?MODULE{streams = Streams0} = State0
 ) ->
     case Streams0 of
@@ -284,51 +281,46 @@ apply(
                 [],
                 Requesters
             ),
-            Stream1 = Stream0#stream{
+            LastOffsetInManifest =
+                case rabbitmq_stream_s3_binary_array:last(?ENTRY_B, Entries) of
+                    ?ENTRY(O, _, _, _, _, _) ->
+                        O;
+                    undefined ->
+                        -1
+                end,
+            Available = lists:filter(
+                fun(#fragment{first_offset = Offset}) ->
+                    Offset > LastOffsetInManifest
+                end,
+                Available0
+            ),
+            {Uncommitted, Committed} = lists:splitwith(
+                fun(#fragment{last_offset = Offset}) ->
+                    Offset > CommitOffset
+                end,
+                Available
+            ),
+            Effects = lists:foldl(
+                fun(Fragment, Acc) ->
+                    [
+                        #upload_fragment{
+                            stream = StreamId,
+                            dir = Dir,
+                            fragment = Fragment
+                        }
+                        | Acc
+                    ]
+                end,
+                Effects0,
+                Committed
+            ),
+            Stream = Stream0#stream{
                 manifest = Manifest,
-                upload_status = {last_uploaded, 0}
+                upload_status = {last_uploaded, 0},
+                available_fragments = Uncommitted
             },
-            case Manifest of
-                #manifest{entries = Entries} ->
-                    LastOffsetInManifest =
-                        case rabbitmq_stream_s3_binary_array:last(?ENTRY_B, Entries) of
-                            ?ENTRY(O, _, _, _, _, _) ->
-                                O;
-                            undefined ->
-                                -1
-                        end,
-                    Available = lists:filter(
-                        fun(#fragment{first_offset = Offset}) ->
-                            Offset > LastOffsetInManifest
-                        end,
-                        Available0
-                    ),
-                    {Uncommitted, Committed} = lists:splitwith(
-                        fun(#fragment{last_offset = Offset}) ->
-                            Offset > CommitOffset
-                        end,
-                        Available
-                    ),
-                    Effects = lists:foldl(
-                        fun(Fragment, Acc) ->
-                            [
-                                #upload_fragment{
-                                    stream = StreamId,
-                                    dir = Dir,
-                                    fragment = Fragment
-                                }
-                                | Acc
-                            ]
-                        end,
-                        Effects0,
-                        Committed
-                    ),
-                    Stream = Stream1#stream{available_fragments = Uncommitted},
-                    State = State0#?MODULE{streams = Streams0#{StreamId := Stream}},
-                    {State, Effects};
-                _ ->
-                    {State0#?MODULE{streams = Streams0#{StreamId := Stream1}}, Effects0}
-            end;
+            State = State0#?MODULE{streams = Streams0#{StreamId := Stream}},
+            {State, Effects};
         _ ->
             {State0, []}
     end;
@@ -470,7 +462,7 @@ apply_infos_to_manifest(
         | Rest
     ],
     StreamId,
-    #stream{manifest = undefined, upload_status = UploadStatus0} = Stream0,
+    #stream{manifest = #manifest{next_offset = 0}, upload_status = UploadStatus0} = Stream0,
     Effects
 ) ->
     ?assertEqual({last_uploaded, 0}, UploadStatus0),

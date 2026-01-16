@@ -143,17 +143,34 @@
     %% Other entries:
     Rest/binary
 >>).
-
--record(manifest, {
-    first_offset :: osiris:offset(),
-    first_timestamp :: osiris:timestamp(),
-    next_offset :: osiris:offset(),
-    total_size :: non_neg_integer(),
-    entries :: binary()
-}).
-
 %% offset (8) + timestamp (8) + kind/size (9) + seq no (2) = 27
 -define(ENTRY_B, 27).
+
+%% A nicer version of the above `?MANIFEST/5' macro. This is the root of the
+%% manifest. A newly created, empty manifest can be identified by checking
+%% `#manifest.next_offset =:= 0'. Checking `#manifest.total_size =:= 0' or
+%% `#manifest.entries =:= <<>>' is not sufficient since the remote tier can
+%% become empty from retention.
+-record(manifest, {
+    %% The oldest offset which has been uploaded and not yet truncated by
+    %% retention.
+    first_offset = 0 :: osiris:offset(),
+    %% The oldest timestamp which has been uploaded and not yet truncated
+    %% by retention.
+    first_timestamp = -1 :: osiris:timestamp(),
+    %% The next offset which must be uploaded to the remote tier to ensure
+    %% that the log has been uploaded without any holes. This corresponds to
+    %% `#fragment.next_offset' for the last fragment which has been uploaded
+    %% to the remote tier.
+    next_offset = 0 :: osiris:offset(),
+    %% Total size of segment data in the remote tier. This does not count
+    %% headers, index data or trailers. This is the summed `#fragment.size` of
+    %% all fragments in the remote tier.
+    total_size = 0 :: non_neg_integer(),
+    %% An array of entries. Use the `?ENTRY/6' macro to access entries.
+    entries = <<>> :: binary()
+}).
+
 %% Number of outgoing edges from this branch. Works for the entries array of
 %% the root or any group.
 -define(ENTRIES_LEN(Entries), erlang:byte_size(Entries) div ?ENTRY_B).
@@ -233,7 +250,7 @@
 }).
 -record(manifest_resolved, {
     stream :: stream_id(),
-    manifest :: #manifest{} | undefined
+    manifest :: #manifest{}
 }).
 -record(writer_spawned, {
     stream :: stream_id(),

@@ -817,7 +817,7 @@ execute_task(#resolve_manifest{stream = StreamId}) ->
                     entries = Entries
                 };
             {error, not_found} ->
-                undefined;
+                #manifest{};
             {error, _} = Err ->
                 exit(Err)
         after
@@ -828,10 +828,6 @@ execute_task(#resolve_manifest{stream = StreamId}) ->
         manifest = resolve_manifest_tail(StreamId, Manifest0)
     }.
 
-resolve_manifest_tail(_StreamId, #manifest{entries = <<>>} = Manifest0) ->
-    Manifest0;
-resolve_manifest_tail(_StreamId, undefined) ->
-    undefined;
 resolve_manifest_tail(
     StreamId,
     #manifest{

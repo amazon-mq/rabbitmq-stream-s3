@@ -44,7 +44,7 @@ spawn_writer(Config) ->
         ],
         Effects1
     ),
-    Event2 = #manifest_resolved{stream = Dir, manifest = undefined},
+    Event2 = #manifest_resolved{stream = Dir, manifest = #manifest{}},
     {_Mac2, Effects2} = ?MAC:apply(?META(), Event2, Mac1),
     ?assertEqual([], Effects2),
     ok.
@@ -82,12 +82,12 @@ simultaneous_manifest_requests(Config) ->
         Effects1
     ),
 
-    Event4 = #manifest_resolved{stream = StreamId, manifest = undefined},
+    Event4 = #manifest_resolved{stream = StreamId, manifest = #manifest{}},
     {_Mac2, Effects2} = ?MAC:apply(?META(), Event4, Mac1),
     ?assertEqual(
         [
-            #reply{to = From1, response = undefined},
-            #reply{to = From2, response = undefined}
+            #reply{to = From1, response = #manifest{}},
+            #reply{to = From2, response = #manifest{}}
         ],
         Effects2
     ),
@@ -121,12 +121,12 @@ spawn_writer_after_readers(Config) ->
     {Mac2, Effects2} = ?MAC:apply(?META(), WriterSpawned, Mac1),
     ?assertEqual([#register_offset_listener{writer_pid = WriterPid, offset = -1}], Effects2),
 
-    ManifestResolved = #manifest_resolved{stream = StreamId, manifest = undefined},
+    ManifestResolved = #manifest_resolved{stream = StreamId, manifest = #manifest{}},
     {_Mac3, Effects3} = ?MAC:apply(?META(), ManifestResolved, Mac2),
     ?assertEqual(
         [
-            #reply{to = From1, response = undefined},
-            #reply{to = From2, response = undefined}
+            #reply{to = From1, response = #manifest{}},
+            #reply{to = From2, response = #manifest{}}
         ],
         Effects3
     ),
@@ -238,7 +238,7 @@ recover_uploaded_fragments(Config) ->
         Effects7
     ),
     {_Mac8, Effects8} = ?MAC:apply(?META(), Up3, Mac7),
-    ?assertEqual([], Effects8),
+    ?assertMatch([#set_last_tiered_offset{offset = 59}], Effects8),
     ok.
 
 %%----------------------------------------------------------------------------
@@ -252,7 +252,7 @@ setup_writer(Config) ->
         pid = Pid,
         dir = Dir
     },
-    Event2 = #manifest_resolved{stream = StreamId, manifest = undefined},
+    Event2 = #manifest_resolved{stream = StreamId, manifest = #manifest{}},
     {Mac, _} = handle_events(?META(), [Event1, Event2], ?MAC:new()),
     {Mac, StreamId}.
 
