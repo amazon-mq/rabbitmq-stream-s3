@@ -7,7 +7,6 @@
 -export([start/2, stop/1]).
 
 start(_Type, _StartArgs) ->
-    {ok, _} = application:ensure_all_started(rabbitmq_aws),
     rabbitmq_stream_s3_sup:start_link().
 
 stop(_State) ->

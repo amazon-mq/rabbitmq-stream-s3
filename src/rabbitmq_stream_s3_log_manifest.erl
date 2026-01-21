@@ -73,7 +73,7 @@
 %% Need to be exported for `erlang:apply/3`.
 -export([start/0, format_osiris_event/1, execute_task/2]).
 
--export([get_manifest/1, get_fragment_trailer/2]).
+-export([get_manifest/1, get_fragment_trailer/1, get_fragment_trailer/2]).
 
 %% Useful to search module.
 -export([fragment_key/2, group_key/3, make_file_name/2, fragment_trailer_to_info/1]).
@@ -93,9 +93,7 @@
 ).
 
 start() ->
-    {ok, _} = application:ensure_all_started(rabbitmq_aws),
-
-    ok = setup_credentials_and_region(),
+    ok = rabbitmq_stream_s3_api_aws:init(),
 
     ok = rabbitmq_stream_s3_counters:init(),
     rabbit_sup:start_child(?MODULE).
@@ -465,9 +463,9 @@ handle_info(#fragments_applied{} = Event, State) ->
     evolve_event(Event, State);
 handle_info({'DOWN', _MRef, process, Pid, Reason}, #?MODULE{tasks = Tasks0} = State0) ->
     case maps:take(Pid, Tasks0) of
-        {_Effect, Tasks} ->
-            ?LOG_INFO("Task ~p down with reason ~w. Tasks: ~W", [
-                Pid, Reason, Tasks0, 10
+        {Effect, Tasks} ->
+            ?LOG_INFO("Task ~0p (~p) down with reason ~0p. Tasks: ~0P", [
+                Effect, Pid, Reason, Tasks0, 10
             ]),
             %% TODO: retry. We have the effect and can attempt it again.
             {noreply, State0#?MODULE{tasks = Tasks}};
@@ -502,7 +500,7 @@ manifest_key(StreamId) when is_binary(StreamId) ->
 
 -spec manifest_key(stream_id(), filename()) -> binary().
 manifest_key(StreamId, Filename) when is_binary(StreamId) andalso is_binary(Filename) ->
-    <<"rabbitmq/stream/", StreamId/binary, "/metadata/", Filename/binary>>.
+    <<"/rabbitmq/stream/", StreamId/binary, "/metadata/", Filename/binary>>.
 
 -spec group_key(stream_id(), rabbitmq_stream_s3_log_manifest_entry:kind(), osiris:offset()) ->
     binary().
@@ -511,7 +509,7 @@ group_key(StreamId, Kind, Offset) ->
 
 -spec stream_data_key(stream_id(), filename()) -> binary().
 stream_data_key(StreamId, Filename) when is_binary(StreamId) andalso is_binary(Filename) ->
-    <<"rabbitmq/stream/", StreamId/binary, "/data/", Filename/binary>>.
+    <<"/rabbitmq/stream/", StreamId/binary, "/data/", Filename/binary>>.
 
 -spec fragment_key(stream_id(), osiris:offset()) -> binary().
 fragment_key(StreamId, Offset) when is_binary(StreamId) andalso is_integer(Offset) ->
@@ -594,8 +592,7 @@ execute_task(#upload_fragment{
         } = Fragment
 }) ->
     Timeout = application:get_env(rabbitmq_stream_s3, segment_upload_timeout, 45_000),
-    {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
-    {ok, Handle} = rabbitmq_aws:open_connection("s3"),
+    {ok, Conn} = rabbitmq_stream_s3_api:open(),
     FragmentFilename = make_file_name(FragmentOffset, <<"fragment">>),
     SegmentFilename = make_file_name(SegmentOffset, <<"segment">>),
     IndexFilename = make_file_name(SegmentOffset, <<"index">>),
@@ -656,16 +653,15 @@ execute_task(#upload_fragment{
                     end,
                 %% TODO: should be able to upload this in chunks. Gun should
                 %% support that.
-                ok = rabbitmq_stream_s3_api:put_object(
-                    Handle,
-                    Bucket,
+                ok = rabbitmq_stream_s3_api:put(
+                    Conn,
                     Key,
                     Data,
-                    [
-                        {payload_hash, "UNSIGNED-PAYLOAD"},
-                        {crc32, Checksum},
-                        {timeout, Timeout}
-                    ]
+                    #{
+                        unsigned_payload => true,
+                        crc32 => Checksum,
+                        timeout => Timeout
+                    }
                 ),
                 {iolist_size(Data), fragment_trailer_to_info(Trailer)}
             end,
@@ -679,7 +675,7 @@ execute_task(#upload_fragment{
 
         #fragment_uploaded{stream = StreamId, info = FragmentInfo}
     after
-        ok = rabbitmq_aws:close_connection(Handle)
+        ok = rabbitmq_stream_s3_api:close(Conn)
     end;
 execute_task(#rebalance_manifest{
     stream = StreamId,
@@ -689,7 +685,6 @@ execute_task(#rebalance_manifest{
     rebalanced = RebalancedEntries,
     manifest = Manifest0
 }) ->
-    {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
     Ext = group_extension(GroupKind),
     ?ENTRY(GroupOffset, Ts, _, _, _, _) = GroupEntries,
     Key = manifest_key(StreamId, make_file_name(GroupOffset, group_extension(GroupKind))),
@@ -699,12 +694,12 @@ execute_task(#rebalance_manifest{
         GroupEntries
     ],
 
-    {ok, Handle} = rabbitmq_aws:open_connection("s3"),
+    {ok, Conn} = rabbitmq_stream_s3_api:open(),
     try
         ?LOG_DEBUG("rebalancing: adding a ~ts to the manifest for '~tp'", [Ext, StreamId]),
         {UploadMsec, ok} = timer:tc(
             fun() ->
-                ok = rabbitmq_stream_s3_api:put_object(Handle, Bucket, Key, Data)
+                ok = rabbitmq_stream_s3_api:put(Conn, Key, Data)
             end,
             millisecond
         ),
@@ -716,7 +711,7 @@ execute_task(#rebalance_manifest{
         %% rabbitmq_stream_s3_counters:manifest_written(Size),
         ok
     after
-        ok = rabbitmq_aws:close_connection(Handle)
+        ok = rabbitmq_stream_s3_api:close(Conn)
     end,
     Manifest = Manifest0#manifest{entries = RebalancedEntries},
     #manifest_rebalanced{stream = StreamId, manifest = Manifest};
@@ -730,8 +725,7 @@ execute_task(#upload_manifest{
         entries = Entries
     }
 }) ->
-    {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
-    {ok, Handle} = rabbitmq_aws:open_connection("s3"),
+    {ok, Conn} = rabbitmq_stream_s3_api:open(),
     Key = manifest_key(StreamId),
     Data = [?MANIFEST(Offset, Ts, NextOffset, Size, <<>>), Entries],
 
@@ -739,7 +733,7 @@ execute_task(#upload_manifest{
         ?LOG_DEBUG("Uploading manifest for '~tp'", [StreamId]),
         {UploadMsec, ok} = timer:tc(
             fun() ->
-                ok = rabbitmq_stream_s3_api:put_object(Handle, Bucket, Key, Data)
+                ok = rabbitmq_stream_s3_api:put(Conn, Key, Data)
             end,
             millisecond
         ),
@@ -750,15 +744,14 @@ execute_task(#upload_manifest{
         rabbitmq_stream_s3_counters:manifest_written(ManifestSize),
         ok
     after
-        ok = rabbitmq_aws:close_connection(Handle)
+        ok = rabbitmq_stream_s3_api:close(Conn)
     end,
     #manifest_uploaded{stream = StreamId};
 execute_task(#resolve_manifest{stream = StreamId}) ->
-    {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
-    {ok, Handle} = rabbitmq_aws:open_connection("s3"),
+    {ok, Conn} = rabbitmq_stream_s3_api:open(),
     Key = manifest_key(StreamId),
     Manifest0 =
-        try rabbitmq_stream_s3_api:get_object(Handle, Bucket, Key) of
+        try rabbitmq_stream_s3_api:get(Conn, Key) of
             {ok, ?MANIFEST(FirstOffset, FirstTimestamp, NextOffset, TotalSize, Entries) = Data} ->
                 rabbitmq_stream_s3_counters:manifest_read(byte_size(Data)),
                 #manifest{
@@ -773,7 +766,7 @@ execute_task(#resolve_manifest{stream = StreamId}) ->
             {error, _} = Err ->
                 exit(Err)
         after
-            ok = rabbitmq_aws:close_connection(Handle)
+            ok = rabbitmq_stream_s3_api:close(Conn)
         end,
     #manifest_resolved{
         stream = StreamId,
@@ -821,21 +814,18 @@ group_header(?MANIFEST_KIND_MEGA_GROUP) ->
     <<?MANIFEST_MEGA_GROUP_MAGIC, ?MANIFEST_MEGA_GROUP_VERSION:32/unsigned>>.
 
 get_fragment_trailer(StreamId, FragmentOffset) ->
-    {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
-    {ok, Handle} = rabbitmq_aws:open_connection("s3"),
-    Key = rabbitmq_stream_s3_log_manifest:fragment_key(StreamId, FragmentOffset),
+    get_fragment_trailer(fragment_key(StreamId, FragmentOffset)).
+
+get_fragment_trailer(Key) ->
+    {ok, Conn} = rabbitmq_stream_s3_api:open(),
     ?LOG_DEBUG("Looking up key ~ts (~ts)", [Key, ?FUNCTION_NAME]),
-    try
-        rabbitmq_stream_s3_api:get_object_with_range(
-            Handle, Bucket, Key, -?FRAGMENT_TRAILER_B, []
-        )
-    of
+    try rabbitmq_stream_s3_api:get_range(Conn, Key, -?FRAGMENT_TRAILER_B) of
         {ok, Data} ->
-            {ok, rabbitmq_stream_s3_log_manifest:fragment_trailer_to_info(Data)};
+            {ok, fragment_trailer_to_info(Data)};
         {error, _} = Err ->
             Err
     after
-        ok = rabbitmq_aws:close_connection(Handle)
+        ok = rabbitmq_stream_s3_api:close(Conn)
     end.
 
 -spec fragment_trailer_to_info(binary()) -> #fragment_info{}.
@@ -885,21 +875,6 @@ index_files(Dir, SortFun) ->
         filename:join(Dir, F)
      || <<_:20/binary, ".index">> = F <- list_dir(Dir)
     ]).
-
-setup_credentials_and_region() ->
-    AccessKey = application:get_env(rabbitmq_stream_s3, aws_access_key, undefined),
-    SecretKey = application:get_env(rabbitmq_stream_s3, aws_secret_key, undefined),
-    Region = application:get_env(rabbitmq_stream_s3, aws_region, undefined),
-
-    ok = maybe_setup_credentials(AccessKey, SecretKey),
-    ok = maybe_setup_region(Region).
-
-maybe_setup_credentials(undefined, _) -> ok;
-maybe_setup_credentials(_, undefined) -> ok;
-maybe_setup_credentials(AccessKey, SecretKey) -> rabbitmq_aws:set_credentials(AccessKey, SecretKey).
-
-maybe_setup_region(undefined) -> ok;
-maybe_setup_region(Region) -> rabbitmq_aws:set_region(Region).
 
 -spec metadata() -> rabbitmq_stream_s3_log_manifest_machine:metadata().
 metadata() ->

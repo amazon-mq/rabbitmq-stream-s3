@@ -4,7 +4,7 @@
 %% -*- mode: erlang; -*-
 
 {mapping, "s3.region", "rabbitmq_stream_s3.aws_region", [
-    {datatype, string}
+    {datatype, binary}
 ]}.
 
 {translation, "rabbitmq_stream_s3.aws_region",
@@ -15,10 +15,31 @@ fun(Conf) ->
     end
 end}.
 
+%% A mapping between region name and top-level domain names.
+{mapping, "s3.region_endpoints.$region", "rabbitmq_stream_s3.aws_region_endpoints", [
+    {datatype, [binary]}
+]}.
+
+{translation, "rabbitmq_stream_s3.aws_region_endpoints",
+fun(Conf) ->
+    case cuttlefish_variable:filter_by_prefix("s3.region_endpoints", Conf) of
+        [] ->
+            cuttlefish:unset();
+        Settings ->
+            lists:foldl(
+              fun ({["s3", "region_endpoints", Region0], TLD}, Acc) ->
+                      Acc#{list_to_binary(Region0) => TLD};
+                  (Other, _Acc) ->
+                      cuttlefish:invalid(
+                        lists:flatten(io_lib:format("~p is invalid", [Other])))
+              end, #{}, Settings)
+    end
+end}.
+
 %% access_key_id
 
 {mapping, "s3.access_key_id", "rabbitmq_stream_s3.aws_access_key", [
-    {datatype, string}
+    {datatype, binary}
 ]}.
 
 {translation, "rabbitmq_stream_s3.aws_access_key",
@@ -32,7 +53,7 @@ end}.
 %% secret_key
 
 {mapping, "s3.secret_key", "rabbitmq_stream_s3.aws_secret_key", [
-    {datatype, string}
+    {datatype, binary}
 ]}.
 
 {translation, "rabbitmq_stream_s3.aws_secret_key",
@@ -44,7 +65,7 @@ fun(Conf) ->
 end}.
 
 {mapping, "s3.account_id", "rabbitmq_stream_s3.aws_account_id", [
-    {datatype, string}
+    {datatype, binary}
 ]}.
 
 {translation, "rabbitmq_stream_s3.aws_account_id",

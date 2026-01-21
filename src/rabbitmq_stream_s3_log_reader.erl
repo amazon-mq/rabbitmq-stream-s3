@@ -36,14 +36,14 @@
 }).
 
 -record(state, {
-    connection :: rabbitmq_aws:connection_handle(),
+    connection :: rabbitmq_stream_s3_api:connection(),
     buffer = <<>> :: binary(),
     offset_start :: byte_offset() | undefined,
     offset_end :: byte_offset() | undefined,
     read_size :: pos_integer(),
-    bucket :: binary(),
     object :: binary(),
-    object_size :: pos_integer()
+    segment_data_size :: pos_integer(),
+    next_fragment_offset :: osiris:offset()
 }).
 
 %% osiris_log_reader
@@ -59,7 +59,7 @@
 
 %% gen_server
 -export([
-    start_link/3,
+    start_link/2,
     init/1,
     handle_call/3,
     handle_cast/2,
@@ -255,26 +255,23 @@ iterator_next(Local) ->
 %%% gen_server callbacks
 %%%===================================================================
 
-start_link(Reader, Bucket, Key) ->
-    gen_server:start_link(?MODULE, {Reader, Bucket, Key}, []).
+start_link(Reader, Key) ->
+    gen_server:start_link(?MODULE, {Reader, Key}, []).
 
-init({Reader, Bucket, Key}) ->
+init({Reader, Key}) ->
     erlang:monitor(process, Reader),
-    {ok, Connection} = rabbitmq_aws:open_connection("s3", []),
-    {ok, Size} = rabbitmq_stream_s3_api:get_object_size(
-        Connection,
-        Bucket,
-        Key,
-        [{timeout, ?READ_TIMEOUT}]
+    {ok, Conn} = rabbitmq_stream_s3_api:open(),
+    {ok, #fragment_info{size = SegmentDataSize, next_offset = NextOffset}} = rabbitmq_stream_s3_log_manifest:get_fragment_trailer(
+        Key
     ),
     {ok, ReadSize} =
         rabbit_resource_monitor_misc:parse_information_unit(?READAHEAD),
     {ok, #state{
-        connection = Connection,
-        bucket = Bucket,
+        connection = Conn,
         object = Key,
-        object_size = Size,
-        read_size = ReadSize
+        segment_data_size = SegmentDataSize,
+        read_size = ReadSize,
+        next_fragment_offset = NextOffset
     }}.
 
 handle_call({read, Offset, Bytes, Hint}, _From, State0) ->
@@ -305,7 +302,7 @@ handle_info(Message, State) ->
     {noreply, State}.
 
 terminate(_Reason, #state{connection = Connection}) ->
-    ok = rabbitmq_aws:close_connection(Connection).
+    ok = rabbitmq_stream_s3_api:close(Connection).
 
 format_status(#{state := #state{buffer = Buffer} = State0} = Status0) ->
     %% Avoid formatting the buffer - it can be large.
@@ -318,25 +315,16 @@ code_change(_, _, State) ->
 %%---------------------------------------------------------------------------
 %% Helpers
 
-%% fragment_key(File) ->
-%%     [SegmentBasename, StreamName | _] = lists:reverse(filename:split(File)),
-%%     Suffix = string:replace(SegmentBasename, ".segment", ".fragment", trailing),
-%%     iolist_to_binary(["rabbitmq/stream/", StreamName, "/data/", Suffix]).
-
 send(tcp, Socket, Data) ->
     gen_tcp:send(Socket, Data);
 send(ssl, Socket, Data) ->
     ssl:send(Socket, Data).
 
-do_read(#state{object_size = Size}, Offset, _Bytes) when Offset >= Size ->
-    %% TODO: store the segment data size in the prelude of a fragment so that
-    %% we know eof accurately. This branch is never hit, currently, because we
-    %% store the index at the end of the fragment.
+do_read(#state{segment_data_size = Size}, Offset, _Bytes) when Offset >= Size + ?SEGMENT_HEADER_B ->
     eof;
 do_read(
     #state{
         connection = Connection,
-        bucket = Bucket,
         object = Object,
         buffer = Buffer,
         read_size = ReadSize,
@@ -354,12 +342,10 @@ do_read(
             {State0, binary:part(Buffer, OffsetInBuf, Bytes)};
         false ->
             ToRead = max(ReadSize, Bytes),
-            {ok, NewBuffer} = rabbitmq_stream_s3_api:get_object_with_range(
+            {ok, NewBuffer} = rabbitmq_stream_s3_api:get_range(
                 Connection,
-                Bucket,
                 Object,
-                {Offset, Offset + ToRead - 1},
-                [{timeout, ?READ_TIMEOUT}]
+                {Offset, Offset + ToRead - 1}
             ),
             rabbitmq_stream_s3_counters:read_bytes(byte_size(NewBuffer)),
             State = State0#state{
@@ -423,11 +409,10 @@ read_header1(
                 _ when NextChId > LastChId ->
                     {end_of_stream, Remote0};
                 _ ->
-                    {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
                     %% TODO: what if retention takes away fragments? We need to
                     %% jump ahead to the start of the log.
                     Key = rabbitmq_stream_s3_log_manifest:fragment_key(StreamId, NextChId),
-                    case rabbitmq_stream_s3_log_reader_sup:add_child(self(), Bucket, Key) of
+                    case rabbitmq_stream_s3_log_reader_sup:add_child(self(), Key) of
                         {ok, Pid} ->
                             ok = gen_server:cast(Pid0, close),
                             Remote = Remote0#remote{
@@ -534,9 +519,8 @@ init_remote_reader(
             _ ->
                 undefined
         end,
-    {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
     Key = rabbitmq_stream_s3_log_manifest:fragment_key(StreamId, Fragment),
-    case rabbitmq_stream_s3_log_reader_sup:add_child(self(), Bucket, Key) of
+    case rabbitmq_stream_s3_log_reader_sup:add_child(self(), Key) of
         {ok, Pid} ->
             Reader = #?MODULE{
                 config = Config,
@@ -638,28 +622,27 @@ saturating_decr(0) -> 0;
 saturating_decr(N) -> N - 1.
 
 index_data(StreamId, FragmentOffset, StartPos) ->
-    {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
-    {ok, Handle} = rabbitmq_aws:open_connection("s3"),
+    {ok, Conn} = rabbitmq_stream_s3_api:open(),
     Key = rabbitmq_stream_s3_log_manifest:fragment_key(StreamId, FragmentOffset),
     ?LOG_DEBUG("Looking up key ~ts (~ts)", [Key, ?FUNCTION_NAME]),
     try
-        {ok, Data} = rabbitmq_stream_s3_api:get_object_with_range(
-            Handle, Bucket, Key, {StartPos, undefined}, [{timeout, ?READ_TIMEOUT}]
+        {ok, Data} = rabbitmq_stream_s3_api:get_range(
+            Conn,
+            Key,
+            {StartPos, undefined},
+            #{timeout => ?READ_TIMEOUT}
         ),
         binary:part(Data, 0, byte_size(Data) - ?FRAGMENT_TRAILER_B)
     after
-        ok = rabbitmq_aws:close_connection(Handle)
+        ok = rabbitmq_stream_s3_api:close(Conn)
     end.
 
 get_group(StreamId, Kind, GroupOffset) ->
-    {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
-    {ok, Handle} = rabbitmq_aws:open_connection("s3"),
+    {ok, Conn} = rabbitmq_stream_s3_api:open(),
     Key = rabbitmq_stream_s3_log_manifest:group_key(StreamId, Kind, GroupOffset),
     ?LOG_DEBUG("Looking up key ~ts (~ts)", [Key, ?FUNCTION_NAME]),
     try
-        {ok, Data} = rabbitmq_stream_s3_api:get_object(
-            Handle, Bucket, Key, [{timeout, ?READ_TIMEOUT}]
-        ),
+        {ok, Data} = rabbitmq_stream_s3_api:get(Conn, Key, #{timeout => ?READ_TIMEOUT}),
         <<
             _Magic:4/binary,
             _Vsn:32/unsigned,
@@ -671,5 +654,5 @@ get_group(StreamId, Kind, GroupOffset) ->
         >> = Data,
         Data
     after
-        ok = rabbitmq_aws:close_connection(Handle)
+        ok = rabbitmq_stream_s3_api:close(Conn)
     end.
