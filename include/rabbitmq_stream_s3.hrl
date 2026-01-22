@@ -261,8 +261,16 @@
     retention = [] :: [osiris:retention_spec()]
 }).
 -record(acceptor_spawned, {stream :: stream_id()}).
+%% Sent from the writer to replicas to notify them of when new fragments are
+%% applied to the writer's manifest, or when truncation moves the first offset
+%% and timestamp forward.
+%%
+%% For retention `fragments` may be empty. Kinda like an append-entries RPC in
+%% Raft.
 -record(fragments_applied, {
     stream :: stream_id(),
+    first_offset :: osiris:offset(),
+    first_timestamp :: osiris:timestamp(),
     fragments :: [#fragment_info{}]
 }).
 -record(tick, {}).
@@ -312,9 +320,12 @@
 %% last fragment to see if fragments have been uploaded but not yet applied.
 -record(resolve_manifest, {stream :: stream_id()}).
 -record(reply, {to :: gen_server:from(), response :: term()}).
--record(set_last_tiered_offset, {
+%% Set the range of the remote tier stream.
+-record(set_range, {
     stream :: stream_id(),
-    offset :: osiris:offset() | -1
+    first :: osiris:offset() | -1,
+    %% The exclusive end of the stream - an offset which may not exist yet.
+    next :: osiris:offset()
 }).
 -record(send, {
     to :: pid() | {atom(), node()},
@@ -322,13 +333,20 @@
     %% See `erlang:send/3`.
     options = [] :: [nosuspend | noconnect | priority]
 }).
+%% TODO: include the fragment kind to make this generic for group objects
+%% as well?
+-record(delete_fragments, {
+    stream :: stream_id(),
+    offsets :: [osiris:offset()]
+}).
 
 -type effect() ::
-    #rebalance_manifest{}
+    #delete_fragments{}
+    | #rebalance_manifest{}
     | #register_offset_listener{}
     | #reply{}
     | #resolve_manifest{}
     | #send{}
-    | #set_last_tiered_offset{}
+    | #set_range{}
     | #upload_fragment{}
     | #upload_manifest{}.

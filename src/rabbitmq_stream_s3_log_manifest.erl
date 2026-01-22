@@ -12,7 +12,7 @@
 -include("include/rabbitmq_stream_s3.hrl").
 
 -define(SERVER, ?MODULE).
--define(LAST_TIERED_OFFSET_TABLE, rabbitmq_stream_s3_log_manifest_last_tiered_offset).
+-define(RANGE_TABLE, rabbitmq_stream_s3_log_manifest_range).
 
 -behaviour(osiris_log_manifest).
 -behaviour(gen_server).
@@ -404,7 +404,7 @@ init([]) ->
     %% Table keyed by stream ID. This is used for local retention: segments
     %% with all offsets less than or equal to the last tiered offset can be
     %% deleted by retention since they are stored in the remote tier.
-    _ = ets:new(?LAST_TIERED_OFFSET_TABLE, [named_table]),
+    _ = ets:new(?RANGE_TABLE, [named_table]),
     set_tick_timer(),
     {ok, #?MODULE{}}.
 
@@ -482,7 +482,7 @@ handle_info({osiris_offset, Reference, Offset}, #?MODULE{references = References
         _ ->
             {noreply, State}
     end;
-handle_info(#set_last_tiered_offset{} = Effect, State) ->
+handle_info(#set_range{} = Effect, State) ->
     {noreply, apply_effect(Effect, State)};
 handle_info(#manifest_resolved{} = Event, State) ->
     {noreply, evolve_event(Event, State)};
@@ -577,12 +577,12 @@ apply_effect(#send{to = Pid, message = Message, options = Options}, State) ->
 apply_effect(#register_offset_listener{writer_pid = Pid, offset = Offset}, State) ->
     ok = osiris:register_offset_listener(Pid, Offset, {?MODULE, format_osiris_event, []}),
     State;
-apply_effect(#set_last_tiered_offset{stream = StreamId, offset = Offset}, State) ->
+apply_effect(#set_range{stream = StreamId, first = First, next = Next}, State) ->
     _ = ets:update_element(
-        ?LAST_TIERED_OFFSET_TABLE,
+        ?RANGE_TABLE,
         StreamId,
-        {2, Offset},
-        {StreamId, Offset}
+        [{2, First}, {3, Next}],
+        {StreamId, First, Next}
     ),
     State;
 apply_effect(#upload_fragment{} = Event, State) ->
@@ -918,9 +918,9 @@ metadata() ->
 -spec local_retention_fun(stream_id()) -> osiris:retention_fun().
 local_retention_fun(Stream) ->
     fun(IdxFiles) ->
-        try ets:lookup_element(?LAST_TIERED_OFFSET_TABLE, Stream, 2) of
-            LastTieredOffset ->
-                eval_local_retention(IdxFiles, LastTieredOffset)
+        try ets:lookup_element(?RANGE_TABLE, Stream, 3) of
+            NextTieredOffset ->
+                eval_local_retention(IdxFiles, NextTieredOffset)
         catch
             error:badarg ->
                 {[], IdxFiles}
@@ -929,20 +929,20 @@ local_retention_fun(Stream) ->
 
 -spec eval_local_retention(IdxFiles :: [filename()], osiris:offset()) ->
     {ToDelete :: [filename()], ToKeep :: [filename(), ...]}.
-eval_local_retention(IdxFiles, LastTieredOffset) ->
+eval_local_retention(IdxFiles, NextTieredOffset) ->
     %% Always keep the current active segment no matter what the last tiered
     %% offset is.
-    eval_local_retention(lists:reverse(IdxFiles), LastTieredOffset, [], []).
+    eval_local_retention(lists:reverse(IdxFiles), NextTieredOffset, [], []).
 
-eval_local_retention([], _LastTieredOffset, ToDelete, ToKeep) ->
+eval_local_retention([], _NextTieredOffset, ToDelete, ToKeep) ->
     %% Always keep the current active segment no matter what the last tiered
     %% offset is.
     {lists:reverse(ToDelete), ToKeep};
-eval_local_retention([IdxFile | Rest], LastTieredOffset, ToDelete, ToKeep) ->
+eval_local_retention([IdxFile | Rest], NextTieredOffset, ToDelete, ToKeep) ->
     Offset = binary_to_integer(filename:basename(IdxFile, <<".index">>)),
-    case Offset > LastTieredOffset of
+    case Offset >= NextTieredOffset of
         true ->
-            eval_local_retention(Rest, LastTieredOffset, ToDelete, [IdxFile | ToKeep]);
+            eval_local_retention(Rest, NextTieredOffset, ToDelete, [IdxFile | ToKeep]);
         false ->
             {lists:reverse(Rest), [IdxFile | ToKeep]}
     end.
@@ -970,7 +970,7 @@ eval_local_retention_test() ->
                 <<"/data/00000000000000000400.index">>
             ]
         },
-        eval_local_retention(IdxFiles, 250)
+        eval_local_retention(IdxFiles, 251)
     ),
     %% Always keep the current segment:
     ?assertEqual(
@@ -985,7 +985,7 @@ eval_local_retention_test() ->
                 <<"/data/00000000000000000400.index">>
             ]
         },
-        eval_local_retention(IdxFiles, 450)
+        eval_local_retention(IdxFiles, 451)
     ),
     ?assertEqual(
         {
@@ -999,7 +999,7 @@ eval_local_retention_test() ->
                 <<"/data/00000000000000000400.index">>
             ]
         },
-        eval_local_retention(IdxFiles, 300)
+        eval_local_retention(IdxFiles, 301)
     ),
     ?assertEqual(
         {

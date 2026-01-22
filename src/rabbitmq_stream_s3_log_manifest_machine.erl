@@ -220,8 +220,7 @@ apply(
             StreamId := #{
                 manifest := #manifest{next_offset = NextOffset0} = Manifest0,
                 modifications := Modifications0,
-                uploaded_fragments := Uploaded0,
-                replica_nodes := ReplicaNodes
+                uploaded_fragments := Uploaded0
             } = Writer0
         } ->
             Uploaded1 = insert_info(Info, Uploaded0),
@@ -235,29 +234,8 @@ apply(
                 modifications := Modifications0 + length(Finished),
                 uploaded_fragments := Pending
             },
-            {Writer, Effects0} = evaluate_writer(Cfg, Meta, StreamId, Writer1, []),
-            Effects =
-                case NextOffset of
-                    NextOffset0 ->
-                        Effects0;
-                    _ ->
-                        SetLTO = #set_last_tiered_offset{
-                            stream = StreamId, offset = NextOffset - 1
-                        },
-                        lists:foldl(
-                            fun(Node, Acc) ->
-                                Event = #fragments_applied{stream = StreamId, fragments = Finished},
-                                Effect = #send{
-                                    to = {?SERVER, Node},
-                                    message = Event,
-                                    options = [noconnect]
-                                },
-                                [Effect | Acc]
-                            end,
-                            [SetLTO | Effects0],
-                            ReplicaNodes
-                        )
-                end,
+            {Writer2, Effects0} = evaluate_writer(Cfg, Meta, StreamId, Writer1, []),
+            {Writer, Effects} = notify_fragments_applied(Finished, StreamId, Writer2, Effects0),
             State = State0#?MODULE{streams = Streams0#{StreamId := Writer}},
             {State, Effects};
         _ ->
@@ -265,16 +243,29 @@ apply(
     end;
 apply(
     _Meta,
-    #fragments_applied{stream = StreamId, fragments = Fragments},
+    #fragments_applied{
+        stream = StreamId,
+        first_offset = FirstOffset,
+        first_timestamp = FirstTs,
+        fragments = Fragments
+    },
     #?MODULE{streams = Streams0} = State0
 ) ->
     case Streams0 of
         #{StreamId := #{kind := replica, manifest := #manifest{} = Manifest0} = Replica0} ->
             case apply_infos(Fragments, Manifest0) of
-                {ok, #manifest{next_offset = NextOffset} = Manifest} ->
+                {ok, #manifest{next_offset = NextOffset} = Manifest1} ->
+                    Manifest = Manifest1#manifest{
+                        first_offset = FirstOffset,
+                        first_timestamp = FirstTs
+                    },
                     Streams = Streams0#{StreamId := Replica0#{manifest := Manifest}},
-                    SetLTO = #set_last_tiered_offset{stream = StreamId, offset = NextOffset - 1},
-                    {State0#?MODULE{streams = Streams}, [SetLTO]};
+                    SetRange = #set_range{
+                        stream = StreamId,
+                        first = FirstOffset,
+                        next = NextOffset
+                    },
+                    {State0#?MODULE{streams = Streams}, [SetRange]};
                 {error, OutOfSequenceInfo} ->
                     ?LOG_DEBUG(
                         "Replica received an out-of-sequence fragment info. Refreshing manifest from writer... ~0p",
@@ -293,7 +284,9 @@ apply(
     #?MODULE{streams = Streams0} = State0
 ) ->
     case Streams0 of
-        #{StreamId := #{kind := writer, pending_change := upload} = Writer0} ->
+        #{StreamId := #{kind := writer, pending_change := Pending} = Writer0} when
+            Pending /= none
+        ->
             Writer = Writer0#{modifications := 0, last_uploaded := Ts, pending_change := none},
             State = State0#?MODULE{streams = Streams0#{StreamId := Writer}},
             {State, []};
@@ -366,14 +359,19 @@ apply(
     #{time := Ts},
     #manifest_resolved{
         stream = StreamId,
-        manifest = #manifest{next_offset = NTO, entries = Entries} = Manifest
+        manifest =
+            #manifest{
+                first_offset = FirstOffset,
+                next_offset = NextOffset,
+                entries = Entries
+            } = Manifest
     } = Event,
     #?MODULE{streams = Streams0} = State0
 ) ->
     case Streams0 of
         #{StreamId := #{manifest := {pending, Requesters}} = Stream0} ->
             Stream1 = Stream0#{manifest := Manifest},
-            SetLTO = #set_last_tiered_offset{stream = StreamId, offset = NTO - 1},
+            SetLTO = #set_range{stream = StreamId, first = FirstOffset, next = NextOffset},
             %% NOTE: `Requesters` is in reverse order.
             Effects0 = lists:foldl(
                 fun
@@ -562,6 +560,50 @@ apply_infos(
 apply_infos([Info | _], #manifest{}) ->
     {error, Info}.
 
+-spec notify_fragments_applied([#fragment_info{}], stream_id(), writer(), [effect()]) ->
+    {writer(), [effect()]}.
+notify_fragments_applied(
+    Fragments,
+    StreamId,
+    #{
+        ranges := Ranges0,
+        manifest := #manifest{
+            first_offset = FirstOffset,
+            first_timestamp = FirstTs,
+            next_offset = NextOffset
+        }
+    } = Writer0,
+    Effects0
+) ->
+    Effects =
+        maps:fold(
+            fun
+                (_Node, {F, N}, Acc) when F =:= FirstOffset andalso N =:= NextOffset ->
+                    Acc;
+                (ReplicaNode, {_, _}, Acc) when ReplicaNode /= node() ->
+                    Event = #fragments_applied{
+                        stream = StreamId,
+                        first_offset = FirstOffset,
+                        first_timestamp = FirstTs,
+                        fragments = Fragments
+                    },
+                    Effect = #send{
+                        to = {?SERVER, ReplicaNode},
+                        message = Event,
+                        options = [noconnect]
+                    },
+                    [Effect | Acc];
+                (Node, {_, _}, Acc) when Node == node() ->
+                    Effect = #set_range{stream = StreamId, first = FirstOffset, next = NextOffset},
+                    [Effect | Acc]
+            end,
+            Effects0,
+            Ranges0
+        ),
+    Ranges = #{Node => {FirstOffset, NextOffset} || Node := _ <- Ranges0},
+    Writer = Writer0#{ranges := Ranges},
+    {Writer, Effects}.
+
 -doc """
 Add a fragment to the list of available fragments.
 
@@ -593,9 +635,101 @@ evaluate_writer(Cfg, Meta, StreamId, Writer0, Effects0) ->
     {Writer2, Effects2} = evaluate_rebalance(StreamId, Writer1, Effects1),
     evaluate_upload(Cfg, Meta, StreamId, Writer2, Effects2).
 
-evaluate_retention(#{time := _Ts}, _StreamId, Writer0, Effects0) ->
-    %% TODO
-    {Writer0, Effects0}.
+evaluate_retention(
+    #{time := Now},
+    StreamId,
+    #{
+        pending_change := none,
+        retention := RetentionSpec,
+        manifest := #manifest{
+            total_size = TotalSize0,
+            first_timestamp = FirstTs,
+            entries = Entries0
+        } = Manifest0
+    } = Writer0,
+    Effects0
+) ->
+    ExceedsRetention =
+        case RetentionSpec of
+            #{max_bytes := MaxBytes} when TotalSize0 > MaxBytes ->
+                true;
+            #{max_age := MaxAge} when FirstTs < Now - MaxAge ->
+                true;
+            _ when Entries0 =:= <<>> ->
+                %% Nothing to reclaim!
+                false;
+            _ ->
+                false
+        end,
+    case ExceedsRetention of
+        true ->
+            case Entries0 of
+                ?ENTRY(_Offset, _Timestamp, ?MANIFEST_KIND_FRAGMENT, _Size, _SeqNo, _Rest) ->
+                    %% In the common case a stream will not be so long that it
+                    %% needs groups. Luckily, this means we can determine
+                    %% which fragments can be deleted very efficiently by
+                    %% looking just at manifest's entries array.
+                    {Manifest, Offsets} = evaluate_retention1(Manifest0, Now, RetentionSpec),
+                    Writer = Writer0#{manifest := Manifest, pending_change := retention},
+                    UploadManifest = #upload_manifest{stream = StreamId, manifest = Manifest},
+                    DeleteFragments = #delete_fragments{stream = StreamId, offsets = Offsets},
+                    {Writer, [UploadManifest, DeleteFragments | Effects0]};
+                _ ->
+                    %% TODO: if the first entry is not a fragment then it is
+                    %% a group (or kilo-group or mega-group). Create a new
+                    %% effect which downloads the necessary group(s) and
+                    %% carries on retention from there.
+                    erlang:error(unimplemented)
+            end;
+        false ->
+            {Writer0, Effects0}
+    end;
+evaluate_retention(_Meta, _StreamId, Writer, Effects) ->
+    {Writer, Effects}.
+
+evaluate_retention1(Manifest, Now, RetentionSpec) ->
+    evaluate_retention1(Manifest, Now, RetentionSpec, []).
+
+%% NOTE: keep at least one entry so that we can set the `first_offset` and
+%% `first_timestamp`.
+evaluate_retention1(
+    #manifest{
+        total_size = TotalSize0,
+        entries = ?ENTRY(Offset, _Ts, Kind, Size, _SeqNo, Rest)
+    } = Manifest0,
+    Now,
+    #{max_bytes := MaxBytes} = Spec,
+    Offsets0
+) when TotalSize0 > MaxBytes andalso Rest /= <<>> ->
+    ?assertEqual(Kind, ?MANIFEST_KIND_FRAGMENT),
+    Manifest = Manifest0#manifest{
+        total_size = TotalSize0 - Size,
+        entries = Rest
+    },
+    evaluate_retention1(Manifest, Now, Spec, [Offset | Offsets0]);
+evaluate_retention1(
+    #manifest{
+        total_size = TotalSize0,
+        entries = ?ENTRY(Offset, Ts, Kind, Size, _SeqNo, Rest)
+    } = Manifest0,
+    Now,
+    #{max_age := MaxAge} = Spec,
+    Offsets0
+) when Now - Ts > MaxAge andalso Rest /= <<>> ->
+    ?assertEqual(Kind, ?MANIFEST_KIND_FRAGMENT),
+    Manifest = Manifest0#manifest{
+        total_size = TotalSize0 - Size,
+        entries = Rest
+    },
+    evaluate_retention1(Manifest, Now, Spec, [Offset | Offsets0]);
+evaluate_retention1(#manifest{entries = Entries} = Manifest0, _Now, _Spec, Offsets) ->
+    ?ENTRY(Offset, Ts, ?MANIFEST_KIND_FRAGMENT, _Size, _SeqNo, _Rest) = Entries,
+    Manifest = Manifest0#manifest{
+        first_offset = Offset,
+        first_timestamp = Ts
+    },
+    %% No real point to this lists:reverse/1. It just makes it appear nicer.
+    {Manifest, lists:reverse(Offsets)}.
 
 evaluate_rebalance(_StreamId, Writer0, Effects0) ->
     %% TODO
@@ -671,6 +805,55 @@ apply_infos_test() ->
         {error, I3},
         apply_infos([I1, I3], #manifest{})
     ),
+    ok.
+
+evaluate_retention1_test() ->
+    Ts = erlang:system_time(millisecond),
+    Entries = <<
+        ?ENTRY((N * 20), (Ts - 100 + N * 20), ?MANIFEST_KIND_FRAGMENT, 200, N, <<>>)
+     || N <- lists:seq(0, 4)
+    >>,
+    Manifest = #manifest{
+        first_offset = 0,
+        first_timestamp = Ts - 100,
+        next_offset = 6 * 20,
+        total_size = 1000,
+        entries = Entries
+    },
+    %% No retention spec, nothing to do.
+    ?assertEqual({Manifest, []}, evaluate_retention1(Manifest, Ts, #{})),
+
+    %% == MAX BYTES ==
+    ?assertEqual({Manifest, []}, evaluate_retention1(Manifest, Ts, #{max_bytes => 1000})),
+    ?assertMatch(
+        {#manifest{first_offset = 20, total_size = 800}, [0]},
+        evaluate_retention1(Manifest, Ts, #{max_bytes => 900})
+    ),
+    ?assertMatch(
+        {#manifest{first_offset = 60, total_size = 400}, [0, 20, 40]},
+        evaluate_retention1(Manifest, Ts, #{max_bytes => 500})
+    ),
+    %% Make sure we keep at least one entry.
+    ?assertMatch(
+        {#manifest{first_offset = 80, total_size = 200}, [0, 20, 40, 60]},
+        evaluate_retention1(Manifest, Ts, #{max_bytes => 100})
+    ),
+
+    %% == MAX AGE ==
+    ?assertEqual({Manifest, []}, evaluate_retention1(Manifest, Ts, #{max_age => 100_000})),
+    ?assertMatch(
+        {#manifest{first_offset = 20, total_size = 800}, [0]},
+        evaluate_retention1(Manifest, Ts, #{max_age => 99})
+    ),
+    ?assertMatch(
+        {#manifest{first_offset = 60, total_size = 400}, [0, 20, 40]},
+        evaluate_retention1(Manifest, Ts, #{max_age => 59})
+    ),
+    ?assertMatch(
+        {#manifest{first_offset = 80, total_size = 200}, [0, 20, 40, 60]},
+        evaluate_retention1(Manifest, Ts, #{max_age => 1})
+    ),
+
     ok.
 
 -endif.
