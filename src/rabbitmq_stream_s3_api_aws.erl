@@ -6,13 +6,17 @@
 A wrapper around the AWS S3 HTTP API.
 """.
 
+-include_lib("kernel/include/logger.hrl").
+-include_lib("stdlib/include/assert.hrl").
+
 -export([
     init/0,
     open/0,
     close/1,
     get/3,
     get_range/4,
-    put/4
+    put/4,
+    delete/3
 ]).
 
 -define(ALGORITHM, "AWS4-HMAC-SHA256").
@@ -39,7 +43,9 @@ Uppercase HTTP method name, as a binary.
 
 Called "HTTP Verb" in S3 docs.
 
-`<<"GET">> | <<"PUT">> | <<"HEAD">>`.
+```
+<<"GET">> | <<"PUT">> | <<"HEAD">> | <<"POST">> | <<"DELETE">>
+```.
 """.
 -type http_method() :: binary().
 -type http_response() :: #{
@@ -50,8 +56,6 @@ Called "HTTP Verb" in S3 docs.
 }.
 %% Map keys must be lowercase.
 -type req_headers() :: #{binary() => binary()}.
-
--include_lib("kernel/include/logger.hrl").
 
 -spec init() -> ok.
 init() ->
@@ -114,7 +118,7 @@ close(Conn) when is_pid(Conn) ->
 -doc "Gets the body of an object at key `Key`".
 -spec get(connection(), key(), request_opts()) -> {ok, binary()} | {error, any()}.
 get(Conn, Key, Opts) when is_pid(Conn) andalso is_binary(Key) andalso is_map(Opts) ->
-    case request(Conn, <<"GET">>, Key, #{}, <<>>, Opts) of
+    case request(Conn, <<"GET">>, key_to_path(Key), #{}, <<>>, Opts) of
         {ok, #{status := 200, body := Data}} ->
             {ok, Data};
         {ok, #{status := 404}} ->
@@ -136,7 +140,7 @@ range.
     {ok, binary()} | {error, any()}.
 get_range(Conn, Key, Range, Opts) when is_pid(Conn) andalso is_binary(Key) andalso is_map(Opts) ->
     Headers = #{<<"range">> => range_specifier(Range)},
-    case request(Conn, <<"GET">>, Key, Headers, <<>>, Opts) of
+    case request(Conn, <<"GET">>, key_to_path(Key), Headers, <<>>, Opts) of
         %% HTTP Range requests must return 206 if only a partial range is served,
         %% according to the RFC.
         {ok, #{status := Status, body := Data}} when Status =:= 200 orelse Status =:= 206 ->
@@ -159,8 +163,37 @@ put(Conn, Key, Data, Opts) when is_pid(Conn) andalso is_binary(Key) andalso is_m
             _ ->
                 #{}
         end,
-    case request(Conn, <<"PUT">>, Key, Headers, Data, Opts) of
+    case request(Conn, <<"PUT">>, key_to_path(Key), Headers, Data, Opts) of
         {ok, #{status := 200}} ->
+            ok;
+        {ok, Other} ->
+            {error, Other};
+        {error, _} = Err ->
+            Err
+    end.
+
+-doc "Deletes the given key or list of keys".
+-spec delete(connection(), key() | [key()], request_opts()) -> ok | {error, any()}.
+delete(Conn, Keys, Opts) when is_pid(Conn) andalso is_list(Keys) andalso is_map(Opts) ->
+    %% <https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html>
+    ?assert(length(Keys) =< 1000),
+    Data = delete_many_body(Keys),
+    Headers = #{
+        %% A checksum header seems to be required on this endpoint...
+        <<"x-amz-checksum-crc32">> => base64:encode(<<(erlang:crc32(Data)):32/unsigned>>)
+    },
+    case request(Conn, <<"POST">>, <<"/?delete=">>, Headers, Data, Opts) of
+        {ok, #{status := 200}} ->
+            ok;
+        {ok, Other} ->
+            {error, Other};
+        {error, _} = Err ->
+            Err
+    end;
+delete(Conn, Key, Opts) when is_pid(Conn) andalso is_binary(Key) andalso is_map(Opts) ->
+    %% <https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObject.html>.
+    case request(Conn, <<"DELETE">>, key_to_path(Key), #{}, <<>>, Opts) of
+        {ok, #{status := 204}} ->
             ok;
         {ok, Other} ->
             {error, Other};
@@ -171,10 +204,10 @@ put(Conn, Key, Data, Opts) when is_pid(Conn) andalso is_binary(Key) andalso is_m
 -spec request(connection(), http_method(), key(), req_headers(), iodata(), request_opts()) ->
     {ok, http_response()}
     | {error, any()}.
-request(Conn, Method, Key, Headers0, Body, Opts) when
+request(Conn, Method, Path, Headers0, Body, Opts) when
     is_pid(Conn) andalso
         is_binary(Method) andalso
-        is_binary(Key) andalso
+        is_binary(Path) andalso
         is_map(Headers0) andalso
         is_map(Opts)
 ->
@@ -187,13 +220,13 @@ request(Conn, Method, Key, Headers0, Body, Opts) when
                 SecretKey,
                 SecurityToken,
                 Method,
-                Key,
+                Path,
                 Body,
                 Opts
             ),
             Timeout = maps:get(timeout, Opts, 5_000),
             T1 = start_timeout_window(Timeout),
-            StreamRef = gun:request(Conn, Method, Key, Headers, Body),
+            StreamRef = gun:request(Conn, Method, Path, Headers, Body),
             case gun:await(Conn, StreamRef, Timeout) of
                 {response, fin, Status, RespHeaders} ->
                     {ok, #{status => Status, headers => RespHeaders}};
@@ -463,7 +496,7 @@ with_instance_metadata_conn(Fun) when is_function(Fun, 1) ->
             Err
     end.
 
-sign_headers(Headers, AccessKey, SecretKey, SecurityToken, Method, Key, Body, Opts) ->
+sign_headers(Headers, AccessKey, SecretKey, SecurityToken, Method, Path, Body, Opts) ->
     {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
     Region = region(),
     Host = <<Bucket/binary, $., (hostname(Region))/binary>>,
@@ -476,7 +509,7 @@ sign_headers(Headers, AccessKey, SecretKey, SecurityToken, Method, Key, Body, Op
         SecretKey,
         SecurityToken,
         Method,
-        Key,
+        Path,
         Body,
         Opts
     ).
@@ -490,7 +523,7 @@ sign_headers(
     SecretKey,
     SecurityToken,
     Method,
-    Key0,
+    Path,
     Body,
     Opts
 ) ->
@@ -503,11 +536,6 @@ sign_headers(
     %% request details, the signature prevents an attacker from, for example,
     %% overwriting your object to a malicious one when they reuse a prerecorded
     %% authorization header.
-    Key =
-        case Key0 of
-            <<$/, _/binary>> -> Key0;
-            _ -> <<$/, Key0/binary>>
-        end,
     %% YYYYMMDD is 8 bytes.
     <<Date:8/binary, _/binary>> =
         RequestTimestamp = iolist_to_binary(io_lib:format(?ISOFORMAT_BASIC, [Y, M, D, HH, MM, SS])),
@@ -533,23 +561,16 @@ sign_headers(
                 DefaultHeaders0#{<<"x-amz-security-token">> => SecurityToken}
         end,
     Headers1 = maps:merge(DefaultHeaders, Headers0),
-    CanonicalURI = uri_string:quote(Key, "/"),
-    CanonicalQueryString =
-        case Opts of
-            #{query := QueryList} ->
-                uri_string:compose_query(QueryList);
-            _ ->
-                <<>>
-        end,
+    URIMap = uri_string:parse(Path),
     CanonicalRequest0 = <<
         %% <HTTPMethod>\n
         Method/binary,
         $\n,
         %% <CanonicalURI>\n
-        CanonicalURI/binary,
+        (maps:get(path, URIMap))/binary,
         $\n,
         %% <CanonicalQueryString>\n
-        CanonicalQueryString/binary,
+        (maps:get(query, URIMap, <<>>))/binary,
         $\n
     >>,
     %% Signed headers must be in order.
@@ -678,6 +699,23 @@ end_timeout_window(Timeout, T0) ->
     Remaining = Timeout - TDiff,
     erlang:max(Remaining, 0).
 
+delete_many_body(Keys) when is_list(Keys) ->
+    %% NOTE: the XML headers / xmlns are not required.
+    Body0 = lists:foldl(
+        fun(Key, Acc) ->
+            %% TODO: sanitize `Key`.
+            %% <https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-keys.html#object-key-xml-related-constraints>.
+            <<Acc/binary, "<Object><Key>", Key/binary, "</Key></Object>">>
+        end,
+        <<"<Delete>">>,
+        Keys
+    ),
+    <<Body0/binary, "</Delete>">>.
+
+-spec key_to_path(rabbitmq_stream_s3_api:key()) -> binary().
+key_to_path(Key) ->
+    <<$/, (uri_string:quote(Key, "/"))/binary>>.
+
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
@@ -689,6 +727,13 @@ range_spec_test() ->
     ?assertEqual(<<"bytes=-5">>, range_specifier(-5)),
     ?assertEqual(<<"bytes=10-20">>, range_specifier({10, 20})),
     ?assertEqual(<<"bytes=100-">>, range_specifier({100, undefined})),
+    ok.
+
+delete_many_body_test() ->
+    ?assertEqual(
+        <<"<Delete><Object><Key>sample1.txt</Key></Object><Object><Key>sample2.txt</Key></Object></Delete>">>,
+        delete_many_body([<<"sample1.txt">>, <<"sample2.txt">>])
+    ),
     ok.
 
 sign_test() ->
@@ -748,7 +793,7 @@ sign_test() ->
         SecretKey,
         undefined,
         <<"PUT">>,
-        <<"test$file.text">>,
+        uri_string:quote(<<"/test$file.text">>, "/"),
         <<"Welcome to Amazon S3.">>,
         #{}
     ),
@@ -773,9 +818,9 @@ sign_test() ->
         SecretKey,
         undefined,
         <<"GET">>,
+        <<"/?lifecycle=">>,
         <<"">>,
-        <<"">>,
-        #{query => [{<<"lifecycle">>, <<>>}]}
+        #{}
     ),
     ?assertEqual(
         <<"AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request,SignedHeaders=host;x-amz-content-sha256;x-amz-date,Signature=fea454ca298b7da1c68078a5d1bdbfbbe0d65c699e0f91ac7a200a0136783543">>,
@@ -798,9 +843,9 @@ sign_test() ->
         SecretKey,
         undefined,
         <<"GET">>,
+        <<"/?max-keys=2&prefix=J">>,
         <<"">>,
-        <<"">>,
-        #{query => [{<<"max-keys">>, <<"2">>}, {<<"prefix">>, <<"J">>}]}
+        #{}
     ),
     ?assertEqual(
         <<"AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request,SignedHeaders=host;x-amz-content-sha256;x-amz-date,Signature=34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7">>,

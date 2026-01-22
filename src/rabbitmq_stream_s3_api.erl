@@ -21,7 +21,9 @@ file-system operations. Use that in non-unit tests.
     get_range/3,
     get_range/4,
     put/3,
-    put/4
+    put/4,
+    delete/2,
+    delete/3
 ]).
 
 %% Up to the backend exactly what this is. Could be a pid for an HTTP
@@ -51,6 +53,15 @@ This identifies an object. Typically keys look like Unix paths, for example
 -callback get_range(connection(), key(), range_spec(), request_opts()) ->
     {ok, binary()} | {error, any()}.
 -callback put(connection(), key(), iodata(), request_opts()) -> ok | {error, any()}.
+-doc """
+Delete the given key or all of the listed keys from the remote tier.
+
+This operation is not expected to be atomic when passed multiple keys - it is
+only allowed for the sake of reducing requests where possible. It would not be
+atomic in a file system and S3 only supports deleting 1000 keys at a time, for
+examples.
+""".
+-callback delete(connection(), key() | [key()], request_opts()) -> ok | {error, any()}.
 
 backend() ->
     application:get_env(rabbitmq_stream_s3, ?MODULE, rabbitmq_stream_s3_api_aws).
@@ -90,3 +101,12 @@ put(Conn, Key, Data) when is_binary(Key) ->
 -spec put(connection(), key(), iodata(), request_opts()) -> ok | {error, any()}.
 put(Conn, Key, Data, Opts) when is_binary(Key) andalso is_map(Opts) ->
     (backend()):put(Conn, Key, Data, Opts).
+
+-doc #{equiv => delete(Conn, Keys, #{})}.
+-spec delete(connection(), [key()]) -> ok | {error, any()}.
+delete(Conn, Keys) when is_binary(Keys) orelse is_list(Keys) ->
+    delete(Conn, Keys, #{}).
+
+-spec delete(connection(), [key()], request_opts()) -> ok | {error, any()}.
+delete(Conn, Keys, Opts) when (is_binary(Keys) orelse is_list(Keys)) andalso is_map(Opts) ->
+    (backend()):delete(Conn, Keys, Opts).

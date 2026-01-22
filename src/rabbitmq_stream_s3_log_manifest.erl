@@ -3,9 +3,6 @@
 
 -module(rabbitmq_stream_s3_log_manifest).
 
-%% TODO: this is just for testing.
--export([recover_fragments/1]).
-
 -include_lib("kernel/include/logger.hrl").
 -include_lib("stdlib/include/assert.hrl").
 
@@ -525,24 +522,24 @@ format_osiris_event(Event) ->
 make_file_name(Offset, Suffix) when is_integer(Offset) andalso is_binary(Suffix) ->
     <<(iolist_to_binary(io_lib:format("~20..0B", [Offset])))/binary, ".", Suffix/binary>>.
 
--spec manifest_key(stream_id()) -> binary().
+-spec manifest_key(stream_id()) -> rabbitmq_stream_s3_api:key().
 manifest_key(StreamId) when is_binary(StreamId) ->
     manifest_key(StreamId, <<"manifest">>).
 
--spec manifest_key(stream_id(), filename()) -> binary().
+-spec manifest_key(stream_id(), filename()) -> rabbitmq_stream_s3_api:key().
 manifest_key(StreamId, Filename) when is_binary(StreamId) andalso is_binary(Filename) ->
-    <<"/rabbitmq/stream/", StreamId/binary, "/metadata/", Filename/binary>>.
+    <<"rabbitmq/stream/", StreamId/binary, "/metadata/", Filename/binary>>.
 
 -spec group_key(stream_id(), rabbitmq_stream_s3_log_manifest_entry:kind(), osiris:offset()) ->
     binary().
 group_key(StreamId, Kind, Offset) ->
     manifest_key(StreamId, make_file_name(Offset, group_extension(Kind))).
 
--spec stream_data_key(stream_id(), filename()) -> binary().
+-spec stream_data_key(stream_id(), filename()) -> rabbitmq_stream_s3_api:key().
 stream_data_key(StreamId, Filename) when is_binary(StreamId) andalso is_binary(Filename) ->
-    <<"/rabbitmq/stream/", StreamId/binary, "/data/", Filename/binary>>.
+    <<"rabbitmq/stream/", StreamId/binary, "/data/", Filename/binary>>.
 
--spec fragment_key(stream_id(), osiris:offset()) -> binary().
+-spec fragment_key(stream_id(), osiris:offset()) -> rabbitmq_stream_s3_api:key().
 fragment_key(StreamId, Offset) when is_binary(StreamId) andalso is_integer(Offset) ->
     stream_data_key(StreamId, make_file_name(Offset, <<"fragment">>)).
 
@@ -592,6 +589,8 @@ apply_effect(#upload_manifest{} = Event, State) ->
 apply_effect(#rebalance_manifest{} = Event, State) ->
     spawn_task(Event, State);
 apply_effect(#resolve_manifest{} = Event, State) ->
+    spawn_task(Event, State);
+apply_effect(#delete_fragments{} = Event, State) ->
     spawn_task(Event, State).
 
 spawn_task(Effect, #?MODULE{tasks = Tasks0} = State0) ->
@@ -681,6 +680,9 @@ execute_task(#upload_fragment{
                         _ ->
                             erlang:crc32(Checksum0, [?IDX_HEADER, IdxData, Trailer])
                     end,
+                %% TODO: remove this before this plugin sees production use.
+                %% Maybe a good time is when we switch to chunked transfer.
+                ?assertEqual(erlang:crc32(Data), Checksum),
                 %% TODO: should be able to upload this in chunks. Gun should
                 %% support that.
                 ok = rabbitmq_stream_s3_api:put(
@@ -781,27 +783,51 @@ execute_task(#resolve_manifest{stream = StreamId}) ->
     {ok, Conn} = rabbitmq_stream_s3_api:open(),
     Key = manifest_key(StreamId),
     Manifest0 =
-        try rabbitmq_stream_s3_api:get(Conn, Key) of
-            {ok, ?MANIFEST(FirstOffset, FirstTimestamp, NextOffset, TotalSize, Entries) = Data} ->
-                rabbitmq_stream_s3_counters:manifest_read(byte_size(Data)),
-                #manifest{
-                    first_offset = FirstOffset,
-                    first_timestamp = FirstTimestamp,
-                    next_offset = NextOffset,
-                    total_size = TotalSize,
-                    entries = Entries
-                };
-            {error, not_found} ->
-                #manifest{};
-            {error, _} = Err ->
-                exit(Err)
+        try
+            case rabbitmq_stream_s3_api:get(Conn, Key) of
+                {ok, ?MANIFEST(FirstOffset, FirstTimestamp, NextOffset, TotalSize, Entries) = Data} ->
+                    rabbitmq_stream_s3_counters:manifest_read(byte_size(Data)),
+                    #manifest{
+                        first_offset = FirstOffset,
+                        first_timestamp = FirstTimestamp,
+                        next_offset = NextOffset,
+                        total_size = TotalSize,
+                        entries = Entries
+                    };
+                {error, not_found} ->
+                    #manifest{};
+                {error, _} = Err ->
+                    exit(Err)
+            end
         after
             ok = rabbitmq_stream_s3_api:close(Conn)
         end,
     #manifest_resolved{
         stream = StreamId,
         manifest = resolve_manifest_tail(StreamId, Manifest0)
-    }.
+    };
+execute_task(#delete_fragments{stream = StreamId, offsets = Offsets}) ->
+    NumFragments = length(Offsets),
+    ?LOG_DEBUG("Deleting ~b fragments for stream '~ts' with offsets ~0p", [
+        NumFragments, StreamId, Offsets
+    ]),
+    Keys = [fragment_key(StreamId, Offset) || Offset <- Offsets],
+    {ok, Conn} = rabbitmq_stream_s3_api:open(),
+    try
+        {DeleteMsec, ok} = timer:tc(
+            fun() ->
+                ok = rabbitmq_stream_s3_api:delete(Conn, Keys)
+            end,
+            millisecond
+        ),
+        ?LOG_DEBUG("Deleted ~b fragments from stream '~ts' in ~b msec", [
+            NumFragments, StreamId, DeleteMsec
+        ]),
+        ok
+    after
+        ok = rabbitmq_stream_s3_api:close(Conn)
+    end,
+    ok.
 
 resolve_manifest_tail(
     StreamId,
