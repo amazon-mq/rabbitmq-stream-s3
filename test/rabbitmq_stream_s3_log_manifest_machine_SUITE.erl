@@ -137,7 +137,7 @@ spawn_writer_after_readers(Config) ->
     ok.
 
 out_of_order_fragment_uploads(Config) ->
-    {Mac0, StreamId} = setup_writer(Config),
+    {Mac0, StreamId} = setup_writer(Config, ?MAC:new(#{debounce_modifications => 3})),
     Fragments = [fragment(From, To) || {From, To} <- [{0, 19}, {20, 39}, {40, 59}]],
     FragmentsAvailable = [#fragment_available{stream = StreamId, fragment = F} || F <- Fragments],
     {Mac1, Effects1} = handle_events(?META(), FragmentsAvailable, Mac0),
@@ -167,7 +167,10 @@ out_of_order_fragment_uploads(Config) ->
     ?assertMatch(
         [
             #set_last_tiered_offset{offset = 59},
-            #upload_manifest{stream = StreamId, manifest = #manifest{first_offset = 0}}
+            #upload_manifest{
+                stream = StreamId,
+                manifest = #manifest{first_offset = 0, next_offset = 60}
+            }
         ],
         Effects4
     ),
@@ -177,7 +180,7 @@ recover_uploaded_fragments(Config) ->
     %% The writer uploads fragments but the updated manifest is not yet
     %% uploaded. When restarting, the writer resolve the full manifest and
     %% upload it.
-    {Mac0, StreamId} = setup_writer(Config),
+    {Mac0, StreamId} = setup_writer(Config, ?MAC:new(#{debounce_modifications => 1})),
     [F1, F2, _F3] = Fragments = [fragment(From, To) || {From, To} <- [{0, 19}, {20, 39}, {40, 59}]],
     FragmentsAvailable = [#fragment_available{stream = StreamId, fragment = F} || F <- Fragments],
     {Mac1, Effects1} = handle_events(?META(), FragmentsAvailable, Mac0),
@@ -202,7 +205,13 @@ recover_uploaded_fragments(Config) ->
     ?assertMatch(
         [
             #set_last_tiered_offset{offset = 19},
-            #upload_manifest{manifest = #manifest{first_offset = 0, total_size = 1}}
+            #upload_manifest{
+                manifest = #manifest{
+                    first_offset = 0,
+                    total_size = 200,
+                    next_offset = 20
+                }
+            }
         ],
         Effects3
     ),
@@ -244,7 +253,13 @@ recover_uploaded_fragments(Config) ->
         Effects7
     ),
     {_Mac8, Effects8} = ?MAC:apply(?META(), Up3, Mac7),
-    ?assertMatch([#set_last_tiered_offset{offset = 59}], Effects8),
+    ?assertMatch(
+        [
+            #set_last_tiered_offset{offset = 59},
+            #upload_manifest{manifest = #manifest{first_offset = 0, next_offset = 60}}
+        ],
+        Effects8
+    ),
     ok.
 
 manifest_replication(Config) ->
@@ -259,7 +274,8 @@ manifest_replication(Config) ->
         dir = Dir,
         replica_nodes = [ReplicaNode]
     },
-    {Writer1, Effects1} = ?MAC:apply(?META(), WriterSpawned, ?MAC:new()),
+    Writer0 = ?MAC:new(#{debounce_modifications => 3}),
+    {Writer1, Effects1} = ?MAC:apply(?META(), WriterSpawned, Writer0),
     ?assertMatch([#resolve_manifest{}, #register_offset_listener{}], Effects1),
     %% Replica manifest server requests the manifest from the writer when the
     %% acceptor initializes.
@@ -277,8 +293,9 @@ manifest_replication(Config) ->
         ],
         Effects3
     ),
-    {Replica1, Effects4} = ?MAC:apply(?META(), ManifestResolved, ?MAC:new()),
-    ?assertEqual([], Effects4),
+    AcceptorSpawned = #acceptor_spawned{stream = StreamId},
+    {Replica1, Effects4} = handle_events(?META(), [AcceptorSpawned, ManifestResolved], ?MAC:new()),
+    ?assertMatch([#set_last_tiered_offset{offset = -1}], Effects4),
     %% Now when fragments are fully uploaded and applied to the manifest, the
     %% acceptor will get notifications that fragments were applied.
     Fragments = [fragment(From, To) || {From, To} <- [{0, 19}, {20, 39}, {40, 59}]],
@@ -293,8 +310,6 @@ manifest_replication(Config) ->
     ),
     Infos = [fragment_to_info(F) || F <- Fragments],
     Uploaded0 = [#fragment_uploaded{stream = StreamId, info = I} || I <- Infos],
-    %% HACK: reverse the uploaded events so that they're all applied to the
-    %% manifest at once.
     Uploaded = lists:reverse(Uploaded0),
     {Writer5, Effects6} = handle_events(?META(), Uploaded, Writer4),
     FragmentsApplied = #fragments_applied{stream = StreamId, fragments = Infos},
@@ -315,6 +330,9 @@ manifest_replication(Config) ->
 %%----------------------------------------------------------------------------
 
 setup_writer(Config) ->
+    setup_writer(Config, ?MAC:new()).
+
+setup_writer(Config, Mac0) ->
     Dir = directory(Config),
     Pid = self(),
     StreamId = erlang:make_ref(),
@@ -324,7 +342,7 @@ setup_writer(Config) ->
         dir = Dir
     },
     Event2 = #manifest_resolved{stream = StreamId, manifest = #manifest{}},
-    {Mac, _} = handle_events(?META(), [Event1, Event2], ?MAC:new()),
+    {Mac, _} = handle_events(?META(), [Event1, Event2], Mac0),
     {Mac, StreamId}.
 
 handle_events(Meta, Events, Mac) ->

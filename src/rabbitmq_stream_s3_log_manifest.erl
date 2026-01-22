@@ -27,6 +27,10 @@
 -record(?MODULE, {
     machine = rabbitmq_stream_s3_log_manifest_machine:new() :: rabbitmq_stream_s3_log_manifest_machine:state(),
     tasks = #{} :: #{pid() => effect()},
+    %% A lookup from stream reference to ID. This is used to determine the
+    %% stream ID associated with an offset notification `{osiris_offset,
+    %% Reference, osiris:offset()}` sent by the writer (because we used
+    %% `osiris:register_offset_listener/3`).
     references = #{} :: #{stream_reference() => stream_id()}
 }).
 
@@ -48,7 +52,7 @@
     dir :: directory()
 }).
 -record(get_manifest, {stream :: stream_id()}).
--record(task_completed, {task_pid :: pid(), event :: event()}).
+-record(task_completed, {task_pid :: pid(), event :: event() | ok}).
 
 %% osiris_log_manifest
 -export([
@@ -396,6 +400,7 @@ init([]) ->
     %% with all offsets less than or equal to the last tiered offset can be
     %% deleted by retention since they are stored in the remote tier.
     _ = ets:new(?LAST_TIERED_OFFSET_TABLE, [named_table]),
+    set_tick_timer(),
     {ok, #?MODULE{}}.
 
 handle_call(#get_manifest{stream = StreamId}, From, State) ->
@@ -403,7 +408,7 @@ handle_call(#get_manifest{stream = StreamId}, From, State) ->
     %% done within the server. And then the server should give a spec to
     %% readers to find anything within branches.
     Event = #manifest_requested{stream = StreamId, requester = From},
-    evolve_event(Event, State);
+    {noreply, evolve_event(Event, State)};
 handle_call(Request, From, State) ->
     ?LOG_INFO(?MODULE_STRING " received unexpected call from ~p: ~W", [From, Request, 10]),
     {noreply, State}.
@@ -420,7 +425,7 @@ handle_cast(
 ) ->
     State1 = State0#?MODULE{references = References0#{Reference => StreamId}},
     Event = #writer_spawned{pid = Pid, stream = StreamId, dir = Dir, replica_nodes = ReplicaNodes},
-    evolve_event(Event, State1);
+    {noreply, evolve_event(Event, State1)};
 handle_cast(
     #init_acceptor{writer_pid = WriterPid, stream = StreamId, reference = Reference},
     #?MODULE{references = References0} = State0
@@ -429,10 +434,10 @@ handle_cast(
         stream = StreamId,
         requester = self()
     }),
-    State = State0#?MODULE{references = References0#{Reference => StreamId}},
-    {noreply, State};
+    State1 = State0#?MODULE{references = References0#{Reference => StreamId}},
+    {noreply, evolve_event(#acceptor_spawned{stream = StreamId}, State1)};
 handle_cast(#manifest_requested{} = Event, State) ->
-    evolve_event(Event, State);
+    {noreply, evolve_event(Event, State)};
 handle_cast(
     #task_completed{task_pid = TaskPid, event = Event},
     #?MODULE{tasks = Tasks0} = State0
@@ -440,9 +445,17 @@ handle_cast(
     %% assertion
     #{TaskPid := _Effect} = Tasks0,
     Tasks = maps:remove(TaskPid, Tasks0),
-    evolve_event(Event, State0#?MODULE{tasks = Tasks});
+    State1 = State0#?MODULE{tasks = Tasks},
+    State =
+        case Event of
+            ok ->
+                State1;
+            _ ->
+                evolve_event(Event, State1)
+        end,
+    {noreply, State};
 handle_cast(#fragment_available{} = Event, State) ->
-    evolve_event(Event, State);
+    {noreply, evolve_event(Event, State)};
 handle_cast(Message, State) ->
     ?LOG_DEBUG(?MODULE_STRING " received unexpected cast: ~W", [Message, 10]),
     {noreply, State}.
@@ -451,16 +464,20 @@ handle_info({osiris_offset, Reference, Offset}, #?MODULE{references = References
     case References of
         #{Reference := StreamId} ->
             Event = #commit_offset_increased{stream = StreamId, offset = Offset},
-            evolve_event(Event, State);
+            {noreply, evolve_event(Event, State)};
         _ ->
             {noreply, State}
     end;
 handle_info(#set_last_tiered_offset{} = Effect, State) ->
     {noreply, apply_effect(Effect, State)};
 handle_info(#manifest_resolved{} = Event, State) ->
-    evolve_event(Event, State);
+    {noreply, evolve_event(Event, State)};
 handle_info(#fragments_applied{} = Event, State) ->
-    evolve_event(Event, State);
+    {noreply, evolve_event(Event, State)};
+handle_info(tick_timeout, State0) ->
+    State = evolve_event(#tick{}, State0),
+    ok = set_tick_timer(),
+    {noreply, State};
 handle_info({'DOWN', _MRef, process, Pid, Reason}, #?MODULE{tasks = Tasks0} = State0) ->
     case maps:take(Pid, Tasks0) of
         {Effect, Tasks} ->
@@ -529,13 +546,12 @@ filename_offset(Basename) when is_binary(Basename) ->
 filename_offset(Basename) when is_list(Basename) ->
     list_to_integer(Basename).
 
--spec evolve_event(event(), #?MODULE{}) -> {noreply, #?MODULE{}}.
+-spec evolve_event(event(), #?MODULE{}) -> #?MODULE{}.
 evolve_event(Event, #?MODULE{machine = MacState0} = State0) ->
     {MacState, Effects} = rabbitmq_stream_s3_log_manifest_machine:apply(
         metadata(), Event, MacState0
     ),
-    State = lists:foldl(fun apply_effect/2, State0#?MODULE{machine = MacState}, Effects),
-    {noreply, State}.
+    lists:foldl(fun apply_effect/2, State0#?MODULE{machine = MacState}, Effects).
 
 -spec apply_effect(effect(), #?MODULE{}) -> #?MODULE{}.
 apply_effect(#reply{to = To, response = Response}, State) ->
@@ -876,9 +892,14 @@ index_files(Dir, SortFun) ->
      || <<_:20/binary, ".index">> = F <- list_dir(Dir)
     ]).
 
+set_tick_timer() ->
+    Timeout = application:get_env(rabbitmq_stream_s3, tick_timeout_milliseconds, 5000),
+    _ = erlang:send_after(Timeout, self(), tick_timeout),
+    ok.
+
 -spec metadata() -> rabbitmq_stream_s3_log_manifest_machine:metadata().
 metadata() ->
-    #{time => erlang:monotonic_time()}.
+    #{time => erlang:system_time(millisecond)}.
 
 -spec local_retention_fun(stream_id()) -> osiris:retention_fun().
 local_retention_fun(Stream) ->

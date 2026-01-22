@@ -20,60 +20,106 @@ for the log manifest server to execute.
 
 -define(SERVER, rabbitmq_stream_s3_log_manifest).
 
-%% NOTE: Pending is reversed.
--type upload_status() ::
-    {uploading, Pending :: [#fragment_info{}]}
-    | {last_uploaded, non_neg_integer() | infinity}.
+-type cfg() :: #{
+    debounce_modifications => non_neg_integer(),
+    debounce_milliseconds => non_neg_integer()
+}.
 
--record(stream, {
-    %% PID of the osiris_writer process. Used to attach offset listeners.
-    writer_pid :: pid() | undefined,
-    replica_nodes = [] :: [node()],
-    %% Directory of the local copy of the log.
-    %% This is undefined unless there is a local writer. This field is used to
-    %% add information to effects like `upload_fragment{}' which act on local
-    %% files.
-    dir :: directory() | undefined,
-    %% Most up-to-date known copy of the manifest, if there is one, or a list
-    %% of callers waiting for it to be resolved.
-    manifest = {pending, []} :: #manifest{} | {pending, [gen_server:from() | pid()]},
-    upload_status = {last_uploaded, 0} :: upload_status(),
+-type manifest() :: #manifest{} | {pending, [gen_server:from() | pid()]}.
+
+-type writer() :: #{
+    kind := writer,
+    %% PID of the `osiris_writer` process. Used to attach offset listeners.
+    pid := pid(),
+    %% Used to send `#fragments_applied{}` notifications.
+    replica_nodes := [node()],
+    %% Local log's directory.
+    dir := directory(),
+    manifest := manifest(),
+    %% Number of fragments applied to the manifest since the last upload.
+    modifications := non_neg_integer(),
+    %% The current active modification to the remote tier. We set this to
+    %% prevent ourselves from performing retention at the same time as
+    %% rebalancing, for example.
+    pending_change := none | upload | retention | rebalance,
+    %% Timestamp when the manifest was last uploaded. Used to debounce uploads.
+    last_uploaded := osiris:timestamp(),
     %% Current commit offset (updated by offset listener notifications) known
     %% to the manifest - this can lag behind the actual commit offset.
-    commit_offset = -1 :: osiris:offset() | -1,
+    commit_offset := osiris:offset() | -1,
     %% List of segments in ascending offset order which have been rolled and
     %% are awaiting upload.
-    available_fragments = [] :: [#fragment{}],
+    available_fragments := [#fragment{}],
     %% List of fragments in ascending offset order which have been uploaded
     %% successfully but have not yet been applied to the manifest.
-    uploaded_fragments = [] :: [#fragment_info{}]
-}).
+    uploaded_fragments := [#fragment_info{}]
+}.
+
+-type replica() :: #{kind := replica, manifest := manifest()}.
+
+-type stream() :: writer() | replica().
 
 -record(?MODULE, {
-    streams = #{} :: #{stream_id() => #stream{}}
+    cfg :: cfg(),
+    streams = #{} :: #{stream_id() => stream()}
 }).
 
 -type metadata() :: #{
-    %% Warp-safe native time, i.e. `erlang:monotonic_time/0`
-    time := integer()
+    %% Time the same way Osiris computes it: erlang:system_time(millisecond).
+    time := osiris:timestamp()
 }.
 
 -opaque state() :: #?MODULE{}.
 
 -export_type([metadata/0, state/0]).
 
--export([new/0, get_manifest/2, apply/3]).
+-export([new/0, new/1, get_manifest/2, apply/3]).
+
+-spec writer(pid(), [node()], directory()) -> writer().
+writer(Pid, ReplicaNodes, Dir) ->
+    #{
+        kind => writer,
+        pid => Pid,
+        replica_nodes => ReplicaNodes,
+        dir => Dir,
+        manifest => {pending, []},
+        pending_change => none,
+        modifications => 0,
+        last_uploaded => -1,
+        commit_offset => -1,
+        available_fragments => [],
+        uploaded_fragments => []
+    }.
+
+-spec replica() -> replica().
+replica() ->
+    #{
+        kind => replica,
+        manifest => {pending, []}
+    }.
 
 -doc """
 Create a default, empty machine state.
 """.
 -spec new() -> state().
-new() -> #?MODULE{}.
+new() ->
+    new(#{
+        debounce_modifications => application:get_env(
+            rabbitmq_stream_s3, manifest_debounce_modifications, 10
+        ),
+        debounce_milliseconds => application:get_env(
+            rabbitmq_stream_s3, manifest_debounce_milliseconds, 5000
+        )
+    }).
+
+-spec new(cfg()) -> state().
+new(Cfg) ->
+    #?MODULE{cfg = Cfg}.
 
 -spec get_manifest(StreamId :: stream_id(), state()) -> #manifest{} | undefined.
 get_manifest(StreamId, #?MODULE{streams = Streams}) ->
     case Streams of
-        #{StreamId := #stream{manifest = #manifest{} = M}} ->
+        #{StreamId := #{manifest := #manifest{} = M}} ->
             M;
         _ ->
             undefined
@@ -91,10 +137,10 @@ apply(
     #?MODULE{streams = Streams0} = State0
 ) ->
     case Streams0 of
-        #{StreamId := #stream{available_fragments = Fragments0} = Stream0} ->
+        #{StreamId := #{available_fragments := Fragments0} = Writer0} ->
             Fragments = add_available_fragment(Fragment, Fragments0),
-            Stream = Stream0#stream{available_fragments = Fragments},
-            State = State0#?MODULE{streams = Streams0#{StreamId := Stream}},
+            Writer = Writer0#{available_fragments := Fragments},
+            State = State0#?MODULE{streams = Streams0#{StreamId := Writer}},
             {State, []};
         _ ->
             {State0, []}
@@ -106,12 +152,12 @@ apply(
 ) ->
     case Streams0 of
         #{
-            StreamId := #stream{
-                writer_pid = Pid,
-                dir = Dir,
-                available_fragments = Available,
-                manifest = Manifest
-            } = Stream0
+            StreamId := #{
+                pid := Pid,
+                dir := Dir,
+                available_fragments := Available,
+                manifest := Manifest
+            } = Writer0
         } ->
             Effects0 = [#register_offset_listener{writer_pid = Pid, offset = Offset + 1}],
             case Manifest of
@@ -119,8 +165,8 @@ apply(
                     %% Wait until the manifest is resolved to upload fragments
                     %% so that we avoid uploading something which already
                     %% exists in the remote tier.
-                    Stream = Stream0#stream{commit_offset = Offset},
-                    {State0#?MODULE{streams = Streams0#{StreamId := Stream}}, Effects0};
+                    Writer = Writer0#{commit_offset := Offset},
+                    {State0#?MODULE{streams = Streams0#{StreamId := Writer}}, Effects0};
                 _ ->
                     {Uncommitted, Committed} = lists:splitwith(
                         fun(#fragment{last_offset = LastOffset}) -> LastOffset > Offset end,
@@ -140,11 +186,11 @@ apply(
                         Effects0,
                         Committed
                     ),
-                    Stream = Stream0#stream{
-                        commit_offset = Offset,
-                        available_fragments = Uncommitted
+                    Writer = Writer0#{
+                        commit_offset := Offset,
+                        available_fragments := Uncommitted
                     },
-                    Streams = Streams0#{StreamId := Stream},
+                    Streams = Streams0#{StreamId := Writer},
                     State = State0#?MODULE{streams = Streams},
                     {State, Effects}
             end;
@@ -152,37 +198,39 @@ apply(
             {State0, []}
     end;
 apply(
-    _Meta,
+    Meta,
     #fragment_uploaded{stream = StreamId, info = #fragment_info{} = Info},
-    #?MODULE{streams = Streams0} = State0
+    #?MODULE{cfg = Cfg, streams = Streams0} = State0
 ) ->
     case Streams0 of
         #{
-            StreamId := #stream{
-                manifest = #manifest{next_offset = NTO0} = Manifest0,
-                uploaded_fragments = Uploaded0,
-                replica_nodes = ReplicaNodes
-            } = Stream0
+            StreamId := #{
+                manifest := #manifest{next_offset = NextOffset0} = Manifest0,
+                modifications := Modifications0,
+                uploaded_fragments := Uploaded0,
+                replica_nodes := ReplicaNodes
+            } = Writer0
         } ->
             Uploaded1 = insert_info(Info, Uploaded0),
-            {NTO, Pending, Finished} = split_uploaded_infos(NTO0, Uploaded1),
-            %% assertion: the manifest can't be pending download here.
-            #manifest{} = Manifest0,
-            Stream1 = Stream0#stream{uploaded_fragments = Pending},
-            {Stream, Effects0} = apply_infos_to_manifest(Finished, StreamId, Stream1),
+            {NextOffset, Pending, Finished} = split_uploaded_infos(NextOffset0, Uploaded1),
+            {ok, Manifest} = apply_infos(Finished, Manifest0),
             %% assertion: the finished fragments were applied up to the
             %% next-tiered-offset we expected from split_uploaded_infos/2.
-            %% TODO: this assertion is not currently correct. We should
-            %% refactor out the `{uploading, [#fragment_info{}]}` uploading
-            %% status so that we always apply uploaded fragments to the local
-            %% copy eagerly.
-            #stream{manifest = #manifest{next_offset = NTO}} = Stream,
+            #manifest{next_offset = NextOffset} = Manifest,
+            Writer1 = Writer0#{
+                manifest := Manifest,
+                modifications := Modifications0 + length(Finished),
+                uploaded_fragments := Pending
+            },
+            {Writer, Effects0} = evaluate_writer(Cfg, Meta, StreamId, Writer1, []),
             Effects =
-                case NTO of
-                    NTO0 ->
+                case NextOffset of
+                    NextOffset0 ->
                         Effects0;
                     _ ->
-                        SetLTO = #set_last_tiered_offset{stream = StreamId, offset = NTO - 1},
+                        SetLTO = #set_last_tiered_offset{
+                            stream = StreamId, offset = NextOffset - 1
+                        },
                         lists:foldl(
                             fun(Node, Acc) ->
                                 Event = #fragments_applied{stream = StreamId, fragments = Finished},
@@ -197,7 +245,7 @@ apply(
                             ReplicaNodes
                         )
                 end,
-            State = State0#?MODULE{streams = Streams0#{StreamId := Stream}},
+            State = State0#?MODULE{streams = Streams0#{StreamId := Writer}},
             {State, Effects};
         _ ->
             {State0, []}
@@ -208,64 +256,66 @@ apply(
     #?MODULE{streams = Streams0} = State0
 ) ->
     case Streams0 of
-        #{StreamId := #stream{} = Stream0} ->
-            {Stream, Effects} = apply_infos_to_replica_manifest(Fragments, StreamId, Stream0),
-            State = State0#?MODULE{streams = Streams0#{StreamId := Stream}},
-            {State, Effects};
-        _ ->
-            {State0, []}
-    end;
-apply(_Meta, #manifest_uploaded{stream = StreamId}, #?MODULE{streams = Streams0} = State0) ->
-    case Streams0 of
-        #{StreamId := #stream{upload_status = UploadStatus0} = Stream0} ->
-            %% assertion
-            {uploading, Pending0} = UploadStatus0,
-            %% Pending is stored reversed for quick prepends.
-            Pending = lists:reverse(Pending0),
-            Stream1 = Stream0#stream{upload_status = {last_uploaded, 0}},
-            {Stream, Effects} = apply_infos_to_manifest(Pending, StreamId, Stream1),
-            State = State0#?MODULE{streams = Streams0#{StreamId := Stream}},
-            {State, Effects};
+        #{StreamId := #{kind := replica, manifest := #manifest{} = Manifest0} = Replica0} ->
+            case apply_infos(Fragments, Manifest0) of
+                {ok, #manifest{next_offset = NextOffset} = Manifest} ->
+                    Streams = Streams0#{StreamId := Replica0#{manifest := Manifest}},
+                    SetLTO = #set_last_tiered_offset{stream = StreamId, offset = NextOffset - 1},
+                    {State0#?MODULE{streams = Streams}, [SetLTO]};
+                {error, OutOfSequenceInfo} ->
+                    ?LOG_DEBUG(
+                        "Replica received an out-of-sequence fragment info. Refreshing manifest from writer... ~0p",
+                        [OutOfSequenceInfo]
+                    ),
+                    Effect = #manifest_requested{stream = StreamId, requester = self()},
+                    Replica = Replica0#{manifest := {pending, []}},
+                    {Replica, [Effect]}
+            end;
         _ ->
             {State0, []}
     end;
 apply(
-    _Meta,
-    #manifest_rebalanced{stream = StreamId, manifest = Manifest0},
+    #{time := Ts},
+    #manifest_uploaded{stream = StreamId},
     #?MODULE{streams = Streams0} = State0
 ) ->
     case Streams0 of
-        #{StreamId := #stream{upload_status = UploadStatus0} = Stream0} ->
-            %% assertion
-            {uploading, Pending0} = UploadStatus0,
-            %% Pending is stored reversed for quick prepends.
-            Pending = lists:reverse(Pending0),
-            Stream1 = Stream0#stream{
-                manifest = Manifest0,
-                upload_status = {last_uploaded, infinity}
-            },
-            {Stream, Effects} = apply_infos_to_manifest(Pending, StreamId, Stream1),
-            State = State0#?MODULE{streams = Streams0#{StreamId := Stream}},
-            {State, Effects};
+        #{StreamId := #{kind := writer, pending_change := upload} = Writer0} ->
+            Writer = Writer0#{modifications := 0, last_uploaded := Ts, pending_change := none},
+            State = State0#?MODULE{streams = Streams0#{StreamId := Writer}},
+            {State, []};
         _ ->
             {State0, []}
     end;
+apply(_Meta, #manifest_rebalanced{}, _State) ->
+    erlang:error(unimplemented);
 apply(
     _Meta,
     #writer_spawned{pid = Pid, stream = StreamId, dir = Dir, replica_nodes = ReplicaNodes},
     #?MODULE{streams = Streams0} = State0
 ) ->
+    Writer0 = writer(Pid, ReplicaNodes, Dir),
     Effects0 = [#register_offset_listener{writer_pid = Pid, offset = -1}],
     case Streams0 of
-        #{StreamId := #stream{} = Stream0} ->
-            Stream = Stream0#stream{writer_pid = Pid, dir = Dir, replica_nodes = ReplicaNodes},
-            Streams = Streams0#{StreamId := Stream},
-            {State0#?MODULE{streams = Streams}, Effects0};
+        #{StreamId := #{manifest := {pending, Pending0}}} ->
+            Writer = Writer0#{manifest := {pending, Pending0}},
+            State = State0#?MODULE{streams = Streams0#{StreamId := Writer}},
+            {State, Effects0};
         _ ->
-            Stream = #stream{writer_pid = Pid, dir = Dir, replica_nodes = ReplicaNodes},
-            Streams = Streams0#{StreamId => Stream},
+            State = State0#?MODULE{streams = Streams0#{StreamId => Writer0}},
             Effects = [#resolve_manifest{stream = StreamId} | Effects0],
-            {State0#?MODULE{streams = Streams}, Effects}
+            {State, Effects}
+    end;
+apply(_Meta, #acceptor_spawned{stream = StreamId}, #?MODULE{streams = Streams0} = State0) ->
+    Stream0 = replica(),
+    case Streams0 of
+        #{StreamId := #{manifest := {pending, Pending0}}} ->
+            Stream = Stream0#{manifest := {pending, Pending0}},
+            State = State0#?MODULE{streams = Streams0#{StreamId := Stream}},
+            {State, []};
+        _ ->
+            State = State0#?MODULE{streams = Streams0#{StreamId => Stream0}},
+            {State, []}
     end;
 apply(
     _Meta,
@@ -273,7 +323,7 @@ apply(
     #?MODULE{streams = Streams0} = State0
 ) ->
     case Streams0 of
-        #{StreamId := #stream{manifest = #manifest{} = Manifest}} ->
+        #{StreamId := #{manifest := #manifest{} = Manifest}} ->
             Reply =
                 case Requester of
                     {_, _} ->
@@ -283,17 +333,17 @@ apply(
                         #send{to = Requester, message = Message}
                 end,
             {State0, [Reply]};
-        #{StreamId := #stream{manifest = {pending, Requesters0}} = Stream0} ->
-            Stream = Stream0#stream{manifest = {pending, [Requester | Requesters0]}},
+        #{StreamId := #{manifest := {pending, Requesters0}} = Stream0} ->
+            Stream = Stream0#{manifest := {pending, [Requester | Requesters0]}},
             State = State0#?MODULE{streams = Streams0#{StreamId := Stream}},
             {State, []};
         _ ->
-            Stream = #stream{manifest = {pending, [Requester]}},
+            Stream = (replica())#{manifest := {pending, [Requester]}},
             State = State0#?MODULE{streams = Streams0#{StreamId => Stream}},
             {State, [#resolve_manifest{stream = StreamId}]}
     end;
 apply(
-    _Meta,
+    #{time := Ts},
     #manifest_resolved{
         stream = StreamId,
         manifest = #manifest{next_offset = NTO, entries = Entries} = Manifest
@@ -301,14 +351,8 @@ apply(
     #?MODULE{streams = Streams0} = State0
 ) ->
     case Streams0 of
-        #{
-            StreamId := #stream{
-                dir = Dir,
-                manifest = {pending, Requesters},
-                commit_offset = CommitOffset,
-                available_fragments = Available0
-            } = Stream0
-        } ->
+        #{StreamId := #{manifest := {pending, Requesters}} = Stream0} ->
+            Stream1 = Stream0#{manifest := Manifest},
             SetLTO = #set_last_tiered_offset{stream = StreamId, offset = NTO - 1},
             %% NOTE: `Requesters` is in reverse order.
             Effects0 = lists:foldl(
@@ -321,44 +365,71 @@ apply(
                 [SetLTO],
                 Requesters
             ),
-            LastOffsetInManifest =
-                case rabbitmq_stream_s3_binary_array:last(?ENTRY_B, Entries) of
-                    ?ENTRY(O, _, _, _, _, _) ->
-                        O;
-                    undefined ->
-                        -1
-                end,
-            Available = lists:filter(
-                fun(#fragment{first_offset = Offset}) ->
-                    Offset > LastOffsetInManifest
-                end,
-                Available0
-            ),
-            {Uncommitted, Committed} = lists:splitwith(
-                fun(#fragment{last_offset = Offset}) ->
-                    Offset > CommitOffset
-                end,
-                Available
-            ),
-            Effects = lists:foldl(
-                fun(Fragment, Acc) ->
-                    [#upload_fragment{stream = StreamId, dir = Dir, fragment = Fragment} | Acc]
-                end,
-                Effects0,
-                Committed
-            ),
-            Stream = Stream0#stream{
-                manifest = Manifest,
-                upload_status = {last_uploaded, 0},
-                available_fragments = Uncommitted
-            },
-            State = State0#?MODULE{streams = Streams0#{StreamId := Stream}},
-            {State, Effects};
+            case Stream0 of
+                #{dir := Dir, commit_offset := CommitOffset, available_fragments := Available0} ->
+                    LastOffsetInManifest =
+                        case rabbitmq_stream_s3_binary_array:last(?ENTRY_B, Entries) of
+                            ?ENTRY(O, _, _, _, _, _) ->
+                                O;
+                            undefined ->
+                                -1
+                        end,
+                    Available = lists:filter(
+                        fun(#fragment{first_offset = Offset}) ->
+                            Offset > LastOffsetInManifest
+                        end,
+                        Available0
+                    ),
+                    {Uncommitted, Committed} = lists:splitwith(
+                        fun(#fragment{last_offset = Offset}) ->
+                            Offset > CommitOffset
+                        end,
+                        Available
+                    ),
+                    Effects = lists:foldl(
+                        fun(Fragment, Acc) ->
+                            [
+                                #upload_fragment{stream = StreamId, dir = Dir, fragment = Fragment}
+                                | Acc
+                            ]
+                        end,
+                        Effects0,
+                        Committed
+                    ),
+                    Writer = Stream1#{
+                        manifest := Manifest,
+                        available_fragments := Uncommitted,
+                        last_uploaded := Ts
+                    },
+                    State = State0#?MODULE{streams = Streams0#{StreamId := Writer}},
+                    {State, Effects};
+                _ ->
+                    State = State0#?MODULE{streams = Streams0#{StreamId := Stream1}},
+                    {State, Effects0}
+            end;
         _ ->
-            Stream = #stream{manifest = Manifest},
-            State = State0#?MODULE{streams = Streams0#{StreamId => Stream}},
-            {State, []}
+            {State0, []}
     end;
+apply(Meta, #tick{}, #?MODULE{cfg = Cfg, streams = Streams0} = State0) ->
+    {Streams, Effects} =
+        maps:fold(
+            fun
+                (
+                    StreamId,
+                    #{kind := writer, manifest := #manifest{}, pending_change := none} = Writer0,
+                    {Streams1, Effs0}
+                ) ->
+                    {Writer1, Effs1} = evaluate_retention(Meta, StreamId, Writer0, Effs0),
+                    {Writer2, Effs2} = evaluate_upload(Cfg, Meta, StreamId, Writer1, Effs1),
+                    {Writer, Effs} = notify_fragments_applied([], StreamId, Writer2, Effs2),
+                    {Streams1#{StreamId := Writer}, Effs};
+                (_StreamId, _Stream, Acc) ->
+                    Acc
+            end,
+            {Streams0, []},
+            Streams0
+        ),
+    {State0#?MODULE{streams = Streams}, Effects};
 apply(_Meta, Event, State) ->
     ?LOG_WARNING(?MODULE_STRING " dropped unknown event ~W", [Event, 15]),
     {State, []}.
@@ -413,119 +484,13 @@ split_uploaded_infos(NextTieredOffset, PendingUploaded, Acc) ->
 -doc """
 Apply successfully uploaded fragments to their stream's manifest.
 
-This function also evaluates whether the manifest should be rebalanced and/or
-uploaded to the remote tier.
+`Infos` is expected to be sorted by offset ascending.
 """.
--spec apply_infos_to_manifest([#fragment_info{}], stream_id(), #stream{}) ->
-    {#stream{}, [effect()]}.
-apply_infos_to_manifest(Infos, StreamId, Stream) ->
-    apply_infos_to_manifest(Infos, StreamId, Stream, []).
-
-apply_infos_to_manifest(
-    [],
-    StreamId,
-    #stream{
-        manifest = #manifest{entries = Entries} = Manifest,
-        upload_status = {last_uploaded, _} = UploadStatus0
-    } = Stream0,
-    Effects0
-) when
-    ?ENTRIES_LEN(Entries) >= 2 * ?MANIFEST_BRANCHING_FACTOR
-->
-    %% The manifest is loaded. Try to rebalance away a group. TODO see if we
-    %% can improve this "load factor." It's pretty simple at the moment.
-    case rabbitmq_stream_s3_log_manifest_entry:rebalance(Entries) of
-        undefined ->
-            ?LOG_DEBUG("Manifest is loaded but rebalancing is not possible.", []),
-            {Manifest, UploadStatus0, Effects0};
-        {GroupKind, GroupSize, Group, Rebalanced} ->
-            ?LOG_DEBUG("Compacting away ~b kind ~b's from entries of byte size ~b", [
-                ?MANIFEST_BRANCHING_FACTOR, GroupKind, byte_size(Entries)
-            ]),
-            Rebalance = #rebalance_manifest{
-                stream = StreamId,
-                kind = GroupKind,
-                size = GroupSize,
-                new_group = Group,
-                rebalanced = Rebalanced,
-                manifest = Manifest
-            },
-            Stream = Stream0#stream{
-                manifest = Manifest,
-                upload_status = {uploading, []}
-            },
-            {Stream, [Rebalance | Effects0]}
-    end;
-apply_infos_to_manifest(
-    [],
-    StreamId,
-    #stream{
-        manifest = Manifest,
-        upload_status = {last_uploaded, NumUpdates}
-    } = Stream0,
-    Effects0
-) when
-    NumUpdates >= ?FRAGMENT_UPLOADS_PER_MANIFEST_UPDATE
-->
-    %% Updates have been debounced but there have been enough that now it is
-    %% time to perform the upload.
-    case NumUpdates of
-        infinity ->
-            ?LOG_DEBUG("Forcing upload of manifest");
-        _ when is_integer(NumUpdates) ->
-            ?LOG_DEBUG("Uploading manifest because there have been ~b updates since last upload", [
-                NumUpdates
-            ])
-    end,
-    Stream = Stream0#stream{upload_status = {uploading, []}},
-    Upload = #upload_manifest{stream = StreamId, manifest = Manifest},
-    {Stream, [Upload | Effects0]};
-apply_infos_to_manifest([], _StreamId, #stream{upload_status = UploadStatus} = Stream, Effects) ->
-    %% The manifest is currently being uploaded, or there are no updates
-    %% necessary. Skip the upload.
-    ?LOG_DEBUG("Skipping upload of manifest with status ~w", [UploadStatus]),
-    {Stream, Effects};
-apply_infos_to_manifest(
-    [
-        #fragment_info{
-            offset = Offset,
-            timestamp = Ts,
-            next_offset = NextOffset,
-            seq_no = SeqNo,
-            size = Size
-        }
-        | Rest
-    ],
-    StreamId,
-    #stream{manifest = #manifest{next_offset = 0}, upload_status = UploadStatus0} = Stream0,
-    Effects
-) ->
-    ?assertEqual({last_uploaded, 0}, UploadStatus0),
-    %% The very first fragment in the manifest. Create a new manifest.
-    Manifest = #manifest{
-        first_offset = Offset,
-        first_timestamp = Ts,
-        next_offset = NextOffset,
-        total_size = Size,
-        entries = ?ENTRY(Offset, Ts, ?MANIFEST_KIND_FRAGMENT, Size, SeqNo, <<>>)
-    },
-    %% And force its upload.
-    Stream = Stream0#stream{
-        manifest = Manifest,
-        upload_status = {last_uploaded, infinity}
-    },
-    apply_infos_to_manifest(Rest, StreamId, Stream, Effects);
-apply_infos_to_manifest(
-    [Fragment | Rest],
-    StreamId,
-    #stream{upload_status = {uploading, Pending0}} = Stream0,
-    Effects
-) ->
-    %% The manifest is currently being uploaded. Queue the fragment for later
-    %% application once the current upload completes.
-    Stream = Stream0#stream{upload_status = {uploading, [Fragment | Pending0]}},
-    apply_infos_to_manifest(Rest, StreamId, Stream, Effects);
-apply_infos_to_manifest(
+-spec apply_infos([#fragment_info{}], #manifest{}) ->
+    {ok, #manifest{}} | {error, #fragment_info{}}.
+apply_infos([], Manifest) ->
+    {ok, Manifest};
+apply_infos(
     [
         #fragment_info{
             offset = Offset,
@@ -536,33 +501,30 @@ apply_infos_to_manifest(
         }
         | Rest
     ],
-    StreamId,
-    #stream{
-        manifest = #manifest{total_size = TotalSize0, entries = Entries0} = Manifest0,
-        upload_status = {last_uploaded, NumUpdates0}
-    } = Stream0,
-    Effects
+    #manifest{
+        next_offset = Offset,
+        total_size = TotalSize0,
+        entries = Entries0
+    } = Manifest0
 ) ->
-    %% Common case: the manifest exists. Append the fragment to the entries.
-    NumUpdates =
-        case NumUpdates0 of
-            infinity ->
-                infinity;
-            N when is_integer(N) ->
-                NumUpdates0 + 1
+    Manifest1 =
+        case Offset of
+            0 ->
+                %% For the very first fragment, also set the offset and timestamp.
+                Manifest0#manifest{first_offset = Offset, first_timestamp = Ts};
+            _ ->
+                Manifest0
         end,
-    Manifest = Manifest0#manifest{
+    Manifest = Manifest1#manifest{
         next_offset = NextOffset,
         total_size = TotalSize0 + Size,
         entries =
             <<Entries0/binary,
                 ?ENTRY(Offset, Ts, ?MANIFEST_KIND_FRAGMENT, Size, SeqNo, <<>>)/binary>>
     },
-    Stream = Stream0#stream{
-        manifest = Manifest,
-        upload_status = {last_uploaded, NumUpdates}
-    },
-    apply_infos_to_manifest(Rest, StreamId, Stream, Effects).
+    apply_infos(Rest, Manifest);
+apply_infos([Info | _], #manifest{}) ->
+    {error, Info}.
 
 -doc """
 Add a fragment to the list of available fragments.
@@ -588,75 +550,53 @@ add_available_fragment(
 add_available_fragment(F, Fs, Acc) ->
     lists:reverse(Acc, [F | Fs]).
 
--doc """
-Add the sorted list of fragment infos to the replica copy of a manifest.
+-spec evaluate_writer(cfg(), metadata(), stream_id(), writer(), [effect()]) ->
+    {writer(), [effect()]}.
+evaluate_writer(Cfg, Meta, StreamId, Writer0, Effects0) ->
+    {Writer1, Effects1} = evaluate_retention(Meta, StreamId, Writer0, Effects0),
+    {Writer2, Effects2} = evaluate_rebalance(StreamId, Writer1, Effects1),
+    evaluate_upload(Cfg, Meta, StreamId, Writer2, Effects2).
 
-This is similar to applying fragments to the writer's manifest but it does not
-trigger rebalancing. If a fragments arrive out of order or a fragment is
-dropped, the replica requests an updated copy of the manifest from the writer.
-""".
--spec apply_infos_to_replica_manifest([#fragment_info{}], stream_id(), #stream{}) ->
-    {#stream{}, [effect()]}.
-apply_infos_to_replica_manifest(Infos, StreamId, Stream) ->
-    apply_infos_to_replica_manifest(Infos, StreamId, Stream, []).
+evaluate_retention(#{time := _Ts}, _StreamId, Writer0, Effects0) ->
+    %% TODO
+    {Writer0, Effects0}.
 
-apply_infos_to_replica_manifest([], _StreamId, Stream, Effects) ->
-    {Stream, Effects};
-apply_infos_to_replica_manifest(
-    [
-        #fragment_info{
-            offset = Offset,
-            next_offset = NextOffset,
-            timestamp = Ts,
-            seq_no = SeqNo,
-            size = Size
-        }
-        | Rest
-    ],
+evaluate_rebalance(_StreamId, Writer0, Effects0) ->
+    %% TODO
+    {Writer0, Effects0}.
+
+evaluate_upload(
+    Cfg,
+    #{time := Ts},
     StreamId,
-    #stream{
-        manifest =
-            #manifest{
-                next_offset = Offset,
-                total_size = TotalSize0,
-                entries = Entries0
-            } = Manifest0
-    } = Stream0,
+    #{
+        kind := writer,
+        manifest := #manifest{} = Manifest,
+        modifications := Mods,
+        last_uploaded := LastUploadTs,
+        pending_change := none
+    } = Writer0,
     Effects0
 ) ->
-    %% Common-case: the infos are in order and there was no data loss.
-    %% Update the manifest in-place. The manifest could be fully empty here
-    %% so we may need to set the first offset and timestamp:
-    Manifest1 =
-        case Offset of
-            0 ->
-                Manifest0#manifest{first_offset = Offset, first_timestamp = Ts};
+    ExceedsDebounce =
+        case Cfg of
+            #{debounce_modifications := M} when Mods >= M ->
+                true;
+            #{debounce_milliseconds := Millis} when Millis > Ts - LastUploadTs andalso Mods > 0 ->
+                true;
             _ ->
-                Manifest0
+                false
         end,
-    Manifest = Manifest1#manifest{
-        next_offset = NextOffset,
-        total_size = TotalSize0 + Size,
-        entries =
-            <<Entries0/binary,
-                ?ENTRY(Offset, Ts, ?MANIFEST_KIND_FRAGMENT, Size, SeqNo, <<>>)/binary>>
-    },
-    Stream = Stream0#stream{manifest = Manifest},
-    SetLTO = #set_last_tiered_offset{stream = StreamId, offset = NextOffset - 1},
-    Effects =
-        case Effects0 of
-            [#set_last_tiered_offset{stream = StreamId} | Effects1] ->
-                [SetLTO | Effects1];
-            _ ->
-                [SetLTO | Effects0]
-        end,
-    apply_infos_to_replica_manifest(Rest, StreamId, Stream, Effects);
-apply_infos_to_replica_manifest([_ | _], StreamId, #stream{} = Stream0, Effects0) ->
-    %% Sad path: a fragment info is missing. Refresh the manifest from the
-    %% writer.
-    Effect = #manifest_requested{stream = StreamId, requester = self()},
-    Stream = Stream0#stream{manifest = {pending, []}},
-    {Stream, [Effect | Effects0]}.
+    case ExceedsDebounce of
+        true ->
+            UploadManifest = #upload_manifest{stream = StreamId, manifest = Manifest},
+            Writer = Writer0#{pending_change := upload},
+            {Writer, [UploadManifest | Effects0]};
+        false ->
+            {Writer0, Effects0}
+    end;
+evaluate_upload(_Cfg, _Meta, _StreamId, Writer, Effects) ->
+    {Writer, Effects}.
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
@@ -670,9 +610,7 @@ add_available_fragment_test() ->
     ?assertEqual(Expected, lists:foldr(fun add_available_fragment/2, [], Fragments)),
     ok.
 
-apply_infos_to_replica_manifest_test() ->
-    StreamId = erlang:make_ref(),
-    Stream = #stream{manifest = #manifest{}},
+apply_infos_test() ->
     Ts = erlang:system_time(millisecond),
     [I1, I2, I3] =
         Infos = [
@@ -686,23 +624,16 @@ apply_infos_to_replica_manifest_test() ->
          || N <- lists:seq(0, 2)
         ],
     ?assertMatch(
-        {
-            #stream{manifest = #manifest{first_timestamp = Ts, next_offset = 60}},
-            [#set_last_tiered_offset{offset = 59}]
-        },
-        apply_infos_to_replica_manifest(Infos, StreamId, Stream)
+        {ok, #manifest{first_timestamp = Ts, next_offset = 60}},
+        apply_infos(Infos, #manifest{})
     ),
-    %% Any missing fragments will trigger a new manifest request:
-    ?assertMatch(
-        {
-            #stream{manifest = {pending, []}},
-            [#manifest_requested{}, #set_last_tiered_offset{offset = 19}]
-        },
-        apply_infos_to_replica_manifest([I1, I3], StreamId, Stream)
+    ?assertEqual(
+        {error, I2},
+        apply_infos([I2, I3], #manifest{})
     ),
-    ?assertMatch(
-        {#stream{manifest = {pending, []}}, [#manifest_requested{}]},
-        apply_infos_to_replica_manifest([I2, I3], StreamId, Stream)
+    ?assertEqual(
+        {error, I3},
+        apply_infos([I1, I3], #manifest{})
     ),
     ok.
 

@@ -259,13 +259,16 @@
     pid :: pid(),
     replica_nodes = [] :: [node()]
 }).
+-record(acceptor_spawned, {stream :: stream_id()}).
 -record(fragments_applied, {
     stream :: stream_id(),
     fragments :: [#fragment_info{}]
 }).
+-record(tick, {}).
 
 -type event() ::
-    #commit_offset_increased{}
+    #acceptor_spawned{}
+    | #commit_offset_increased{}
     | #fragment_available{}
     | #fragment_uploaded{}
     | #fragments_applied{}
@@ -273,6 +276,7 @@
     | #manifest_requested{}
     | #manifest_resolved{}
     | #manifest_uploaded{}
+    | #tick{}
     | #writer_spawned{}.
 
 %% Effects.
