@@ -257,7 +257,8 @@
     reference :: stream_reference(),
     dir :: directory(),
     pid :: pid(),
-    replica_nodes = [] :: [node()]
+    replica_nodes = [] :: [node()],
+    retention = [] :: [osiris:retention_spec()]
 }).
 -record(acceptor_spawned, {stream :: stream_id()}).
 -record(fragments_applied, {
@@ -265,6 +266,10 @@
     fragments :: [#fragment_info{}]
 }).
 -record(tick, {}).
+-record(retention_updated, {
+    stream :: stream_id(),
+    retention :: [osiris:retention_spec()]
+}).
 
 -type event() ::
     #acceptor_spawned{}
@@ -277,6 +282,7 @@
     | #manifest_resolved{}
     | #manifest_uploaded{}
     | #tick{}
+    | #retention_updated{}
     | #writer_spawned{}.
 
 %% Effects.

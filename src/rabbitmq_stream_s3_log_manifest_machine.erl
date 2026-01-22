@@ -25,14 +25,25 @@ for the log manifest server to execute.
     debounce_milliseconds => non_neg_integer()
 }.
 
+-type milliseconds() :: non_neg_integer().
+
 -type manifest() :: #manifest{} | {pending, [gen_server:from() | pid()]}.
+
+%% Subset of osiris:retention_spec(), as a map.
+-type retention_spec() :: #{
+    max_bytes := non_neg_integer(),
+    max_age := milliseconds()
+}.
 
 -type writer() :: #{
     kind := writer,
     %% PID of the `osiris_writer` process. Used to attach offset listeners.
     pid := pid(),
-    %% Used to send `#fragments_applied{}` notifications.
-    replica_nodes := [node()],
+    %% A mapping of replica node to the last range sent to it.
+    %% The writer is included in this map. Used to send `#fragments_applied{}`
+    %% notifications to replicas and emit the `#set_range{}` effect on this node.
+    ranges := #{node() := {osiris:offset(), osiris:offset()}},
+    retention := retention_spec(),
     %% Local log's directory.
     dir := directory(),
     manifest := manifest(),
@@ -75,12 +86,14 @@ for the log manifest server to execute.
 
 -export([new/0, new/1, get_manifest/2, apply/3]).
 
--spec writer(pid(), [node()], directory()) -> writer().
-writer(Pid, ReplicaNodes, Dir) ->
+-spec writer(pid(), [node()], directory(), retention_spec()) -> writer().
+writer(Pid, ReplicaNodes, Dir, Retention) ->
+    ?assertEqual(node(Pid), node()),
     #{
         kind => writer,
         pid => Pid,
-        replica_nodes => ReplicaNodes,
+        ranges => #{Node => {0, 0} || Node <- [node() | ReplicaNodes]},
+        retention => Retention,
         dir => Dir,
         manifest => {pending, []},
         pending_change => none,
@@ -291,10 +304,17 @@ apply(_Meta, #manifest_rebalanced{}, _State) ->
     erlang:error(unimplemented);
 apply(
     _Meta,
-    #writer_spawned{pid = Pid, stream = StreamId, dir = Dir, replica_nodes = ReplicaNodes},
+    #writer_spawned{
+        pid = Pid,
+        stream = StreamId,
+        dir = Dir,
+        replica_nodes = ReplicaNodes,
+        retention = Retention0
+    },
     #?MODULE{streams = Streams0} = State0
 ) ->
-    Writer0 = writer(Pid, ReplicaNodes, Dir),
+    Retention = #{K => V || {K, V} <- Retention0, K =:= max_age orelse K =:= max_bytes},
+    Writer0 = writer(Pid, ReplicaNodes, Dir, Retention),
     Effects0 = [#register_offset_listener{writer_pid = Pid, offset = -1}],
     case Streams0 of
         #{StreamId := #{manifest := {pending, Pending0}}} ->
@@ -430,6 +450,22 @@ apply(Meta, #tick{}, #?MODULE{cfg = Cfg, streams = Streams0} = State0) ->
             Streams0
         ),
     {State0#?MODULE{streams = Streams}, Effects};
+apply(
+    Meta,
+    #retention_updated{stream = StreamId, retention = Retention0},
+    #?MODULE{streams = Streams0} = State0
+) ->
+    Retention = #{K => V || {K, V} <- Retention0, K =:= max_age orelse K =:= max_bytes},
+    case Streams0 of
+        #{StreamId := #{kind := writer} = Writer0} ->
+            Writer1 = Writer0#{retention := Retention},
+            {Writer2, Effects0} = evaluate_retention(Meta, StreamId, Writer1, []),
+            {Writer, Effects} = notify_fragments_applied([], StreamId, Writer2, Effects0),
+            State = State0#?MODULE{streams = Streams0#{StreamId := Writer}},
+            {State, Effects};
+        _ ->
+            {State0, []}
+    end;
 apply(_Meta, Event, State) ->
     ?LOG_WARNING(?MODULE_STRING " dropped unknown event ~W", [Event, 15]),
     {State, []}.

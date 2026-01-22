@@ -42,7 +42,8 @@
     dir :: directory(),
     %% Corresponds to the `replica_nodes` key passed in `osiris:config()` for
     %% writers.
-    replica_nodes :: [node()]
+    replica_nodes :: [node()],
+    retention :: [osiris:retention_spec()]
 }).
 -record(init_acceptor, {
     pid :: pid(),
@@ -197,8 +198,11 @@ handle_event(
                 Fragment2
         end,
     Manifest0#log_writer{fragment = Fragment};
-handle_event({retention_updated, _Retention}, #log_writer{} = Manifest) ->
-    %% TODO
+handle_event({retention_updated, Retention}, #log_writer{stream = StreamId} = Manifest) ->
+    ok = gen_server:cast(?SERVER, #retention_updated{
+        stream = StreamId,
+        retention = Retention
+    }),
     Manifest.
 
 checksum(undefined, _) ->
@@ -251,7 +255,8 @@ init_manifest(
         stream = StreamId,
         reference = Reference,
         dir = Dir,
-        replica_nodes = ReplicaNodes
+        replica_nodes = ReplicaNodes,
+        retention = maps:get(retention, Config0, [])
     }),
     ?LOG_DEBUG("Recovering available fragments for stream ~ts", [Dir]),
     %% Recover the current fragment information. To do this we scan through the
@@ -419,12 +424,19 @@ handle_cast(
         stream = StreamId,
         reference = Reference,
         dir = Dir,
-        replica_nodes = ReplicaNodes
+        replica_nodes = ReplicaNodes,
+        retention = Retention
     },
     #?MODULE{references = References0} = State0
 ) ->
     State1 = State0#?MODULE{references = References0#{Reference => StreamId}},
-    Event = #writer_spawned{pid = Pid, stream = StreamId, dir = Dir, replica_nodes = ReplicaNodes},
+    Event = #writer_spawned{
+        pid = Pid,
+        stream = StreamId,
+        dir = Dir,
+        replica_nodes = ReplicaNodes,
+        retention = Retention
+    },
     {noreply, evolve_event(Event, State1)};
 handle_cast(
     #init_acceptor{writer_pid = WriterPid, stream = StreamId, reference = Reference},
@@ -455,6 +467,8 @@ handle_cast(
         end,
     {noreply, State};
 handle_cast(#fragment_available{} = Event, State) ->
+    {noreply, evolve_event(Event, State)};
+handle_cast(#retention_updated{} = Event, State) ->
     {noreply, evolve_event(Event, State)};
 handle_cast(Message, State) ->
     ?LOG_DEBUG(?MODULE_STRING " received unexpected cast: ~W", [Message, 10]),
