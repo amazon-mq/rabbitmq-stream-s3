@@ -216,7 +216,6 @@
     seq_no = 0 :: non_neg_integer(),
     %% NOTE: header size is not included.
     size = 0 :: non_neg_integer(),
-    %% TODO: do checksum during upload if undefined.
     checksum = ?SEGMENT_HEADER_HASH :: checksum() | undefined
 }).
 

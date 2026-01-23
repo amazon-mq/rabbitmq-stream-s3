@@ -139,15 +139,16 @@ handle_event(
         end,
     Manifest0#log_writer{fragment = Fragment};
 handle_event(
-    {chunk_written, #{id := ChId, timestamp := Ts, num := NumRecords, size := ChunkSize}, Chunk},
+    {chunk_written,
+        #{id := ChId, timestamp := Ts, num := NumRecords, size := ChunkSize, pos := Pos}, Chunk},
     #log_writer{
         stream = Stream,
         fragment =
             #fragment{
                 segment_offset = SegmentOffset,
-                segment_pos = SegmentPos0,
+                segment_pos = SegmentPos,
                 num_chunks = {StartNumChunks, NumChunks0},
-                seq_no = SeqNo0,
+                seq_no = SeqNo,
                 size = Size0,
                 checksum = Checksum0
             } = Fragment0
@@ -156,6 +157,7 @@ handle_event(
     Fragment1 =
         case Fragment0 of
             #fragment{first_offset = undefined} ->
+                ?assertEqual(Pos, SegmentPos),
                 Fragment0#fragment{
                     first_offset = ChId,
                     first_timestamp = Ts
@@ -165,12 +167,13 @@ handle_event(
         end,
     Size = Size0 + ChunkSize,
     NumChunks = NumChunks0 + 1,
+    Checksum = checksum(Checksum0, Chunk),
     Fragment2 = Fragment1#fragment{
         last_offset = ChId,
         next_offset = ChId + NumRecords,
         num_chunks = {StartNumChunks, NumChunks},
         size = Size,
-        checksum = checksum(Checksum0, Chunk)
+        checksum = Checksum
     },
     Fragment =
         %% NOTE: in very high throughput scenarios, the writer can can batch
@@ -187,9 +190,9 @@ handle_event(
                 ),
                 #fragment{
                     segment_offset = SegmentOffset,
-                    segment_pos = SegmentPos0 + Size,
+                    segment_pos = SegmentPos + Size,
                     num_chunks = {StartNumChunks + NumChunks, 0},
-                    seq_no = SeqNo0 + 1
+                    seq_no = SeqNo + 1
                 };
             false ->
                 Fragment2
@@ -293,10 +296,12 @@ init_manifest(
 recover_fragments(IdxFile) ->
     ?LOG_DEBUG("Recovering fragments from index file ~ts", [IdxFile]),
     SegmentOffset = index_file_offset(IdxFile),
+    SegmentFile = iolist_to_binary(string:replace(IdxFile, <<".index">>, <<".segment">>, trailing)),
     %% TODO: we should be reading in smaller chunks with pread.
     {ok, <<_:?IDX_HEADER_B/binary, IdxArray/binary>>} = file:read_file(IdxFile),
     recover_fragments(
         ?MAX_FRAGMENT_SIZE_B,
+        SegmentFile,
         SegmentOffset,
         0,
         0,
@@ -306,6 +311,7 @@ recover_fragments(IdxFile) ->
 
 recover_fragments(
     Threshold0,
+    SegmentFile,
     SegmentOffset,
     SeqNo0,
     NumChunks0,
@@ -328,19 +334,26 @@ recover_fragments(
     ?LOG_DEBUG("Fragment boundary ~b (start size ~b)", [FragmentBoundary, StartFilePos]),
     case rabbitmq_stream_s3_binary_array:try_at(FragmentBoundary, ?INDEX_RECORD_SIZE_B, IdxArray) of
         undefined ->
-            <<LastChId:64/unsigned, _LastTs:64/signed, _:64, _:32/unsigned, _:8>> =
+            <<LastChId:64/unsigned, _LastTs:64/signed, _:64, LastFilePos:32/unsigned, _:8>> =
                 rabbitmq_stream_s3_binary_array:last(?INDEX_RECORD_SIZE_B, IdxArray),
             Len = rabbitmq_stream_s3_binary_array:len(?INDEX_RECORD_SIZE_B, IdxArray),
+
+            %% Read the segment file to fill in the info we can't get from the
+            %% index: the last chunk's size and the next offset.
+            {ok, Fd} = file:open(SegmentFile, [read, raw, binary]),
+            {ok, HeaderData} = file:pread(Fd, LastFilePos, ?CHUNK_HEADER_B),
+            {ok, #{chunk_id := LastChId, num_records := NumRecords, next_position := NextFilePos}} =
+                osiris_log:parse_header(HeaderData, LastFilePos),
             Fragment = #fragment{
                 segment_offset = SegmentOffset,
                 segment_pos = StartFilePos,
                 num_chunks = {NumChunks0, Len},
                 first_offset = FirstChId,
                 first_timestamp = FirstTs,
-                %% next_offset and size are filled in with the info from active_segment.
-                next_offset = undefined,
+                next_offset = LastChId + NumRecords,
                 last_offset = LastChId,
                 seq_no = SeqNo0,
+                size = NextFilePos - StartFilePos,
                 checksum = undefined
             },
             {Fragment, lists:reverse(Fragments0)};
@@ -368,7 +381,15 @@ recover_fragments(
             Rest = rabbitmq_stream_s3_binary_array:slice(
                 FragmentBoundary, ?INDEX_RECORD_SIZE_B, IdxArray
             ),
-            recover_fragments(Threshold, SegmentOffset, SeqNo, NumChunks, Fragments, Rest)
+            recover_fragments(
+                Threshold,
+                SegmentFile,
+                SegmentOffset,
+                SeqNo,
+                NumChunks,
+                Fragments,
+                Rest
+            )
     end.
 
 overview(Dir) ->
@@ -680,9 +701,6 @@ execute_task(#upload_fragment{
                         _ ->
                             erlang:crc32(Checksum0, [?IDX_HEADER, IdxData, Trailer])
                     end,
-                %% TODO: remove this before this plugin sees production use.
-                %% Maybe a good time is when we switch to chunked transfer.
-                ?assertEqual(erlang:crc32(Data), Checksum),
                 %% TODO: should be able to upload this in chunks. Gun should
                 %% support that.
                 ok = rabbitmq_stream_s3_api:put(
