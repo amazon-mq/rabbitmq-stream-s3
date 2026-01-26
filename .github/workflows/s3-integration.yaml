@@ -1,0 +1,59 @@
+name: S3 Integration
+
+# This workflow tests `test/rabbitmq_stream_s3_api_aws_SUITE.erl` specifically.
+# See the moduledoc in that file for more information about running manually.
+
+# In addition to the steps there, these steps set up the secrets for use in
+# environment variables in this repository:
+#
+# 1. Go to `https://github.com/amazon-mq/rabbitmq-stream-s3/settings/secrets/actions` > New repository secret
+# 2. Create a secret `AWS_ACCESS_KEY_ID` with the Access key as the Secret.
+# 3. Create a secret `AWS_SECRET_ACCESS_KEY` with the Secret access key as the Secret.
+# 3. Create a secret `AWS_S3_BUCKET` with the bucket name.
+# 3. Create a secret `AWS_REGION` with the region of where the bucket exists.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'src/rabbitmq_stream_s3_api_aws.erl'
+      - 'test/rabbitmq_stream_s3_api_aws_SUITE.erl'
+
+jobs:
+  s3-integration:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rmq-version: ['streams-tiered-storage']
+        include:
+          - rmq-version: 'streams-tiered-storage'
+            otp-version: 27
+            elixir-version: 1.18
+    steps:
+      - id: restore-rabbitmq-server-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/rabbitmq-server
+          key: rmq-${{ matrix.rmq-version }}-otp-${{ matrix.otp-version }}-elixir-${{ matrix.elixir-version }}
+      - id: maybe-fail-rabbitmq-server-miss
+        if: steps.restore-rabbitmq-server-cache.outputs.cache-hit != 'true'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            core.setFailed('could not restore cached rabbitmq-server build');
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.otp-version }}
+          elixir-version: ${{ matrix.elixir-version }}
+      - uses: actions/checkout@v5
+        with:
+          path: rabbitmq-server/deps/rabbitmq_stream_s3
+      - name: make
+        run: make -C ${{ github.workspace }}/rabbitmq-server/deps/rabbitmq_stream_s3
+      - name: Integration tests
+        run: make -C ${{ github.workspace }}/rabbitmq-server/deps/rabbitmq_stream_s3 ct-rabbitmq_stream_s3_api_aws
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
