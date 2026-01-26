@@ -164,47 +164,18 @@ apply(
     #?MODULE{streams = Streams0} = State0
 ) ->
     case Streams0 of
-        #{
-            StreamId := #{
-                pid := Pid,
-                dir := Dir,
-                available_fragments := Available,
-                manifest := Manifest
-            } = Writer0
-        } ->
+        #{StreamId := #{pid := Pid, manifest := Manifest} = Writer0} ->
             Effects0 = [#register_offset_listener{writer_pid = Pid, offset = Offset + 1}],
+            Writer1 = Writer0#{commit_offset := Offset},
             case Manifest of
                 {pending, _Requesters} ->
                     %% Wait until the manifest is resolved to upload fragments
                     %% so that we avoid uploading something which already
                     %% exists in the remote tier.
-                    Writer = Writer0#{commit_offset := Offset},
-                    {State0#?MODULE{streams = Streams0#{StreamId := Writer}}, Effects0};
+                    {State0#?MODULE{streams = Streams0#{StreamId := Writer1}}, Effects0};
                 _ ->
-                    {Uncommitted, Committed} = lists:splitwith(
-                        fun(#fragment{last_offset = LastOffset}) -> LastOffset > Offset end,
-                        Available
-                    ),
-                    Effects = lists:foldl(
-                        fun(Fragment, Acc) ->
-                            [
-                                #upload_fragment{
-                                    stream = StreamId,
-                                    dir = Dir,
-                                    fragment = Fragment
-                                }
-                                | Acc
-                            ]
-                        end,
-                        Effects0,
-                        Committed
-                    ),
-                    Writer = Writer0#{
-                        commit_offset := Offset,
-                        available_fragments := Uncommitted
-                    },
-                    Streams = Streams0#{StreamId := Writer},
-                    State = State0#?MODULE{streams = Streams},
+                    {Writer, Effects} = upload_available_fragments(StreamId, Writer1, Effects0),
+                    State = State0#?MODULE{streams = Streams0#{StreamId := Writer}},
                     {State, Effects}
             end;
         _ ->
@@ -362,8 +333,7 @@ apply(
         manifest =
             #manifest{
                 first_offset = FirstOffset,
-                next_offset = NextOffset,
-                entries = Entries
+                next_offset = NextOffset
             } = Manifest
     } = Event,
     #?MODULE{streams = Streams0} = State0
@@ -371,7 +341,7 @@ apply(
     case Streams0 of
         #{StreamId := #{manifest := {pending, Requesters}} = Stream0} ->
             Stream1 = Stream0#{manifest := Manifest},
-            SetLTO = #set_range{stream = StreamId, first = FirstOffset, next = NextOffset},
+            SetRange = #set_range{stream = StreamId, first = FirstOffset, next = NextOffset},
             %% NOTE: `Requesters` is in reverse order.
             Effects0 = lists:foldl(
                 fun
@@ -380,46 +350,25 @@ apply(
                     (Pid, Acc) when is_pid(Pid) ->
                         [#send{to = Pid, message = Event} | Acc]
                 end,
-                [SetLTO],
+                [SetRange],
                 Requesters
             ),
-            case Stream0 of
-                #{dir := Dir, commit_offset := CommitOffset, available_fragments := Available0} ->
-                    LastOffsetInManifest =
-                        case rabbitmq_stream_s3_binary_array:last(?ENTRY_B, Entries) of
-                            ?ENTRY(O, _, _, _, _, _) ->
-                                O;
-                            undefined ->
-                                -1
-                        end,
+            case Stream1 of
+                #{kind := writer, available_fragments := Available0} ->
+                    %% Drop all available fragments which are older than what
+                    %% has already been uploaded to the remote tier.
                     Available = lists:filter(
                         fun(#fragment{first_offset = Offset}) ->
-                            Offset > LastOffsetInManifest
+                            Offset >= NextOffset
                         end,
                         Available0
                     ),
-                    {Uncommitted, Committed} = lists:splitwith(
-                        fun(#fragment{last_offset = Offset}) ->
-                            Offset > CommitOffset
-                        end,
-                        Available
-                    ),
-                    Effects = lists:foldl(
-                        fun(Fragment, Acc) ->
-                            [
-                                #upload_fragment{stream = StreamId, dir = Dir, fragment = Fragment}
-                                | Acc
-                            ]
-                        end,
-                        Effects0,
-                        Committed
-                    ),
-                    Writer = Stream1#{
-                        manifest := Manifest,
-                        available_fragments := Uncommitted,
-                        last_uploaded := Ts
+                    Stream2 = Stream1#{
+                        last_uploaded := Ts,
+                        available_fragments := Available
                     },
-                    State = State0#?MODULE{streams = Streams0#{StreamId := Writer}},
+                    {Stream, Effects} = upload_available_fragments(StreamId, Stream2, Effects0),
+                    State = State0#?MODULE{streams = Streams0#{StreamId := Stream}},
                     {State, Effects};
                 _ ->
                     State = State0#?MODULE{streams = Streams0#{StreamId := Stream1}},
@@ -628,6 +577,42 @@ add_available_fragment(
 add_available_fragment(F, Fs, Acc) ->
     lists:reverse(Acc, [F | Fs]).
 
+-doc """
+Create effects to upload available fragments.
+
+Fragments may be uploaded when their last offset has been fully committed.
+Fragments can be uploaded in any order: handling for out-of-order uploads is
+done when handling `#fragment_uploaded{}` events rather than before upload.
+Fragments are stored in descending order in the `available_fragments` field
+to make this function quick.
+""".
+-spec upload_available_fragments(stream_id(), writer(), [effect()]) -> {writer(), [effect()]}.
+upload_available_fragments(
+    StreamId,
+    #{
+        dir := Dir,
+        commit_offset := CommitOffset,
+        available_fragments := Available0
+    } = Writer0,
+    Effects0
+) ->
+    {Available, Committed} = lists:splitwith(
+        fun(#fragment{last_offset = LastOffset}) ->
+            LastOffset > CommitOffset
+        end,
+        Available0
+    ),
+    Effects = lists:foldl(
+        fun(Fragment, Acc) ->
+            Eff = #upload_fragment{stream = StreamId, dir = Dir, fragment = Fragment},
+            [Eff | Acc]
+        end,
+        Effects0,
+        Committed
+    ),
+    Writer = Writer0#{available_fragments := Available},
+    {Writer, Effects}.
+
 -spec evaluate_writer(cfg(), metadata(), stream_id(), writer(), [effect()]) ->
     {writer(), [effect()]}.
 evaluate_writer(Cfg, Meta, StreamId, Writer0, Effects0) ->
@@ -778,6 +763,62 @@ add_available_fragment_test() ->
     Expected = lists:reverse(Fragments),
     ?assertEqual(Expected, lists:foldl(fun add_available_fragment/2, [], Fragments)),
     ?assertEqual(Expected, lists:foldr(fun add_available_fragment/2, [], Fragments)),
+    ok.
+
+upload_available_fragments_test() ->
+    StreamId = erlang:make_ref(),
+    Dir = <<"">>,
+    Fragments0 = [
+        #fragment{
+            first_offset = N * 2,
+            last_offset = N * 2 + 1,
+            next_offset = (N + 1) * 2
+        }
+     || N <- lists:seq(0, 5)
+    ],
+    %% `available_fragments` are stored in descending order, see
+    %% `add_available_fragment/2` and the test above.
+    Fragments = lists:reverse(Fragments0),
+    %% Emit upload effects for everything below the commit offset.
+    ?assertMatch(
+        {
+            #{available_fragments := []},
+            [
+                #upload_fragment{fragment = #fragment{first_offset = 0}},
+                #upload_fragment{fragment = #fragment{first_offset = 2}},
+                #upload_fragment{},
+                #upload_fragment{},
+                #upload_fragment{},
+                #upload_fragment{fragment = #fragment{first_offset = 10, next_offset = 12}}
+            ]
+        },
+        upload_available_fragments(
+            StreamId,
+            #{dir => Dir, commit_offset => 12, available_fragments => Fragments},
+            []
+        )
+    ),
+    ?assertMatch(
+        {
+            #{
+                available_fragments := [
+                    #fragment{first_offset = 10},
+                    #fragment{},
+                    #fragment{first_offset = 6}
+                ]
+            },
+            [
+                #upload_fragment{fragment = #fragment{first_offset = 0}},
+                #upload_fragment{fragment = #fragment{first_offset = 2}},
+                #upload_fragment{fragment = #fragment{first_offset = 4}}
+            ]
+        },
+        upload_available_fragments(
+            StreamId,
+            #{dir => Dir, commit_offset => 6, available_fragments => Fragments},
+            []
+        )
+    ),
     ok.
 
 apply_infos_test() ->
