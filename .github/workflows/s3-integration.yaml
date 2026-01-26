@@ -1,4 +1,6 @@
 name: S3 Integration
+permissions:
+  contents: read
 
 # This workflow tests `test/rabbitmq_stream_s3_api_aws_SUITE.erl` specifically.
 # See the moduledoc in that file for more information about running manually.
