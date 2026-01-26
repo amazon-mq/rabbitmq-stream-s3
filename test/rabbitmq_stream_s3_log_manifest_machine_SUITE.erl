@@ -23,7 +23,8 @@ all() ->
         out_of_order_fragment_uploads,
         recover_uploaded_fragments,
         manifest_replication,
-        retention
+        retention,
+        backfill_older_segments
     ].
 
 %%----------------------------------------------------------------------------
@@ -459,6 +460,81 @@ retention(Config) ->
 
     {_Replica4, REffects4} = ?MAC:apply(?META(), FragmentsApplied3, Replica3),
     ?assertMatch([#set_range{first = 80, next = 140}], REffects4),
+    ok.
+
+backfill_older_segments(Config) ->
+    %% When a writer starts up it must read through the latest/active segment
+    %% to recover fragment information. There can also be fragments in older
+    %% segments which were not successfully uploaded to the remote tier -
+    %% probably due to an outage or transient failure. In that case we must
+    %% "backfill" in the older segment data.
+    Dir = directory(Config),
+    Pid = self(),
+    StreamId = erlang:make_ref(),
+    Ts = erlang:system_time(millisecond),
+    Fragments = [
+        #fragment{
+            segment_offset = (N div 3) * 20,
+            seq_no = N rem 3,
+            first_offset = N * 20,
+            first_timestamp = Ts + N * 20,
+            last_offset = N * 20,
+            next_offset = N * 20 + 20,
+            size = 200
+        }
+     || N <- lists:seq(0, 5)
+    ],
+    Seg1Fragments = lists:sublist(Fragments, 4, 3),
+    WriterSpawned = #writer_spawned{
+        stream = StreamId,
+        pid = Pid,
+        dir = Dir,
+        available_fragments = lists:reverse(Seg1Fragments)
+    },
+    {Mac1, Effects1} = ?MAC:apply(?META(), WriterSpawned, ?MAC:new()),
+    ?assertMatch([#resolve_manifest{}, #register_offset_listener{}], Effects1),
+
+    %% All fragments will be committed as they arrive:
+    CommitOffsetIncreased = #commit_offset_increased{stream = StreamId, offset = 120},
+    {Mac2, Effects2} = ?MAC:apply(?META(), CommitOffsetIncreased, Mac1),
+    ?assertMatch([#register_offset_listener{}], Effects2),
+
+    %% Say that seq 0 and 1 of segment 0 were uploaded but upload of seq 2 failed.
+    Manifest = fragments_to_manifest(lists:sublist(Fragments, 2), #manifest{}),
+    ManifestResolved = #manifest_resolved{stream = StreamId, manifest = Manifest},
+    {Mac3, Effects3} = ?MAC:apply(?META(), ManifestResolved, Mac2),
+    ?assertMatch(
+        [
+            #upload_fragment{fragment = #fragment{first_offset = 60}},
+            #upload_fragment{fragment = #fragment{first_offset = 80}},
+            #upload_fragment{fragment = #fragment{first_offset = 100}},
+            %% The machine recognizes that 40..60 was not uploaded.
+            %% (Or maybe it was, but the machine was never notified about it.)
+            #find_fragments{from = 40, to = 60},
+            #set_range{first = 0, next = 40}
+        ],
+        Effects3
+    ),
+    %% That will spawn a task to find available fragments within the range.
+    Fragment3 = lists:nth(3, Fragments),
+    FragmentAvailable = #fragment_available{stream = StreamId, fragment = Fragment3},
+    {Mac4, Effects4} = ?MAC:apply(?META(), FragmentAvailable, Mac3),
+    ?assertMatch([#upload_fragment{fragment = #fragment{first_offset = 40}}], Effects4),
+
+    %% The fragments from segment1 would probably be fully uploaded before
+    %% Fragment3 since they were uploaded first.
+    {Mac5, Effects5} = handle_events(
+        ?META(),
+        [#fragment_uploaded{stream = StreamId, info = fragment_to_info(F)} || F <- Seg1Fragments],
+        Mac4
+    ),
+    ?assertEqual([], Effects5),
+
+    %% Once the last fragment of segment 0 is uploaded then we can apply all
+    %% of these fragments to the manifest and upload it.
+    FragmentUploaded = #fragment_uploaded{stream = StreamId, info = fragment_to_info(Fragment3)},
+    {_Mac6, Effects6} = ?MAC:apply(?META(), FragmentUploaded, Mac5),
+    ?assertMatch([#set_range{first = 0, next = 120}, #upload_manifest{}], Effects6),
     ok.
 
 %%----------------------------------------------------------------------------

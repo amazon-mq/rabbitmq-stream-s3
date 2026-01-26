@@ -40,7 +40,9 @@
     %% Corresponds to the `replica_nodes` key passed in `osiris:config()` for
     %% writers.
     replica_nodes :: [node()],
-    retention :: [osiris:retention_spec()]
+    retention :: [osiris:retention_spec()],
+    %% Fragments of the active segment which are available to upload.
+    available_fragments :: [#fragment{}]
 }).
 -record(init_acceptor, {
     pid :: pid(),
@@ -250,42 +252,32 @@ init_manifest(
         max_segment_size_bytes => ?MAX_SEGMENT_SIZE_BYTES,
         retention => [{'fun', local_retention_fun(StreamId)}]
     },
+    ?LOG_DEBUG("Recovering available fragments for stream ~ts", [Dir]),
+    %% Recover the current fragment information. To do this we scan through the
+    %% most recent index file and find the last fragment. While performing this
+    %% scan we also find the older fragments and notify the manifest server so
+    %% that it may upload them if it hasn't already done so.
+    {Fragment, Available} =
+        case sorted_index_files_rev(Dir) of
+            [] ->
+                %% Empty stream, use default fragment.
+                %% TODO: is offset zero always correct here?
+                {#fragment{segment_offset = 0, seq_no = 0}, []};
+            [LastIdxFile | _] ->
+                %% TODO: handle LastIdxFile being empty / corrupted?
+                %% `osiris_log:first_and_last_seginfos0/1` does but this part runs after
+                %% the writer has cleaned up its log.
+                recover_fragments(LastIdxFile)
+        end,
     ok = gen_server:cast(?SERVER, #init_writer{
         pid = self(),
         stream = StreamId,
         reference = Reference,
         dir = Dir,
         replica_nodes = ReplicaNodes,
-        retention = maps:get(retention, Config0, [])
+        retention = maps:get(retention, Config0, []),
+        available_fragments = Available
     }),
-    ?LOG_DEBUG("Recovering available fragments for stream ~ts", [Dir]),
-    %% Recover the current fragment information. To do this we scan through the
-    %% most recent index file and find the last fragment. While performing this
-    %% scan we also find the older fragments and notify the manifest server so
-    %% that it may upload them if it hasn't already done so.
-    Fragment =
-        case sorted_index_files_rev(Dir) of
-            [] ->
-                %% Empty stream, use default fragment.
-                %% TODO: is offset zero always correct here?
-                #fragment{segment_offset = 0, seq_no = 0};
-            [LastIdxFile | _] ->
-                %% TODO: handle LastIdxFile being empty / corrupted?
-                %% `osiris_log:first_and_last_seginfos0/1` does but this part runs after
-                %% the writer has cleaned up its log.
-                {Latest, Rest} = recover_fragments(LastIdxFile),
-                %% TODO: what if other fragments from other segments haven't been
-                %% uploaded yet? The manifest server should spawn a task to find
-                %% and upload those fragments.
-                _ = [
-                    gen_server:cast(?SERVER, #fragment_available{
-                        stream = StreamId,
-                        fragment = F
-                    })
-                 || F <- Rest
-                ],
-                Latest
-        end,
     Manifest = #log_writer{
         type = writer,
         stream = StreamId,
@@ -294,7 +286,9 @@ init_manifest(
     {Config, Manifest}.
 
 recover_fragments(IdxFile) ->
-    ?LOG_DEBUG("Recovering fragments from index file ~ts", [IdxFile]),
+    recover_fragments(IdxFile, []).
+
+recover_fragments(IdxFile, Acc) ->
     SegmentOffset = index_file_offset(IdxFile),
     SegmentFile = iolist_to_binary(string:replace(IdxFile, <<".index">>, <<".segment">>, trailing)),
     %% TODO: we should be reading in smaller chunks with pread.
@@ -305,7 +299,7 @@ recover_fragments(IdxFile) ->
         SegmentOffset,
         0,
         0,
-        [],
+        Acc,
         IdxArray
     ).
 
@@ -356,7 +350,8 @@ recover_fragments(
                 size = NextFilePos - StartFilePos,
                 checksum = undefined
             },
-            {Fragment, lists:reverse(Fragments0)};
+            %% NOTE: `Fragments0` is naturally sorted descending by first offset.
+            {Fragment, Fragments0};
         <<NextChId:64/unsigned, _NextTs:64/signed, _:64, NextFilePos:32/unsigned, _:8>> ->
             <<LastChId:64/unsigned, _LastTs:64/signed, _:64, _:32/unsigned, _:8>> =
                 rabbitmq_stream_s3_binary_array:at(
@@ -603,16 +598,18 @@ apply_effect(#set_range{stream = StreamId, first = First, next = Next}, State) -
         {StreamId, First, Next}
     ),
     State;
-apply_effect(#upload_fragment{} = Event, State) ->
-    spawn_task(Event, State);
-apply_effect(#upload_manifest{} = Event, State) ->
-    spawn_task(Event, State);
-apply_effect(#rebalance_manifest{} = Event, State) ->
-    spawn_task(Event, State);
-apply_effect(#resolve_manifest{} = Event, State) ->
-    spawn_task(Event, State);
-apply_effect(#delete_fragments{} = Event, State) ->
-    spawn_task(Event, State).
+apply_effect(#upload_fragment{} = Effect, State) ->
+    spawn_task(Effect, State);
+apply_effect(#upload_manifest{} = Effect, State) ->
+    spawn_task(Effect, State);
+apply_effect(#rebalance_manifest{} = Effect, State) ->
+    spawn_task(Effect, State);
+apply_effect(#resolve_manifest{} = Effect, State) ->
+    spawn_task(Effect, State);
+apply_effect(#find_fragments{} = Effect, State) ->
+    spawn_task(Effect, State);
+apply_effect(#delete_fragments{} = Effect, State) ->
+    spawn_task(Effect, State).
 
 spawn_task(Effect, #?MODULE{tasks = Tasks0} = State0) ->
     %% NOTE: use of `erlang:self/0` is intentional here. If we casted to the
@@ -845,6 +842,18 @@ execute_task(#delete_fragments{stream = StreamId, offsets = Offsets}) ->
     after
         ok = rabbitmq_stream_s3_api:close(Conn)
     end,
+    ok;
+execute_task(#find_fragments{stream = StreamId, dir = Dir, from = FromOffset, to = ToOffset}) ->
+    _ = [
+        gen_server:cast(?SERVER, #fragment_available{stream = StreamId, fragment = F})
+     || #fragment{first_offset = FirstOffset, next_offset = NextOffset} = F <- find_fragments_in_range(
+            Dir,
+            FromOffset,
+            ToOffset
+        ),
+        FirstOffset >= FromOffset,
+        NextOffset =< ToOffset
+    ],
     ok.
 
 resolve_manifest_tail(
@@ -991,6 +1000,33 @@ eval_local_retention([IdxFile | Rest], NextTieredOffset, ToDelete, ToKeep) ->
             {lists:reverse(Rest), [IdxFile | ToKeep]}
     end.
 
+-spec find_fragments_in_range(directory() | [filename()], osiris:offset(), osiris:offset()) ->
+    [#fragment{}].
+find_fragments_in_range(Dir, From, To) when is_binary(Dir) ->
+    [_ActiveIndex | IdxFiles] = sorted_index_files_rev(Dir),
+    lists:foldl(
+        fun(IdxFile, Acc0) ->
+            {Last, Acc1} = recover_fragments(IdxFile, Acc0),
+            [Last | Acc1]
+        end,
+        [],
+        index_files_in_range(IdxFiles, From, To, [])
+    ).
+
+index_files_in_range([], _From, _To, Acc) ->
+    Acc;
+index_files_in_range([IdxFile | Rest], From, To, Acc) ->
+    %% NOTE: the index file list is sorted descending by offset.
+    FirstOffset = index_file_offset(IdxFile),
+    if
+        FirstOffset > To ->
+            index_files_in_range(Rest, From, To, Acc);
+        FirstOffset =< From ->
+            [IdxFile | Acc];
+        true ->
+            index_files_in_range(Rest, From, To, [IdxFile | Acc])
+    end.
+
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
@@ -1000,6 +1036,21 @@ index_file_offset_test() ->
     ?assertEqual(100, index_file_offset(<<"00000000000000000100.index">>)),
     ?assertEqual(100, index_file_offset(<<"path/to/00000000000000000100.index">>)),
     ?assertEqual(100, index_file_offset(<<"/path/to/00000000000000000100.index">>)),
+    ok.
+
+index_files_in_range_test() ->
+    Files0 = [make_file_name(O, <<"index">>) || O <- [100, 200, 300, 400, 500]],
+    %% `index_files_in_range/4` expects the files sorted descending.
+    Files = lists:reverse(Files0),
+    GetRange = fun(From, To) ->
+        [index_file_offset(F) || F <- index_files_in_range(Files, From, To, [])]
+    end,
+    ?assertEqual([100], GetRange(125, 175)),
+    ?assertEqual([100, 200], GetRange(125, 275)),
+    ?assertEqual([100, 200], GetRange(100, 275)),
+    ?assertEqual([400, 500], GetRange(400, 600)),
+    ?assertEqual([500], GetRange(600, 700)),
+    ?assertEqual([], GetRange(25, 75)),
     ok.
 
 eval_local_retention_test() ->

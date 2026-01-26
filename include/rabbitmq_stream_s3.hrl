@@ -204,17 +204,18 @@
 -type stream_reference() :: term().
 
 -record(fragment, {
-    segment_offset :: osiris:offset(),
-    segment_pos = ?SEGMENT_HEADER_B :: pos_integer(),
-    %% Number of chunks in prior fragments and number in current fragment.
-    num_chunks = {0, 0} :: {non_neg_integer(), non_neg_integer()},
     first_offset :: osiris:offset() | undefined,
-    first_timestamp :: osiris:timestamp() | undefined,
     last_offset :: osiris:offset() | undefined,
     next_offset :: osiris:offset() | undefined,
+    segment_offset :: osiris:offset(),
+    segment_pos = ?SEGMENT_HEADER_B :: pos_integer(),
+    first_timestamp :: osiris:timestamp() | undefined,
+    %% Number of chunks in prior fragments and number in current fragment.
+    num_chunks = {0, 0} :: {non_neg_integer(), non_neg_integer()},
     %% Zero-based increasing integer for sequence number within the segment.
     seq_no = 0 :: non_neg_integer(),
-    %% NOTE: header size is not included.
+    %% NOTE: `#fragment.size` is the bytes of segment data, not headers or
+    %% index data.
     size = 0 :: non_neg_integer(),
     checksum = ?SEGMENT_HEADER_HASH :: checksum() | undefined
 }).
@@ -257,7 +258,10 @@
     dir :: directory(),
     pid :: pid(),
     replica_nodes = [] :: [node()],
-    retention = [] :: [osiris:retention_spec()]
+    retention = [] :: [osiris:retention_spec()],
+    %% Fragments available in the active segment. This list must be sorted
+    %% descending by first offset.
+    available_fragments = [] :: [#fragment{}]
 }).
 -record(acceptor_spawned, {stream :: stream_id()}).
 %% Sent from the writer to replicas to notify them of when new fragments are
@@ -338,9 +342,23 @@
     stream :: stream_id(),
     offsets :: [osiris:offset()]
 }).
+%% Read through the local stream data and find available fragments.
+%% This is done for the active segment when a writer spawns. This effect is
+%% used to perform the same recovery for older fragments when the manifest
+%% server recognizes a hole between the tail of the resolved manifest and the
+%% first available fragment recovered during writer spawn.
+-record(find_fragments, {
+    stream :: stream_id(),
+    dir :: directory(),
+    from :: osiris:offset(),
+    %% **Exclusive** end: if a fragment starts at this offset it does not need
+    %% to be sent to the manifest server.
+    to :: osiris:offset()
+}).
 
 -type effect() ::
     #delete_fragments{}
+    | #find_fragments{}
     | #rebalance_manifest{}
     | #register_offset_listener{}
     | #reply{}

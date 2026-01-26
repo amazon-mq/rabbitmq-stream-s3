@@ -86,8 +86,8 @@ for the log manifest server to execute.
 
 -export([new/0, new/1, get_manifest/2, apply/3]).
 
--spec writer(pid(), [node()], directory(), retention_spec()) -> writer().
-writer(Pid, ReplicaNodes, Dir, Retention) ->
+-spec writer(pid(), [node()], directory(), retention_spec(), [#fragment{}]) -> writer().
+writer(Pid, ReplicaNodes, Dir, Retention, Available) ->
     ?assertEqual(node(Pid), node()),
     #{
         kind => writer,
@@ -100,7 +100,7 @@ writer(Pid, ReplicaNodes, Dir, Retention) ->
         modifications => 0,
         last_uploaded => -1,
         commit_offset => -1,
-        available_fragments => [],
+        available_fragments => Available,
         uploaded_fragments => []
     }.
 
@@ -152,9 +152,10 @@ apply(
     case Streams0 of
         #{StreamId := #{available_fragments := Fragments0} = Writer0} ->
             Fragments = add_available_fragment(Fragment, Fragments0),
-            Writer = Writer0#{available_fragments := Fragments},
+            Writer1 = Writer0#{available_fragments := Fragments},
+            {Writer, Effects} = upload_available_fragments(StreamId, Writer1, []),
             State = State0#?MODULE{streams = Streams0#{StreamId := Writer}},
-            {State, []};
+            {State, Effects};
         _ ->
             {State0, []}
     end;
@@ -273,12 +274,13 @@ apply(
         stream = StreamId,
         dir = Dir,
         replica_nodes = ReplicaNodes,
-        retention = Retention0
+        retention = Retention0,
+        available_fragments = Available
     },
     #?MODULE{streams = Streams0} = State0
 ) ->
     Retention = #{K => V || {K, V} <- Retention0, K =:= max_age orelse K =:= max_bytes},
-    Writer0 = writer(Pid, ReplicaNodes, Dir, Retention),
+    Writer0 = writer(Pid, ReplicaNodes, Dir, Retention, Available),
     Effects0 = [#register_offset_listener{writer_pid = Pid, offset = -1}],
     case Streams0 of
         #{StreamId := #{manifest := {pending, Pending0}}} ->
@@ -354,7 +356,11 @@ apply(
                 Requesters
             ),
             case Stream1 of
-                #{kind := writer, available_fragments := Available0} ->
+                #{kind := writer, ranges := Ranges0, available_fragments := Available0} ->
+                    %% If there is a hole between the last fragments in the
+                    %% manifest and the first available fragment, backfill
+                    %% fragments from local stream data.
+                    Effects1 = maybe_find_fragments(StreamId, Stream1, Effects0),
                     %% Drop all available fragments which are older than what
                     %% has already been uploaded to the remote tier.
                     Available = lists:filter(
@@ -363,11 +369,13 @@ apply(
                         end,
                         Available0
                     ),
+                    Ranges = #{Node => {FirstOffset, NextOffset} || Node := _ <- Ranges0},
                     Stream2 = Stream1#{
                         last_uploaded := Ts,
-                        available_fragments := Available
+                        available_fragments := Available,
+                        ranges := Ranges
                     },
-                    {Stream, Effects} = upload_available_fragments(StreamId, Stream2, Effects0),
+                    {Stream, Effects} = upload_available_fragments(StreamId, Stream2, Effects1),
                     State = State0#?MODULE{streams = Streams0#{StreamId := Stream}},
                     {State, Effects};
                 _ ->
@@ -752,6 +760,33 @@ evaluate_upload(
     end;
 evaluate_upload(_Cfg, _Meta, _StreamId, Writer, Effects) ->
     {Writer, Effects}.
+
+-spec maybe_find_fragments(stream_id(), writer(), [effect()]) -> [effect()].
+maybe_find_fragments(_StreamId, #{available_fragments := []}, Effects) ->
+    Effects;
+maybe_find_fragments(
+    StreamId,
+    #{
+        available_fragments := Available,
+        dir := Dir,
+        manifest := #manifest{next_offset = NextOffset}
+    },
+    Effects0
+) ->
+    %% `available_fragments` is sorted in descending order.
+    #fragment{first_offset = FirstOffset} = lists:last(Available),
+    case FirstOffset > NextOffset of
+        true ->
+            FindFragments = #find_fragments{
+                stream = StreamId,
+                dir = Dir,
+                from = NextOffset,
+                to = FirstOffset
+            },
+            [FindFragments | Effects0];
+        false ->
+            Effects0
+    end.
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
