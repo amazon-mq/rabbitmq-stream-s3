@@ -994,6 +994,14 @@ eval_local_retention([IdxFile | Rest], NextTieredOffset, ToDelete, ToKeep) ->
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
+index_file_offset_test() ->
+    %% Relative? Absolute? No directory at all? Doesn't matter. The answer
+    %% is the same.
+    ?assertEqual(100, index_file_offset(<<"00000000000000000100.index">>)),
+    ?assertEqual(100, index_file_offset(<<"path/to/00000000000000000100.index">>)),
+    ?assertEqual(100, index_file_offset(<<"/path/to/00000000000000000100.index">>)),
+    ok.
+
 eval_local_retention_test() ->
     IdxFiles = [
         <<"/data/00000000000000000000.index">>,
