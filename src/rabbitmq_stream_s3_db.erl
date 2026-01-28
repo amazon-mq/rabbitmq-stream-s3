@@ -27,6 +27,7 @@ writer cannot make progress anymore.
 -include_lib("rabbit_common/include/resource.hrl").
 
 -define(PATH(StreamId), ?RABBITMQ_KHEPRI_ROOT_PATH([rabbitmq_stream_s3, StreamId])).
+-define(STREAM_QUEUE_DELETION_TRIGGER_ID, rabbitmq_stream_s3_db_sq_deletion).
 
 -doc """
 Version number of a manifest object.
@@ -49,10 +50,45 @@ Zero indicates that the manifest has not been created yet.
 
 -spec setup() -> ok.
 setup() ->
-    %% TODO: this hook is here so we can set up triggers and stored procedures
-    %% that will help us trigger clean up of remote tier data when a stream
-    %% queue is deleted from the metadata store.
+    %% Register a stored procedure which is triggered on deletion of each
+    %% stream created with `put/5`. Streams created with `put/5` are
+    %% automatically deleted by keep-while conditions when a stream queue
+    %% is removed from `rabbit_db_queue` and that triggers a cleanup task which
+    %% deletes all objects belonging to the stream from the remote tier.
+    StoredProcPath = ?RABBITMQ_KHEPRI_ROOT_PATH([
+        stored_procedures,
+        ?MODULE,
+        ?STREAM_QUEUE_DELETION_TRIGGER_ID
+    ]),
+    ok = khepri:put(
+        rabbit_khepri:get_store_id(),
+        StoredProcPath,
+        khepri_payload:sproc(fun handle_queue_deletion/1),
+        #{async => true}
+    ),
+    EvtFilter = khepri_evf:tree(?PATH(#if_has_data{}), #{on_actions => [delete]}),
+    ok = khepri:register_trigger(
+        rabbit_khepri:get_store_id(),
+        ?STREAM_QUEUE_DELETION_TRIGGER_ID,
+        EvtFilter,
+        StoredProcPath,
+        #{async => true}
+    ),
     ok.
+
+%% TODO: contribute this type to Khepri?
+-type sproc_props() :: #{
+    on_action := [create | update | delete],
+    path := khepri_path:native_path()
+}.
+
+-spec handle_queue_deletion(sproc_props()) -> ok.
+handle_queue_deletion(#{path := ?PATH(StreamId)}) ->
+    %% NOTE: A Khepri trigger executes its stored procedures on the current
+    %% Khepri leader node. This may not be the same node as the stream's writer
+    %% process. And in larger clusters (5, 7, 9 nodes, etc..) this might not
+    %% be a node of a replica either.
+    ok = rabbitmq_stream_s3_log_manifest:delete_stream(StreamId).
 
 -doc "Gets the latest-known manifest root UID and revision.".
 -spec get(stream_id()) -> {ok, entry()} | {error, not_found | any()}.
@@ -114,10 +150,7 @@ modifications which would inconvenience the successor writer.
     | {error, any()}.
 put(
     StreamId,
-    %% TODO: use this info in the commented out `Options` below to trigger
-    %% remote tier cleanup when a stream queue is deleted from the metadata
-    %% store:
-    #resource{virtual_host = _VHost, kind = queue, name = _QName},
+    #resource{virtual_host = VHost, kind = queue, name = QName},
     Epoch,
     ExpectedRevision,
     Uid
@@ -143,13 +176,13 @@ put(
                 ]
         end,
     VersionedPath = khepri_path:combine_with_conditions(Path, Conditions),
-    %% Options = #{
-    %%     %% Automatically clean up this entry if the stream queue is deleted.
-    %%     %% This triggers the stored procedure which attempts to delete the
-    %%     %% remote tier data.
-    %%     keep_while => #{?RABBITMQ_KHEPRI_QUEUE_PATH(VHost, QName) => #if_node_exists{}}
-    %% },
-    case rabbit_khepri:adv_put(VersionedPath, {Uid, Epoch}) of
+    Options = #{
+        %% Automatically clean up this entry if the stream queue is deleted.
+        %% This triggers the stored procedure which attempts to delete the
+        %% remote tier data.
+        keep_while => #{?RABBITMQ_KHEPRI_QUEUE_PATH(VHost, QName) => #if_node_exists{}}
+    },
+    case rabbit_khepri:adv_put(VersionedPath, {Uid, Epoch}, Options) of
         {ok, #{Path := #{payload_version := NewRevision, data := {OldUid, OldEpoch}}}} ->
             {ok, {OldUid, OldEpoch}, NewRevision};
         {ok, #{Path := #{payload_version := NewRevision}}} ->

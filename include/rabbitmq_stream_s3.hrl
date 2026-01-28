@@ -382,9 +382,11 @@
     %% to be sent to the manifest server.
     to :: osiris:offset()
 }).
+-record(delete_stream, {stream :: stream_id()}).
 
 -type effect() ::
     #delete_fragments{}
+    | #delete_stream{}
     | #find_fragments{}
     | #rebalance_manifest{}
     | #register_offset_listener{}

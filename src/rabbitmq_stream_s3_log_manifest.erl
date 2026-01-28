@@ -78,7 +78,12 @@
 %% Need to be exported for `erlang:apply/3`.
 -export([start/0, format_osiris_event/1, execute_task/2]).
 
--export([get_manifest/1, get_fragment_trailer/1, get_fragment_trailer/2]).
+-export([
+    get_manifest/1,
+    delete_stream/1,
+    get_fragment_trailer/1,
+    get_fragment_trailer/2
+]).
 
 %% Useful to search module.
 -export([fragment_key/2, group_key/4, make_file_name/2, fragment_trailer_to_info/1]).
@@ -107,6 +112,10 @@ start() ->
 -spec get_manifest(stream_id()) -> #manifest{} | undefined.
 get_manifest(StreamId) ->
     gen_server:call(?SERVER, #get_manifest{stream = StreamId}, infinity).
+
+-spec delete_stream(stream_id()) -> ok.
+delete_stream(StreamId) ->
+    gen_server:cast(?SERVER, #delete_stream{stream = StreamId}).
 
 %%----------------------------------------------------------------------------
 
@@ -490,6 +499,8 @@ handle_cast(#fragment_available{} = Event, State) ->
     {noreply, evolve_event(Event, State)};
 handle_cast(#retention_updated{} = Event, State) ->
     {noreply, evolve_event(Event, State)};
+handle_cast(#delete_stream{} = Effect, State) ->
+    {noreply, apply_effect(Effect, State)};
 handle_cast(Message, State) ->
     ?LOG_DEBUG(?MODULE_STRING " received unexpected cast: ~W", [Message, 10]),
     {noreply, State}.
@@ -625,6 +636,8 @@ apply_effect(#resolve_manifest{} = Effect, State) ->
 apply_effect(#find_fragments{} = Effect, State) ->
     spawn_task(Effect, State);
 apply_effect(#delete_fragments{} = Effect, State) ->
+    spawn_task(Effect, State);
+apply_effect(#delete_stream{} = Effect, State) ->
     spawn_task(Effect, State).
 
 spawn_task(Effect, #?MODULE{tasks = Tasks0} = State0) ->
@@ -948,6 +961,15 @@ execute_task(#find_fragments{stream = StreamId, dir = Dir, from = FromOffset, to
         FirstOffset >= FromOffset,
         NextOffset =< ToOffset
     ],
+    ok;
+execute_task(#delete_stream{stream = StreamId}) ->
+    ?LOG_DEBUG("Deleting stream '~ts'", [StreamId]),
+    %% NOTE: See `rabbitmq_stream_s3_db:handle_queue_deletion/1`. The node
+    %% where this task runs might not be a member of this stream. So we can't
+    %% rely on information in the manifest to perform the deletion.
+    %%
+    %% LIST all keys with the prefix of this stream ID and delete 1000 objects
+    %% at a time.
     ok.
 
 resolve_manifest_tail(
