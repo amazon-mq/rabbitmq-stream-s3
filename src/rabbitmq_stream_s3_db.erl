@@ -108,7 +108,8 @@ modifications which would inconvenience the successor writer.
     rabbitmq_stream_s3:uid()
 ) ->
     {ok, Old :: {rabbitmq_stream_s3:uid(), osiris:epoch()} | undefined, New :: revision()}
-    | {error, {conflict, Expected :: revision(), Actual :: revision()}}
+    | {error, {conflict, entry()}}
+    | {error, not_found}
     | {error, any()}.
 put(
     StreamId,
@@ -153,9 +154,20 @@ put(
         {ok, #{Path := #{payload_version := NewRevision}}} ->
             {ok, undefined, NewRevision};
         {error,
-            ?khepri_error(mismatching_node, #{node_props := #{payload_version := ActualRevision}})} ->
-            %% This branch covers a mismatch of any condition.
-            {error, {conflict, ExpectedRevision, ActualRevision}};
+            ?khepri_error(mismatching_node, #{
+                node_props := #{
+                    payload_version := ActualRevision,
+                    data := {ActualUid, ActualEpoch}
+                }
+            })} ->
+            %% This branch covers a failed expectation if the node actually
+            %% exists, so `data` must be defined here.
+            Entry = #{revision => ActualRevision, uid => ActualUid, epoch => ActualEpoch},
+            {error, {conflict, Entry}};
+        {error, ?khepri_error(node_not_found, _Props)} ->
+            %% The metadata store entry might've been deleted since the last
+            %% update.
+            {error, not_found};
         {error, _} = Err ->
             Err
     end.

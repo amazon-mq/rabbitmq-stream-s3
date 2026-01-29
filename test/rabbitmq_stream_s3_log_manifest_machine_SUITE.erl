@@ -25,7 +25,8 @@ all() ->
         manifest_replication,
         retention,
         backfill_older_segments,
-        manifest_upload_conflict
+        manifest_upload_conflict,
+        stream_deletion_during_fragment_upload
     ].
 
 %%----------------------------------------------------------------------------
@@ -330,7 +331,7 @@ manifest_replication(Config) ->
         ],
         Effects6
     ),
-    ManifestUploaded1 = #manifest_uploaded{stream = StreamId, revision = 1},
+    ManifestUploaded1 = #manifest_uploaded{stream = StreamId, entry = #{revision => 1}},
     {_Writer6, Effects7} = ?MAC:apply(?META(), ManifestUploaded1, Writer5),
     ?assertEqual([], Effects7),
     {_Replica2, Effects8} = ?MAC:apply(?META(), FragmentsApplied, Replica1),
@@ -396,7 +397,7 @@ retention(Config) ->
         ],
         Effects3
     ),
-    ManifestUploaded1 = #manifest_uploaded{stream = StreamId, revision = 1},
+    ManifestUploaded1 = #manifest_uploaded{stream = StreamId, entry = #{revision => 1}},
     {Writer4, Effects4} = ?MAC:apply(?META(), ManifestUploaded1, Writer3),
     ?assertMatch([], Effects4),
 
@@ -420,7 +421,7 @@ retention(Config) ->
         ],
         Effects5
     ),
-    ManifestUploaded2 = #manifest_uploaded{stream = StreamId, revision = 2},
+    ManifestUploaded2 = #manifest_uploaded{stream = StreamId, entry = #{revision => 2}},
     {Writer6, Effects6} = ?MAC:apply(?META(), ManifestUploaded2, Writer5),
     ?assertMatch([], Effects6),
 
@@ -468,7 +469,7 @@ retention(Config) ->
         ],
         Effects8
     ),
-    ManifestUploaded3 = #manifest_uploaded{stream = StreamId, revision = 3},
+    ManifestUploaded3 = #manifest_uploaded{stream = StreamId, entry = #{revision => 3}},
     {_Writer9, Effects9} = ?MAC:apply(?META(), ManifestUploaded3, Writer8),
     ?assertMatch([], Effects9),
 
@@ -622,7 +623,7 @@ manifest_upload_conflict(Config) ->
         NewEffects4
     ),
     %% Say that the new writer successfully uploads a new manifest revision.
-    Manifest2Uploaded = #manifest_uploaded{stream = StreamId, revision = 1},
+    Manifest2Uploaded = #manifest_uploaded{stream = StreamId, entry = #{revision => 1, epoch => 2}},
     {_NewWriter5, NewEffects5} = ?MAC:apply(?META(), Manifest2Uploaded, NewWriter4),
     ?assertMatch([], NewEffects5),
 
@@ -641,12 +642,47 @@ manifest_upload_conflict(Config) ->
         ],
         OldEffects4
     ),
-    ManifestUploadRejected = #manifest_upload_rejected{stream = StreamId, expected = 0, actual = 1},
+    ManifestUploadRejected = #manifest_upload_rejected{
+        stream = StreamId,
+        conflict = #{revision => 1, epoch => 2}
+    },
     {_OldWriter5, OldEffects5} = ?MAC:apply(?META(), ManifestUploadRejected, OldWriter4),
-    %% Currently, we just re-resolve the manifest.
-    %% TODO: include the epoch and have the deposed writer fully step down
-    %% somehow?
-    ?assertMatch([#resolve_manifest{}], OldEffects5),
+    %% Stand down the old writer gracefully.
+    ?assertMatch([], OldEffects5),
+    ok.
+
+stream_deletion_during_fragment_upload(Config) ->
+    %% Basically, show a fragment_uploaded event coming in after a
+    %% stream_deleted.
+    Dir = directory(Config),
+    Pid = self(),
+    StreamId = erlang:make_ref(),
+    Fragment = fragment(0, 19),
+    Event1 = #writer_spawned{
+        stream = StreamId,
+        pid = Pid,
+        dir = Dir,
+        available_fragments = [Fragment]
+    },
+    Event2 = #manifest_resolved{stream = StreamId, manifest = #manifest{}},
+    {Mac1, Effects1} = handle_events(?META(), [Event1, Event2], ?MAC:new()),
+    ?assertMatch([#resolve_manifest{}, #register_offset_listener{}, #set_range{}], Effects1),
+    {Mac2, Effects2} = ?MAC:apply(
+        ?META(),
+        #commit_offset_increased{stream = StreamId, offset = 20},
+        Mac1
+    ),
+    ?assertMatch([#upload_fragment{fragment = Fragment}, #register_offset_listener{}], Effects2),
+
+    %% Say the stream is deleted in the background.
+    {Mac3, Effects3} = ?MAC:apply(?META(), #stream_deleted{stream = StreamId}, Mac2),
+    ?assertMatch([], Effects3),
+
+    FragmentUploaded = #fragment_uploaded{stream = StreamId, info = fragment_to_info(Fragment)},
+    {_Mac4, Effects4} = ?MAC:apply(?META(), FragmentUploaded, Mac3),
+    %% The fragment should be reclaimed later by a background/garbage-collection
+    %% process. There's nothing to do now.
+    ?assertMatch([], Effects4),
     ok.
 
 %%----------------------------------------------------------------------------

@@ -265,7 +265,7 @@ apply(
     end;
 apply(
     #{time := Ts} = Meta,
-    #manifest_uploaded{stream = StreamId, revision = Revision},
+    #manifest_uploaded{stream = StreamId, entry = Entry},
     #?MODULE{streams = Streams0} = State0
 ) ->
     case Streams0 of
@@ -273,31 +273,28 @@ apply(
             StreamId := #{
                 kind := writer,
                 pending_change := Pending,
-                manifest := #manifest{revision = ExpectedRevision} = Manifest0
+                manifest := #manifest{revision = ExpectedRevision}
             } = Writer0
         } when
             Pending /= none
         ->
-            case Revision of
-                ExpectedRevision ->
-                    Manifest = Manifest0#manifest{revision = Revision},
+            case Entry of
+                #{revision := ExpectedRevision} ->
                     Writer = Writer0#{
                         modifications := 0,
                         last_uploaded := Ts,
-                        pending_change := none,
-                        manifest := Manifest
+                        pending_change := none
                     },
                     State = State0#?MODULE{streams = Streams0#{StreamId := Writer}},
                     {State, []};
-                _ ->
+                #{revision := ActualRevision} ->
                     ?LOG_INFO(
                         "received #manifest_uploaded{} for unexpected revision (expected ~b, actual ~b)",
-                        [ExpectedRevision, Revision]
+                        [ExpectedRevision, ActualRevision]
                     ),
                     Event = #manifest_upload_rejected{
                         stream = StreamId,
-                        expected = ExpectedRevision,
-                        actual = Revision
+                        conflict = Entry
                     },
                     apply(Meta, Event, State0)
             end;
@@ -306,21 +303,27 @@ apply(
     end;
 apply(
     _Meta,
-    #manifest_upload_rejected{stream = StreamId},
+    #manifest_upload_rejected{stream = StreamId, conflict = #{epoch := NewEpoch}},
     #?MODULE{streams = Streams0} = State0
 ) ->
     case Streams0 of
-        #{StreamId := #{kind := writer} = Writer0} ->
-            Writer = Writer0#{
-                pending_change := none,
-                manifest := {pending, []}
-            },
-            State = State0#?MODULE{streams = Streams0#{StreamId := Writer}},
-            %% THOUGHT: add an optional payload version hint to this effect?
-            %% We could avoid returning stale manifests when the local member
-            %% is behind on Khepri replication if we prefer a consistent
-            %% query when the hint is set.
-            {State, [#resolve_manifest{stream = StreamId}]};
+        #{StreamId := #{kind := writer, epoch := Epoch} = Writer0} ->
+            case Epoch >= NewEpoch of
+                true ->
+                    %% If this is the latest-elected writer then there is a
+                    %% deposed writer making changes. Re-resolve the manifest
+                    %% and continue working as a writer.
+                    Writer = Writer0#{
+                        pending_change := none,
+                        manifest := {pending, []}
+                    },
+                    State = State0#?MODULE{streams = Streams0#{StreamId := Writer}},
+                    {State, [#resolve_manifest{stream = StreamId}]};
+                false ->
+                    %% This writer has been deposed. Stand down gracefully.
+                    State = State0#?MODULE{streams = maps:remove(StreamId, Streams0)},
+                    {State, []}
+            end;
         _ ->
             {State0, []}
     end;
@@ -482,6 +485,9 @@ apply(
         _ ->
             {State0, []}
     end;
+apply(_Meta, #stream_deleted{stream = StreamId}, #?MODULE{streams = Streams0} = State0) ->
+    State = State0#?MODULE{streams = maps:remove(StreamId, Streams0)},
+    {State, []};
 apply(_Meta, Event, State) ->
     ?LOG_WARNING(?MODULE_STRING " dropped unknown event ~W", [Event, 15]),
     {State, []}.

@@ -841,17 +841,37 @@ execute_task(#upload_manifest{
                                 ok
                         end
                 end,
-                #manifest_uploaded{stream = StreamId, revision = NewRevision};
-            {error, {conflict, ExpectedRevision, ActualRevision}} ->
+                Entry = #{uid => Uid, epoch => Epoch, revision => NewRevision},
+                #manifest_uploaded{stream = StreamId, entry = Entry};
+            {error,
+                {conflict,
+                    #{uid := ActualUid, epoch := ActualEpoch, revision := ActualRevision} =
+                        Entry}} ->
                 ?LOG_INFO(
-                    "An uploaded manifest was rejected by the metadata store's optimistic lock (expected ~b, actual ~b) '~ts'",
-                    [ExpectedRevision, ActualRevision, Key]
+                    "An uploaded manifest was rejected by the metadata store's optimistic lock. Expected revision ~b actual ~b, uid '~ts' actual '~ts', epoch ~b actual ~b)",
+                    [
+                        ExpectedRevision,
+                        ActualRevision,
+                        rabbitmq_stream_s3:format_uid(Uid),
+                        rabbitmq_stream_s3:format_uid(ActualUid),
+                        Epoch,
+                        ActualEpoch
+                    ]
                 ),
                 #manifest_upload_rejected{
                     stream = StreamId,
-                    expected = ExpectedRevision,
-                    actual = ActualRevision
+                    conflict = Entry
                 };
+            {error, not_found} ->
+                ?LOG_INFO(
+                    "An uploaded manifest was rejected by the metadata store's optimistic lock. Expected revision ~b, uid '~ts', epoch ~b but found no entry",
+                    [
+                        ExpectedRevision,
+                        rabbitmq_stream_s3:format_uid(Uid),
+                        Epoch
+                    ]
+                ),
+                #stream_deleted{stream = StreamId};
             {error, _} = Err ->
                 exit(Err)
         end
