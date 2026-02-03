@@ -50,6 +50,7 @@
 -export([
     init_offset_reader/2,
     next_offset/1,
+    committed_chunk_id/1,
     committed_offset/1,
     close/1,
     send_file/3,
@@ -127,8 +128,13 @@ next_offset(#?MODULE{mode = #remote{next_offset = NextOffset}}) ->
 next_offset(#?MODULE{mode = Local}) ->
     osiris_log:next_offset(Local).
 
-committed_offset(#?MODULE{mode = #remote{shared = Shared}}) ->
+committed_chunk_id(#?MODULE{mode = #remote{shared = Shared}}) ->
     osiris_log_shared:committed_chunk_id(Shared);
+committed_chunk_id(#?MODULE{mode = Local}) ->
+    osiris_log:committed_chunk_id(Local).
+
+committed_offset(#?MODULE{mode = #remote{shared = Shared}}) ->
+    osiris_log_shared:committed_offset(Shared);
 committed_offset(#?MODULE{mode = Local}) ->
     osiris_log:committed_offset(Local).
 
