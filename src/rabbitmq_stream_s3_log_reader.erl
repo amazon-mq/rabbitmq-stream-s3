@@ -74,6 +74,8 @@
 %%% osiris_log_reader callbacks
 %%%===================================================================
 
+init_offset_reader(Tail, Config) when Tail =:= last orelse Tail =:= next ->
+    init_local_reader(Tail, Config);
 init_offset_reader(first, #{name := StreamId, shared := Shared} = Config) ->
     LocalFirstOffset = osiris_log_shared:first_chunk_id(Shared),
     case rabbitmq_stream_s3_log_manifest:get_manifest(StreamId) of
@@ -86,23 +88,27 @@ init_offset_reader(first, #{name := StreamId, shared := Shared} = Config) ->
         _ ->
             init_local_reader(first, Config)
     end;
-init_offset_reader(Offset, #{name := StreamId} = Config) when
+init_offset_reader(Offset, #{name := StreamId, shared := Shared} = Config) when
     is_integer(Offset)
 ->
-    ?LOG_DEBUG(?MODULE_STRING ":~ts/2 finding offset ~b", [?FUNCTION_NAME, Offset]),
-    case init_local_reader({abs, Offset}, Config) of
-        {ok, _} = Ok ->
-            Ok;
-        {error, {offset_out_of_range, {_First, LastLocalOffset}}} when Offset > LastLocalOffset ->
-            ?LOG_DEBUG("requested offset ~b is higher than last local offset ~b", [
-                Offset, LastLocalOffset
-            ]),
-            %% TODO: try the remote tier? Or just attach to next?
-            init_local_reader(next, Config);
-        {error, {offset_out_of_range, Range}} ->
-            ?LOG_DEBUG("offset ~b is not local (local range ~w), trying the remote tier", [
-                Offset, Range
-            ]),
+    ?LOG_DEBUG(?MODULE_STRING ":~ts/2 finding offset ~b for stream '~ts'", [
+        ?FUNCTION_NAME, Offset, StreamId
+    ]),
+    FirstChunkId = osiris_log_shared:first_chunk_id(Shared),
+    case Offset >= FirstChunkId of
+        true ->
+            ?LOG_DEBUG(
+                "Offset ~b is in the local tier of stream '~ts' (start ~b), using a local reader", [
+                    Offset, StreamId, FirstChunkId
+                ]
+            ),
+            init_local_reader(Offset, Config);
+        false ->
+            ?LOG_DEBUG(
+                "Offset ~b of stream '~ts' is not local (start ~b), trying the remote tier", [
+                    Offset, StreamId, FirstChunkId
+                ]
+            ),
             case rabbitmq_stream_s3_log_manifest:get_manifest(StreamId) of
                 undefined ->
                     init_local_reader(next, Config);
@@ -110,18 +116,65 @@ init_offset_reader(Offset, #{name := StreamId} = Config) when
                     %% Emulate osiris_log's behavior: attach at the beginning
                     %% of the stream.
                     init_remote_reader(FirstOffset, ?SEGMENT_HEADER_B, FirstOffset, Config);
-                #manifest{} = Manifest ->
-                    {ok, ChunkId, Position, Fragment} = find_fragment_for_offset(
-                        Offset, Manifest, StreamId
+                #manifest{entries = Entries} ->
+                    {ok, ChunkId, Position, Fragment} = find_position(
+                        {offset, Offset},
+                        Entries,
+                        StreamId
                     ),
                     init_remote_reader(Fragment, Position, ChunkId, Config)
+            end
+    end;
+init_offset_reader({timestamp, Ts} = Spec, #{name := StreamId} = Config) ->
+    ?LOG_DEBUG(?MODULE_STRING ":~ts/2 finding timestamp ~b for stream '~ts'", [
+        ?FUNCTION_NAME, Ts, StreamId
+    ]),
+    %% We can't cheaply query the first timestamp from `osiris_log_shared`.
+    %% Instead try the remote tier first.
+    case rabbitmq_stream_s3_log_manifest:get_manifest(StreamId) of
+        #manifest{first_offset = FirstOffset, first_timestamp = FirstTs} when Ts < FirstTs ->
+            init_remote_reader(FirstOffset, ?SEGMENT_HEADER_B, FirstOffset, Config);
+        #manifest{entries = Entries} ->
+            case rabbitmq_stream_s3_binary_array:last(?ENTRY_B, Entries) of
+                ?ENTRY(_O, ETs, _, _, _, _, _) when ETs > Ts ->
+                    {ok, ChunkId, Position, Fragment} = find_position(
+                        {timestamp, Ts},
+                        Entries,
+                        StreamId
+                    ),
+                    init_remote_reader(Fragment, Position, ChunkId, Config);
+                _ ->
+                    init_local_reader(Spec, Config)
+            end;
+        undefined ->
+            init_local_reader(Spec, Config)
+    end;
+init_offset_reader({abs, Offset} = Spec, #{name := StreamId} = Config) ->
+    case init_local_reader(Spec, Config) of
+        {ok, _} = Ok ->
+            Ok;
+        {error, {offset_out_of_range, empty}} = Err ->
+            Err;
+        {error, {offset_out_of_range, {_LocalFirst, LocalLast}}} = Err ->
+            case rabbitmq_stream_s3_log_manifest:get_manifest(StreamId) of
+                #manifest{first_offset = RemoteFirst, entries = Entries} ->
+                    case RemoteFirst >= Offset of
+                        true ->
+                            {ok, ChunkId, Position, Fragment} = find_position(
+                                {offset, Offset},
+                                Entries,
+                                StreamId
+                            ),
+                            init_remote_reader(Fragment, Position, ChunkId, Config);
+                        false ->
+                            {error, {offset_out_of_range, {RemoteFirst, LocalLast}}}
+                    end;
+                undefined ->
+                    Err
             end;
         {error, _} = Err ->
             Err
-    end;
-init_offset_reader(OffsetSpec, Config) ->
-    %% TODO: implement the other offset specs
-    init_local_reader(OffsetSpec, Config).
+    end.
 
 next_offset(#?MODULE{mode = #remote{next_offset = NextOffset}}) ->
     NextOffset;
@@ -555,75 +608,109 @@ convert_remote_to_local(#?MODULE{
     ok = gen_server:cast(Pid, close),
     init_local_reader(first, Config).
 
-%% TODO: make this generic for timestamps too.
--spec find_fragment_for_offset(
-    osiris:offset(),
-    #manifest{} | rabbitmq_stream_s3_binary_array:array(),
+-spec find_position(
+    {offset, osiris:offset()} | {timestamp, osiris:timestamp()},
+    rabbitmq_stream_s3_log_manifest_entry:entries(),
     stream_id()
 ) ->
     {ok, ChunkId :: osiris:offset(), byte_offset(), Fragment :: osiris:offset()}.
-find_fragment_for_offset(Offset, #manifest{entries = Entries}, StreamId) ->
-    find_fragment_for_offset(Offset, Entries, StreamId);
-find_fragment_for_offset(Offset, Entries, StreamId) ->
-    RootIdx0 =
-        rabbitmq_stream_s3_binary_array:partition_point(
-            fun(?ENTRY(O, _T, _K, _S, _N, _U, _)) -> Offset > O end,
-            ?ENTRY_B,
-            Entries
-        ),
-    RootIdx = saturating_decr(RootIdx0),
-    ?ENTRY(EntryOffset, _, Kind, _, _, Uid, _) = rabbitmq_stream_s3_binary_array:at(
-        RootIdx, ?ENTRY_B, Entries
+find_position(Spec, Entries, StreamId) ->
+    Fragment = find_fragment(Entries, Spec, get_group_fun(StreamId)),
+    find_position0(Spec, Fragment, StreamId).
+
+-doc """
+Finds the offset of the manifest which contains the requested offset or
+timestamp.
+
+This scans the entries array in logarithmic time. If the offset/timestamp
+being searched for is within a group, the group will be fetched with `GetGroup`
+and then searched recursively.
+""".
+-spec find_fragment(
+    rabbitmq_stream_s3_log_manifest_entry:entries(),
+    {offset, osiris:offset()} | {timestamp, osiris:timestamp()},
+    fun(
+        (
+            rabbitmq_stream_s3:uid(),
+            rabbitmq_stream_s3_log_manifest_entry:kind(),
+            osiris:offset()
+        ) -> rabbitmq_stream_s3_log_manifest_entry:entries()
+    )
+) -> Fragment :: osiris:offset().
+find_fragment(Entries, Spec, GetGroup) ->
+    PartitionPredicate =
+        case Spec of
+            {offset, Offset} ->
+                fun(?ENTRY(O, _T, _K, _S, _N, _U, _)) -> Offset >= O end;
+            {timestamp, Ts} ->
+                fun(?ENTRY(_O, T, _K, _S, _N, _U, _)) -> Ts >= T end
+        end,
+    Idx0 = rabbitmq_stream_s3_binary_array:partition_point(
+        PartitionPredicate,
+        ?ENTRY_B,
+        Entries
     ),
-    ?LOG_DEBUG("partition-point ~b for offset ~b is entry ~b", [
-        RootIdx,
-        Offset,
-        EntryOffset
-    ]),
+    Idx = saturating_decr(Idx0),
+    ?ENTRY(EntryOffset, _, Kind, _, _, Uid, _) = rabbitmq_stream_s3_binary_array:at(
+        Idx,
+        ?ENTRY_B,
+        Entries
+    ),
     case Kind of
         ?MANIFEST_KIND_FRAGMENT ->
-            ?LOG_DEBUG("Searching for offset ~b within fragment ~b", [Offset, EntryOffset]),
-            %% TODO: pass in size now that we have it.
-            {ok, #fragment_info{index_start_pos = IdxStartPos}} = rabbitmq_stream_s3_log_manifest:get_fragment_trailer(
-                StreamId, EntryOffset
-            ),
-            Index = index_data(StreamId, EntryOffset, IdxStartPos),
-            IndexIdx0 =
-                rabbitmq_stream_s3_binary_array:partition_point(
-                    fun(?INDEX_RECORD(O, _T, _P)) -> Offset >= O end,
-                    ?INDEX_RECORD_B,
-                    Index
-                ),
-            IndexIdx = saturating_decr(IndexIdx0),
-            ?INDEX_RECORD(ChunkId, _, Pos) =
-                rabbitmq_stream_s3_binary_array:at(IndexIdx, ?INDEX_RECORD_B, Index),
-            ?LOG_DEBUG(
-                "partition-point ~b for offset ~b is chunk id ~b, pos ~b", [
-                    IndexIdx,
-                    Offset,
-                    ChunkId,
-                    Pos
-                ]
-            ),
-            ?LOG_DEBUG("Attaching to offset ~b, pos ~b, fragment ~b", [Offset, Pos, EntryOffset]),
-            {ok, ChunkId, Pos, EntryOffset};
+            EntryOffset;
         _ ->
             %% Download the group and search recursively within that.
             ?LOG_DEBUG("Entry is not a fragment. Searching within group ~b kind ~b", [
                 EntryOffset, Kind
             ]),
-            <<
-                _:4/binary,
-                _:32,
-                EntryOffset:64/unsigned,
-                _:64,
-                0:2/unsigned,
-                _:70,
-                Uid:8/binary,
-                GroupEntries/binary
-            >> = get_group(StreamId, Uid, Kind, EntryOffset),
-            find_fragment_for_offset(Offset, GroupEntries, StreamId)
+            GroupEntries = GetGroup(Uid, Kind, EntryOffset),
+            find_fragment(GroupEntries, Spec, GetGroup)
     end.
+
+find_position0(Spec, Fragment, StreamId) ->
+    %% TODO: pass in size now that we have it.
+    {ok, #fragment_info{index_start_pos = IdxStartPos}} = rabbitmq_stream_s3_log_manifest:get_fragment_trailer(
+        StreamId,
+        Fragment
+    ),
+    IndexData = index_data(StreamId, Fragment, IdxStartPos),
+    {ChunkId, _, Pos} = find_index_position(IndexData, Spec),
+    {ok, ChunkId, Pos, Fragment}.
+
+find_index_position(IndexData, Spec) ->
+    %% Osiris prefers different chunk boundaries for offset and timestamp
+    %% lookups. If the requested offset is between two chunk IDs, Osiris
+    %% resolves the offset as the earlier/lesser chunk ID. If the requested
+    %% timestamp is between two chunk IDs, Osiris resolves the timestamp as
+    %% the later/greater chunk ID.
+    PartitionPredicate =
+        case Spec of
+            {offset, Offset} ->
+                fun(?INDEX_RECORD(O, _T, _P)) -> Offset >= O end;
+            {timestamp, Ts} ->
+                fun(?INDEX_RECORD(_O, T, _P)) -> Ts > T end
+        end,
+    Idx0 =
+        rabbitmq_stream_s3_binary_array:partition_point(
+            PartitionPredicate,
+            ?INDEX_RECORD_B,
+            IndexData
+        ),
+    ?INDEX_RECORD(ChunkId, ChunkTs, Pos) =
+        case Spec of
+            {offset, _} ->
+                Idx = saturating_decr(Idx0),
+                rabbitmq_stream_s3_binary_array:at(Idx, ?INDEX_RECORD_B, IndexData);
+            {timestamp, _} ->
+                case rabbitmq_stream_s3_binary_array:try_at(Idx0, ?INDEX_RECORD_B, IndexData) of
+                    undefined ->
+                        rabbitmq_stream_s3_binary_array:last(?INDEX_RECORD_B, IndexData);
+                    Record ->
+                        Record
+                end
+        end,
+    {ChunkId, ChunkTs, Pos}.
 
 saturating_decr(0) -> 0;
 saturating_decr(N) -> N - 1.
@@ -644,6 +731,11 @@ index_data(StreamId, FragmentOffset, StartPos) ->
         ok = rabbitmq_stream_s3_api:close(Conn)
     end.
 
+get_group_fun(StreamId) ->
+    fun(Uid, Kind, Offset) ->
+        get_group(StreamId, Uid, Kind, Offset)
+    end.
+
 get_group(StreamId, Uid, Kind, GroupOffset) ->
     {ok, Conn} = rabbitmq_stream_s3_api:open(),
     Key = rabbitmq_stream_s3_log_manifest:group_key(StreamId, Uid, Kind, GroupOffset),
@@ -657,9 +749,116 @@ get_group(StreamId, Uid, Kind, GroupOffset) ->
             _FirstTimestamp:64/unsigned,
             0:2/unsigned,
             _TotalSize:70/unsigned,
-            _GroupEntries/binary
+            GroupEntries/binary
         >> = Data,
-        Data
+        GroupEntries
     after
         ok = rabbitmq_stream_s3_api:close(Conn)
     end.
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+find_fragment_test() ->
+    Ts = erlang:system_time(millisecond),
+    Size = 200,
+    FragmentEntries = <<
+        ?ENTRY(
+            %% Fragments every 20 offsets, 0..=2000
+            (N * 20),
+            %% Timestamps between 2000ms ago and `Ts`
+            (Ts - 2000 + N * 20),
+            ?MANIFEST_KIND_FRAGMENT,
+            Size,
+            (N rem 5),
+            rabbitmq_stream_s3:null_uid(),
+            <<>>
+        )
+     || N <- lists:seq(0, 100)
+    >>,
+
+    FindFragment1 = fun(Spec) ->
+        find_fragment(
+            FragmentEntries,
+            Spec,
+            %% There are only fragments in this manifest.
+            fun(_, _, _) -> erlang:error(unimplemented) end
+        )
+    end,
+    %% Offsets:
+    ?assertEqual(0, FindFragment1({offset, 0})),
+    ?assertEqual(40, FindFragment1({offset, 50})),
+    ?assertEqual(100, FindFragment1({offset, 100})),
+    ?assertEqual(2_000, FindFragment1({offset, 10_000})),
+    %% Timestamps:
+    ?assertEqual(0, FindFragment1({timestamp, Ts - 2000})),
+    %% When placed between two chunks timestamp search prefers the later chunk.
+    %% But when searching in fragments we want to prefer the earlier fragment
+    %% since it most likely contains the target timestamp.
+    ?assertEqual(40, FindFragment1({timestamp, Ts - 2000 + 50})),
+    ?assertEqual(100, FindFragment1({timestamp, Ts - 2000 + 100})),
+    ?assertEqual(2_000, FindFragment1({timestamp, Ts - 2000 + 10_000})),
+
+    %% Factor out those fragments into a group.
+    NextFragmentEntries = <<
+        ?ENTRY(
+            (N * 20),
+            (Ts - 2000 + N * 20),
+            ?MANIFEST_KIND_FRAGMENT,
+            Size,
+            (N rem 5),
+            rabbitmq_stream_s3:null_uid(),
+            <<>>
+        )
+     || N <- lists:seq(101, 150)
+    >>,
+    GroupUid = rabbitmq_stream_s3:uid(),
+    Entries = ?ENTRY(
+        0,
+        (Ts - 2000),
+        ?MANIFEST_KIND_GROUP,
+        Size,
+        0,
+        GroupUid,
+        NextFragmentEntries
+    ),
+    GetGroup = fun(Uid, Kind, Offset) ->
+        ?assertEqual(GroupUid, Uid),
+        ?assertEqual(?MANIFEST_KIND_GROUP, Kind),
+        ?assertEqual(0, Offset),
+        FragmentEntries
+    end,
+    FindFragment2 = fun(Spec) ->
+        find_fragment(Entries, Spec, GetGroup)
+    end,
+    %% The new fragments can be found normally.
+    ?assertEqual(2040, FindFragment2({offset, 2050})),
+    ?assertEqual(3000, FindFragment2({offset, 10_000})),
+    %% The group's fragments can be found recursively.
+    ?assertEqual(0, FindFragment2({offset, 0})),
+    ?assertEqual(40, FindFragment2({offset, 50})),
+    ?assertEqual(40, FindFragment2({timestamp, Ts - 2000 + 50})),
+
+    ok.
+
+find_index_position_test() ->
+    Ts = erlang:system_time(millisecond),
+    IndexData = <<?INDEX_RECORD((N * 20), (Ts - 60 * 20 + N * 20), N) || N <- lists:seq(0, 60)>>,
+    FindPosition = fun(Spec) ->
+        {ChunkId, _Ts, _Pos} = find_index_position(IndexData, Spec),
+        ChunkId
+    end,
+    %% See `find_index_position/2`. Osiris prefers different chunk IDs for
+    %% offsets compared to timestamps.
+    ?assertEqual(0, FindPosition({offset, 0})),
+    ?assertEqual(40, FindPosition({offset, 40})),
+    ?assertEqual(40, FindPosition({offset, 50})),
+
+    ?assertEqual(0, FindPosition({timestamp, Ts - 60 * 20})),
+    ?assertEqual(40, FindPosition({timestamp, Ts - 60 * 20 + 40})),
+    ?assertEqual(60 * 20, FindPosition({timestamp, Ts + 1000})),
+    %% For timestamps, though, we prefer the later chunk ID. Chunk 60, not 40:
+    ?assertEqual(60, FindPosition({timestamp, Ts - 60 * 20 + 50})),
+    ok.
+
+-endif.
