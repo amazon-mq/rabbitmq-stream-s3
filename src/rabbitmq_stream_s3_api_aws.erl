@@ -8,6 +8,7 @@ A wrapper around the AWS S3 HTTP API.
 
 -include_lib("kernel/include/logger.hrl").
 -include_lib("stdlib/include/assert.hrl").
+-include_lib("xmerl/include/xmerl.hrl").
 
 -export([
     init/0,
@@ -700,17 +701,15 @@ end_timeout_window(Timeout, T0) ->
     erlang:max(Remaining, 0).
 
 delete_many_body(Keys) when is_list(Keys) ->
-    %% NOTE: the XML headers / xmlns are not required.
-    Body0 = lists:foldl(
-        fun(Key, Acc) ->
-            %% TODO: sanitize `Key`.
-            %% <https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-keys.html#object-key-xml-related-constraints>.
-            <<Acc/binary, "<Object><Key>", Key/binary, "</Key></Object>">>
-        end,
-        <<"<Delete>">>,
-        Keys
-    ),
-    <<Body0/binary, "</Delete>">>.
+    Objects = [
+        #xmlElement{
+            name = 'Object',
+            content = [#xmlElement{name = 'Key', content = [#xmlText{value = Key}]}]
+        }
+     || Key <- Keys
+    ],
+    Delete = #xmlElement{name = 'Delete', content = Objects},
+    iolist_to_binary(xmerl:export_simple([Delete], xmerl_xml, [])).
 
 -spec key_to_path(rabbitmq_stream_s3_api:key()) -> binary().
 key_to_path(Key) ->
@@ -731,8 +730,12 @@ range_spec_test() ->
 
 delete_many_body_test() ->
     ?assertEqual(
-        <<"<Delete><Object><Key>sample1.txt</Key></Object><Object><Key>sample2.txt</Key></Object></Delete>">>,
+        <<"<?xml version=\"1.0\"?><Delete><Object><Key>sample1.txt</Key></Object><Object><Key>sample2.txt</Key></Object></Delete>">>,
         delete_many_body([<<"sample1.txt">>, <<"sample2.txt">>])
+    ),
+    ?assertEqual(
+        <<"<?xml version=\"1.0\"?><Delete><Object><Key>foo&amp;bar.txt</Key></Object></Delete>">>,
+        delete_many_body([<<"foo&bar.txt">>])
     ),
     ok.
 
