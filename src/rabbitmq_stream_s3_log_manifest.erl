@@ -2,17 +2,22 @@
 %% SPDX-License-Identifier: Apache-2.0
 
 -module(rabbitmq_stream_s3_log_manifest).
+-moduledoc """
+Functions for interfacing with the local tier.
+
+This is an implementation of the `osiris_log_manifest` behaviour and helper
+functions related to recovering fragment information on boot. This module
+doesn't contain any logic for uploading data. Instead it notifies
+`rabbitmq_stream_s3_server` when new fragments are available (and other events)
+and the server handles background uploads.
+""".
 
 -include_lib("kernel/include/logger.hrl").
 -include_lib("stdlib/include/assert.hrl").
 
 -include("include/rabbitmq_stream_s3.hrl").
 
--define(SERVER, ?MODULE).
--define(RANGE_TABLE, rabbitmq_stream_s3_log_manifest_range).
-
 -behaviour(osiris_log_manifest).
--behaviour(gen_server).
 
 -record(log_writer, {
     type :: writer | acceptor,
@@ -20,40 +25,6 @@
     %% Only defined for writers:
     fragment :: #fragment{} | undefined
 }).
-
--record(?MODULE, {
-    machine = rabbitmq_stream_s3_log_manifest_machine:new() :: rabbitmq_stream_s3_log_manifest_machine:state(),
-    tasks = #{} :: #{pid() => effect()},
-    %% A lookup from stream reference to ID. This is used to determine the
-    %% stream ID associated with an offset notification `{osiris_offset,
-    %% Reference, osiris:offset()}` sent by the writer (because we used
-    %% `osiris:register_offset_listener/3`).
-    references = #{} :: #{stream_reference() => stream_id()}
-}).
-
-%% records for the gen_server to handle:
--record(init_writer, {
-    pid :: pid(),
-    stream :: stream_id(),
-    dir :: directory(),
-    epoch :: osiris:epoch(),
-    reference :: stream_reference(),
-    %% Corresponds to the `replica_nodes` key passed in `osiris:config()` for
-    %% writers.
-    replica_nodes :: [node()],
-    retention :: [osiris:retention_spec()],
-    %% Fragments of the active segment which are available to upload.
-    available_fragments :: [#fragment{}]
-}).
--record(init_acceptor, {
-    pid :: pid(),
-    writer_pid :: pid(),
-    stream :: stream_id(),
-    reference :: stream_reference(),
-    dir :: directory()
-}).
--record(get_manifest, {stream :: stream_id()}).
--record(task_completed, {task_pid :: pid(), event :: event() | ok}).
 
 %% osiris_log_manifest
 -export([
@@ -64,70 +35,86 @@
     delete/1
 ]).
 
-%% gen_server
 -export([
-    start_link/0,
-    init/1,
-    handle_call/3,
-    handle_cast/2,
-    handle_info/2,
-    format_status/1,
-    terminate/2,
-    code_change/3
+    recover_fragments/2,
+    find_fragments_in_range/3
 ]).
-
-%% Need to be exported for `erlang:apply/3`.
--export([start/0, format_osiris_event/1, execute_task/2]).
-
--export([
-    get_manifest/1,
-    delete_stream/1,
-    get_fragment_trailer/1,
-    get_fragment_trailer/2
-]).
-
-%% For `sys:get_state/1` debugging.
--export([format_state/1]).
-
-%% Useful to search module.
--export([fragment_key/2, group_key/4, make_file_name/2, fragment_trailer_to_info/1]).
-
-%% This server needs to be started by a boot step so that it is online before
-%% the stream coordinator. Otherwise the stream coordinator will attempt to
-%% recover replicas before this server is started and writer_manifest/1 will
-%% fail a few times and look messy in the logs.
-
--rabbit_boot_step(
-    {rabbitmq_stream_s3_log_manifest, [
-        {description, "tiered storage S3 coordinator"},
-        {mfa, {?MODULE, start, []}},
-        {requires, pre_boot},
-        {enables, core_initialized}
-    ]}
-).
-
-start() ->
-    ok = rabbitmq_stream_s3_api:init(),
-
-    ok = rabbitmq_stream_s3_counters:init(),
-    ok = rabbitmq_stream_s3_db:setup(),
-    rabbit_sup:start_child(?MODULE).
-
--spec get_manifest(stream_id()) -> #manifest{} | undefined.
-get_manifest(StreamId) ->
-    gen_server:call(?SERVER, #get_manifest{stream = StreamId}, infinity).
-
--spec delete_stream(stream_id()) -> ok.
-delete_stream(StreamId) ->
-    gen_server:cast(?SERVER, #delete_stream{stream = StreamId}).
 
 %%----------------------------------------------------------------------------
+
+init_manifest(
+    #{
+        dir := Dir0,
+        name := StreamId0,
+        reference := Reference,
+        leader_pid := LeaderPid
+    } = Config0,
+    acceptor
+) ->
+    StreamId = iolist_to_binary(StreamId0),
+    Dir = list_to_binary(Dir0),
+    Config = Config0#{
+        max_segment_size_bytes => ?MAX_SEGMENT_SIZE_BYTES,
+        retention => [{'fun', local_retention_fun(StreamId)}]
+    },
+    ok = rabbitmq_stream_s3_server:init_acceptor(StreamId, Dir, LeaderPid, Reference),
+    {Config, #log_writer{type = acceptor, stream = StreamId}};
+init_manifest(
+    #{
+        dir := Dir0,
+        name := StreamId0,
+        epoch := Epoch,
+        reference := Reference,
+        replica_nodes := ReplicaNodes
+    } = Config0,
+    writer
+) ->
+    StreamId = iolist_to_binary(StreamId0),
+    Dir = list_to_binary(Dir0),
+    %% TODO: apply original retention settings to the remote tier.
+    _ = maps:get(retention, Config0, []),
+    Config = Config0#{
+        max_segment_size_bytes => ?MAX_SEGMENT_SIZE_BYTES,
+        retention => [{'fun', local_retention_fun(StreamId)}]
+    },
+    ?LOG_DEBUG("Recovering available fragments for stream ~ts", [Dir]),
+    %% Recover the current fragment information. To do this we scan through the
+    %% most recent index file and find the last fragment. While performing this
+    %% scan we also find the older fragments and notify the manifest server so
+    %% that it may upload them if it hasn't already done so.
+    {Fragment, Available} =
+        case sorted_index_files_rev(Dir) of
+            [] ->
+                %% Empty stream, use default fragment.
+                %% TODO: is offset zero always correct here?
+                {#fragment{segment_offset = 0, seq_no = 0}, []};
+            [LastIdxFile | _] ->
+                %% TODO: handle LastIdxFile being empty / corrupted?
+                %% `osiris_log:first_and_last_seginfos0/1` does but this part runs after
+                %% the writer has cleaned up its log.
+                recover_fragments(LastIdxFile)
+        end,
+    ok = rabbitmq_stream_s3_server:init_writer(
+        StreamId,
+        Dir,
+        Epoch,
+        Reference,
+        ReplicaNodes,
+        maps:get(retention, Config0, []),
+        Available
+    ),
+    Manifest = #log_writer{
+        type = writer,
+        stream = StreamId,
+        fragment = Fragment
+    },
+    {Config, Manifest}.
 
 handle_event(_Event, #log_writer{type = acceptor} = Manifest) ->
     Manifest;
 handle_event(
     {segment_opened, RolledSegment, NewSegment},
-    #log_writer{stream = Stream, fragment = Fragment0} = Manifest0
+    #log_writer{stream = StreamId, fragment = Fragment0} = Manifest0
 ) ->
     Fragment =
         %% Submit the fragment for the rolled segment (if there actually is one) to
@@ -147,10 +134,7 @@ handle_event(
                         %% start a new one belonging to this segment.
                         ok;
                     _ ->
-                        ok = gen_server:cast(
-                            ?SERVER,
-                            #fragment_available{stream = Stream, fragment = Fragment0}
-                        )
+                        ok = rabbitmq_stream_s3_server:fragment_available(StreamId, Fragment0)
                 end,
                 #fragment{segment_offset = segment_file_offset(NewSegment)}
         end,
@@ -159,7 +143,7 @@ handle_event(
     {chunk_written,
         #{id := ChId, timestamp := Ts, num := NumRecords, size := ChunkSize, pos := Pos}, Chunk},
     #log_writer{
-        stream = Stream,
+        stream = StreamId,
         fragment =
             #fragment{
                 segment_offset = SegmentOffset,
@@ -201,10 +185,7 @@ handle_event(
             true ->
                 ?assertNotEqual(undefined, Fragment2#fragment.first_offset),
                 %% Roll over the fragment.
-                ok = gen_server:cast(
-                    ?SERVER,
-                    #fragment_available{stream = Stream, fragment = Fragment2}
-                ),
+                ok = rabbitmq_stream_s3_server:fragment_available(StreamId, Fragment2),
                 #fragment{
                     segment_offset = SegmentOffset,
                     segment_pos = SegmentPos + Size,
@@ -216,91 +197,36 @@ handle_event(
         end,
     Manifest0#log_writer{fragment = Fragment};
 handle_event({retention_updated, Retention}, #log_writer{stream = StreamId} = Manifest) ->
-    ok = gen_server:cast(?SERVER, #retention_updated{
-        stream = StreamId,
-        retention = Retention
-    }),
+    ok = rabbitmq_stream_s3_server:retention_updated(StreamId, Retention),
     Manifest.
+
+overview(Dir) ->
+    %% TODO: adjust the lower end of the range from the local overview to
+    %% move up to the offset of the oldest segment which is not yet fully
+    %% uploaded to the remote tier. (Also see the local retention function,
+    %% it should be nearly the same calculation.) This could make replication
+    %% to a new member quicker.
+    _StreamId = iolist_to_binary(filename:basename(Dir)),
+    osiris_log:overview(Dir).
+
+close_manifest(#log_writer{}) ->
+    %% TODO: unregister writers with the server.
+    ok.
+
+delete(_Config) ->
+    %% TODO use the `dir` from config to delete the remote manifest and
+    %% fragments.
+    %% TODO the stream coordinator deletes individual replicas rather than
+    %% issuing any "delete the whole stream," so we need to recognize when
+    %% membership falls to zero in order to clean up from the remote tier.
+    ok.
+
+%%----------------------------------------------------------------------------
 
 checksum(undefined, _) ->
     undefined;
 checksum(Checksum, Data) ->
     erlang:crc32(Checksum, Data).
-
-init_manifest(
-    #{
-        dir := Dir0,
-        name := StreamId0,
-        reference := Reference,
-        leader_pid := LeaderPid
-    } = Config0,
-    acceptor
-) ->
-    StreamId = iolist_to_binary(StreamId0),
-    Dir = list_to_binary(Dir0),
-    Config = Config0#{
-        max_segment_size_bytes => ?MAX_SEGMENT_SIZE_BYTES,
-        retention => [{'fun', local_retention_fun(StreamId)}]
-    },
-    ok = gen_server:cast(?SERVER, #init_acceptor{
-        pid = self(),
-        writer_pid = LeaderPid,
-        stream = StreamId,
-        reference = Reference,
-        dir = Dir
-    }),
-    {Config, #log_writer{type = acceptor, stream = StreamId}};
-init_manifest(
-    #{
-        dir := Dir0,
-        name := StreamId0,
-        epoch := Epoch,
-        reference := Reference,
-        replica_nodes := ReplicaNodes
-    } = Config0,
-    writer
-) ->
-    StreamId = iolist_to_binary(StreamId0),
-    Dir = list_to_binary(Dir0),
-    %% TODO: apply original retention settings to the remote tier.
-    _ = maps:get(retention, Config0, []),
-    Config = Config0#{
-        max_segment_size_bytes => ?MAX_SEGMENT_SIZE_BYTES,
-        retention => [{'fun', local_retention_fun(StreamId)}]
-    },
-    ?LOG_DEBUG("Recovering available fragments for stream ~ts", [Dir]),
-    %% Recover the current fragment information. To do this we scan through the
-    %% most recent index file and find the last fragment. While performing this
-    %% scan we also find the older fragments and notify the manifest server so
-    %% that it may upload them if it hasn't already done so.
-    {Fragment, Available} =
-        case sorted_index_files_rev(Dir) of
-            [] ->
-                %% Empty stream, use default fragment.
-                %% TODO: is offset zero always correct here?
-                {#fragment{segment_offset = 0, seq_no = 0}, []};
-            [LastIdxFile | _] ->
-                %% TODO: handle LastIdxFile being empty / corrupted?
-                %% `osiris_log:first_and_last_seginfos0/1` does but this part runs after
-                %% the writer has cleaned up its log.
-                recover_fragments(LastIdxFile)
-        end,
-    ok = gen_server:cast(?SERVER, #init_writer{
-        pid = self(),
-        stream = StreamId,
-        dir = Dir,
-        epoch = Epoch,
-        reference = Reference,
-        replica_nodes = ReplicaNodes,
-        retention = maps:get(retention, Config0, []),
-        available_fragments = Available
-    }),
-    Manifest = #log_writer{
-        type = writer,
-        stream = StreamId,
-        fragment = Fragment
-    },
-    {Config, Manifest}.
 
 recover_fragments(IdxFile) ->
     recover_fragments(IdxFile, []).
@@ -331,7 +257,7 @@ recover_fragments(
 ) ->
     %% NOTE: all indexes in this function are chunk indexes. `FragmentBoundary`
     %% is a chunk index.
-    FragmentBoundary = rabbitmq_stream_s3_binary_array:partition_point(
+    FragmentBoundary = rabbitmq_stream_s3_array:partition_point(
         fun(<<_ChId:64, _Ts:64, _E:64, FilePos:32/unsigned, _ChT:8>>) ->
             Threshold0 > FilePos
         end,
@@ -341,13 +267,13 @@ recover_fragments(
     %% TODO: what if the partition point is the length? If there's no array
     %% left?
     <<FirstChId:64/unsigned, FirstTs:64/signed, _:64, StartFilePos:32/unsigned, _:8>> =
-        rabbitmq_stream_s3_binary_array:at(0, ?INDEX_RECORD_SIZE_B, IdxArray),
+        rabbitmq_stream_s3_array:at(0, ?INDEX_RECORD_SIZE_B, IdxArray),
     ?LOG_DEBUG("Fragment boundary ~b (start size ~b)", [FragmentBoundary, StartFilePos]),
-    case rabbitmq_stream_s3_binary_array:try_at(FragmentBoundary, ?INDEX_RECORD_SIZE_B, IdxArray) of
+    case rabbitmq_stream_s3_array:try_at(FragmentBoundary, ?INDEX_RECORD_SIZE_B, IdxArray) of
         undefined ->
             <<LastChId:64/unsigned, _LastTs:64/signed, _:64, LastFilePos:32/unsigned, _:8>> =
-                rabbitmq_stream_s3_binary_array:last(?INDEX_RECORD_SIZE_B, IdxArray),
-            Len = rabbitmq_stream_s3_binary_array:len(?INDEX_RECORD_SIZE_B, IdxArray),
+                rabbitmq_stream_s3_array:last(?INDEX_RECORD_SIZE_B, IdxArray),
+            Len = rabbitmq_stream_s3_array:len(?INDEX_RECORD_SIZE_B, IdxArray),
 
             %% Read the segment file to fill in the info we can't get from the
             %% index: the last chunk's size and the next offset.
@@ -371,7 +297,7 @@ recover_fragments(
             {Fragment, Fragments0};
         <<NextChId:64/unsigned, _NextTs:64/signed, _:64, NextFilePos:32/unsigned, _:8>> ->
             <<LastChId:64/unsigned, _LastTs:64/signed, _:64, _:32/unsigned, _:8>> =
-                rabbitmq_stream_s3_binary_array:at(
+                rabbitmq_stream_s3_array:at(
                     FragmentBoundary - 1, ?INDEX_RECORD_SIZE_B, IdxArray
                 ),
             Fragment = #fragment{
@@ -390,7 +316,7 @@ recover_fragments(
             SeqNo = SeqNo0 + 1,
             NumChunks = NumChunks0 + FragmentBoundary,
             Fragments = [Fragment | Fragments0],
-            Rest = rabbitmq_stream_s3_binary_array:slice(
+            Rest = rabbitmq_stream_s3_array:slice(
                 FragmentBoundary, ?INDEX_RECORD_SIZE_B, IdxArray
             ),
             recover_fragments(
@@ -402,684 +328,6 @@ recover_fragments(
                 Fragments,
                 Rest
             )
-    end.
-
-overview(Dir) ->
-    %% TODO: adjust the lower end of the range from the local overview to
-    %% move up to the offset of the oldest segment which is not yet fully
-    %% uploaded to the remote tier. (Also see the local retention function,
-    %% it should be nearly the same calculation.) This could make replication
-    %% to a new member quicker.
-    _StreamId = iolist_to_binary(filename:basename(Dir)),
-    osiris_log:overview(Dir).
-
-close_manifest(#log_writer{}) ->
-    %% TODO: unregister writers with the server.
-    ok.
-
-delete(_Config) ->
-    %% TODO use the `dir` from config to delete the remote manifest and
-    %% fragments.
-    %% TODO the stream coordinator deletes individual replicas rather than
-    %% issuing any "delete the whole stream," so we need to recognize when
-    %% membership falls to zero in order to clean up from the remote tier.
-    ok.
-
-%%---------------------------------------------------------------------------
-
-start_link() ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
-
-init([]) ->
-    %% Table keyed by stream ID. This is used for local retention: segments
-    %% with all offsets less than or equal to the last tiered offset can be
-    %% deleted by retention since they are stored in the remote tier.
-    _ = ets:new(?RANGE_TABLE, [named_table]),
-    set_tick_timer(),
-    {ok, #?MODULE{}}.
-
-handle_call(#get_manifest{stream = StreamId}, From, State) ->
-    %% TODO: this is too simplistic. Reading from the root manifest should be
-    %% done within the server. And then the server should give a spec to
-    %% readers to find anything within branches.
-    Event = #manifest_requested{stream = StreamId, requester = From},
-    {noreply, evolve_event(Event, State)};
-handle_call(Request, From, State) ->
-    ?LOG_INFO(?MODULE_STRING " received unexpected call from ~p: ~W", [From, Request, 10]),
-    {noreply, State}.
-
-handle_cast(
-    #init_writer{
-        pid = Pid,
-        stream = StreamId,
-        dir = Dir,
-        epoch = Epoch,
-        reference = Reference,
-        replica_nodes = ReplicaNodes,
-        retention = Retention
-    },
-    #?MODULE{references = References0} = State0
-) ->
-    State1 = State0#?MODULE{references = References0#{Reference => StreamId}},
-    Event = #writer_spawned{
-        pid = Pid,
-        stream = StreamId,
-        dir = Dir,
-        epoch = Epoch,
-        reference = Reference,
-        replica_nodes = ReplicaNodes,
-        retention = Retention
-    },
-    {noreply, evolve_event(Event, State1)};
-handle_cast(
-    #init_acceptor{writer_pid = WriterPid, stream = StreamId, reference = Reference},
-    #?MODULE{references = References0} = State0
-) ->
-    ok = gen_server:cast({?SERVER, node(WriterPid)}, #manifest_requested{
-        stream = StreamId,
-        requester = self()
-    }),
-    State1 = State0#?MODULE{references = References0#{Reference => StreamId}},
-    {noreply, evolve_event(#acceptor_spawned{stream = StreamId}, State1)};
-handle_cast(#manifest_requested{} = Event, State) ->
-    {noreply, evolve_event(Event, State)};
-handle_cast(
-    #task_completed{task_pid = TaskPid, event = Event},
-    #?MODULE{tasks = Tasks0} = State0
-) ->
-    %% assertion
-    #{TaskPid := _Effect} = Tasks0,
-    Tasks = maps:remove(TaskPid, Tasks0),
-    State1 = State0#?MODULE{tasks = Tasks},
-    State =
-        case Event of
-            ok ->
-                State1;
-            _ ->
-                evolve_event(Event, State1)
-        end,
-    {noreply, State};
-handle_cast(#fragment_available{} = Event, State) ->
-    {noreply, evolve_event(Event, State)};
-handle_cast(#retention_updated{} = Event, State) ->
-    {noreply, evolve_event(Event, State)};
-handle_cast(#delete_stream{} = Effect, State) ->
-    {noreply, apply_effect(Effect, State)};
-handle_cast(Message, State) ->
-    ?LOG_DEBUG(?MODULE_STRING " received unexpected cast: ~W", [Message, 10]),
-    {noreply, State}.
-
-handle_info({osiris_offset, Reference, Offset}, #?MODULE{references = References} = State) ->
-    case References of
-        #{Reference := StreamId} ->
-            Event = #commit_offset_increased{stream = StreamId, offset = Offset},
-            {noreply, evolve_event(Event, State)};
-        _ ->
-            {noreply, State}
-    end;
-handle_info(#set_range{} = Effect, State) ->
-    {noreply, apply_effect(Effect, State)};
-handle_info(#manifest_resolved{} = Event, State) ->
-    {noreply, evolve_event(Event, State)};
-handle_info(#fragments_applied{} = Event, State) ->
-    {noreply, evolve_event(Event, State)};
-handle_info(tick_timeout, State0) ->
-    State = evolve_event(#tick{}, State0),
-    ok = set_tick_timer(),
-    {noreply, State};
-handle_info({'DOWN', _MRef, process, Pid, Reason}, #?MODULE{tasks = Tasks0} = State0) ->
-    case maps:take(Pid, Tasks0) of
-        {Effect, Tasks} ->
-            ?LOG_INFO("Task ~0p (~p) down with reason ~0p. Tasks: ~0P", [
-                Effect, Pid, Reason, Tasks0, 10
-            ]),
-            %% TODO: retry. We have the effect and can attempt it again.
-            {noreply, State0#?MODULE{tasks = Tasks}};
-        error ->
-            {noreply, State0}
-    end;
-handle_info(Message, State) ->
-    ?LOG_DEBUG(
-        ?MODULE_STRING " received unexpected message: ~W",
-        [Message, 10]
-    ),
-    {noreply, State}.
-
-format_status(#{state := #?MODULE{} = State0} = Status0) ->
-    Status0#{state := format_state(State0)}.
-
-terminate(_Reason, _State) ->
-    ok.
-
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
-
-%%---------------------------------------------------------------------------
-
-format_osiris_event(Event) ->
-    Event.
-
-format_state(#?MODULE{machine = Machine, tasks = Tasks}) ->
-    #{
-        machine => rabbitmq_stream_s3_log_manifest_machine:format(Machine),
-        tasks => map_size(Tasks)
-    }.
-
--spec make_file_name(osiris:offset(), Suffix :: binary()) -> filename().
-make_file_name(Offset, Suffix) when is_integer(Offset) andalso is_binary(Suffix) ->
-    <<(iolist_to_binary(io_lib:format("~20..0B", [Offset])))/binary, ".", Suffix/binary>>.
-
--spec manifest_key(stream_id(), rabbitmq_stream_s3:uid()) -> rabbitmq_stream_s3_api:key().
-manifest_key(StreamId, Uid) when is_binary(StreamId) andalso is_binary(Uid) ->
-    manifest_key(StreamId, Uid, <<"manifest">>).
-
--spec manifest_key(stream_id(), rabbitmq_stream_s3:uid(), filename()) ->
-    rabbitmq_stream_s3_api:key().
-manifest_key(StreamId, Uid, Filename) when
-    is_binary(StreamId) andalso is_binary(Uid) andalso is_binary(Filename)
-->
-    <<"rabbitmq/stream/", StreamId/binary, "/metadata/",
-        (rabbitmq_stream_s3:format_uid(Uid))/binary, $., Filename/binary>>.
-
--spec group_key(
-    stream_id(),
-    rabbitmq_stream_s3:uid(),
-    rabbitmq_stream_s3_log_manifest_entry:kind(),
-    osiris:offset()
-) ->
-    rabbitmq_stream_s3_api:key().
-group_key(StreamId, Uid, Kind, Offset) ->
-    manifest_key(StreamId, Uid, make_file_name(Offset, group_extension(Kind))).
-
--spec stream_data_key(stream_id(), filename()) -> rabbitmq_stream_s3_api:key().
-stream_data_key(StreamId, Filename) when is_binary(StreamId) andalso is_binary(Filename) ->
-    <<"rabbitmq/stream/", StreamId/binary, "/data/", Filename/binary>>.
-
--spec fragment_key(stream_id(), osiris:offset()) -> rabbitmq_stream_s3_api:key().
-fragment_key(StreamId, Offset) when is_binary(StreamId) andalso is_integer(Offset) ->
-    stream_data_key(StreamId, make_file_name(Offset, <<"fragment">>)).
-
--spec segment_file_offset(file:filename_all()) -> osiris:offset().
-segment_file_offset(Filename) ->
-    filename_offset(filename:basename(Filename, <<".segment">>)).
-
--spec index_file_offset(file:filename_all()) -> osiris:offset().
-index_file_offset(Filename) ->
-    filename_offset(filename:basename(Filename, <<".index">>)).
-
--spec filename_offset(file:filename_all()) -> osiris:offset().
-filename_offset(Basename) when is_binary(Basename) ->
-    binary_to_integer(Basename);
-filename_offset(Basename) when is_list(Basename) ->
-    list_to_integer(Basename).
-
--spec evolve_event(event(), #?MODULE{}) -> #?MODULE{}.
-evolve_event(Event, #?MODULE{machine = MacState0} = State0) ->
-    {MacState, Effects} = rabbitmq_stream_s3_log_manifest_machine:apply(
-        metadata(), Event, MacState0
-    ),
-    lists:foldl(fun apply_effect/2, State0#?MODULE{machine = MacState}, Effects).
-
--spec apply_effect(effect(), #?MODULE{}) -> #?MODULE{}.
-apply_effect(#reply{to = To, response = Response}, State) ->
-    ok = gen_server:reply(To, Response),
-    State;
-apply_effect(#send{to = Pid, message = Message, options = Options}, State) ->
-    _ = erlang:send(Pid, Message, Options),
-    State;
-apply_effect(#register_offset_listener{writer_pid = Pid, offset = Offset}, State) ->
-    ok = osiris:register_offset_listener(Pid, Offset, {?MODULE, format_osiris_event, []}),
-    State;
-apply_effect(#set_range{stream = StreamId, first = First, next = Next}, State) ->
-    _ = ets:update_element(
-        ?RANGE_TABLE,
-        StreamId,
-        [{2, First}, {3, Next}],
-        {StreamId, First, Next}
-    ),
-    State;
-apply_effect(#upload_fragment{} = Effect, State) ->
-    spawn_task(Effect, State);
-apply_effect(#upload_manifest{} = Effect, State) ->
-    spawn_task(Effect, State);
-apply_effect(#rebalance_manifest{} = Effect, State) ->
-    spawn_task(Effect, State);
-apply_effect(#resolve_manifest{} = Effect, State) ->
-    spawn_task(Effect, State);
-apply_effect(#find_fragments{} = Effect, State) ->
-    spawn_task(Effect, State);
-apply_effect(#delete_fragments{} = Effect, State) ->
-    spawn_task(Effect, State);
-apply_effect(#delete_stream{} = Effect, State) ->
-    spawn_task(Effect, State).
-
-spawn_task(Effect, #?MODULE{tasks = Tasks0} = State0) ->
-    %% NOTE: use of `erlang:self/0` is intentional here. If we casted to the
-    %% server's registered name instead, a restarted manifest server after a
-    %% crash could get nonsensical task events from old incarnations.
-    {TaskPid, _MRef} = spawn_monitor(?MODULE, execute_task, [Effect, self()]),
-    State0#?MODULE{tasks = Tasks0#{TaskPid => Effect}}.
-
-execute_task(Effect, ManifestServer) ->
-    Event = execute_task(Effect),
-    gen_server:cast(ManifestServer, #task_completed{task_pid = self(), event = Event}).
-
-execute_task(#upload_fragment{
-    stream = StreamId,
-    dir = Dir,
-    fragment =
-        #fragment{
-            segment_offset = SegmentOffset,
-            segment_pos = SegmentPos,
-            first_offset = FragmentOffset,
-            first_timestamp = Ts,
-            next_offset = NextOffset,
-            checksum = Checksum0,
-            num_chunks = {IdxStart, IdxLen},
-            seq_no = SeqNo,
-            size = Size
-        } = Fragment
-}) ->
-    Timeout = application:get_env(rabbitmq_stream_s3, segment_upload_timeout, 45_000),
-    {ok, Conn} = rabbitmq_stream_s3_api:open(),
-    FragmentFilename = make_file_name(FragmentOffset, <<"fragment">>),
-    SegmentFilename = make_file_name(SegmentOffset, <<"segment">>),
-    IndexFilename = make_file_name(SegmentOffset, <<"index">>),
-    Key = fragment_key(StreamId, FragmentOffset),
-    ?LOG_DEBUG(
-        "Starting upload of ~ts (~b of ~ts, next offset ~b of ~ts): ~w", [
-            FragmentFilename, SeqNo, SegmentFilename, NextOffset, StreamId, Fragment
-        ]
-    ),
-
-    try
-        {UploadMSec, {UploadSize, FragmentInfo}} = timer:tc(
-            fun() ->
-                {ok, SegFd} = file:open(filename:join(Dir, SegmentFilename), [read, raw, binary]),
-                {ok, IdxFd} = file:open(filename:join(Dir, IndexFilename), [read, raw, binary]),
-
-                {ok, SegData} = file:pread(SegFd, SegmentPos, Size),
-                {ok, IdxData0} = file:pread(
-                    IdxFd,
-                    ?IDX_HEADER_B + (IdxStart * ?INDEX_RECORD_SIZE_B),
-                    IdxLen * ?INDEX_RECORD_SIZE_B
-                ),
-                %% Convert from osiris index style to fragment index. We can
-                %% drop epoch since it's not necessary after commit. TODO: right?
-                %% TODO: this is pretty messy. Use the INDEX_RECORD macro.
-                IdxData = <<
-                    <<
-                        IdxChId:64/unsigned,
-                        IdxTs:64/signed,
-                        (SegmentFilePos - SegmentPos + ?SEGMENT_HEADER_B):32/unsigned
-                    >>
-                 || <<
-                        IdxChId:64/unsigned,
-                        IdxTs:64/signed,
-                        _Epoch:64/unsigned,
-                        SegmentFilePos:32/unsigned,
-                        _ChType:8/unsigned
-                    >> <= IdxData0
-                >>,
-                Trailer = ?FRAGMENT_TRAILER(
-                    FragmentOffset,
-                    Ts,
-                    NextOffset,
-                    SeqNo,
-                    Size,
-                    IdxStart,
-                    SegmentPos,
-                    (?SEGMENT_HEADER_B + Size + ?IDX_HEADER_B),
-                    (byte_size(IdxData))
-                ),
-                Data = [?SEGMENT_HEADER, SegData, ?IDX_HEADER, IdxData, Trailer],
-                Checksum =
-                    case Checksum0 of
-                        undefined ->
-                            erlang:crc32(Data);
-                        _ ->
-                            erlang:crc32(Checksum0, [?IDX_HEADER, IdxData, Trailer])
-                    end,
-                %% TODO: should be able to upload this in chunks. Gun should
-                %% support that.
-                ok = rabbitmq_stream_s3_api:put(
-                    Conn,
-                    Key,
-                    Data,
-                    #{
-                        unsigned_payload => true,
-                        crc32 => Checksum,
-                        timeout => Timeout
-                    }
-                ),
-                {iolist_size(Data), fragment_trailer_to_info(Trailer)}
-            end,
-            millisecond
-        ),
-        ?LOG_DEBUG("Uploaded ~ts of ~ts in ~b msec (~b bytes)", [
-            FragmentFilename, SegmentFilename, UploadMSec, UploadSize
-        ]),
-        %% TODO: update counters for fragments.
-        rabbitmq_stream_s3_counters:segment_uploaded(UploadSize),
-
-        #fragment_uploaded{stream = StreamId, info = FragmentInfo}
-    after
-        ok = rabbitmq_stream_s3_api:close(Conn)
-    end;
-execute_task(#rebalance_manifest{
-    stream = StreamId,
-    kind = GroupKind,
-    size = GroupSize,
-    new_group = GroupEntries,
-    rebalanced = RebalancedEntries,
-    manifest = Manifest0
-}) ->
-    Ext = group_extension(GroupKind),
-    ?ENTRY(GroupOffset, Ts, _, _, _, Uid, _) = GroupEntries,
-    Key = manifest_key(StreamId, Uid, make_file_name(GroupOffset, group_extension(GroupKind))),
-    Data = [
-        group_header(GroupKind),
-        <<GroupOffset:64/unsigned, Ts:64/signed, 0:2/signed, GroupSize:70/unsigned>>,
-        GroupEntries
-    ],
-
-    {ok, Conn} = rabbitmq_stream_s3_api:open(),
-    try
-        ?LOG_DEBUG("rebalancing: adding a ~ts to the manifest for '~tp'", [Ext, StreamId]),
-        {UploadMsec, ok} = timer:tc(
-            fun() ->
-                ok = rabbitmq_stream_s3_api:put(Conn, Key, Data)
-            end,
-            millisecond
-        ),
-        DataSize = iolist_size(Data),
-        ?LOG_DEBUG("Uploaded ~ts for '~tp' in ~b msec (~b bytes)", [
-            Ext, StreamId, UploadMsec, DataSize
-        ]),
-        %% TODO: counters per group kind.
-        %% rabbitmq_stream_s3_counters:manifest_written(Size),
-        ok
-    after
-        ok = rabbitmq_stream_s3_api:close(Conn)
-    end,
-    Manifest = Manifest0#manifest{entries = RebalancedEntries},
-    %% TODO: update `rabbitmq_stream_s3_db`.
-    #manifest_rebalanced{stream = StreamId, manifest = Manifest};
-execute_task(#upload_manifest{
-    stream = StreamId,
-    epoch = Epoch,
-    reference = Reference,
-    manifest = #manifest{
-        first_offset = Offset,
-        first_timestamp = Ts,
-        next_offset = NextOffset,
-        total_size = Size,
-        revision = ExpectedRevision,
-        entries = Entries
-    }
-}) ->
-    {ok, Conn} = rabbitmq_stream_s3_api:open(),
-    Uid = rabbitmq_stream_s3:uid(),
-    Key = manifest_key(StreamId, Uid),
-    Data = ?MANIFEST(Offset, Ts, NextOffset, Size, Entries),
-    try
-        ?LOG_DEBUG("Uploading manifest for stream '~ts'", [StreamId]),
-        {UploadMsec, ok} = timer:tc(
-            fun() ->
-                ok = rabbitmq_stream_s3_api:put(Conn, Key, Data)
-            end,
-            millisecond
-        ),
-        ManifestSize = iolist_size(Data),
-        ?LOG_DEBUG("Uploaded manifest for stream '~ts' in ~b msec (~b bytes)", [
-            StreamId, UploadMsec, ManifestSize
-        ]),
-        rabbitmq_stream_s3_counters:manifest_written(ManifestSize),
-        case rabbitmq_stream_s3_db:put(StreamId, Reference, Epoch, ExpectedRevision, Uid) of
-            {ok, OldInfo, NewRevision} ->
-                case OldInfo of
-                    undefined ->
-                        ?LOG_DEBUG("Initial manifest created for stream '~ts' at epoch ~b", [
-                            StreamId, Epoch
-                        ]),
-                        ok;
-                    {OldUid, OldEpoch} ->
-                        ?LOG_DEBUG(
-                            "Manifest updated for stream '~ts', epoch ~b->~b, uid '~ts'->'~ts'", [
-                                StreamId,
-                                OldEpoch,
-                                Epoch,
-                                rabbitmq_stream_s3:format_uid(OldUid),
-                                rabbitmq_stream_s3:format_uid(Uid)
-                            ]
-                        ),
-                        OldKey = manifest_key(StreamId, OldUid),
-                        case rabbitmq_stream_s3_api:delete(Conn, OldKey) of
-                            ok ->
-                                ?LOG_DEBUG("Cleaned up old manifest with uid '~ts'", [
-                                    rabbitmq_stream_s3:format_uid(OldUid)
-                                ]),
-                                ok;
-                            {error, _} = Err ->
-                                ?LOG_DEBUG("Failed to clean up old manifest with uid '~ts': ~0p", [
-                                    rabbitmq_stream_s3:format_uid(OldUid), Err
-                                ]),
-                                ok
-                        end
-                end,
-                Entry = #{uid => Uid, epoch => Epoch, revision => NewRevision},
-                #manifest_uploaded{stream = StreamId, entry = Entry};
-            {error,
-                {conflict,
-                    #{uid := ActualUid, epoch := ActualEpoch, revision := ActualRevision} =
-                        Entry}} ->
-                ?LOG_INFO(
-                    "An uploaded manifest was rejected by the metadata store's optimistic lock. Expected revision ~b actual ~b, uid '~ts' actual '~ts', epoch ~b actual ~b)",
-                    [
-                        ExpectedRevision,
-                        ActualRevision,
-                        rabbitmq_stream_s3:format_uid(Uid),
-                        rabbitmq_stream_s3:format_uid(ActualUid),
-                        Epoch,
-                        ActualEpoch
-                    ]
-                ),
-                #manifest_upload_rejected{
-                    stream = StreamId,
-                    conflict = Entry
-                };
-            {error, not_found} ->
-                ?LOG_INFO(
-                    "An uploaded manifest was rejected by the metadata store's optimistic lock. Expected revision ~b, uid '~ts', epoch ~b but found no entry",
-                    [
-                        ExpectedRevision,
-                        rabbitmq_stream_s3:format_uid(Uid),
-                        Epoch
-                    ]
-                ),
-                #stream_deleted{stream = StreamId};
-            {error, _} = Err ->
-                exit(Err)
-        end
-    after
-        ok = rabbitmq_stream_s3_api:close(Conn)
-    end;
-execute_task(#resolve_manifest{stream = StreamId}) ->
-    Manifest0 =
-        case rabbitmq_stream_s3_db:get(StreamId) of
-            {ok, #{uid := Uid, revision := Revision}} ->
-                Key = manifest_key(StreamId, Uid),
-                {ok, Conn} = rabbitmq_stream_s3_api:open(),
-                try
-                    case rabbitmq_stream_s3_api:get(Conn, Key) of
-                        {ok,
-                            ?MANIFEST(FirstOffset, FirstTimestamp, NextOffset, TotalSize, Entries) =
-                                Data} ->
-                            rabbitmq_stream_s3_counters:manifest_read(byte_size(Data)),
-                            #manifest{
-                                first_offset = FirstOffset,
-                                first_timestamp = FirstTimestamp,
-                                next_offset = NextOffset,
-                                total_size = TotalSize,
-                                revision = Revision,
-                                entries = Entries
-                            };
-                        {error, not_found} ->
-                            #manifest{};
-                        {error, _} = Err ->
-                            exit(Err)
-                    end
-                after
-                    ok = rabbitmq_stream_s3_api:close(Conn)
-                end;
-            {error, not_found} ->
-                #manifest{};
-            {error, _} = Err ->
-                exit(Err)
-        end,
-    #manifest_resolved{
-        stream = StreamId,
-        manifest = resolve_manifest_tail(StreamId, Manifest0)
-    };
-execute_task(#delete_fragments{stream = StreamId, offsets = Offsets}) ->
-    NumFragments = length(Offsets),
-    ?LOG_DEBUG("Deleting ~b fragments for stream '~ts' with offsets ~0p", [
-        NumFragments, StreamId, Offsets
-    ]),
-    Keys = [fragment_key(StreamId, Offset) || Offset <- Offsets],
-    {ok, Conn} = rabbitmq_stream_s3_api:open(),
-    try
-        {DeleteMsec, ok} = timer:tc(
-            fun() ->
-                ok = rabbitmq_stream_s3_api:delete(Conn, Keys)
-            end,
-            millisecond
-        ),
-        ?LOG_DEBUG("Deleted ~b fragments from stream '~ts' in ~b msec", [
-            NumFragments, StreamId, DeleteMsec
-        ]),
-        ok
-    after
-        ok = rabbitmq_stream_s3_api:close(Conn)
-    end,
-    ok;
-execute_task(#find_fragments{stream = StreamId, dir = Dir, from = FromOffset, to = ToOffset}) ->
-    _ = [
-        gen_server:cast(?SERVER, #fragment_available{stream = StreamId, fragment = F})
-     || #fragment{first_offset = FirstOffset, next_offset = NextOffset} = F <- find_fragments_in_range(
-            Dir,
-            FromOffset,
-            ToOffset
-        ),
-        FirstOffset >= FromOffset,
-        NextOffset =< ToOffset
-    ],
-    ok;
-execute_task(#delete_stream{stream = StreamId}) ->
-    ?LOG_DEBUG("Deleting stream '~ts'", [StreamId]),
-    %% NOTE: See `rabbitmq_stream_s3_db:handle_queue_deletion/1`. The node
-    %% where this task runs might not be a member of this stream. So we can't
-    %% rely on information in the manifest to perform the deletion.
-    %%
-    %% LIST all keys with the prefix of this stream ID and delete 1000 objects
-    %% at a time.
-    ok.
-
-resolve_manifest_tail(
-    StreamId,
-    #manifest{
-        next_offset = NextOffset0,
-        entries = Entries0,
-        total_size = TotalSize0
-    } = Manifest0
-) ->
-    case get_fragment_trailer(StreamId, NextOffset0) of
-        {ok, #fragment_info{
-            offset = NextOffset0,
-            next_offset = NextOffset,
-            timestamp = Ts,
-            size = Size,
-            seq_no = SeqNo
-        }} ->
-            Entries =
-                <<Entries0/binary,
-                    (?ENTRY(
-                        NextOffset0,
-                        Ts,
-                        ?MANIFEST_KIND_FRAGMENT,
-                        Size,
-                        SeqNo,
-                        rabbitmq_stream_s3:uid(),
-                        <<>>
-                    ))/binary>>,
-            Manifest = Manifest0#manifest{
-                next_offset = NextOffset,
-                total_size = TotalSize0 + Size,
-                entries = Entries
-            },
-            resolve_manifest_tail(StreamId, Manifest);
-        {error, not_found} ->
-            Manifest0
-    end.
-
-group_extension(?MANIFEST_KIND_GROUP) -> <<"group">>;
-group_extension(?MANIFEST_KIND_KILO_GROUP) -> <<"kgroup">>;
-group_extension(?MANIFEST_KIND_MEGA_GROUP) -> <<"mgroup">>.
-
-group_header(?MANIFEST_KIND_GROUP) ->
-    <<?MANIFEST_GROUP_MAGIC, ?MANIFEST_GROUP_VERSION:32/unsigned>>;
-group_header(?MANIFEST_KIND_KILO_GROUP) ->
-    <<?MANIFEST_KILO_GROUP_MAGIC, ?MANIFEST_KILO_GROUP_VERSION:32/unsigned>>;
-group_header(?MANIFEST_KIND_MEGA_GROUP) ->
-    <<?MANIFEST_MEGA_GROUP_MAGIC, ?MANIFEST_MEGA_GROUP_VERSION:32/unsigned>>.
-
-get_fragment_trailer(StreamId, FragmentOffset) ->
-    get_fragment_trailer(fragment_key(StreamId, FragmentOffset)).
-
-get_fragment_trailer(Key) ->
-    {ok, Conn} = rabbitmq_stream_s3_api:open(),
-    ?LOG_DEBUG("Looking up key ~ts (~ts)", [Key, ?FUNCTION_NAME]),
-    try rabbitmq_stream_s3_api:get_range(Conn, Key, -?FRAGMENT_TRAILER_B) of
-        {ok, Data} ->
-            {ok, fragment_trailer_to_info(Data)};
-        {error, _} = Err ->
-            Err
-    after
-        ok = rabbitmq_stream_s3_api:close(Conn)
-    end.
-
--spec fragment_trailer_to_info(binary()) -> #fragment_info{}.
-fragment_trailer_to_info(
-    ?FRAGMENT_TRAILER(
-        Offset,
-        Ts,
-        NextOffset,
-        SeqNo,
-        Size,
-        NumChunksInSegment,
-        SegmentStartPos,
-        IdxStartPos,
-        IdxSize
-    )
-) ->
-    #fragment_info{
-        offset = Offset,
-        timestamp = Ts,
-        next_offset = NextOffset,
-        seq_no = SeqNo,
-        num_chunks_in_segment = NumChunksInSegment,
-        segment_start_pos = SegmentStartPos,
-        size = Size,
-        index_start_pos = IdxStartPos,
-        index_size = IdxSize
-    }.
-
-list_dir(Dir) ->
-    case prim_file:list_dir(Dir) of
-        {error, enoent} ->
-            [];
-        {ok, Files} ->
-            [list_to_binary(F) || F <- Files]
     end.
 
 %% sorted_index_files(Dir) ->
@@ -1096,14 +344,54 @@ index_files(Dir, SortFun) ->
      || <<_:20/binary, ".index">> = F <- list_dir(Dir)
     ]).
 
-set_tick_timer() ->
-    Timeout = application:get_env(rabbitmq_stream_s3, tick_timeout_milliseconds, 5000),
-    _ = erlang:send_after(Timeout, self(), tick_timeout),
-    ok.
+list_dir(Dir) ->
+    case prim_file:list_dir(Dir) of
+        {error, enoent} ->
+            [];
+        {ok, Files} ->
+            [list_to_binary(F) || F <- Files]
+    end.
 
--spec metadata() -> rabbitmq_stream_s3_log_manifest_machine:metadata().
-metadata() ->
-    #{time => erlang:system_time(millisecond)}.
+-spec segment_file_offset(file:filename_all()) -> osiris:offset().
+segment_file_offset(Filename) ->
+    filename_offset(filename:basename(Filename, <<".segment">>)).
+
+-spec index_file_offset(file:filename_all()) -> osiris:offset().
+index_file_offset(Filename) ->
+    filename_offset(filename:basename(Filename, <<".index">>)).
+
+-spec filename_offset(file:filename_all()) -> osiris:offset().
+filename_offset(Basename) when is_binary(Basename) ->
+    binary_to_integer(Basename);
+filename_offset(Basename) when is_list(Basename) ->
+    list_to_integer(Basename).
+
+-spec find_fragments_in_range(directory() | [filename()], osiris:offset(), osiris:offset()) ->
+    [#fragment{}].
+find_fragments_in_range(Dir, From, To) when is_binary(Dir) ->
+    [_ActiveIndex | IdxFiles] = sorted_index_files_rev(Dir),
+    lists:foldl(
+        fun(IdxFile, Acc0) ->
+            {Last, Acc1} = recover_fragments(IdxFile, Acc0),
+            [Last | Acc1]
+        end,
+        [],
+        index_files_in_range(IdxFiles, From, To, [])
+    ).
+
+index_files_in_range([], _From, _To, Acc) ->
+    Acc;
+index_files_in_range([IdxFile | Rest], From, To, Acc) ->
+    %% NOTE: the index file list is sorted descending by offset.
+    FirstOffset = index_file_offset(IdxFile),
+    if
+        FirstOffset > To ->
+            index_files_in_range(Rest, From, To, Acc);
+        FirstOffset =< From ->
+            [IdxFile | Acc];
+        true ->
+            index_files_in_range(Rest, From, To, [IdxFile | Acc])
+    end.
 
 -spec local_retention_fun(stream_id()) -> osiris:retention_fun().
 local_retention_fun(Stream) ->
@@ -1137,33 +425,6 @@ eval_local_retention([IdxFile | Rest], NextTieredOffset, ToDelete, ToKeep) ->
             {lists:reverse(Rest), [IdxFile | ToKeep]}
     end.
 
--spec find_fragments_in_range(directory() | [filename()], osiris:offset(), osiris:offset()) ->
-    [#fragment{}].
-find_fragments_in_range(Dir, From, To) when is_binary(Dir) ->
-    [_ActiveIndex | IdxFiles] = sorted_index_files_rev(Dir),
-    lists:foldl(
-        fun(IdxFile, Acc0) ->
-            {Last, Acc1} = recover_fragments(IdxFile, Acc0),
-            [Last | Acc1]
-        end,
-        [],
-        index_files_in_range(IdxFiles, From, To, [])
-    ).
-
-index_files_in_range([], _From, _To, Acc) ->
-    Acc;
-index_files_in_range([IdxFile | Rest], From, To, Acc) ->
-    %% NOTE: the index file list is sorted descending by offset.
-    FirstOffset = index_file_offset(IdxFile),
-    if
-        FirstOffset > To ->
-            index_files_in_range(Rest, From, To, Acc);
-        FirstOffset =< From ->
-            [IdxFile | Acc];
-        true ->
-            index_files_in_range(Rest, From, To, [IdxFile | Acc])
-    end.
-
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
@@ -1176,7 +437,7 @@ index_file_offset_test() ->
     ok.
 
 index_files_in_range_test() ->
-    Files0 = [make_file_name(O, <<"index">>) || O <- [100, 200, 300, 400, 500]],
+    Files0 = [rabbitmq_stream_s3:offset_filename(O, <<"index">>) || O <- [100, 200, 300, 400, 500]],
     %% `index_files_in_range/4` expects the files sorted descending.
     Files = lists:reverse(Files0),
     GetRange = fun(From, To) ->

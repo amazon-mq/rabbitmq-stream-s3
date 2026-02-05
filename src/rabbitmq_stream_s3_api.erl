@@ -30,13 +30,7 @@ file-system operations. Use that in non-unit tests.
 %% Up to the backend exactly what this is. Could be a pid for an HTTP
 %% connection or a file descriptor for a local file.
 -type connection() :: any().
--doc """
-A key within a bucket.
-
-This identifies an object. Typically keys look like Unix paths, for example
-`<<"rabbitmq/stream/data/__sq_12346786783/00000000000000000000.fragment">>`.
-""".
--type key() :: binary().
+-type key() :: rabbitmq_stream_s3:key().
 -type range_spec() ::
     {StartByte :: non_neg_integer(), EndByte :: non_neg_integer() | undefined}
     | SuffixRange :: integer().
@@ -46,7 +40,7 @@ This identifies an object. Typically keys look like Unix paths, for example
     unsigned_payload => boolean()
 }.
 
--export_type([connection/0, key/0, range_spec/0, request_opts/0]).
+-export_type([connection/0, range_spec/0, request_opts/0]).
 
 -callback init() -> ok.
 -callback open() -> {ok, connection()} | {error, any()}.

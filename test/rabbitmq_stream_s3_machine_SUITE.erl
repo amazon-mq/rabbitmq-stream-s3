@@ -1,7 +1,7 @@
 %% Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 %% SPDX-License-Identifier: Apache-2.0
 
--module(rabbitmq_stream_s3_log_manifest_machine_SUITE).
+-module(rabbitmq_stream_s3_machine_SUITE).
 
 -compile([export_all, nowarn_export_all]).
 
@@ -12,7 +12,7 @@
 
 -import(rabbit_ct_helpers, [get_config/2]).
 
--define(MAC, rabbitmq_stream_s3_log_manifest_machine).
+-define(MAC, rabbitmq_stream_s3_machine).
 -define(META(), #{time => ?LINE}).
 
 all() ->

@@ -188,7 +188,7 @@
     %% This is used for an optimistic concurrency control.
     revision = 0 :: rabbitmq_stream_s3_db:revision(),
     %% An array of entries. Use the `?ENTRY/6' macro to access entries.
-    entries = <<>> :: rabbitmq_stream_s3_log_manifest_entry:entries()
+    entries = <<>> :: rabbitmq_stream_s3:entries()
 }).
 
 %% Number of outgoing edges from this branch. Works for the entries array of
@@ -210,6 +210,8 @@
 -type checksum() :: non_neg_integer().
 
 %% rabbitmq_stream_s3_log_manifest_machine types:
+
+-define(RANGE_TABLE, rabbitmq_stream_s3_log_manifest_range).
 
 %% The name of a stream. This is a unique identifier for an incarnation of a
 %% stream, meaning that it will not be identical if you delete a stream queue
@@ -340,10 +342,10 @@
 }).
 -record(rebalance_manifest, {
     stream :: stream_id(),
-    kind :: rabbitmq_stream_s3_log_manifest_entry:kind(),
+    kind :: rabbitmq_stream_s3:kind(),
     size :: pos_integer(),
-    new_group :: rabbitmq_stream_s3_log_manifest_entry:entries(),
-    rebalanced :: rabbitmq_stream_s3_log_manifest_entry:entries(),
+    new_group :: rabbitmq_stream_s3:entries(),
+    rebalanced :: rabbitmq_stream_s3:entries(),
     manifest :: #manifest{}
 }).
 %% Download the manifest from the remote tier and also check the tail of the

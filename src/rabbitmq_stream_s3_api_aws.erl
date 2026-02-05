@@ -32,7 +32,7 @@ A wrapper around the AWS S3 HTTP API.
 %% gun connection PID.
 -type connection() :: rabbitmq_stream_s3_api:connection().
 
--type key() :: rabbitmq_stream_s3_api:key().
+-type key() :: rabbitmq_stream_s3:key().
 -type request_opts() ::
     rabbitmq_stream_s3_api:request_opts()
     | #{
@@ -711,7 +711,7 @@ delete_many_body(Keys) when is_list(Keys) ->
     Delete = #xmlElement{name = 'Delete', content = Objects},
     iolist_to_binary(xmerl:export_simple([Delete], xmerl_xml, [])).
 
--spec key_to_path(rabbitmq_stream_s3_api:key()) -> binary().
+-spec key_to_path(rabbitmq_stream_s3:key()) -> binary().
 key_to_path(Key) ->
     <<$/, (uri_string:quote(Key, "/"))/binary>>.
 

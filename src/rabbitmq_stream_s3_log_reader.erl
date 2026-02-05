@@ -2,6 +2,15 @@
 %% SPDX-License-Identifier: Apache-2.0
 
 -module(rabbitmq_stream_s3_log_reader).
+-moduledoc """
+Functions for reading from either the remote or local tiers.
+
+This is an implementation of the `osiris_log_reader` behaviour which resolves
+offset specs to absolute positions and reads forwards through the stream data.
+If the data can be found locally, this module delegates to `osiris_log`.
+Otherwise this module spawns a gen_server which fetches data from the remote
+tier.
+""".
 
 -include_lib("kernel/include/logger.hrl").
 
@@ -78,7 +87,7 @@ init_offset_reader(Tail, Config) when Tail =:= last orelse Tail =:= next ->
     init_local_reader(Tail, Config);
 init_offset_reader(first, #{name := StreamId, shared := Shared} = Config) ->
     LocalFirstOffset = osiris_log_shared:first_chunk_id(Shared),
-    case rabbitmq_stream_s3_log_manifest:get_manifest(StreamId) of
+    case rabbitmq_stream_s3_server:get_manifest(StreamId) of
         #manifest{first_offset = RemoteFirstOffset} when RemoteFirstOffset < LocalFirstOffset ->
             ?LOG_DEBUG(
                 "Attaching remote reader at first offset ~b pos ~b for spec 'first'",
@@ -109,7 +118,7 @@ init_offset_reader(Offset, #{name := StreamId, shared := Shared} = Config) when
                     Offset, StreamId, FirstChunkId
                 ]
             ),
-            case rabbitmq_stream_s3_log_manifest:get_manifest(StreamId) of
+            case rabbitmq_stream_s3_server:get_manifest(StreamId) of
                 undefined ->
                     init_local_reader(next, Config);
                 #manifest{first_offset = FirstOffset} when Offset < FirstOffset ->
@@ -131,11 +140,11 @@ init_offset_reader({timestamp, Ts} = Spec, #{name := StreamId} = Config) ->
     ]),
     %% We can't cheaply query the first timestamp from `osiris_log_shared`.
     %% Instead try the remote tier first.
-    case rabbitmq_stream_s3_log_manifest:get_manifest(StreamId) of
+    case rabbitmq_stream_s3_server:get_manifest(StreamId) of
         #manifest{first_offset = FirstOffset, first_timestamp = FirstTs} when Ts < FirstTs ->
             init_remote_reader(FirstOffset, ?SEGMENT_HEADER_B, FirstOffset, Config);
         #manifest{entries = Entries} ->
-            case rabbitmq_stream_s3_binary_array:last(?ENTRY_B, Entries) of
+            case rabbitmq_stream_s3_array:last(?ENTRY_B, Entries) of
                 ?ENTRY(_O, ETs, _, _, _, _, _) when ETs > Ts ->
                     {ok, ChunkId, Position, Fragment} = find_position(
                         {timestamp, Ts},
@@ -156,7 +165,7 @@ init_offset_reader({abs, Offset} = Spec, #{name := StreamId} = Config) ->
         {error, {offset_out_of_range, empty}} = Err ->
             Err;
         {error, {offset_out_of_range, {_LocalFirst, LocalLast}}} = Err ->
-            case rabbitmq_stream_s3_log_manifest:get_manifest(StreamId) of
+            case rabbitmq_stream_s3_server:get_manifest(StreamId) of
                 #manifest{first_offset = RemoteFirst, entries = Entries} ->
                     case RemoteFirst >= Offset of
                         true ->
@@ -320,7 +329,7 @@ start_link(Reader, Key) ->
 init({Reader, Key}) ->
     erlang:monitor(process, Reader),
     {ok, Conn} = rabbitmq_stream_s3_api:open(),
-    {ok, #fragment_info{size = SegmentDataSize, next_offset = NextOffset}} = rabbitmq_stream_s3_log_manifest:get_fragment_trailer(
+    {ok, #fragment_info{size = SegmentDataSize, next_offset = NextOffset}} = rabbitmq_stream_s3_server:get_fragment_trailer(
         Key
     ),
     {ok, ReadSize} =
@@ -470,7 +479,7 @@ read_header1(
                 _ ->
                     %% TODO: what if retention takes away fragments? We need to
                     %% jump ahead to the start of the log.
-                    Key = rabbitmq_stream_s3_log_manifest:fragment_key(StreamId, NextChId),
+                    Key = rabbitmq_stream_s3:fragment_key(StreamId, NextChId),
                     case rabbitmq_stream_s3_log_reader_sup:add_child(self(), Key) of
                         {ok, Pid} ->
                             ok = gen_server:cast(Pid0, close),
@@ -578,7 +587,7 @@ init_remote_reader(
             _ ->
                 undefined
         end,
-    Key = rabbitmq_stream_s3_log_manifest:fragment_key(StreamId, Fragment),
+    Key = rabbitmq_stream_s3:fragment_key(StreamId, Fragment),
     case rabbitmq_stream_s3_log_reader_sup:add_child(self(), Key) of
         {ok, Pid} ->
             Reader = #?MODULE{
@@ -610,7 +619,7 @@ convert_remote_to_local(#?MODULE{
 
 -spec find_position(
     {offset, osiris:offset()} | {timestamp, osiris:timestamp()},
-    rabbitmq_stream_s3_log_manifest_entry:entries(),
+    rabbitmq_stream_s3:entries(),
     stream_id()
 ) ->
     {ok, ChunkId :: osiris:offset(), byte_offset(), Fragment :: osiris:offset()}.
@@ -627,14 +636,11 @@ being searched for is within a group, the group will be fetched with `GetGroup`
 and then searched recursively.
 """.
 -spec find_fragment(
-    rabbitmq_stream_s3_log_manifest_entry:entries(),
+    rabbitmq_stream_s3:entries(),
     {offset, osiris:offset()} | {timestamp, osiris:timestamp()},
     fun(
-        (
-            rabbitmq_stream_s3:uid(),
-            rabbitmq_stream_s3_log_manifest_entry:kind(),
-            osiris:offset()
-        ) -> rabbitmq_stream_s3_log_manifest_entry:entries()
+        (rabbitmq_stream_s3:uid(), rabbitmq_stream_s3:kind(), osiris:offset()) ->
+            rabbitmq_stream_s3:entries()
     )
 ) -> Fragment :: osiris:offset().
 find_fragment(Entries, Spec, GetGroup) ->
@@ -645,13 +651,13 @@ find_fragment(Entries, Spec, GetGroup) ->
             {timestamp, Ts} ->
                 fun(?ENTRY(_O, T, _K, _S, _N, _U, _)) -> Ts >= T end
         end,
-    Idx0 = rabbitmq_stream_s3_binary_array:partition_point(
+    Idx0 = rabbitmq_stream_s3_array:partition_point(
         PartitionPredicate,
         ?ENTRY_B,
         Entries
     ),
     Idx = saturating_decr(Idx0),
-    ?ENTRY(EntryOffset, _, Kind, _, _, Uid, _) = rabbitmq_stream_s3_binary_array:at(
+    ?ENTRY(EntryOffset, _, Kind, _, _, Uid, _) = rabbitmq_stream_s3_array:at(
         Idx,
         ?ENTRY_B,
         Entries
@@ -670,7 +676,7 @@ find_fragment(Entries, Spec, GetGroup) ->
 
 find_position0(Spec, Fragment, StreamId) ->
     %% TODO: pass in size now that we have it.
-    {ok, #fragment_info{index_start_pos = IdxStartPos}} = rabbitmq_stream_s3_log_manifest:get_fragment_trailer(
+    {ok, #fragment_info{index_start_pos = IdxStartPos}} = rabbitmq_stream_s3_server:get_fragment_trailer(
         StreamId,
         Fragment
     ),
@@ -692,7 +698,7 @@ find_index_position(IndexData, Spec) ->
                 fun(?INDEX_RECORD(_O, T, _P)) -> Ts > T end
         end,
     Idx0 =
-        rabbitmq_stream_s3_binary_array:partition_point(
+        rabbitmq_stream_s3_array:partition_point(
             PartitionPredicate,
             ?INDEX_RECORD_B,
             IndexData
@@ -701,11 +707,11 @@ find_index_position(IndexData, Spec) ->
         case Spec of
             {offset, _} ->
                 Idx = saturating_decr(Idx0),
-                rabbitmq_stream_s3_binary_array:at(Idx, ?INDEX_RECORD_B, IndexData);
+                rabbitmq_stream_s3_array:at(Idx, ?INDEX_RECORD_B, IndexData);
             {timestamp, _} ->
-                case rabbitmq_stream_s3_binary_array:try_at(Idx0, ?INDEX_RECORD_B, IndexData) of
+                case rabbitmq_stream_s3_array:try_at(Idx0, ?INDEX_RECORD_B, IndexData) of
                     undefined ->
-                        rabbitmq_stream_s3_binary_array:last(?INDEX_RECORD_B, IndexData);
+                        rabbitmq_stream_s3_array:last(?INDEX_RECORD_B, IndexData);
                     Record ->
                         Record
                 end
@@ -717,7 +723,7 @@ saturating_decr(N) -> N - 1.
 
 index_data(StreamId, FragmentOffset, StartPos) ->
     {ok, Conn} = rabbitmq_stream_s3_api:open(),
-    Key = rabbitmq_stream_s3_log_manifest:fragment_key(StreamId, FragmentOffset),
+    Key = rabbitmq_stream_s3:fragment_key(StreamId, FragmentOffset),
     ?LOG_DEBUG("Looking up key ~ts (~ts)", [Key, ?FUNCTION_NAME]),
     try
         {ok, Data} = rabbitmq_stream_s3_api:get_range(
@@ -738,7 +744,7 @@ get_group_fun(StreamId) ->
 
 get_group(StreamId, Uid, Kind, GroupOffset) ->
     {ok, Conn} = rabbitmq_stream_s3_api:open(),
-    Key = rabbitmq_stream_s3_log_manifest:group_key(StreamId, Uid, Kind, GroupOffset),
+    Key = rabbitmq_stream_s3:group_key(StreamId, Uid, Kind, GroupOffset),
     ?LOG_DEBUG("Looking up key ~ts (~ts)", [Key, ?FUNCTION_NAME]),
     try
         {ok, Data} = rabbitmq_stream_s3_api:get(Conn, Key, #{timeout => ?READ_TIMEOUT}),

@@ -1,7 +1,7 @@
 %% Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 %% SPDX-License-Identifier: Apache-2.0
 
--module(rabbitmq_stream_s3_log_manifest_machine).
+-module(rabbitmq_stream_s3_machine).
 -moduledoc """
 The "functional core" of the log manifest.
 
@@ -931,7 +931,7 @@ format_manifest(#manifest{
     entries = Entries
 }) ->
     Format0 =
-        case rabbitmq_stream_s3_binary_array:last(?ENTRY_B, Entries) of
+        case rabbitmq_stream_s3_array:last(?ENTRY_B, Entries) of
             ?ENTRY(LastOffset, LastTs, _K, _S, _Seq, _Uid, _) ->
                 #{
                     last_offset => LastOffset,
