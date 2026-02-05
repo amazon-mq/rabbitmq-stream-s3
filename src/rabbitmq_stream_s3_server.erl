@@ -8,6 +8,7 @@
 -include("include/rabbitmq_stream_s3.hrl").
 
 -define(SERVER, ?MODULE).
+-define(RANGE_TABLE, rabbitmq_stream_s3_log_manifest_range).
 
 -behaviour(gen_server).
 
@@ -23,10 +24,8 @@
 %% records for the gen_server to handle:
 -record(init_acceptor, {
     pid :: pid(),
-    writer_pid :: pid(),
     stream :: stream_id(),
-    reference :: stream_reference(),
-    dir :: directory()
+    config :: osiris_log:config()
 }).
 -record(get_manifest, {stream :: stream_id()}).
 -record(task_completed, {task_pid :: pid(), event :: event() | ok}).
@@ -44,8 +43,8 @@
 %% API
 -export([
     get_manifest/1,
-    init_acceptor/4,
-    init_writer/7,
+    init_acceptor/2,
+    init_writer/3,
     fragment_available/2,
     retention_updated/2,
     delete_stream/1
@@ -92,34 +91,20 @@ start() ->
 get_manifest(StreamId) ->
     gen_server:call(?SERVER, #get_manifest{stream = StreamId}, infinity).
 
--spec init_writer(
-    stream_id(),
-    directory(),
-    osiris:epoch(),
-    stream_reference(),
-    [node()],
-    [osiris:retention_spec()],
-    [#fragment{}]
-) -> ok.
-init_writer(StreamId, Dir, Epoch, Reference, ReplicaNodes, Retention, AvailableFragments) ->
+-spec init_writer(stream_id(), osiris_log:config(), [#fragment{}]) -> ok.
+init_writer(StreamId, Config, AvailableFragments) ->
     gen_server:cast(?SERVER, #writer_spawned{
         stream = StreamId,
-        dir = Dir,
-        epoch = Epoch,
-        reference = Reference,
         pid = self(),
-        replica_nodes = ReplicaNodes,
-        retention = Retention,
+        config = Config,
         available_fragments = AvailableFragments
     }).
 
--spec init_acceptor(stream_id(), directory(), pid(), stream_reference()) -> ok.
-init_acceptor(StreamId, Dir, WriterPid, Reference) ->
+-spec init_acceptor(stream_id(), osiris_log:config()) -> ok.
+init_acceptor(StreamId, Config) ->
     gen_server:cast(?SERVER, #init_acceptor{
         stream = StreamId,
-        dir = Dir,
-        writer_pid = WriterPid,
-        reference = Reference,
+        config = Config,
         pid = self()
     }).
 
@@ -161,21 +146,29 @@ handle_call(Request, From, State) ->
     {noreply, State}.
 
 handle_cast(
-    #writer_spawned{stream = StreamId, reference = Reference} = Event,
+    #writer_spawned{stream = StreamId, config = #{reference := Reference}} = Event,
     #?MODULE{references = References0} = State0
 ) ->
     State1 = State0#?MODULE{references = References0#{Reference => StreamId}},
     {noreply, evolve_event(Event, State1)};
 handle_cast(
-    #init_acceptor{writer_pid = WriterPid, stream = StreamId, reference = Reference},
+    #init_acceptor{
+        stream = StreamId,
+        config =
+            #{
+                leader_pid := LeaderPid,
+                reference := Reference
+            } = Config
+    },
     #?MODULE{references = References0} = State0
 ) ->
-    ok = gen_server:cast({?SERVER, node(WriterPid)}, #manifest_requested{
+    ok = gen_server:cast({?SERVER, node(LeaderPid)}, #manifest_requested{
         stream = StreamId,
         requester = self()
     }),
     State1 = State0#?MODULE{references = References0#{Reference => StreamId}},
-    {noreply, evolve_event(#acceptor_spawned{stream = StreamId}, State1)};
+    Event = #acceptor_spawned{stream = StreamId, config = Config},
+    {noreply, evolve_event(Event, State1)};
 handle_cast(#manifest_requested{} = Event, State) ->
     {noreply, evolve_event(Event, State)};
 handle_cast(
@@ -275,13 +268,49 @@ apply_effect(#send{to = Pid, message = Message, options = Options}, State) ->
 apply_effect(#register_offset_listener{writer_pid = Pid, offset = Offset}, State) ->
     ok = osiris:register_offset_listener(Pid, Offset, {?MODULE, format_osiris_event, []}),
     State;
-apply_effect(#set_range{stream = StreamId, first = First, next = Next}, State) ->
+apply_effect(
+    #set_range{
+        stream = StreamId,
+        counter = Cnt,
+        first_offset = FirstOffset,
+        first_timestamp = FirstTs,
+        next_offset = NextOffset
+    },
+    State
+) ->
+    ok = counters:put(Cnt, ?C_OSIRIS_LOG_FIRST_OFFSET, FirstOffset),
+    ok = counters:put(Cnt, ?C_OSIRIS_LOG_FIRST_TIMESTAMP, FirstTs),
     _ = ets:update_element(
         ?RANGE_TABLE,
         StreamId,
-        [{2, First}, {3, Next}],
-        {StreamId, First, Next}
+        [{2, FirstOffset}, {3, NextOffset}],
+        {StreamId, FirstOffset, NextOffset}
     ),
+    State;
+apply_effect(
+    #trigger_retention{
+        stream = StreamId,
+        dir = Dir,
+        shared = Shared,
+        counter = Cnt
+    },
+    State
+) ->
+    %% This is an abbreviated version of the `EvalFun` used by `osiris_log`.
+    %% It also moves the first offset and timestamp forward. We don't want to
+    %% do that though since the data can exist in the remote tier.
+    EvalFun = fun
+        ({{FstOff, _}, FstTs, NumSegLeft}) when
+            is_integer(FstOff),
+            is_integer(FstTs)
+        ->
+            osiris_log_shared:set_first_chunk_id(Shared, FstOff),
+            counters:put(Cnt, ?C_OSIRIS_LOG_SEGMENTS, NumSegLeft);
+        (_) ->
+            ok
+    end,
+    Spec = [{'fun', local_retention_fun(StreamId)}],
+    ok = osiris_retention:eval(StreamId, Dir, Spec, EvalFun),
     State;
 apply_effect(#upload_fragment{} = Effect, State) ->
     spawn_task(Effect, State);
@@ -726,3 +755,106 @@ set_tick_timer() ->
 -spec metadata() -> rabbitmq_stream_s3_machine:metadata().
 metadata() ->
     #{time => erlang:system_time(millisecond)}.
+
+-spec local_retention_fun(stream_id()) -> osiris:retention_fun().
+local_retention_fun(StreamId) ->
+    fun(IdxFiles) ->
+        try ets:lookup_element(?RANGE_TABLE, StreamId, 3) of
+            NextTieredOffset ->
+                eval_local_retention(IdxFiles, NextTieredOffset)
+        catch
+            error:badarg ->
+                {[], IdxFiles}
+        end
+    end.
+
+-spec eval_local_retention(IdxFiles :: [filename()], osiris:offset()) ->
+    {ToDelete :: [filename()], ToKeep :: [filename(), ...]}.
+eval_local_retention(IdxFiles, NextTieredOffset) ->
+    %% Always keep the current active segment no matter what the last tiered
+    %% offset is.
+    eval_local_retention(lists:reverse(IdxFiles), NextTieredOffset, [], []).
+
+eval_local_retention([], _NextTieredOffset, ToDelete, ToKeep) ->
+    %% Always keep the current active segment no matter what the last tiered
+    %% offset is.
+    {lists:reverse(ToDelete), ToKeep};
+eval_local_retention([IdxFile | Rest], NextTieredOffset, ToDelete, ToKeep) ->
+    Offset = rabbitmq_stream_s3:index_file_offset(IdxFile),
+    case Offset >= NextTieredOffset of
+        true ->
+            eval_local_retention(Rest, NextTieredOffset, ToDelete, [IdxFile | ToKeep]);
+        false ->
+            {lists:reverse(Rest), [IdxFile | ToKeep]}
+    end.
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+eval_local_retention_test() ->
+    IdxFiles = [
+        <<"/data/00000000000000000000.index">>,
+        <<"/data/00000000000000000100.index">>,
+        <<"/data/00000000000000000200.index">>,
+        <<"/data/00000000000000000300.index">>,
+        <<"/data/00000000000000000400.index">>
+    ],
+    ?assertEqual(
+        {
+            [
+                <<"/data/00000000000000000000.index">>,
+                <<"/data/00000000000000000100.index">>
+            ],
+            [
+                <<"/data/00000000000000000200.index">>,
+                <<"/data/00000000000000000300.index">>,
+                <<"/data/00000000000000000400.index">>
+            ]
+        },
+        eval_local_retention(IdxFiles, 251)
+    ),
+    %% Always keep the current segment:
+    ?assertEqual(
+        {
+            [
+                <<"/data/00000000000000000000.index">>,
+                <<"/data/00000000000000000100.index">>,
+                <<"/data/00000000000000000200.index">>,
+                <<"/data/00000000000000000300.index">>
+            ],
+            [
+                <<"/data/00000000000000000400.index">>
+            ]
+        },
+        eval_local_retention(IdxFiles, 451)
+    ),
+    ?assertEqual(
+        {
+            [
+                <<"/data/00000000000000000000.index">>,
+                <<"/data/00000000000000000100.index">>,
+                <<"/data/00000000000000000200.index">>
+            ],
+            [
+                <<"/data/00000000000000000300.index">>,
+                <<"/data/00000000000000000400.index">>
+            ]
+        },
+        eval_local_retention(IdxFiles, 301)
+    ),
+    ?assertEqual(
+        {
+            [],
+            [
+                <<"/data/00000000000000000000.index">>,
+                <<"/data/00000000000000000100.index">>,
+                <<"/data/00000000000000000200.index">>,
+                <<"/data/00000000000000000300.index">>,
+                <<"/data/00000000000000000400.index">>
+            ]
+        },
+        eval_local_retention(IdxFiles, 0)
+    ),
+    ok.
+
+-endif.

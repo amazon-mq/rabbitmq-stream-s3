@@ -59,7 +59,9 @@ efficiently using the `rabbitmq_stream_s3_array` module.
     group_key/4,
     group_extension/1,
     next_group/1,
-    fragment_key/2
+    fragment_key/2,
+    index_file_offset/1,
+    segment_file_offset/1
 ]).
 
 -doc "Creates a new random UID.".
@@ -129,11 +131,35 @@ fragment_key(StreamId, Offset) when is_binary(StreamId) andalso is_integer(Offse
 stream_data_key(StreamId, Filename) when is_binary(StreamId) andalso is_binary(Filename) ->
     <<"rabbitmq/stream/", StreamId/binary, "/data/", Filename/binary>>.
 
+-doc "Extracts the first offset from a segment filename".
+-spec segment_file_offset(file:filename_all()) -> osiris:offset().
+segment_file_offset(Filename) ->
+    filename_offset(filename:basename(Filename, <<".segment">>)).
+
+-doc "Extracts the first offset from an index filename".
+-spec index_file_offset(file:filename_all()) -> osiris:offset().
+index_file_offset(Filename) ->
+    filename_offset(filename:basename(Filename, <<".index">>)).
+
+-spec filename_offset(file:filename_all()) -> osiris:offset().
+filename_offset(Basename) when is_binary(Basename) ->
+    binary_to_integer(Basename);
+filename_offset(Basename) when is_list(Basename) ->
+    list_to_integer(Basename).
+
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
 format_uid_test() ->
     ?assertEqual(<<"0000000000000000">>, format_uid(null_uid())),
+    ok.
+
+index_file_offset_test() ->
+    %% Relative? Absolute? No directory at all? Doesn't matter. The answer
+    %% is the same.
+    ?assertEqual(100, index_file_offset(<<"00000000000000000100.index">>)),
+    ?assertEqual(100, index_file_offset(<<"path/to/00000000000000000100.index">>)),
+    ?assertEqual(100, index_file_offset(<<"/path/to/00000000000000000100.index">>)),
     ok.
 
 -endif.

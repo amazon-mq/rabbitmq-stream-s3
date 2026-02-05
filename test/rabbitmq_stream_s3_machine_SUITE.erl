@@ -29,29 +29,37 @@ all() ->
         stream_deletion_during_fragment_upload
     ].
 
+init_per_suite(Config) ->
+    application:ensure_all_started(seshat),
+    osiris_counters:init(),
+    osiris_writer:init_fields_spec(),
+    Config.
+
+end_per_suite(_Config) ->
+    ok.
+
 %%----------------------------------------------------------------------------
 
 spawn_writer(Config) ->
-    Dir = directory(Config),
     Mac0 = ?MAC:new(),
     Pid = self(),
     StreamId = erlang:make_ref(),
     Event1 = #writer_spawned{
         stream = StreamId,
         pid = Pid,
-        dir = Dir
+        config = writer_config(Config)
     },
     {Mac1, Effects1} = ?MAC:apply(?META(), Event1, Mac0),
-    ?assertEqual(
+    ?assertMatch(
         [
             #resolve_manifest{stream = StreamId},
             #register_offset_listener{writer_pid = Pid, offset = -1}
         ],
         Effects1
     ),
-    Event2 = #manifest_resolved{stream = Dir, manifest = #manifest{}},
+    Event2 = #manifest_resolved{stream = StreamId, manifest = #manifest{}},
     {_Mac2, Effects2} = ?MAC:apply(?META(), Event2, Mac1),
-    ?assertEqual([], Effects2),
+    ?assertMatch([#set_range{}], Effects2),
     ok.
 
 simultaneous_manifest_requests(Config) ->
@@ -60,13 +68,12 @@ simultaneous_manifest_requests(Config) ->
     %% download of the manifest should be shared between any processes which
     %% request it without duplicate downloads effects.
 
-    Dir = directory(Config),
     WriterPid = self(),
     StreamId = erlang:make_ref(),
     Event1 = #writer_spawned{
         stream = StreamId,
         pid = WriterPid,
-        dir = Dir
+        config = writer_config(Config)
     },
 
     %% Simulate two offset readers starting while the manifest is being
@@ -93,7 +100,7 @@ simultaneous_manifest_requests(Config) ->
         [
             #reply{to = From1, response = #manifest{}},
             #reply{to = From2, response = #manifest{}},
-            #set_range{next = 0}
+            #set_range{next_offset = 0}
         ],
         Effects2
     ),
@@ -103,7 +110,6 @@ spawn_writer_after_readers(Config) ->
     %% A writer could hypothetically start up after readers have requested the
     %% manifest. The manifest should only be resolved once.
 
-    Dir = directory(Config),
     WriterPid = self(),
     StreamId = erlang:make_ref(),
     Pid1 = spawn(fun() -> ok end),
@@ -122,7 +128,7 @@ spawn_writer_after_readers(Config) ->
     WriterSpawned = #writer_spawned{
         stream = StreamId,
         pid = WriterPid,
-        dir = Dir
+        config = writer_config(Config)
     },
     {Mac2, Effects2} = ?MAC:apply(?META(), WriterSpawned, Mac1),
     ?assertEqual([#register_offset_listener{writer_pid = WriterPid, offset = -1}], Effects2),
@@ -133,7 +139,7 @@ spawn_writer_after_readers(Config) ->
         [
             #reply{to = From1, response = #manifest{}},
             #reply{to = From2, response = #manifest{}},
-            #set_range{next = 0}
+            #set_range{next_offset = 0}
         ],
         Effects3
     ),
@@ -141,8 +147,17 @@ spawn_writer_after_readers(Config) ->
     ok.
 
 out_of_order_fragment_uploads(Config) ->
-    {Mac0, StreamId} = setup_writer(Config, ?MAC:new(#{debounce_modifications => 3})),
-    Fragments = [fragment(From, To) || {From, To} <- [{0, 19}, {20, 39}, {40, 59}]],
+    StreamId = erlang:make_ref(),
+    WriterSpawned = #writer_spawned{
+        stream = StreamId,
+        pid = self(),
+        config = writer_config(Config)
+    },
+    ManifestResolved = #manifest_resolved{stream = StreamId, manifest = #manifest{}},
+    {Mac0, _} = handle_events(
+        ?META(), [WriterSpawned, ManifestResolved], ?MAC:new(#{debounce_modifications => 3})
+    ),
+    Fragments = fragments([{0, 19}, {20, 39}, {40, 59}]),
     FragmentsAvailable = [#fragment_available{stream = StreamId, fragment = F} || F <- Fragments],
     {Mac1, Effects1} = handle_events(?META(), FragmentsAvailable, Mac0),
     ?assertEqual([], Effects1),
@@ -170,11 +185,12 @@ out_of_order_fragment_uploads(Config) ->
     {_Mac4, Effects4} = ?MAC:apply(?META(), Up1, Mac3),
     ?assertMatch(
         [
-            #set_range{next = 60},
+            #set_range{next_offset = 60},
             #upload_manifest{
                 stream = StreamId,
                 manifest = #manifest{first_offset = 0, next_offset = 60}
-            }
+            },
+            #trigger_retention{}
         ],
         Effects4
     ),
@@ -185,8 +201,15 @@ recover_uploaded_fragments(Config) ->
     %% uploaded. When restarting, the writer resolve the full manifest and
     %% upload it.
     Cfg = #{debounce_modifications => 1},
-    {Mac0, StreamId} = setup_writer(Config, ?MAC:new(Cfg)),
-    [F1, F2, _F3] = Fragments = [fragment(From, To) || {From, To} <- [{0, 19}, {20, 39}, {40, 59}]],
+    StreamId = erlang:make_ref(),
+    WriterSpawned = #writer_spawned{
+        stream = StreamId,
+        pid = self(),
+        config = writer_config(Config)
+    },
+    ManifestResolved = #manifest_resolved{stream = StreamId, manifest = #manifest{}},
+    {Mac0, _} = handle_events(?META(), [WriterSpawned, ManifestResolved], ?MAC:new(Cfg)),
+    [F1, F2, _F3] = Fragments = fragments([{0, 19}, {20, 39}, {40, 59}]),
     FragmentsAvailable = [#fragment_available{stream = StreamId, fragment = F} || F <- Fragments],
     {Mac1, Effects1} = handle_events(?META(), FragmentsAvailable, Mac0),
     ?assertEqual([], Effects1),
@@ -209,14 +232,15 @@ recover_uploaded_fragments(Config) ->
     {_Mac3, Effects3} = ?MAC:apply(?META(), Up1, Mac2),
     ?assertMatch(
         [
-            #set_range{next = 20},
+            #set_range{next_offset = 20},
             #upload_manifest{
                 manifest = #manifest{
                     first_offset = 0,
                     total_size = 200,
                     next_offset = 20
                 }
-            }
+            },
+            #trigger_retention{}
         ],
         Effects3
     ),
@@ -227,13 +251,12 @@ recover_uploaded_fragments(Config) ->
     %% what has been uploaded (fragments 1 and 2 now) and
 
     Pid = self(),
-    Dir = directory(Config),
-    WriterSpawned = #writer_spawned{
+    WriterSpawned1 = #writer_spawned{
         stream = StreamId,
         pid = Pid,
-        dir = Dir
+        config = writer_config(Config)
     },
-    {Mac4, Effects4} = ?MAC:apply(?META(), WriterSpawned, ?MAC:new(Cfg)),
+    {Mac4, Effects4} = ?MAC:apply(?META(), WriterSpawned1, ?MAC:new(Cfg)),
     ?assertMatch([#resolve_manifest{stream = StreamId}, #register_offset_listener{}], Effects4),
     %% The existing local fragments are sent to the manifest server as
     %% available.
@@ -243,24 +266,24 @@ recover_uploaded_fragments(Config) ->
     COI2 = #commit_offset_increased{stream = StreamId, offset = 60},
     {Mac6, Effects6} = ?MAC:apply(?META(), COI2, Mac5),
     ?assertMatch([#register_offset_listener{}], Effects6),
-    ManifestResolved = #manifest_resolved{
+    ManifestResolved1 = #manifest_resolved{
         stream = StreamId,
         manifest = fragments_to_manifest([F1, F2])
     },
-    {Mac7, Effects7} = ?MAC:apply(?META(), ManifestResolved, Mac6),
+    {Mac7, Effects7} = ?MAC:apply(?META(), ManifestResolved1, Mac6),
     %% The last fragment is now eligible for upload since the commit offset
     %% increased.
     ?assertMatch(
         [
             #upload_fragment{stream = StreamId, fragment = #fragment{first_offset = 40}},
-            #set_range{next = 40}
+            #set_range{next_offset = 40}
         ],
         Effects7
     ),
     {_Mac8, Effects8} = ?MAC:apply(?META(), Up3, Mac7),
     ?assertMatch(
         [
-            #set_range{next = 60},
+            #set_range{next_offset = 60},
             #upload_manifest{manifest = #manifest{first_offset = 0, next_offset = 60}}
         ],
         Effects8
@@ -268,7 +291,6 @@ recover_uploaded_fragments(Config) ->
     ok.
 
 manifest_replication(Config) ->
-    Dir = directory(Config),
     WriterPid = self(),
     ReplicaPid = spawn(fun() -> ok end),
     ReplicaNode = 'rabbit@replica',
@@ -276,8 +298,7 @@ manifest_replication(Config) ->
     WriterSpawned = #writer_spawned{
         stream = StreamId,
         pid = WriterPid,
-        dir = Dir,
-        replica_nodes = [ReplicaNode]
+        config = (writer_config(Config))#{replica_nodes := [ReplicaNode]}
     },
     Writer0 = ?MAC:new(#{debounce_modifications => 3}),
     {Writer1, Effects1} = ?MAC:apply(?META(), WriterSpawned, Writer0),
@@ -294,16 +315,16 @@ manifest_replication(Config) ->
     ?assertMatch(
         [
             #send{to = ReplicaPid, message = ManifestResolved},
-            #set_range{next = 0}
+            #set_range{next_offset = 0}
         ],
         Effects3
     ),
-    AcceptorSpawned = #acceptor_spawned{stream = StreamId},
+    AcceptorSpawned = #acceptor_spawned{stream = StreamId, config = writer_config(Config)},
     {Replica1, Effects4} = handle_events(?META(), [AcceptorSpawned, ManifestResolved], ?MAC:new()),
-    ?assertMatch([#set_range{next = 0}], Effects4),
+    ?assertMatch([#set_range{next_offset = 0}], Effects4),
     %% Now when fragments are fully uploaded and applied to the manifest, the
     %% acceptor will get notifications that fragments were applied.
-    Fragments = [fragment(From, To) || {From, To} <- [{0, 19}, {20, 39}, {40, 59}]],
+    Fragments = fragments([{0, 19}, {20, 39}, {40, 59}]),
     FragmentsAvailable = [#fragment_available{stream = StreamId, fragment = F} || F <- Fragments],
     CommitOffsetIncreased = #commit_offset_increased{stream = StreamId, offset = 60},
     {Writer4, Effects5} = handle_events(
@@ -326,8 +347,9 @@ manifest_replication(Config) ->
     ?assertMatch(
         [
             #send{to = {_, ReplicaNode}, message = FragmentsApplied},
-            #set_range{next = 60},
-            #upload_manifest{}
+            #set_range{next_offset = 60},
+            #upload_manifest{},
+            #trigger_retention{}
         ],
         Effects6
     ),
@@ -335,20 +357,26 @@ manifest_replication(Config) ->
     {_Writer6, Effects7} = ?MAC:apply(?META(), ManifestUploaded1, Writer5),
     ?assertEqual([], Effects7),
     {_Replica2, Effects8} = ?MAC:apply(?META(), FragmentsApplied, Replica1),
-    ?assertMatch([#set_range{next = 60}], Effects8),
+    ?assertMatch(
+        [
+            #set_range{next_offset = 60},
+            #trigger_retention{}
+        ],
+        Effects8
+    ),
     ok.
 
 retention(Config) ->
-    Dir = directory(Config),
     Pid = self(),
     ReplicaNode = 'rabbit@replica',
     StreamId = erlang:make_ref(),
     WriterSpawned = #writer_spawned{
         stream = StreamId,
         pid = Pid,
-        dir = Dir,
-        replica_nodes = [ReplicaNode],
-        retention = [{max_bytes, 700}]
+        config = (writer_config(Config))#{
+            replica_nodes := [ReplicaNode],
+            retention := [{max_bytes, 700}]
+        }
     },
     Writer0 = ?MAC:new(#{debounce_modifications => 1}),
     {Writer1, _Effects1} = ?MAC:apply(?META(), WriterSpawned, Writer0),
@@ -375,11 +403,11 @@ retention(Config) ->
     },
     ManifestResolved = #manifest_resolved{stream = StreamId, manifest = Manifest},
     {Writer2, Effects2} = ?MAC:apply(?META(), ManifestResolved, Writer1),
-    ?assertMatch([#set_range{first = 0, next = 120}], Effects2),
+    ?assertMatch([#set_range{first_offset = 0, next_offset = 120}], Effects2),
 
-    AcceptorSpawned = #acceptor_spawned{stream = StreamId},
+    AcceptorSpawned = #acceptor_spawned{stream = StreamId, config = writer_config(Config)},
     {Replica1, REffects1} = handle_events(?META(), [AcceptorSpawned, ManifestResolved], ?MAC:new()),
-    ?assertMatch([#set_range{first = 0, next = 120}], REffects1),
+    ?assertMatch([#set_range{first_offset = 0, next_offset = 120}], REffects1),
 
     FragmentsApplied1 = #fragments_applied{
         stream = StreamId,
@@ -391,7 +419,7 @@ retention(Config) ->
     ?assertMatch(
         [
             #send{to = {_, ReplicaNode}, message = FragmentsApplied1},
-            #set_range{first = 40, next = 120},
+            #set_range{first_offset = 40, next_offset = 120},
             #upload_manifest{manifest = #manifest{first_offset = 40, total_size = 600}},
             #delete_fragments{offsets = [0, 20]}
         ],
@@ -402,7 +430,7 @@ retention(Config) ->
     ?assertMatch([], Effects4),
 
     {Replica2, REffects2} = ?MAC:apply(?META(), FragmentsApplied1, Replica1),
-    ?assertMatch([#set_range{first = 40, next = 120}], REffects2),
+    ?assertMatch([#set_range{first_offset = 40, next_offset = 120}], REffects2),
 
     RetentionUpdated = #retention_updated{stream = StreamId, retention = [{max_bytes, 500}]},
     {Writer5, Effects5} = ?MAC:apply(?META(), RetentionUpdated, Writer4),
@@ -415,7 +443,7 @@ retention(Config) ->
     ?assertMatch(
         [
             #send{to = {_, ReplicaNode}, message = FragmentsApplied2},
-            #set_range{first = 60, next = 120},
+            #set_range{first_offset = 60, next_offset = 120},
             #upload_manifest{manifest = #manifest{first_offset = 60, total_size = 400}},
             #delete_fragments{offsets = [40]}
         ],
@@ -426,7 +454,7 @@ retention(Config) ->
     ?assertMatch([], Effects6),
 
     {Replica3, REffects3} = ?MAC:apply(?META(), FragmentsApplied2, Replica2),
-    ?assertMatch([#set_range{first = 60, next = 120}], REffects3),
+    ?assertMatch([#set_range{first_offset = 60, next_offset = 120}], REffects3),
 
     %% Publish another fragment which will exceed the max-bytes setting.
     %% That fragment should be added to the manifest and the oldest fragment
@@ -461,11 +489,12 @@ retention(Config) ->
     ?assertMatch(
         [
             #send{to = {_, ReplicaNode}, message = FragmentsApplied3},
-            #set_range{first = 80, next = 140},
+            #set_range{first_offset = 80, next_offset = 140},
             #upload_manifest{
                 manifest = #manifest{first_offset = 80, next_offset = 140, total_size = 400}
             },
-            #delete_fragments{offsets = [60]}
+            #delete_fragments{offsets = [60]},
+            #trigger_retention{}
         ],
         Effects8
     ),
@@ -474,7 +503,13 @@ retention(Config) ->
     ?assertMatch([], Effects9),
 
     {_Replica4, REffects4} = ?MAC:apply(?META(), FragmentsApplied3, Replica3),
-    ?assertMatch([#set_range{first = 80, next = 140}], REffects4),
+    ?assertMatch(
+        [
+            #set_range{first_offset = 80, next_offset = 140},
+            #trigger_retention{}
+        ],
+        REffects4
+    ),
     ok.
 
 backfill_older_segments(Config) ->
@@ -483,7 +518,6 @@ backfill_older_segments(Config) ->
     %% segments which were not successfully uploaded to the remote tier -
     %% probably due to an outage or transient failure. In that case we must
     %% "backfill" in the older segment data.
-    Dir = directory(Config),
     Pid = self(),
     StreamId = erlang:make_ref(),
     Ts = erlang:system_time(millisecond),
@@ -503,7 +537,7 @@ backfill_older_segments(Config) ->
     WriterSpawned = #writer_spawned{
         stream = StreamId,
         pid = Pid,
-        dir = Dir,
+        config = writer_config(Config),
         available_fragments = lists:reverse(Seg1Fragments)
     },
     Mac0 = ?MAC:new(#{debounce_modifications => 1}),
@@ -527,7 +561,7 @@ backfill_older_segments(Config) ->
             %% The machine recognizes that 40..60 was not uploaded.
             %% (Or maybe it was, but the machine was never notified about it.)
             #find_fragments{from = 40, to = 60},
-            #set_range{first = 0, next = 40}
+            #set_range{first_offset = 0, next_offset = 40}
         ],
         Effects3
     ),
@@ -550,7 +584,14 @@ backfill_older_segments(Config) ->
     %% of these fragments to the manifest and upload it.
     FragmentUploaded = #fragment_uploaded{stream = StreamId, info = fragment_to_info(Fragment3)},
     {_Mac6, Effects6} = ?MAC:apply(?META(), FragmentUploaded, Mac5),
-    ?assertMatch([#set_range{first = 0, next = 120}, #upload_manifest{}], Effects6),
+    ?assertMatch(
+        [
+            #set_range{first_offset = 0, next_offset = 120},
+            #upload_manifest{},
+            #trigger_retention{}
+        ],
+        Effects6
+    ),
     ok.
 
 manifest_upload_conflict(Config) ->
@@ -559,14 +600,9 @@ manifest_upload_conflict(Config) ->
     %% overwrite the other. We use an optimistic lock to prevent this. This
     %% test case doesn't cover the optimistic lock - it just simulates the
     %% lock rejecting a write.
-    Dir = directory(Config),
     OldWriterPid = self(),
     StreamId = erlang:make_ref(),
-    StreamRef = erlang:make_ref(),
-    [F1, F2, F3, F4] = [
-        fragment(From, To)
-     || {From, To} <- [{0, 19}, {20, 39}, {40, 59}, {60, 79}]
-    ],
+    [F1, F2, F3, F4] = fragments([{0, 19}, {20, 39}, {40, 59}, {60, 79}]),
     %% Room for two of those fragments:
     Retention = [{max_bytes, 400}],
 
@@ -574,10 +610,7 @@ manifest_upload_conflict(Config) ->
     OldWriterSpawned = #writer_spawned{
         stream = StreamId,
         pid = OldWriterPid,
-        dir = Dir,
-        retention = Retention,
-        epoch = 1,
-        reference = StreamRef
+        config = (writer_config(Config))#{retention => Retention}
     },
     OldWriter0 = ?MAC:new(#{debounce_modifications => 1}),
     {OldWriter1, OldEffects1} = ?MAC:apply(?META(), OldWriterSpawned, OldWriter0),
@@ -597,7 +630,7 @@ manifest_upload_conflict(Config) ->
     NewWriterPid = spawn(fun() -> ok end),
     NewWriterSpawned = OldWriterSpawned#writer_spawned{
         pid = NewWriterPid,
-        epoch = 2,
+        config = (writer_config(Config))#{retention => Retention, epoch => 2},
         available_fragments = [F4]
     },
     NewWriter0 = ?MAC:new(#{debounce_modifications => 1}),
@@ -614,7 +647,7 @@ manifest_upload_conflict(Config) ->
     {NewWriter4, NewEffects4} = ?MAC:apply(?META(), F4Uploaded, NewWriter3),
     ?assertMatch(
         [
-            #set_range{first = 40, next = 80},
+            #set_range{first_offset = 40, next_offset = 80},
             #upload_manifest{
                 manifest = #manifest{first_offset = 40, next_offset = 80, total_size = 400}
             },
@@ -634,7 +667,7 @@ manifest_upload_conflict(Config) ->
     ?assertMatch(
         [
             %% Note that it does not know about F4.
-            #set_range{first = 20, next = 60},
+            #set_range{first_offset = 20, next_offset = 60},
             #upload_manifest{
                 manifest = #manifest{first_offset = 20, next_offset = 60, total_size = 400}
             },
@@ -654,14 +687,13 @@ manifest_upload_conflict(Config) ->
 stream_deletion_during_fragment_upload(Config) ->
     %% Basically, show a fragment_uploaded event coming in after a
     %% stream_deleted.
-    Dir = directory(Config),
     Pid = self(),
     StreamId = erlang:make_ref(),
     Fragment = fragment(0, 19),
     Event1 = #writer_spawned{
         stream = StreamId,
         pid = Pid,
-        dir = Dir,
+        config = writer_config(Config),
         available_fragments = [Fragment]
     },
     Event2 = #manifest_resolved{stream = StreamId, manifest = #manifest{}},
@@ -687,21 +719,20 @@ stream_deletion_during_fragment_upload(Config) ->
 
 %%----------------------------------------------------------------------------
 
-setup_writer(Config) ->
-    setup_writer(Config, ?MAC:new()).
-
-setup_writer(Config, Mac0) ->
-    Dir = directory(Config),
-    Pid = self(),
-    StreamId = erlang:make_ref(),
-    Event1 = #writer_spawned{
-        stream = StreamId,
-        pid = Pid,
-        dir = Dir
-    },
-    Event2 = #manifest_resolved{stream = StreamId, manifest = #manifest{}},
-    {Mac, _} = handle_events(?META(), [Event1, Event2], Mac0),
-    {Mac, StreamId}.
+writer_config(Config) ->
+    Ref = erlang:make_ref(),
+    Counter = osiris_counters:new(
+        {osiris_writer, Ref}, {persistent_term, osiris_writer_seshat_fields_spec}
+    ),
+    #{
+        dir => directory(Config),
+        epoch => 1,
+        reference => Ref,
+        shared => osiris_log_shared:new(),
+        counter => Counter,
+        replica_nodes => [],
+        retention => []
+    }.
 
 handle_events(Meta, Events, Mac) ->
     handle_events(Meta, Events, Mac, []).
@@ -713,13 +744,20 @@ handle_events(Meta, [Event | Rest], Mac0, Acc) ->
     {Mac, Effects} = ?MAC:apply(Meta, Event, Mac0),
     handle_events(Meta, Rest, Mac, [Effects | Acc]).
 
+fragments(OffsetRanges) ->
+    [fragment(From, To, N) || {N, {From, To}} <- lists:enumerate(0, OffsetRanges)].
+
 fragment(Offset, LastOffset) ->
+    fragment(Offset, LastOffset, 0).
+
+fragment(Offset, LastOffset, SeqNo) ->
     #fragment{
         segment_offset = Offset,
         first_offset = Offset,
         first_timestamp = erlang:system_time(millisecond),
         last_offset = LastOffset,
         next_offset = LastOffset + 1,
+        seq_no = SeqNo,
         size = 200
     }.
 

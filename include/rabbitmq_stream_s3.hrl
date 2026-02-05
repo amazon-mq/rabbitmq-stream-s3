@@ -48,6 +48,13 @@
 -define(REMOTE_IDX_HEADER, <<?REMOTE_IDX_MAGIC, ?REMOTE_IDX_VERSION:32/unsigned>>).
 -define(REMOTE_IDX_HEADER_SIZE, 8).
 
+%% Counter indexes from osiris_log.erl:
+-define(C_OSIRIS_LOG_OFFSET, 1).
+-define(C_OSIRIS_LOG_FIRST_OFFSET, 2).
+-define(C_OSIRIS_LOG_FIRST_TIMESTAMP, 3).
+-define(C_OSIRIS_LOG_CHUNKS, 4).
+-define(C_OSIRIS_LOG_SEGMENTS, 5).
+
 %% first offset (8) + first timestamp (8) + next offset (8) + seq no (2) +
 %% size (4) + segment start pos (4) + num chunks in segment (4) +
 %% index byte offset (4) + index size (4) = 46.
@@ -211,8 +218,6 @@
 
 %% rabbitmq_stream_s3_log_manifest_machine types:
 
--define(RANGE_TABLE, rabbitmq_stream_s3_log_manifest_range).
-
 %% The name of a stream. This is a unique identifier for an incarnation of a
 %% stream, meaning that it will not be identical if you delete a stream queue
 %% and recreate it. RabbitMQ sets these to be the vhost name, stream name and
@@ -273,17 +278,16 @@
 }).
 -record(writer_spawned, {
     stream :: stream_id(),
-    dir :: directory(),
-    epoch :: osiris:epoch(),
-    reference :: stream_reference(),
     pid :: pid(),
-    replica_nodes = [] :: [node()],
-    retention = [] :: [osiris:retention_spec()],
+    config :: osiris_log:config(),
     %% Fragments available in the active segment. This list must be sorted
     %% descending by first offset.
     available_fragments = [] :: [#fragment{}]
 }).
--record(acceptor_spawned, {stream :: stream_id()}).
+-record(acceptor_spawned, {
+    stream :: stream_id(),
+    config :: osiris_log:config()
+}).
 %% Sent from the writer to replicas to notify them of when new fragments are
 %% applied to the writer's manifest, or when truncation moves the first offset
 %% and timestamp forward.
@@ -355,9 +359,11 @@
 %% Set the range of the remote tier stream.
 -record(set_range, {
     stream :: stream_id(),
-    first :: osiris:offset() | -1,
+    counter :: counters:counters_ref(),
+    first_offset :: osiris:offset() | -1,
+    first_timestamp :: osiris:timestamp(),
     %% The exclusive end of the stream - an offset which may not exist yet.
-    next :: osiris:offset()
+    next_offset :: osiris:offset()
 }).
 -record(send, {
     to :: pid() | {atom(), node()},
@@ -385,6 +391,12 @@
     to :: osiris:offset()
 }).
 -record(delete_stream, {stream :: stream_id()}).
+-record(trigger_retention, {
+    stream :: stream_id(),
+    dir :: directory(),
+    shared :: atomics:atomics_ref(),
+    counter :: counters:counters_ref()
+}).
 
 -type effect() ::
     #delete_fragments{}
@@ -396,5 +408,6 @@
     | #resolve_manifest{}
     | #send{}
     | #set_range{}
+    | #trigger_retention{}
     | #upload_fragment{}
     | #upload_manifest{}.

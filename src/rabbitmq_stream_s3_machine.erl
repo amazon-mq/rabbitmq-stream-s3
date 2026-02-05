@@ -24,7 +24,7 @@ for the log manifest server to execute.
 
 -include("include/rabbitmq_stream_s3.hrl").
 
--define(SERVER, rabbitmq_stream_s3_log_manifest).
+-define(SERVER, rabbitmq_stream_s3_server).
 
 -type cfg() :: #{
     debounce_modifications => non_neg_integer(),
@@ -54,6 +54,8 @@ for the log manifest server to execute.
     dir := directory(),
     epoch := osiris:epoch(),
     reference := stream_reference(),
+    shared := atomics:atomics_ref(),
+    counter := counters:counters_ref(),
     manifest := manifest(),
     %% Number of fragments applied to the manifest since the last upload.
     modifications := non_neg_integer(),
@@ -74,7 +76,13 @@ for the log manifest server to execute.
     uploaded_fragments := [#fragment_info{}]
 }.
 
--type replica() :: #{kind := replica, manifest := manifest()}.
+-type replica() :: #{
+    kind := replica,
+    manifest := manifest(),
+    dir => directory(),
+    counter => counters:counters_ref(),
+    shared => atomics:atomics_ref()
+}.
 
 -type stream() :: writer() | replica().
 
@@ -94,17 +102,21 @@ for the log manifest server to execute.
 
 -export([new/0, new/1, get_manifest/2, apply/3, format/1]).
 
--spec writer(
-    pid(),
-    [node()],
-    directory(),
-    osiris:epoch(),
-    stream_reference(),
-    retention_spec(),
-    [#fragment{}]
-) ->
-    writer().
-writer(Pid, ReplicaNodes, Dir, Epoch, Reference, Retention, Available) ->
+-spec writer(#writer_spawned{}) -> writer().
+writer(#writer_spawned{
+    pid = Pid,
+    config = #{
+        dir := Dir,
+        epoch := Epoch,
+        reference := Reference,
+        shared := Shared,
+        counter := Counter,
+        replica_nodes := ReplicaNodes,
+        retention := Retention0
+    },
+    available_fragments = Available
+}) ->
+    Retention = #{K => V || {K, V} <- Retention0, K =:= max_age orelse K =:= max_bytes},
     ?assertEqual(node(Pid), node()),
     #{
         kind => writer,
@@ -114,6 +126,8 @@ writer(Pid, ReplicaNodes, Dir, Epoch, Reference, Retention, Available) ->
         dir => Dir,
         epoch => Epoch,
         reference => Reference,
+        shared => Shared,
+        counter => Counter,
         manifest => {pending, []},
         pending_change => none,
         modifications => 0,
@@ -128,6 +142,13 @@ replica() ->
     #{
         kind => replica,
         manifest => {pending, []}
+    }.
+-spec replica(osiris_log:config()) -> replica().
+replica(#{dir := Dir, shared := Shared, counter := Counter}) ->
+    (replica())#{
+        dir => Dir,
+        shared => Shared,
+        counter => Counter
     }.
 
 -doc """
@@ -209,6 +230,9 @@ apply(
     case Streams0 of
         #{
             StreamId := #{
+                dir := Dir,
+                shared := Shared,
+                counter := Counter,
                 manifest := #manifest{next_offset = NextOffset0} = Manifest0,
                 modifications := Modifications0,
                 uploaded_fragments := Uploaded0
@@ -217,6 +241,19 @@ apply(
             Uploaded1 = insert_info(Info, Uploaded0),
             {NextOffset, Pending, Finished} = split_uploaded_infos(NextOffset0, Uploaded1),
             {ok, Manifest} = apply_infos(Finished, Manifest0),
+            Effects0 =
+                case lists:any(fun(#fragment_info{seq_no = SeqNo}) -> SeqNo =:= 0 end, Finished) of
+                    true ->
+                        TriggerRetention = #trigger_retention{
+                            stream = StreamId,
+                            dir = Dir,
+                            shared = Shared,
+                            counter = Counter
+                        },
+                        [TriggerRetention];
+                    false ->
+                        []
+                end,
             %% assertion: the finished fragments were applied up to the
             %% next-tiered-offset we expected from split_uploaded_infos/2.
             #manifest{next_offset = NextOffset} = Manifest,
@@ -225,8 +262,8 @@ apply(
                 modifications := Modifications0 + length(Finished),
                 uploaded_fragments := Pending
             },
-            {Writer2, Effects0} = evaluate_writer(Cfg, Meta, StreamId, Writer1, []),
-            {Writer, Effects} = notify_fragments_applied(Finished, StreamId, Writer2, Effects0),
+            {Writer2, Effects1} = evaluate_writer(Cfg, Meta, StreamId, Writer1, Effects0),
+            {Writer, Effects} = notify_fragments_applied(Finished, StreamId, Writer2, Effects1),
             State = State0#?MODULE{streams = Streams0#{StreamId := Writer}},
             {State, Effects};
         _ ->
@@ -243,7 +280,15 @@ apply(
     #?MODULE{streams = Streams0} = State0
 ) ->
     case Streams0 of
-        #{StreamId := #{kind := replica, manifest := #manifest{} = Manifest0} = Replica0} ->
+        #{
+            StreamId := #{
+                kind := replica,
+                dir := Dir,
+                shared := Shared,
+                counter := Counter,
+                manifest := #manifest{} = Manifest0
+            } = Replica0
+        } ->
             case apply_infos(Fragments, Manifest0) of
                 {ok, #manifest{next_offset = NextOffset} = Manifest1} ->
                     Manifest = Manifest1#manifest{
@@ -253,10 +298,29 @@ apply(
                     Streams = Streams0#{StreamId := Replica0#{manifest := Manifest}},
                     SetRange = #set_range{
                         stream = StreamId,
-                        first = FirstOffset,
-                        next = NextOffset
+                        counter = Counter,
+                        first_offset = FirstOffset,
+                        first_timestamp = FirstTs,
+                        next_offset = NextOffset
                     },
-                    {State0#?MODULE{streams = Streams}, [SetRange]};
+                    HasSeq0 = lists:any(
+                        fun(#fragment_info{seq_no = SeqNo}) -> SeqNo =:= 0 end,
+                        Fragments
+                    ),
+                    Effects =
+                        case HasSeq0 of
+                            true ->
+                                TriggerRetention = #trigger_retention{
+                                    stream = StreamId,
+                                    dir = Dir,
+                                    shared = Shared,
+                                    counter = Counter
+                                },
+                                [SetRange, TriggerRetention];
+                            false ->
+                                [SetRange]
+                        end,
+                    {State0#?MODULE{streams = Streams}, Effects};
                 {error, OutOfSequenceInfo} ->
                     ?LOG_DEBUG(
                         "Replica received an out-of-sequence fragment info. Refreshing manifest from writer... ~0p",
@@ -337,20 +401,10 @@ apply(_Meta, #manifest_rebalanced{}, _State) ->
     erlang:error(unimplemented);
 apply(
     _Meta,
-    #writer_spawned{
-        pid = Pid,
-        stream = StreamId,
-        dir = Dir,
-        epoch = Epoch,
-        reference = Reference,
-        replica_nodes = ReplicaNodes,
-        retention = Retention0,
-        available_fragments = Available
-    },
+    #writer_spawned{stream = StreamId, pid = Pid} = Event,
     #?MODULE{streams = Streams0} = State0
 ) ->
-    Retention = #{K => V || {K, V} <- Retention0, K =:= max_age orelse K =:= max_bytes},
-    Writer0 = writer(Pid, ReplicaNodes, Dir, Epoch, Reference, Retention, Available),
+    Writer0 = writer(Event),
     Effects0 = [#register_offset_listener{writer_pid = Pid, offset = -1}],
     case Streams0 of
         #{StreamId := #{manifest := {pending, Pending0}}} ->
@@ -362,8 +416,12 @@ apply(
             Effects = [#resolve_manifest{stream = StreamId} | Effects0],
             {State, Effects}
     end;
-apply(_Meta, #acceptor_spawned{stream = StreamId}, #?MODULE{streams = Streams0} = State0) ->
-    Stream0 = replica(),
+apply(
+    _Meta,
+    #acceptor_spawned{stream = StreamId, config = Config},
+    #?MODULE{streams = Streams0} = State0
+) ->
+    Stream0 = replica(Config),
     case Streams0 of
         #{StreamId := #{manifest := {pending, Pending0}}} ->
             Stream = Stream0#{manifest := {pending, Pending0}},
@@ -405,6 +463,7 @@ apply(
         manifest =
             #manifest{
                 first_offset = FirstOffset,
+                first_timestamp = FirstTs,
                 next_offset = NextOffset
             } = Manifest
     } = Event,
@@ -413,16 +472,29 @@ apply(
     case Streams0 of
         #{StreamId := #{manifest := {pending, Requesters}} = Stream0} ->
             Stream1 = Stream0#{manifest := Manifest},
-            SetRange = #set_range{stream = StreamId, first = FirstOffset, next = NextOffset},
+            Effects0 =
+                case Stream0 of
+                    #{counter := Counter} ->
+                        SetRange = #set_range{
+                            stream = StreamId,
+                            counter = Counter,
+                            first_offset = FirstOffset,
+                            first_timestamp = FirstTs,
+                            next_offset = NextOffset
+                        },
+                        [SetRange];
+                    _ ->
+                        []
+                end,
             %% NOTE: `Requesters` is in reverse order.
-            Effects0 = lists:foldl(
+            Effects1 = lists:foldl(
                 fun
                     ({_, _} = R, Acc) ->
                         [#reply{to = R, response = Manifest} | Acc];
                     (Pid, Acc) when is_pid(Pid) ->
                         [#send{to = Pid, message = Event} | Acc]
                 end,
-                [SetRange],
+                Effects0,
                 Requesters
             ),
             case Stream1 of
@@ -430,7 +502,7 @@ apply(
                     %% If there is a hole between the last fragments in the
                     %% manifest and the first available fragment, backfill
                     %% fragments from local stream data.
-                    Effects1 = maybe_find_fragments(StreamId, Stream1, Effects0),
+                    Effects2 = maybe_find_fragments(StreamId, Stream1, Effects1),
                     %% Drop all available fragments which are older than what
                     %% has already been uploaded to the remote tier.
                     Available = lists:filter(
@@ -445,12 +517,12 @@ apply(
                         available_fragments := Available,
                         ranges := Ranges
                     },
-                    {Stream, Effects} = upload_available_fragments(StreamId, Stream2, Effects1),
+                    {Stream, Effects} = upload_available_fragments(StreamId, Stream2, Effects2),
                     State = State0#?MODULE{streams = Streams0#{StreamId := Stream}},
                     {State, Effects};
                 _ ->
                     State = State0#?MODULE{streams = Streams0#{StreamId := Stream1}},
-                    {State, Effects0}
+                    {State, Effects1}
             end;
         _ ->
             {State0, []}
@@ -604,6 +676,7 @@ notify_fragments_applied(
     Fragments,
     StreamId,
     #{
+        counter := Counter,
         ranges := Ranges0,
         manifest := #manifest{
             first_offset = FirstOffset,
@@ -632,7 +705,13 @@ notify_fragments_applied(
                     },
                     [Effect | Acc];
                 (Node, {_, _}, Acc) when Node == node() ->
-                    Effect = #set_range{stream = StreamId, first = FirstOffset, next = NextOffset},
+                    Effect = #set_range{
+                        stream = StreamId,
+                        counter = Counter,
+                        first_offset = FirstOffset,
+                        first_timestamp = FirstTs,
+                        next_offset = NextOffset
+                    },
                     [Effect | Acc]
             end,
             Effects0,
@@ -907,10 +986,12 @@ format_stream(
         uploaded_fragments := Uploaded
     } = Writer0
 ) ->
+    %% No point in printing these:
+    Writer1 = maps:without([shared, counter], Writer0),
     %% Format reference as "queue 'queue name' in vhost 'vhost name'"?
     %% Depending on changes to rabbitmq_stream_s3_db we may not need to carry
     %% the reference in state, so maybe this is not worthwhile.
-    Writer0#{
+    Writer1#{
         manifest := format_manifest(Manifest),
         last_uploaded := format_timestamp(LastUploaded),
         available_fragments := [

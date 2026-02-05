@@ -42,40 +42,30 @@ and the server handles background uploads.
 
 %%----------------------------------------------------------------------------
 
-init_manifest(
-    #{
-        dir := Dir0,
-        name := StreamId0,
-        reference := Reference,
-        leader_pid := LeaderPid
-    } = Config0,
-    acceptor
-) ->
+init_manifest(#{dir := Dir0, name := StreamId0} = Config0, acceptor) ->
     StreamId = iolist_to_binary(StreamId0),
     Dir = list_to_binary(Dir0),
-    Config = Config0#{
-        max_segment_size_bytes => ?MAX_SEGMENT_SIZE_BYTES,
-        retention => [{'fun', local_retention_fun(StreamId)}]
+    Config1 = Config0#{
+        name := StreamId,
+        dir := Dir,
+        shared => osiris_log_shared:new(),
+        counter => osiris_log:make_counter(Config0)
     },
-    ok = rabbitmq_stream_s3_server:init_acceptor(StreamId, Dir, LeaderPid, Reference),
+    Config = Config1#{
+        max_segment_size_bytes => ?MAX_SEGMENT_SIZE_BYTES,
+        retention => []
+    },
+    ok = rabbitmq_stream_s3_server:init_acceptor(StreamId, Config1),
     {Config, #log_writer{type = acceptor, stream = StreamId}};
-init_manifest(
-    #{
-        dir := Dir0,
-        name := StreamId0,
-        epoch := Epoch,
-        reference := Reference,
-        replica_nodes := ReplicaNodes
-    } = Config0,
-    writer
-) ->
+init_manifest(#{name := StreamId0, dir := Dir0} = Config0, writer) ->
+    %% Binaries are more compact. Coerce name and dir.
     StreamId = iolist_to_binary(StreamId0),
     Dir = list_to_binary(Dir0),
-    %% TODO: apply original retention settings to the remote tier.
-    _ = maps:get(retention, Config0, []),
+    Config1 = Config0#{name := StreamId, dir := Dir},
+
     Config = Config0#{
         max_segment_size_bytes => ?MAX_SEGMENT_SIZE_BYTES,
-        retention => [{'fun', local_retention_fun(StreamId)}]
+        retention => []
     },
     ?LOG_DEBUG("Recovering available fragments for stream ~ts", [Dir]),
     %% Recover the current fragment information. To do this we scan through the
@@ -94,15 +84,7 @@ init_manifest(
                 %% the writer has cleaned up its log.
                 recover_fragments(LastIdxFile)
         end,
-    ok = rabbitmq_stream_s3_server:init_writer(
-        StreamId,
-        Dir,
-        Epoch,
-        Reference,
-        ReplicaNodes,
-        maps:get(retention, Config0, []),
-        Available
-    ),
+    ok = rabbitmq_stream_s3_server:init_writer(StreamId, Config1, Available),
     Manifest = #log_writer{
         type = writer,
         stream = StreamId,
@@ -136,7 +118,7 @@ handle_event(
                     _ ->
                         ok = rabbitmq_stream_s3_server:fragment_available(StreamId, Fragment0)
                 end,
-                #fragment{segment_offset = segment_file_offset(NewSegment)}
+                #fragment{segment_offset = rabbitmq_stream_s3:segment_file_offset(NewSegment)}
         end,
     Manifest0#log_writer{fragment = Fragment};
 handle_event(
@@ -232,7 +214,7 @@ recover_fragments(IdxFile) ->
     recover_fragments(IdxFile, []).
 
 recover_fragments(IdxFile, Acc) ->
-    SegmentOffset = index_file_offset(IdxFile),
+    SegmentOffset = rabbitmq_stream_s3:index_file_offset(IdxFile),
     SegmentFile = iolist_to_binary(string:replace(IdxFile, <<".index">>, <<".segment">>, trailing)),
     %% TODO: we should be reading in smaller chunks with pread.
     {ok, <<_:?IDX_HEADER_B/binary, IdxArray/binary>>} = file:read_file(IdxFile),
@@ -352,20 +334,6 @@ list_dir(Dir) ->
             [list_to_binary(F) || F <- Files]
     end.
 
--spec segment_file_offset(file:filename_all()) -> osiris:offset().
-segment_file_offset(Filename) ->
-    filename_offset(filename:basename(Filename, <<".segment">>)).
-
--spec index_file_offset(file:filename_all()) -> osiris:offset().
-index_file_offset(Filename) ->
-    filename_offset(filename:basename(Filename, <<".index">>)).
-
--spec filename_offset(file:filename_all()) -> osiris:offset().
-filename_offset(Basename) when is_binary(Basename) ->
-    binary_to_integer(Basename);
-filename_offset(Basename) when is_list(Basename) ->
-    list_to_integer(Basename).
-
 -spec find_fragments_in_range(directory() | [filename()], osiris:offset(), osiris:offset()) ->
     [#fragment{}].
 find_fragments_in_range(Dir, From, To) when is_binary(Dir) ->
@@ -383,7 +351,7 @@ index_files_in_range([], _From, _To, Acc) ->
     Acc;
 index_files_in_range([IdxFile | Rest], From, To, Acc) ->
     %% NOTE: the index file list is sorted descending by offset.
-    FirstOffset = index_file_offset(IdxFile),
+    FirstOffset = rabbitmq_stream_s3:index_file_offset(IdxFile),
     if
         FirstOffset > To ->
             index_files_in_range(Rest, From, To, Acc);
@@ -393,55 +361,15 @@ index_files_in_range([IdxFile | Rest], From, To, Acc) ->
             index_files_in_range(Rest, From, To, [IdxFile | Acc])
     end.
 
--spec local_retention_fun(stream_id()) -> osiris:retention_fun().
-local_retention_fun(Stream) ->
-    fun(IdxFiles) ->
-        try ets:lookup_element(?RANGE_TABLE, Stream, 3) of
-            NextTieredOffset ->
-                eval_local_retention(IdxFiles, NextTieredOffset)
-        catch
-            error:badarg ->
-                {[], IdxFiles}
-        end
-    end.
-
--spec eval_local_retention(IdxFiles :: [filename()], osiris:offset()) ->
-    {ToDelete :: [filename()], ToKeep :: [filename(), ...]}.
-eval_local_retention(IdxFiles, NextTieredOffset) ->
-    %% Always keep the current active segment no matter what the last tiered
-    %% offset is.
-    eval_local_retention(lists:reverse(IdxFiles), NextTieredOffset, [], []).
-
-eval_local_retention([], _NextTieredOffset, ToDelete, ToKeep) ->
-    %% Always keep the current active segment no matter what the last tiered
-    %% offset is.
-    {lists:reverse(ToDelete), ToKeep};
-eval_local_retention([IdxFile | Rest], NextTieredOffset, ToDelete, ToKeep) ->
-    Offset = binary_to_integer(filename:basename(IdxFile, <<".index">>)),
-    case Offset >= NextTieredOffset of
-        true ->
-            eval_local_retention(Rest, NextTieredOffset, ToDelete, [IdxFile | ToKeep]);
-        false ->
-            {lists:reverse(Rest), [IdxFile | ToKeep]}
-    end.
-
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
-
-index_file_offset_test() ->
-    %% Relative? Absolute? No directory at all? Doesn't matter. The answer
-    %% is the same.
-    ?assertEqual(100, index_file_offset(<<"00000000000000000100.index">>)),
-    ?assertEqual(100, index_file_offset(<<"path/to/00000000000000000100.index">>)),
-    ?assertEqual(100, index_file_offset(<<"/path/to/00000000000000000100.index">>)),
-    ok.
 
 index_files_in_range_test() ->
     Files0 = [rabbitmq_stream_s3:offset_filename(O, <<"index">>) || O <- [100, 200, 300, 400, 500]],
     %% `index_files_in_range/4` expects the files sorted descending.
     Files = lists:reverse(Files0),
     GetRange = fun(From, To) ->
-        [index_file_offset(F) || F <- index_files_in_range(Files, From, To, [])]
+        [rabbitmq_stream_s3:index_file_offset(F) || F <- index_files_in_range(Files, From, To, [])]
     end,
     ?assertEqual([100], GetRange(125, 175)),
     ?assertEqual([100, 200], GetRange(125, 275)),
@@ -449,72 +377,6 @@ index_files_in_range_test() ->
     ?assertEqual([400, 500], GetRange(400, 600)),
     ?assertEqual([500], GetRange(600, 700)),
     ?assertEqual([], GetRange(25, 75)),
-    ok.
-
-eval_local_retention_test() ->
-    IdxFiles = [
-        <<"/data/00000000000000000000.index">>,
-        <<"/data/00000000000000000100.index">>,
-        <<"/data/00000000000000000200.index">>,
-        <<"/data/00000000000000000300.index">>,
-        <<"/data/00000000000000000400.index">>
-    ],
-    ?assertEqual(
-        {
-            [
-                <<"/data/00000000000000000000.index">>,
-                <<"/data/00000000000000000100.index">>
-            ],
-            [
-                <<"/data/00000000000000000200.index">>,
-                <<"/data/00000000000000000300.index">>,
-                <<"/data/00000000000000000400.index">>
-            ]
-        },
-        eval_local_retention(IdxFiles, 251)
-    ),
-    %% Always keep the current segment:
-    ?assertEqual(
-        {
-            [
-                <<"/data/00000000000000000000.index">>,
-                <<"/data/00000000000000000100.index">>,
-                <<"/data/00000000000000000200.index">>,
-                <<"/data/00000000000000000300.index">>
-            ],
-            [
-                <<"/data/00000000000000000400.index">>
-            ]
-        },
-        eval_local_retention(IdxFiles, 451)
-    ),
-    ?assertEqual(
-        {
-            [
-                <<"/data/00000000000000000000.index">>,
-                <<"/data/00000000000000000100.index">>,
-                <<"/data/00000000000000000200.index">>
-            ],
-            [
-                <<"/data/00000000000000000300.index">>,
-                <<"/data/00000000000000000400.index">>
-            ]
-        },
-        eval_local_retention(IdxFiles, 301)
-    ),
-    ?assertEqual(
-        {
-            [],
-            [
-                <<"/data/00000000000000000000.index">>,
-                <<"/data/00000000000000000100.index">>,
-                <<"/data/00000000000000000200.index">>,
-                <<"/data/00000000000000000300.index">>,
-                <<"/data/00000000000000000400.index">>
-            ]
-        },
-        eval_local_retention(IdxFiles, 0)
-    ),
     ok.
 
 -endif.
