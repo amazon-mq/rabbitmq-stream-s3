@@ -188,7 +188,7 @@
     %% This is used for an optimistic concurrency control.
     revision = 0 :: rabbitmq_stream_s3_db:revision(),
     %% An array of entries. Use the `?ENTRY/6' macro to access entries.
-    entries = <<>> :: binary()
+    entries = <<>> :: rabbitmq_stream_s3_log_manifest_entry:entries()
 }).
 
 %% Number of outgoing edges from this branch. Works for the entries array of

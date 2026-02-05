@@ -13,6 +13,12 @@ for the log manifest server to execute.
 
 -compile({no_auto_import, [apply/2, apply/3]}).
 
+%% OTP 27 dialyzer is incorrect about these warnings. OTP 28 dialyzer correctly
+%% passes without these exceptions. Once OTP 28 is required, remove these
+%% exceptions:
+-dialyzer({no_return, format_timestamp/1}).
+-dialyzer({no_unused, [format_size/1, format_size/2, format_entries/1, count_kinds/2]}).
+
 -include_lib("kernel/include/logger.hrl").
 -include_lib("stdlib/include/assert.hrl").
 
@@ -86,7 +92,7 @@ for the log manifest server to execute.
 
 -export_type([metadata/0, state/0]).
 
--export([new/0, new/1, get_manifest/2, apply/3]).
+-export([new/0, new/1, get_manifest/2, apply/3, format/1]).
 
 -spec writer(
     pid(),
@@ -882,6 +888,102 @@ maybe_find_fragments(
             Effects0
     end.
 
+-spec format(state()) -> map().
+format(#?MODULE{cfg = Cfg, streams = Streams}) ->
+    #{
+        cfg => Cfg,
+        streams => #{StreamId => format_stream(Stream) || StreamId := Stream <- Streams}
+    }.
+
+-spec format_stream(stream()) -> map().
+format_stream(#{kind := replica, manifest := Manifest} = Replica0) ->
+    Replica0#{manifest := format_manifest(Manifest)};
+format_stream(
+    #{
+        kind := writer,
+        manifest := Manifest,
+        last_uploaded := LastUploaded,
+        available_fragments := Available,
+        uploaded_fragments := Uploaded
+    } = Writer0
+) ->
+    %% Format reference as "queue 'queue name' in vhost 'vhost name'"?
+    %% Depending on changes to rabbitmq_stream_s3_db we may not need to carry
+    %% the reference in state, so maybe this is not worthwhile.
+    Writer0#{
+        manifest := format_manifest(Manifest),
+        last_uploaded := format_timestamp(LastUploaded),
+        available_fragments := [
+            {O, N}
+         || #fragment{first_offset = O, next_offset = N} <- Available
+        ],
+        uploaded_fragments := [{O, N} || #fragment_info{offset = O, next_offset = N} <- Uploaded]
+    }.
+
+format_manifest({pending, _Requesters}) ->
+    pending;
+format_manifest(#manifest{
+    first_offset = FirstOffset,
+    first_timestamp = FirstTs,
+    next_offset = NextOffset,
+    total_size = TotalSize,
+    revision = Revision,
+    entries = Entries
+}) ->
+    Format0 =
+        case rabbitmq_stream_s3_binary_array:last(?ENTRY_B, Entries) of
+            ?ENTRY(LastOffset, LastTs, _K, _S, _Seq, _Uid, _) ->
+                #{
+                    last_offset => LastOffset,
+                    last_timestamp => format_timestamp(LastTs)
+                };
+            undefined ->
+                #{}
+        end,
+    Format0#{
+        first_offset => FirstOffset,
+        first_timestamp => format_timestamp(FirstTs),
+        next_offset => NextOffset,
+        total_size => format_size(TotalSize),
+        revision => Revision,
+        entries => format_entries(Entries)
+    }.
+
+-spec format_timestamp(osiris:timestamp()) -> binary().
+format_timestamp(Ts) when is_integer(Ts) ->
+    calendar:system_time_to_rfc3339(Ts, [{unit, millisecond}, {return, binary}, {offset, "Z"}]).
+
+-spec format_size(Bytes :: non_neg_integer()) -> binary().
+format_size(Size) when Size < 1024 ->
+    <<(integer_to_binary(Size))/binary, " B">>;
+format_size(Size) ->
+    format_size(Size / 1024.0, [$k, $M, $G, $T, $P, $E, $Z]).
+
+format_size(Size, [Metric | _]) when Size < 1024.0 ->
+    <<(float_to_binary(Size, [{decimals, 3}, compact]))/binary, " ", Metric, "iB">>;
+format_size(Size, [_ | Metrics]) ->
+    format_size(Size / 1024.0, Metrics).
+
+format_entries(Entries) ->
+    EntriesB = byte_size(Entries),
+    (count_kinds(Entries, #{}))#{
+        size => format_size(EntriesB),
+        len => EntriesB div ?ENTRY_B
+    }.
+
+count_kinds(<<>>, Counts) ->
+    Counts;
+count_kinds(?ENTRY(_O, _T, Kind, _Sz, _Sq, _U, Rest), Counts0) ->
+    Key =
+        case Kind of
+            ?MANIFEST_KIND_FRAGMENT -> fragments;
+            ?MANIFEST_KIND_GROUP -> groups;
+            ?MANIFEST_KIND_KILO_GROUP -> kilo_groups;
+            ?MANIFEST_KIND_MEGA_GROUP -> mega_groups
+        end,
+    Counts = maps:update_with(Key, fun(N) -> N + 1 end, 1, Counts0),
+    count_kinds(Rest, Counts).
+
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
@@ -1032,6 +1134,17 @@ evaluate_retention1_test() ->
         evaluate_retention1(Manifest, Ts, #{max_age => 1})
     ),
 
+    ok.
+
+format_size_test() ->
+    ?assertEqual(<<"0 B">>, format_size(0)),
+    ?assertEqual(<<"500 B">>, format_size(500)),
+    ?assertEqual(<<"1.0 kiB">>, format_size(1024)),
+    ?assertEqual(<<"1.205 kiB">>, format_size(1234)),
+    ?assertEqual(<<"1.0 GiB">>, format_size(math:pow(1024, 3))),
+    ?assertEqual(<<"1.5 GiB">>, format_size(math:pow(1024, 3) + math:pow(1024, 3) / 2)),
+    ?assertEqual(<<"50.0 TiB">>, format_size(50 * math:pow(1024, 4))),
+    ?assertEqual(<<"1.0 PiB">>, format_size(math:pow(1024, 5))),
     ok.
 
 -endif.

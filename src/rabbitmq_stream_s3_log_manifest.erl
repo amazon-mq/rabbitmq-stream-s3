@@ -71,6 +71,7 @@
     handle_call/3,
     handle_cast/2,
     handle_info/2,
+    format_status/1,
     terminate/2,
     code_change/3
 ]).
@@ -84,6 +85,9 @@
     get_fragment_trailer/1,
     get_fragment_trailer/2
 ]).
+
+%% For `sys:get_state/1` debugging.
+-export([format_state/1]).
 
 %% Useful to search module.
 -export([fragment_key/2, group_key/4, make_file_name/2, fragment_trailer_to_info/1]).
@@ -541,6 +545,9 @@ handle_info(Message, State) ->
     ),
     {noreply, State}.
 
+format_status(#{state := #?MODULE{} = State0} = Status0) ->
+    Status0#{state := format_state(State0)}.
+
 terminate(_Reason, _State) ->
     ok.
 
@@ -551,6 +558,12 @@ code_change(_OldVsn, State, _Extra) ->
 
 format_osiris_event(Event) ->
     Event.
+
+format_state(#?MODULE{machine = Machine, tasks = Tasks}) ->
+    #{
+        machine => rabbitmq_stream_s3_log_manifest_machine:format(Machine),
+        tasks => map_size(Tasks)
+    }.
 
 -spec make_file_name(osiris:offset(), Suffix :: binary()) -> filename().
 make_file_name(Offset, Suffix) when is_integer(Offset) andalso is_binary(Suffix) ->
