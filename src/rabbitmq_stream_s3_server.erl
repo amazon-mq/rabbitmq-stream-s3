@@ -351,7 +351,8 @@ execute_task(#upload_fragment{
             checksum = Checksum0,
             num_chunks = {IdxStart, IdxLen},
             seq_no = SeqNo,
-            size = Size
+            size = Size,
+            roll_reason = RollReason
         } = Fragment
 }) ->
     Timeout = application:get_env(rabbitmq_stream_s3, segment_upload_timeout, 45_000),
@@ -367,7 +368,7 @@ execute_task(#upload_fragment{
     ),
 
     try
-        {UploadMSec, {UploadSize, FragmentInfo}} = timer:tc(
+        {UploadMSec, {UploadSize, FragmentInfo0}} = timer:tc(
             fun() ->
                 {ok, SegFd} = file:open(filename:join(Dir, SegmentFilename), [read, raw, binary]),
                 {ok, IdxFd} = file:open(filename:join(Dir, IndexFilename), [read, raw, binary]),
@@ -435,7 +436,7 @@ execute_task(#upload_fragment{
         ]),
         %% TODO: update counters for fragments.
         rabbitmq_stream_s3_counters:segment_uploaded(UploadSize),
-
+        FragmentInfo = FragmentInfo0#fragment_info{roll_reason = RollReason},
         #fragment_uploaded{stream = StreamId, info = FragmentInfo}
     after
         ok = rabbitmq_stream_s3_api:close(Conn)

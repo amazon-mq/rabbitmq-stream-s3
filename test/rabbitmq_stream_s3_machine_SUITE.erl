@@ -239,8 +239,7 @@ recover_uploaded_fragments(Config) ->
                     total_size = 200,
                     next_offset = 20
                 }
-            },
-            #trigger_retention{}
+            }
         ],
         Effects3
     ),
@@ -284,7 +283,8 @@ recover_uploaded_fragments(Config) ->
     ?assertMatch(
         [
             #set_range{next_offset = 60},
-            #upload_manifest{manifest = #manifest{first_offset = 0, next_offset = 60}}
+            #upload_manifest{manifest = #manifest{first_offset = 0, next_offset = 60}},
+            #trigger_retention{}
         ],
         Effects8
     ),
@@ -324,7 +324,9 @@ manifest_replication(Config) ->
     ?assertMatch([#set_range{next_offset = 0}], Effects4),
     %% Now when fragments are fully uploaded and applied to the manifest, the
     %% acceptor will get notifications that fragments were applied.
-    Fragments = fragments([{0, 19}, {20, 39}, {40, 59}]),
+    [F0, F1, F2v0] = fragments([{0, 19}, {20, 39}, {40, 59}]),
+    F2 = F2v0#fragment{roll_reason = segment_roll},
+    Fragments = [F0, F1, F2],
     FragmentsAvailable = [#fragment_available{stream = StreamId, fragment = F} || F <- Fragments],
     CommitOffsetIncreased = #commit_offset_increased{stream = StreamId, offset = 60},
     {Writer4, Effects5} = handle_events(
@@ -461,7 +463,7 @@ retention(Config) ->
     %% currently in the manifest (offset 80) should be deleted by retention.
     %% Both the new fragment and fragment deletion should be reflected in the
     %% same upload of the manifest object.
-    Fragment = fragment(120, 139),
+    Fragment = (fragment(120, 139))#fragment{roll_reason = segment_roll},
     {Writer7, Effects7} = handle_events(
         ?META(),
         [
@@ -529,7 +531,12 @@ backfill_older_segments(Config) ->
             first_timestamp = Ts + N * 20,
             last_offset = N * 20,
             next_offset = N * 20 + 20,
-            size = 200
+            size = 200,
+            roll_reason =
+                case N rem 3 of
+                    N -> segment_roll;
+                    _ -> size
+                end
         }
      || N <- lists:seq(0, 5)
     ],
@@ -651,7 +658,8 @@ manifest_upload_conflict(Config) ->
             #upload_manifest{
                 manifest = #manifest{first_offset = 40, next_offset = 80, total_size = 400}
             },
-            #delete_fragments{offsets = [0, 20]}
+            #delete_fragments{offsets = [0, 20]},
+            #trigger_retention{}
         ],
         NewEffects4
     ),
@@ -744,8 +752,11 @@ handle_events(Meta, [Event | Rest], Mac0, Acc) ->
     {Mac, Effects} = ?MAC:apply(Meta, Event, Mac0),
     handle_events(Meta, Rest, Mac, [Effects | Acc]).
 
-fragments(OffsetRanges) ->
-    [fragment(From, To, N) || {N, {From, To}} <- lists:enumerate(0, OffsetRanges)].
+fragments([_ | _] = OffsetRanges) ->
+    Fragments0 = [fragment(From, To, N) || {N, {From, To}} <- lists:enumerate(0, OffsetRanges)],
+    [Last0 | Rest] = lists:reverse(Fragments0),
+    Last = Last0#fragment{roll_reason = segment_roll},
+    lists:reverse(Rest, [Last]).
 
 fragment(Offset, LastOffset) ->
     fragment(Offset, LastOffset, 0).
@@ -766,14 +777,16 @@ fragment_to_info(#fragment{
     first_timestamp = T,
     next_offset = N,
     seq_no = Seq,
-    size = Size
+    size = Size,
+    roll_reason = RollReason
 }) ->
     #fragment_info{
         offset = O,
         timestamp = T,
         next_offset = N,
         seq_no = Seq,
-        size = Size
+        size = Size,
+        roll_reason = RollReason
     }.
 
 fragments_to_manifest([

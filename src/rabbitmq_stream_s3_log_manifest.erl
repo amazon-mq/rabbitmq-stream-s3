@@ -116,7 +116,8 @@ handle_event(
                         %% start a new one belonging to this segment.
                         ok;
                     _ ->
-                        ok = rabbitmq_stream_s3_server:fragment_available(StreamId, Fragment0)
+                        Fragment1 = Fragment0#fragment{roll_reason = segment_roll},
+                        ok = rabbitmq_stream_s3_server:fragment_available(StreamId, Fragment1)
                 end,
                 #fragment{segment_offset = rabbitmq_stream_s3:segment_file_offset(NewSegment)}
         end,
@@ -340,7 +341,8 @@ find_fragments_in_range(Dir, From, To) when is_binary(Dir) ->
     [_ActiveIndex | IdxFiles] = sorted_index_files_rev(Dir),
     lists:foldl(
         fun(IdxFile, Acc0) ->
-            {Last, Acc1} = recover_fragments(IdxFile, Acc0),
+            {Last0, Acc1} = recover_fragments(IdxFile, Acc0),
+            Last = Last0#fragment{roll_reason = segment_roll},
             [Last | Acc1]
         end,
         [],

@@ -97,7 +97,11 @@
     size :: pos_integer(),
     %% Position into the fragment file where the index starts.
     index_start_pos :: pos_integer(),
-    index_size :: pos_integer()
+    index_size :: pos_integer(),
+    %% Copied from `#fragment.roll_reason`. Only defined when the info record
+    %% is created by an upload task. Not defined when the info record comes
+    %% from reading an existing fragment's trailer.
+    roll_reason :: size | segment_roll | undefined
 }).
 
 -define(INDEX_RECORD(Offset, Timestamp, FragmentFilePos), <<
@@ -238,7 +242,12 @@
     %% NOTE: `#fragment.size` is the bytes of segment data, not headers or
     %% index data.
     size = 0 :: non_neg_integer(),
-    checksum = ?SEGMENT_HEADER_HASH :: checksum() | undefined
+    checksum = ?SEGMENT_HEADER_HASH :: checksum() | undefined,
+    %% The reason that the fragment was considered complete / "rolled" (like a
+    %% segment file). Fragments are capped by max size or rolled over with a
+    %% segment. Tracking the roll reason lets us delete local tier data
+    %% aggressively in retention.
+    roll_reason = size :: size | segment_roll
 }).
 
 %% Events.

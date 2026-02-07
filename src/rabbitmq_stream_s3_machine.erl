@@ -230,9 +230,6 @@ apply(
     case Streams0 of
         #{
             StreamId := #{
-                dir := Dir,
-                shared := Shared,
-                counter := Counter,
                 manifest := #manifest{next_offset = NextOffset0} = Manifest0,
                 modifications := Modifications0,
                 uploaded_fragments := Uploaded0
@@ -241,19 +238,6 @@ apply(
             Uploaded1 = insert_info(Info, Uploaded0),
             {NextOffset, Pending, Finished} = split_uploaded_infos(NextOffset0, Uploaded1),
             {ok, Manifest} = apply_infos(Finished, Manifest0),
-            Effects0 =
-                case lists:any(fun(#fragment_info{seq_no = SeqNo}) -> SeqNo =:= 0 end, Finished) of
-                    true ->
-                        TriggerRetention = #trigger_retention{
-                            stream = StreamId,
-                            dir = Dir,
-                            shared = Shared,
-                            counter = Counter
-                        },
-                        [TriggerRetention];
-                    false ->
-                        []
-                end,
             %% assertion: the finished fragments were applied up to the
             %% next-tiered-offset we expected from split_uploaded_infos/2.
             #manifest{next_offset = NextOffset} = Manifest,
@@ -262,6 +246,7 @@ apply(
                 modifications := Modifications0 + length(Finished),
                 uploaded_fragments := Pending
             },
+            Effects0 = maybe_trigger_retention(Finished, StreamId, Writer1, []),
             {Writer2, Effects1} = evaluate_writer(Cfg, Meta, StreamId, Writer1, Effects0),
             {Writer, Effects} = notify_fragments_applied(Finished, StreamId, Writer2, Effects1),
             State = State0#?MODULE{streams = Streams0#{StreamId := Writer}},
@@ -283,8 +268,6 @@ apply(
         #{
             StreamId := #{
                 kind := replica,
-                dir := Dir,
-                shared := Shared,
                 counter := Counter,
                 manifest := #manifest{} = Manifest0
             } = Replica0
@@ -295,7 +278,8 @@ apply(
                         first_offset = FirstOffset,
                         first_timestamp = FirstTs
                     },
-                    Streams = Streams0#{StreamId := Replica0#{manifest := Manifest}},
+                    Replica = Replica0#{manifest := Manifest},
+                    Effects0 = maybe_trigger_retention(Fragments, StreamId, Replica, []),
                     SetRange = #set_range{
                         stream = StreamId,
                         counter = Counter,
@@ -303,24 +287,8 @@ apply(
                         first_timestamp = FirstTs,
                         next_offset = NextOffset
                     },
-                    HasSeq0 = lists:any(
-                        fun(#fragment_info{seq_no = SeqNo}) -> SeqNo =:= 0 end,
-                        Fragments
-                    ),
-                    Effects =
-                        case HasSeq0 of
-                            true ->
-                                TriggerRetention = #trigger_retention{
-                                    stream = StreamId,
-                                    dir = Dir,
-                                    shared = Shared,
-                                    counter = Counter
-                                },
-                                [SetRange, TriggerRetention];
-                            false ->
-                                [SetRange]
-                        end,
-                    {State0#?MODULE{streams = Streams}, Effects};
+                    Effects = [SetRange | Effects0],
+                    {State0#?MODULE{streams = Streams0#{StreamId := Replica}}, Effects};
                 {error, OutOfSequenceInfo} ->
                     ?LOG_DEBUG(
                         "Replica received an out-of-sequence fragment info. Refreshing manifest from writer... ~0p",
@@ -963,6 +931,30 @@ maybe_find_fragments(
                 to = FirstOffset
             },
             [FindFragments | Effects0];
+        false ->
+            Effects0
+    end.
+
+-spec maybe_trigger_retention([#fragment_info{}], stream_id(), stream(), [effect()]) -> [effect()].
+maybe_trigger_retention(
+    Infos,
+    StreamId,
+    #{dir := Dir, shared := Shared, counter := Counter},
+    Effects0
+) ->
+    SegmentRolled = lists:any(
+        fun(#fragment_info{roll_reason = Reason}) -> Reason =:= segment_roll end,
+        Infos
+    ),
+    case SegmentRolled of
+        true ->
+            TriggerRetention = #trigger_retention{
+                stream = StreamId,
+                dir = Dir,
+                shared = Shared,
+                counter = Counter
+            },
+            [TriggerRetention | Effects0];
         false ->
             Effects0
     end.
