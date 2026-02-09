@@ -198,8 +198,6 @@ The implementation of the `osiris_log_manifest` behaviour (`rabbitmq_stream_s3_l
 
 When `rabbitmq_stream_s3_server` applies uploaded fragments to the manifest, it evaluates whether the manifest is 'loaded' and a group (or kilo group or mega group) should be introduced to shrink the size of the root. The server kicks off a task to upload the group object and when that completes, the server updates the in-memory copy of the manifest and kicks off a manifest upload.
 
-NOTE: this part is not yet implemented.
-
 #### Retention
 
 After fragments have been successfully uploaded to the remote tier, `rabbitmq_stream_s3_server` evaluates whether the manifest exceeds the configured retention for the stream. Evaluating these rules is cheap since the in-memory copy of the manifest contains the total size of segment data in the stream and the first timestamp. If the retention rules are exceeded and the manifest doesn't contain any groups, the server can perform retention in-place without spawning another process to perform the task. The server splits the entries array into a list of fragment offsets which should be deleted and the remaining entries array, and then the server kicks off a task to delete the fragments and a task to upload the new copy of the manifest.

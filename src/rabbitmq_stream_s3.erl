@@ -42,12 +42,22 @@ efficiently using the `rabbitmq_stream_s3_array` module.
     | ?MANIFEST_KIND_KILO_GROUP
     | ?MANIFEST_KIND_MEGA_GROUP.
 
+-type milliseconds() :: non_neg_integer().
+
+%% Subset of osiris:retention_spec(), as a map.
+-type retention_spec() :: #{
+    max_bytes := non_neg_integer(),
+    max_age := milliseconds()
+}.
+
 -export_type([
     uid/0,
     key/0,
     entry/0,
     entries/0,
-    kind/0
+    kind/0,
+    milliseconds/0,
+    retention_spec/0
 ]).
 
 -export([

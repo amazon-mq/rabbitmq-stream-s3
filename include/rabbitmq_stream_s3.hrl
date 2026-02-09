@@ -206,10 +206,6 @@
 %% the root or any group.
 -define(ENTRIES_LEN(Entries), erlang:byte_size(Entries) div ?ENTRY_B).
 
--define(MANIFEST_BRANCHING_FACTOR, 1024).
--define(MANIFEST_MAX_HEIGHT, 4).
--define(FRAGMENT_UPLOADS_PER_MANIFEST_UPDATE, 10).
-
 %% 64 MiB (2^26 B)
 -define(MAX_FRAGMENT_SIZE_B, 67_108_864).
 %% %% 1 GiB (2^30 B)
@@ -250,6 +246,25 @@
     roll_reason = size :: size | segment_roll
 }).
 
+%% An edit to the manifest entries array. This type generically covers
+%% insertions, deletions and replacements. Edits are passed from the writer
+%% to replica servers to express changes to the manifest.
+%% * New fragments applied: pos points to the end of the array, len is zero and
+%%   the entries are appended.
+%% * Rebalancing: the section at pos with length len is replaced with the new
+%%   entries sub-array.
+%% * Retention: entries is empty and the section at pos with length len is
+%%   deleted. Pos is always zero.
+-record(edit, {
+    first_offset :: osiris:offset(),
+    first_timestamp :: osiris:timestamp(),
+    next_offset :: osiris:offset(),
+    total_size :: non_neg_integer(),
+    entries = <<>> :: rabbitmq_stream_s3:entries(),
+    pos = 0 :: non_neg_integer(),
+    len = 0 :: non_neg_integer()
+}).
+
 %% Events.
 
 %% The writer has written enough data and the given fragment is ready to be
@@ -273,9 +288,11 @@
     stream :: stream_id(),
     entry :: rabbitmq_stream_s3_db:entry()
 }).
--record(manifest_rebalanced, {
+-record(group_uploaded, {
     stream :: stream_id(),
-    manifest :: #manifest{}
+    entry :: rabbitmq_stream_s3:entry(),
+    pos :: non_neg_integer(),
+    len :: pos_integer()
 }).
 -record(manifest_requested, {
     stream :: stream_id(),
@@ -283,7 +300,8 @@
 }).
 -record(manifest_resolved, {
     stream :: stream_id(),
-    manifest :: #manifest{}
+    manifest :: #manifest{},
+    seq :: non_neg_integer() | undefined
 }).
 -record(writer_spawned, {
     stream :: stream_id(),
@@ -297,17 +315,18 @@
     stream :: stream_id(),
     config :: osiris_log:config()
 }).
-%% Sent from the writer to replicas to notify them of when new fragments are
-%% applied to the writer's manifest, or when truncation moves the first offset
-%% and timestamp forward.
+%% Sent from the writer to replicas to notify them of changes to the in-memory
+%% copy of the manifest.
 %%
-%% For retention `fragments` may be empty. Kinda like an append-entries RPC in
-%% Raft.
--record(fragments_applied, {
+%% This is somewhat similar to the append-entries RPC in raft.
+-record(manifest_edited, {
     stream :: stream_id(),
-    first_offset :: osiris:offset(),
-    first_timestamp :: osiris:timestamp(),
-    fragments :: [#fragment_info{}]
+    edits :: [#edit{}, ...],
+    seq :: non_neg_integer(),
+    %% Suggest that the replica triggers local retention. This is set to true
+    %% when the writer finishes uploading a fragment which was taken because
+    %% of segment rollover.
+    trigger_retention = false :: boolean()
 }).
 -record(tick, {}).
 -record(retention_updated, {
@@ -325,8 +344,8 @@
     | #commit_offset_increased{}
     | #fragment_available{}
     | #fragment_uploaded{}
-    | #fragments_applied{}
-    | #manifest_rebalanced{}
+    | #group_uploaded{}
+    | #manifest_edited{}
     | #manifest_requested{}
     | #manifest_resolved{}
     | #manifest_upload_rejected{}
@@ -353,13 +372,12 @@
     reference :: stream_reference(),
     manifest :: #manifest{}
 }).
--record(rebalance_manifest, {
+-record(upload_group, {
     stream :: stream_id(),
     kind :: rabbitmq_stream_s3:kind(),
-    size :: pos_integer(),
-    new_group :: rabbitmq_stream_s3:entries(),
-    rebalanced :: rabbitmq_stream_s3:entries(),
-    manifest :: #manifest{}
+    entries :: rabbitmq_stream_s3:entries(),
+    pos :: non_neg_integer(),
+    len :: pos_integer()
 }).
 %% Download the manifest from the remote tier and also check the tail of the
 %% last fragment to see if fragments have been uploaded but not yet applied.
@@ -400,18 +418,29 @@
     to :: osiris:offset()
 }).
 -record(delete_stream, {stream :: stream_id()}).
+%% Trigger evaluation of retention in the local tier.
 -record(trigger_retention, {
     stream :: stream_id(),
     dir :: directory(),
     shared :: atomics:atomics_ref(),
     counter :: counters:counters_ref()
 }).
+%% Evaluate retention in the remote tier within group files. This effect is
+%% emitted when a manifest has group entries. (If there are only fragment
+%% entries then remote tier retention is evaluated in-place.)
+-record(evaluate_retention, {
+    stream :: stream_id(),
+    manifest :: #manifest{},
+    retention_spec :: rabbitmq_stream_s3:retention_spec(),
+    now :: osiris:timestamp()
+}).
 
 -type effect() ::
     #delete_fragments{}
     | #delete_stream{}
+    | #evaluate_retention{}
     | #find_fragments{}
-    | #rebalance_manifest{}
+    | #group_uploaded{}
     | #register_offset_listener{}
     | #reply{}
     | #resolve_manifest{}

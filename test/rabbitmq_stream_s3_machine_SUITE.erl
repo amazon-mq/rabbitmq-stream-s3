@@ -26,7 +26,8 @@ all() ->
         retention,
         backfill_older_segments,
         manifest_upload_conflict,
-        stream_deletion_during_fragment_upload
+        stream_deletion_during_fragment_upload,
+        rebalance_group
     ].
 
 init_per_suite(Config) ->
@@ -186,11 +187,11 @@ out_of_order_fragment_uploads(Config) ->
     ?assertMatch(
         [
             #set_range{next_offset = 60},
+            #trigger_retention{},
             #upload_manifest{
                 stream = StreamId,
                 manifest = #manifest{first_offset = 0, next_offset = 60}
-            },
-            #trigger_retention{}
+            }
         ],
         Effects4
     ),
@@ -283,8 +284,8 @@ recover_uploaded_fragments(Config) ->
     ?assertMatch(
         [
             #set_range{next_offset = 60},
-            #upload_manifest{manifest = #manifest{first_offset = 0, next_offset = 60}},
-            #trigger_retention{}
+            #trigger_retention{},
+            #upload_manifest{manifest = #manifest{first_offset = 0, next_offset = 60}}
         ],
         Effects8
     ),
@@ -310,17 +311,19 @@ manifest_replication(Config) ->
     ?assertEqual([], Effects2),
     %% Once the manifest is resolved, the writer will forward it to the
     %% replica which requested it.
-    ManifestResolved = #manifest_resolved{stream = StreamId, manifest = #manifest{}},
+    Manifest = #manifest{},
+    ManifestResolved = #manifest_resolved{stream = StreamId, manifest = Manifest},
+    ManifestResolved1 = ManifestResolved#manifest_resolved{seq = 1},
     {Writer3, Effects3} = ?MAC:apply(?META(), ManifestResolved, Writer2),
     ?assertMatch(
         [
-            #send{to = ReplicaPid, message = ManifestResolved},
+            #send{to = ReplicaPid, message = ManifestResolved1},
             #set_range{next_offset = 0}
         ],
         Effects3
     ),
     AcceptorSpawned = #acceptor_spawned{stream = StreamId, config = writer_config(Config)},
-    {Replica1, Effects4} = handle_events(?META(), [AcceptorSpawned, ManifestResolved], ?MAC:new()),
+    {Replica1, Effects4} = handle_events(?META(), [AcceptorSpawned, ManifestResolved1], ?MAC:new()),
     ?assertMatch([#set_range{next_offset = 0}], Effects4),
     %% Now when fragments are fully uploaded and applied to the manifest, the
     %% acceptor will get notifications that fragments were applied.
@@ -340,25 +343,26 @@ manifest_replication(Config) ->
     Uploaded0 = [#fragment_uploaded{stream = StreamId, info = I} || I <- Infos],
     Uploaded = lists:reverse(Uploaded0),
     {Writer5, Effects6} = handle_events(?META(), Uploaded, Writer4),
-    FragmentsApplied = #fragments_applied{
+    {ok, Edit0} = ?MAC:apply_infos(Infos, Manifest),
+    ManifestEdited = #manifest_edited{
         stream = StreamId,
-        first_offset = (hd(Fragments))#fragment.first_offset,
-        first_timestamp = (hd(Fragments))#fragment.first_timestamp,
-        fragments = Infos
+        edits = [Edit0],
+        seq = 2,
+        trigger_retention = true
     },
     ?assertMatch(
         [
-            #send{to = {_, ReplicaNode}, message = FragmentsApplied},
             #set_range{next_offset = 60},
-            #upload_manifest{},
-            #trigger_retention{}
+            #trigger_retention{},
+            #send{to = {_, ReplicaNode}, message = ManifestEdited},
+            #upload_manifest{}
         ],
         Effects6
     ),
     ManifestUploaded1 = #manifest_uploaded{stream = StreamId, entry = #{revision => 1}},
     {_Writer6, Effects7} = ?MAC:apply(?META(), ManifestUploaded1, Writer5),
     ?assertEqual([], Effects7),
-    {_Replica2, Effects8} = ?MAC:apply(?META(), FragmentsApplied, Replica1),
+    {_Replica2, Effects8} = ?MAC:apply(?META(), ManifestEdited, Replica1),
     ?assertMatch(
         [
             #set_range{next_offset = 60},
@@ -408,20 +412,35 @@ retention(Config) ->
     ?assertMatch([#set_range{first_offset = 0, next_offset = 120}], Effects2),
 
     AcceptorSpawned = #acceptor_spawned{stream = StreamId, config = writer_config(Config)},
-    {Replica1, REffects1} = handle_events(?META(), [AcceptorSpawned, ManifestResolved], ?MAC:new()),
+    ManifestResolved1 = ManifestResolved#manifest_resolved{seq = 1},
+    {Replica1, REffects1} = handle_events(
+        ?META(),
+        [AcceptorSpawned, ManifestResolved1],
+        ?MAC:new()
+    ),
     ?assertMatch([#set_range{first_offset = 0, next_offset = 120}], REffects1),
 
-    FragmentsApplied1 = #fragments_applied{
-        stream = StreamId,
+    Edit0 = ?MAC:new_edit(Manifest),
+    Edit1 = Edit0#edit{
         first_offset = 40,
         first_timestamp = Ts - 100 + 40,
-        fragments = []
+        total_size = 600,
+        %% Deletion from retention always starts at zero and goes for the
+        %% number of entries being deleted. Two fragments in this edit.
+        pos = 0,
+        len = ?ENTRY_B * 2
+    },
+    ManifestEdited1 = #manifest_edited{
+        stream = StreamId,
+        edits = [Edit1],
+        seq = 2,
+        trigger_retention = false
     },
     {Writer3, Effects3} = ?MAC:apply(?META(), #tick{}, Writer2),
     ?assertMatch(
         [
-            #send{to = {_, ReplicaNode}, message = FragmentsApplied1},
             #set_range{first_offset = 40, next_offset = 120},
+            #send{to = {_, ReplicaNode}, message = ManifestEdited1},
             #upload_manifest{manifest = #manifest{first_offset = 40, total_size = 600}},
             #delete_fragments{offsets = [0, 20]}
         ],
@@ -431,21 +450,28 @@ retention(Config) ->
     {Writer4, Effects4} = ?MAC:apply(?META(), ManifestUploaded1, Writer3),
     ?assertMatch([], Effects4),
 
-    {Replica2, REffects2} = ?MAC:apply(?META(), FragmentsApplied1, Replica1),
+    {Replica2, REffects2} = ?MAC:apply(?META(), ManifestEdited1, Replica1),
     ?assertMatch([#set_range{first_offset = 40, next_offset = 120}], REffects2),
 
     RetentionUpdated = #retention_updated{stream = StreamId, retention = [{max_bytes, 500}]},
     {Writer5, Effects5} = ?MAC:apply(?META(), RetentionUpdated, Writer4),
-    FragmentsApplied2 = #fragments_applied{
-        stream = StreamId,
+    Edit2 = Edit1#edit{
         first_offset = 60,
         first_timestamp = Ts - 100 + 60,
-        fragments = []
+        total_size = 400,
+        %% Only one fragment this time.
+        len = ?ENTRY_B
+    },
+    ManifestEdited2 = #manifest_edited{
+        stream = StreamId,
+        edits = [Edit2],
+        seq = 3,
+        trigger_retention = false
     },
     ?assertMatch(
         [
-            #send{to = {_, ReplicaNode}, message = FragmentsApplied2},
             #set_range{first_offset = 60, next_offset = 120},
+            #send{to = {_, ReplicaNode}, message = ManifestEdited2},
             #upload_manifest{manifest = #manifest{first_offset = 60, total_size = 400}},
             #delete_fragments{offsets = [40]}
         ],
@@ -455,7 +481,7 @@ retention(Config) ->
     {Writer6, Effects6} = ?MAC:apply(?META(), ManifestUploaded2, Writer5),
     ?assertMatch([], Effects6),
 
-    {Replica3, REffects3} = ?MAC:apply(?META(), FragmentsApplied2, Replica2),
+    {Replica3, REffects3} = ?MAC:apply(?META(), ManifestEdited2, Replica2),
     ?assertMatch([#set_range{first_offset = 60, next_offset = 120}], REffects3),
 
     %% Publish another fragment which will exceed the max-bytes setting.
@@ -481,22 +507,32 @@ retention(Config) ->
     ),
     Info = fragment_to_info(Fragment),
     FragmentUploaded = #fragment_uploaded{stream = StreamId, info = Info},
+    Manifest1 = ?MAC:get_manifest(StreamId, Writer7),
     {Writer8, Effects8} = ?MAC:apply(?META(), FragmentUploaded, Writer7),
-    FragmentsApplied3 = #fragments_applied{
-        stream = StreamId,
+    {ok, UploadEdit} = ?MAC:apply_infos([Info], Manifest1),
+    RetentionEdit = UploadEdit#edit{
         first_offset = 80,
         first_timestamp = Ts - 100 + 80,
-        fragments = [Info]
+        total_size = 400,
+        entries = <<>>,
+        pos = 0,
+        len = ?ENTRY_B
+    },
+    ManifestEdited3 = #manifest_edited{
+        stream = StreamId,
+        edits = [UploadEdit, RetentionEdit],
+        seq = 4,
+        trigger_retention = true
     },
     ?assertMatch(
         [
-            #send{to = {_, ReplicaNode}, message = FragmentsApplied3},
             #set_range{first_offset = 80, next_offset = 140},
+            #trigger_retention{},
+            #send{to = {_, ReplicaNode}, message = ManifestEdited3},
             #upload_manifest{
                 manifest = #manifest{first_offset = 80, next_offset = 140, total_size = 400}
             },
-            #delete_fragments{offsets = [60]},
-            #trigger_retention{}
+            #delete_fragments{offsets = [60]}
         ],
         Effects8
     ),
@@ -504,7 +540,7 @@ retention(Config) ->
     {_Writer9, Effects9} = ?MAC:apply(?META(), ManifestUploaded3, Writer8),
     ?assertMatch([], Effects9),
 
-    {_Replica4, REffects4} = ?MAC:apply(?META(), FragmentsApplied3, Replica3),
+    {_Replica4, REffects4} = ?MAC:apply(?META(), ManifestEdited3, Replica3),
     ?assertMatch(
         [
             #set_range{first_offset = 80, next_offset = 140},
@@ -594,8 +630,8 @@ backfill_older_segments(Config) ->
     ?assertMatch(
         [
             #set_range{first_offset = 0, next_offset = 120},
-            #upload_manifest{},
-            #trigger_retention{}
+            #trigger_retention{},
+            #upload_manifest{}
         ],
         Effects6
     ),
@@ -655,11 +691,11 @@ manifest_upload_conflict(Config) ->
     ?assertMatch(
         [
             #set_range{first_offset = 40, next_offset = 80},
+            #trigger_retention{},
             #upload_manifest{
                 manifest = #manifest{first_offset = 40, next_offset = 80, total_size = 400}
             },
-            #delete_fragments{offsets = [0, 20]},
-            #trigger_retention{}
+            #delete_fragments{offsets = [0, 20]}
         ],
         NewEffects4
     ),
@@ -723,6 +759,80 @@ stream_deletion_during_fragment_upload(Config) ->
     %% The fragment should be reclaimed later by a background/garbage-collection
     %% process. There's nothing to do now.
     ?assertMatch([], Effects4),
+    ok.
+
+rebalance_group(Config) ->
+    WriterPid = self(),
+    ReplicaNode = 'rabbit@replica',
+    StreamId = erlang:make_ref(),
+    WriterSpawned = #writer_spawned{
+        stream = StreamId,
+        pid = WriterPid,
+        config = (writer_config(Config))#{replica_nodes := [ReplicaNode]}
+    },
+    Fragments = fragments([{0, 19}, {20, 29}, {30, 39}, {40, 49}, {50, 59}, {60, 69}]),
+    Manifest = fragments_to_manifest(lists:sublist(Fragments, 4)),
+    [F5, F6] = lists:sublist(Fragments, 5, 2),
+    ManifestResolved = #manifest_resolved{stream = StreamId, manifest = Manifest},
+    Writer0 = ?MAC:new(#{rebalance_factor => 5}),
+    {Writer1, _WEffects1} = handle_events(?META(), [WriterSpawned, ManifestResolved], Writer0),
+
+    AcceptorSpawned = #acceptor_spawned{stream = StreamId, config = writer_config(Config)},
+    ManifestResolved1 = ManifestResolved#manifest_resolved{seq = 1},
+    {Replica1, _REffects1} = handle_events(
+        ?META(), [AcceptorSpawned, ManifestResolved1], ?MAC:new()
+    ),
+
+    F5Uploaded = #fragment_uploaded{stream = StreamId, info = fragment_to_info(F5)},
+    {Writer2, WEffects2} = ?MAC:apply(?META(), F5Uploaded, Writer1),
+    [
+        #set_range{},
+        #send{to = {_, ReplicaNode}, message = #manifest_edited{} = ManifestEdited1}
+    ] = WEffects2,
+
+    {Replica2, REffects2} = ?MAC:apply(?META(), ManifestEdited1, Replica1),
+    ?assertMatch([#set_range{}], REffects2),
+
+    F6Uploaded = #fragment_uploaded{stream = StreamId, info = fragment_to_info(F6)},
+    {Writer3, WEffects3} = ?MAC:apply(?META(), F6Uploaded, Writer2),
+    [
+        #set_range{},
+        #trigger_retention{},
+        #send{to = {_, ReplicaNode}, message = #manifest_edited{} = ManifestEdited2},
+        #upload_group{kind = ?MANIFEST_KIND_GROUP, pos = Pos, len = Len, entries = GroupEntries}
+    ] = WEffects3,
+
+    {Replica3, REffects3} = ?MAC:apply(?META(), ManifestEdited2, Replica2),
+    ?assertMatch([#set_range{}, #trigger_retention{}], REffects3),
+
+    ?ENTRY(GroupOffset, GroupTs, ?MANIFEST_KIND_FRAGMENT, _Sz, _Sq, _U, _) = GroupEntries,
+    GroupUploaded = #group_uploaded{
+        stream = StreamId,
+        pos = Pos,
+        len = Len,
+        entry = ?ENTRY(
+            GroupOffset,
+            GroupTs,
+            ?MANIFEST_KIND_GROUP,
+            2000,
+            0,
+            rabbitmq_stream_s3:uid(),
+            <<>>
+        )
+    },
+    {Writer4, WEffects4} = ?MAC:apply(?META(), GroupUploaded, Writer3),
+    [
+        #set_range{},
+        #send{to = {_, ReplicaNode}, message = #manifest_edited{} = ManifestEdited3},
+        #upload_manifest{}
+    ] = WEffects4,
+
+    {Replica4, REffects4} = ?MAC:apply(?META(), ManifestEdited3, Replica3),
+    ?assertMatch([#set_range{}], REffects4),
+    Entries = (?MAC:get_manifest(StreamId, Writer4))#manifest.entries,
+    ?assertEqual(Entries, (?MAC:get_manifest(StreamId, Replica4))#manifest.entries),
+    %% Two entries in the array now, the group and fragment 6.
+    ?assertEqual(2, byte_size(Entries) div ?ENTRY_B),
     ok.
 
 %%----------------------------------------------------------------------------

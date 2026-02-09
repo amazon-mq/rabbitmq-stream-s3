@@ -209,7 +209,7 @@ handle_info(#set_range{} = Effect, State) ->
     {noreply, apply_effect(Effect, State)};
 handle_info(#manifest_resolved{} = Event, State) ->
     {noreply, evolve_event(Event, State)};
-handle_info(#fragments_applied{} = Event, State) ->
+handle_info(#manifest_edited{} = Event, State) ->
     {noreply, evolve_event(Event, State)};
 handle_info(tick_timeout, State0) ->
     State = evolve_event(#tick{}, State0),
@@ -316,11 +316,13 @@ apply_effect(#upload_fragment{} = Effect, State) ->
     spawn_task(Effect, State);
 apply_effect(#upload_manifest{} = Effect, State) ->
     spawn_task(Effect, State);
-apply_effect(#rebalance_manifest{} = Effect, State) ->
+apply_effect(#upload_group{} = Effect, State) ->
     spawn_task(Effect, State);
 apply_effect(#resolve_manifest{} = Effect, State) ->
     spawn_task(Effect, State);
 apply_effect(#find_fragments{} = Effect, State) ->
+    spawn_task(Effect, State);
+apply_effect(#evaluate_retention{} = Effect, State) ->
     spawn_task(Effect, State);
 apply_effect(#delete_fragments{} = Effect, State) ->
     spawn_task(Effect, State);
@@ -441,26 +443,34 @@ execute_task(#upload_fragment{
     after
         ok = rabbitmq_stream_s3_api:close(Conn)
     end;
-execute_task(#rebalance_manifest{
+execute_task(#upload_group{
     stream = StreamId,
     kind = GroupKind,
-    size = GroupSize,
-    new_group = GroupEntries,
-    rebalanced = RebalancedEntries,
-    manifest = Manifest0
+    entries = ?ENTRY(GroupOffset, GroupTs, _, _, _, _, _) = GroupEntries,
+    pos = Pos,
+    len = Len
 }) ->
+    Uid = rabbitmq_stream_s3:uid(),
     Ext = rabbitmq_stream_s3:group_extension(GroupKind),
-    ?ENTRY(GroupOffset, Ts, _, _, _, Uid, _) = GroupEntries,
     Key = rabbitmq_stream_s3:group_key(StreamId, Uid, GroupKind, GroupOffset),
-    Data = [
-        group_header(GroupKind),
-        <<GroupOffset:64/unsigned, Ts:64/signed, 0:2/signed, GroupSize:70/unsigned>>,
+    GroupSize = rabbitmq_stream_s3_array:fold(
+        fun(?ENTRY(_O, _T, _K, Size, _Sq, _U, _), Acc) -> Size + Acc end,
+        0,
+        ?ENTRY_B,
         GroupEntries
-    ],
+    ),
+    Data = <<
+        (group_header(GroupKind))/binary,
+        GroupOffset:64/unsigned,
+        GroupTs:64/signed,
+        0:2/signed,
+        GroupSize:70/unsigned,
+        GroupEntries/binary
+    >>,
 
     {ok, Conn} = rabbitmq_stream_s3_api:open(),
     try
-        ?LOG_DEBUG("rebalancing: adding a ~ts to the manifest for '~tp'", [Ext, StreamId]),
+        ?LOG_DEBUG("rebalancing: adding a ~ts to the manifest for stream '~ts'", [Ext, StreamId]),
         {UploadMsec, ok} = timer:tc(
             fun() ->
                 ok = rabbitmq_stream_s3_api:put(Conn, Key, Data)
@@ -468,7 +478,7 @@ execute_task(#rebalance_manifest{
             millisecond
         ),
         DataSize = iolist_size(Data),
-        ?LOG_DEBUG("Uploaded ~ts for '~tp' in ~b msec (~b bytes)", [
+        ?LOG_DEBUG("Uploaded ~ts for stream '~ts' in ~b msec (~b bytes)", [
             Ext, StreamId, UploadMsec, DataSize
         ]),
         %% TODO: counters per group kind.
@@ -477,9 +487,12 @@ execute_task(#rebalance_manifest{
     after
         ok = rabbitmq_stream_s3_api:close(Conn)
     end,
-    Manifest = Manifest0#manifest{entries = RebalancedEntries},
-    %% TODO: update `rabbitmq_stream_s3_db`.
-    #manifest_rebalanced{stream = StreamId, manifest = Manifest};
+    #group_uploaded{
+        stream = StreamId,
+        entry = ?ENTRY(GroupOffset, GroupTs, GroupKind, GroupSize, 0, Uid, <<>>),
+        pos = Pos,
+        len = Len
+    };
 execute_task(#upload_manifest{
     stream = StreamId,
     epoch = Epoch,
@@ -661,6 +674,10 @@ execute_task(#delete_stream{stream = StreamId}) ->
     %%
     %% LIST all keys with the prefix of this stream ID and delete 1000 objects
     %% at a time.
+    ok;
+execute_task(#evaluate_retention{stream = StreamId}) ->
+    ?LOG_DEBUG("Evaluating retention for stream '~ts'", [StreamId]),
+    %% TODO
     ok.
 
 resolve_manifest_tail(
