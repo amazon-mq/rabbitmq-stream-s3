@@ -451,7 +451,7 @@ execute_task(#upload_group{
     len = Len
 }) ->
     Uid = rabbitmq_stream_s3:uid(),
-    Ext = rabbitmq_stream_s3:group_extension(GroupKind),
+    Ext = rabbitmq_stream_s3:group_name(GroupKind),
     Key = rabbitmq_stream_s3:group_key(StreamId, Uid, GroupKind, GroupOffset),
     GroupSize = rabbitmq_stream_s3_array:fold(
         fun(?ENTRY(_O, _T, _K, Size, _Sq, _U, _), Acc) -> Size + Acc end,

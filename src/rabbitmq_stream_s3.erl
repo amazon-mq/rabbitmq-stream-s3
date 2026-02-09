@@ -67,7 +67,7 @@ efficiently using the `rabbitmq_stream_s3_array` module.
     offset_filename/2,
     manifest_key/2,
     group_key/4,
-    group_extension/1,
+    group_name/1,
     next_group/1,
     fragment_key/2,
     index_file_offset/1,
@@ -101,30 +101,33 @@ The offset is padded with leading zeroes to a width of 20.
 """.
 -spec offset_filename(osiris:offset(), Suffix :: binary()) -> filename().
 offset_filename(Offset, Suffix) when is_integer(Offset) andalso is_binary(Suffix) ->
-    <<(iolist_to_binary(io_lib:format("~20..0B", [Offset])))/binary, ".", Suffix/binary>>.
+    <<(pad_zeroes(Offset))/binary, $., Suffix/binary>>.
+
+pad_zeroes(Offset) ->
+    iolist_to_binary(io_lib:format("~20..0B", [Offset])).
 
 -doc "Creates the key for the given stream and UID".
 -spec manifest_key(stream_id(), uid()) -> key().
 manifest_key(StreamId, Uid) when is_binary(StreamId) andalso is_binary(Uid) ->
-    manifest_key(StreamId, Uid, <<"manifest">>).
+    manifest_key(StreamId, <<"root">>, Uid, <<"manifest">>).
 
--spec manifest_key(stream_id(), uid(), filename()) -> key().
-manifest_key(StreamId, Uid, Filename) when
-    is_binary(StreamId) andalso is_binary(Uid) andalso is_binary(Filename)
+-spec manifest_key(stream_id(), binary(), uid(), binary()) -> key().
+manifest_key(StreamId, Prefix, Uid, Suffix) when
+    is_binary(StreamId) andalso is_binary(Prefix) andalso is_binary(Uid) andalso is_binary(Suffix)
 ->
-    <<"rabbitmq/stream/", StreamId/binary, "/metadata/", (format_uid(Uid))/binary, $.,
-        Filename/binary>>.
+    <<"rabbitmq/stream/", StreamId/binary, "/metadata/", Prefix/binary, $.,
+        (format_uid(Uid))/binary, $., Suffix/binary>>.
 
 -doc "Creates the key for the given group".
 -spec group_key(stream_id(), uid(), kind(), osiris:offset()) -> key().
 group_key(StreamId, Uid, Kind, Offset) ->
-    manifest_key(StreamId, Uid, offset_filename(Offset, group_extension(Kind))).
+    manifest_key(StreamId, pad_zeroes(Offset), Uid, group_name(Kind)).
 
 %% TODO: this should be private.
--spec group_extension(kind()) -> binary().
-group_extension(?MANIFEST_KIND_GROUP) -> <<"group">>;
-group_extension(?MANIFEST_KIND_KILO_GROUP) -> <<"kgroup">>;
-group_extension(?MANIFEST_KIND_MEGA_GROUP) -> <<"mgroup">>.
+-spec group_name(kind()) -> binary().
+group_name(?MANIFEST_KIND_GROUP) -> <<"group">>;
+group_name(?MANIFEST_KIND_KILO_GROUP) -> <<"kgroup">>;
+group_name(?MANIFEST_KIND_MEGA_GROUP) -> <<"mgroup">>.
 
 -doc "Returns next largest group above the given group".
 -spec next_group(kind()) -> kind().
