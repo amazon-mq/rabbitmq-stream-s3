@@ -120,7 +120,7 @@ When a fragment is uploaded, a metadata record for it is appended to the array o
 
 ![M-way tree manifest](./ManifestMWay.svg)
 
-The branching factor will be tuned in testing but a relatively high value like `M=1024` provides a theoretically good balance. With 35 bytes of metadata per fragment, group files would take around 35 KiB to represent - small enough to be comfortably downloaded and searched in-memory. A high branching factor keeps the height of the tree low. With `M=1024` and fragments even as small as 1 MB, a lookup within the tree for one of the oldest fragments would take at-most four round-trips to S3: the root (cached), a kilo-group, a group, and the leaf (fragment). Within tree nodes, fragment metadata is naturally stored in ascending order of offset. This mitigates the high branching factor: binary search can be used on the record arrays to quickly find specific fragments or groups within each tree node.
+The branching factor will be tuned in testing but a relatively high value like `M=1024` provides a theoretically good balance. With 30 bytes of metadata per fragment, group files would take around 30 KiB to represent - small enough to be comfortably downloaded and searched in-memory. A high branching factor keeps the height of the tree low. With `M=1024` and fragments even as small as 1 MB, a lookup within the tree for one of the oldest fragments would take at-most four round-trips to S3: the root (cached), a kilo-group, a group, and the leaf (fragment). Within tree nodes, fragment metadata is naturally stored in ascending order of offset. This mitigates the high branching factor: binary search can be used on the record arrays to quickly find specific fragments or groups within each tree node.
 
 ```
 rabbitmq/

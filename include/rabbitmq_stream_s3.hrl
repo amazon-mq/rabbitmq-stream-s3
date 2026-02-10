@@ -55,14 +55,23 @@
 -define(C_OSIRIS_LOG_CHUNKS, 4).
 -define(C_OSIRIS_LOG_SEGMENTS, 5).
 
-%% first offset (8) + first timestamp (8) + next offset (8) + seq no (2) +
-%% size (4) + segment start pos (4) + num chunks in segment (4) +
-%% index byte offset (4) + index size (4) = 46.
--define(FRAGMENT_TRAILER_B, 46).
+%% * first offset (8)
+%% * next offset (8)
+%% * first timestamp (8)
+%% * last timestamp (8)
+%% * seq no (2)
+%% * size (4)
+%% * segment start pos (4)
+%% * num chunks in segment (4)
+%% * index byte offset (4)
+%% * index size (4)
+%% = 54.
+-define(FRAGMENT_TRAILER_B, 54).
 -define(FRAGMENT_TRAILER(
     FirstOffset,
-    FirstTimestamp,
     NextOffset,
+    FirstTs,
+    LastTs,
     SeqNo,
     Size,
     SegmentStartPos,
@@ -72,8 +81,9 @@
 ),
     <<
         FirstOffset:64/unsigned,
-        FirstTimestamp:64/unsigned,
         NextOffset:64/unsigned,
+        FirstTs:64/signed,
+        LastTs:64/signed,
         SeqNo:16/unsigned,
         Size:32/unsigned,
         SegmentStartPos:32/unsigned,
@@ -84,9 +94,10 @@
 ).
 %% Info stored in a fragment's trailer. Nicer version of the above.
 -record(fragment_info, {
-    offset :: osiris:offset(),
-    timestamp :: osiris:timestamp(),
+    first_offset :: osiris:offset(),
     next_offset :: osiris:offset(),
+    first_timestamp :: osiris:timestamp(),
+    last_timestamp :: osiris:timestamp(),
     %% Zero-based sequence number within the segment.
     seq_no :: non_neg_integer(),
     %% The position into the segment file where this fragment data started.
@@ -134,40 +145,78 @@
 %% * magic (4)
 %% * version (4)
 %% * first offset (8)
-%% * first timestamp (8)
 %% * next offset (8)
+%% * first timestamp (8)
+%% * first last timestamp (8)
 %% * size (9)
 %% = 41 bytes
--define(MANIFEST_HEADER_SIZE, 41).
+-define(MANIFEST_HEADER_SIZE, 49).
 
--define(MANIFEST(FirstOffset, FirstTimestamp, NextOffset, TotalSize, Entries), <<
+-define(MANIFEST(FirstOffset, NextOffset, FirstTs, FirstLastTs, TotalSize, Entries), <<
     ?MANIFEST_ROOT_MAGIC,
     ?MANIFEST_ROOT_VERSION:32/unsigned,
     FirstOffset:64/unsigned,
-    FirstTimestamp:64/signed,
     NextOffset:64/unsigned,
+    FirstTs:64/signed,
+    FirstLastTs:64/signed,
     0:2/unsigned,
     TotalSize:70/unsigned,
     %% Entries array:
     Entries/binary
 >>).
--define(ENTRY(Offset, Timestamp, Kind, Size, SeqNo, Uid, Rest), <<
+
+%% Helper macros to form #manifest.entries array entries. Entries may either
+%% point to fragments directly, or point to groups of fragments that have been
+%% "rebalanced" out of the manifest root. These entries have different contents
+%% but share the same amount of space - to make the entries arrays compact even
+%% when there are thousands of fragments.
+%%
+%% So an entry is a sort of union type between fragment and group. Both groups
+%% and fragments store the first offset and last timestamp in their range. This
+%% is used for readers to resolve offset specs. Fragments also store the
+%% segment data size. This is used for retention. Groups instead store the UID
+%% of the object.
+-define(ENTRY_B, 30).
+-define(ENTRY(Offset, FirstTs, LastTs, Kind), ?ENTRY(Offset, FirstTs, LastTs, Kind, <<>>)).
+-define(ENTRY(Offset, FirstTs, LastTs, Kind, Rest), <<
     Offset:64/unsigned,
-    Timestamp:64/signed,
+    FirstTs:64/signed,
+    LastTs:64/signed,
     Kind:2/unsigned,
-    Size:70/unsigned,
-    SeqNo:16/unsigned,
-    (Uid):8/binary,
+    _:46,
     %% Other entries:
     Rest/binary
 >>).
-%% * offset(8)
-%% * timestamp (8)
-%% * kind/size (9)
-%% * seq no (2)
-%% * uid (8)
-%% = 35
--define(ENTRY_B, 35).
+-define(FRAGMENT(Offset, FirstTs, LastTs, IsSeqZero, Size),
+    ?FRAGMENT(Offset, FirstTs, LastTs, IsSeqZero, Size, <<>>)
+).
+-define(FRAGMENT(Offset, FirstTs, LastTs, IsSeqZero, Size, Rest), <<
+    Offset:64/unsigned,
+    FirstTs:64/signed,
+    LastTs:64/signed,
+    ?MANIFEST_KIND_FRAGMENT:2/unsigned,
+    %% Whether the fragment was the first in the segment. This can be used to
+    %% search for a tracking snapshot.
+    IsSeqZero:1/unsigned,
+    %% 45 bits can describe segment data of up to 32 TiB.
+    %% 2^45 == 32 * 1024^4
+    Size:45/unsigned,
+    Rest/binary
+>>).
+%% NOTE: ?GROUP will match fragments. Always attempt to match ?FRAGMENT first
+%% or guard on the Kind argument.
+-define(GROUP(Offset, FirstTs, LastTs, Kind, Uid),
+    ?GROUP(Offset, FirstTs, LastTs, Kind, Uid, <<>>)
+).
+-define(GROUP(Offset, FirstTs, LastTs, Kind, Uid, Rest), <<
+    Offset:64/unsigned,
+    FirstTs:64/signed,
+    LastTs:64/signed,
+    Kind:2/unsigned,
+    %% 46 bits of entropy. See the uid() type.
+    Uid:46/unsigned,
+    Rest/binary
+>>).
 
 %% A nicer version of the above `?MANIFEST/5' macro.
 %%
@@ -180,12 +229,15 @@
 %% This record also contains the optimistic concurrency information necessary
 %% for the stream, i.e. `revision'.
 -record(manifest, {
-    %% The oldest offset which has been uploaded and not yet truncated by
-    %% retention.
+    %% The offset of the first chunk in the first fragment in the remote
+    %% tier. Used to set the first_offset counter.
     first_offset = 0 :: osiris:offset(),
-    %% The oldest timestamp which has been uploaded and not yet truncated
-    %% by retention.
+    %% The timestamp of the first chunk in the first fragment in the
+    %% remote tier. Used to set the first_timestamp counter.
     first_timestamp = -1 :: osiris:timestamp(),
+    %% The timestamp of the last chunk in the first fragment in the remote
+    %% tier. Used by max-age retention.
+    first_last_timestamp = -1 :: osiris:timestamp(),
     %% The next offset which must be uploaded to the remote tier to ensure
     %% that the log has been uploaded without any holes. This corresponds to
     %% `#fragment.next_offset' for the last fragment which has been uploaded
@@ -201,10 +253,6 @@
     %% An array of entries. Use the `?ENTRY/6' macro to access entries.
     entries = <<>> :: rabbitmq_stream_s3:entries()
 }).
-
-%% Number of outgoing edges from this branch. Works for the entries array of
-%% the root or any group.
--define(ENTRIES_LEN(Entries), erlang:byte_size(Entries) div ?ENTRY_B).
 
 %% 64 MiB (2^26 B)
 -define(MAX_FRAGMENT_SIZE_B, 67_108_864).
@@ -231,6 +279,7 @@
     segment_offset :: osiris:offset(),
     segment_pos = ?SEGMENT_HEADER_B :: pos_integer(),
     first_timestamp :: osiris:timestamp() | undefined,
+    last_timestamp :: osiris:timestamp() | undefined,
     %% Number of chunks in prior fragments and number in current fragment.
     num_chunks = {0, 0} :: {non_neg_integer(), non_neg_integer()},
     %% Zero-based increasing integer for sequence number within the segment.
@@ -258,6 +307,7 @@
 -record(edit, {
     first_offset :: osiris:offset(),
     first_timestamp :: osiris:timestamp(),
+    first_last_timestamp :: osiris:timestamp(),
     next_offset :: osiris:offset(),
     total_size :: non_neg_integer(),
     entries = <<>> :: rabbitmq_stream_s3:entries(),

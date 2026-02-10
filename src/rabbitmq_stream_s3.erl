@@ -8,10 +8,22 @@
 -doc """
 A unique, randomly generated ID.
 
-This binary contains random bytes. Use `format_uid/1` to format into human
-readable text.
+This is represented as a 46 bit integer. Why 46 bits? It fits tightly into the
+manifest entries array for group entries. (The remaining two bits are a union
+discriminant that says which `kind()` of group the entry is.) This also fits
+into an Erlang immediate term, so it is cheap to represent compared to a binary
+for example.
+
+See [Birthday attack] and the related math. With the approximation formula
+there, for 46 bits of entropy: `sqrt(2^(1 + 46 - 20)) == 11585`. To have a
+one-in-a-million chance of a collision we would need to have ~11.5k objects
+with competing UIDs. Objects like groups also have offsets which make them
+further unique. And there is typically only one manifest root in the common
+case, so we say that this is _enough_ entropy.
+
+[Birthday attack]: https://en.wikipedia.org/wiki/Birthday_attack#Simple_approximation
 """.
--type uid() :: <<_:64>>.
+-type uid() :: non_neg_integer().
 
 -doc """
 A key within a bucket.
@@ -62,7 +74,6 @@ efficiently using the `rabbitmq_stream_s3_array` module.
 
 -export([
     uid/0,
-    null_uid/0,
     format_uid/1,
     offset_filename/2,
     manifest_key/2,
@@ -77,21 +88,13 @@ efficiently using the `rabbitmq_stream_s3_array` module.
 -doc "Creates a new random UID.".
 -spec uid() -> uid().
 uid() ->
-    crypto:strong_rand_bytes(8).
-
--doc """
-Creates a zeroed UID binary.
-
-This is meant for covering scenarios where the UID is not used.
-""".
--spec null_uid() -> uid().
-null_uid() ->
-    <<0:64>>.
+    <<_:2, Uid:46>> = crypto:strong_rand_bytes(6),
+    Uid.
 
 -doc "Formats a UID as human-readable text".
--spec format_uid(uid()) -> <<_:128>>.
-format_uid(<<_:64>> = Uid) ->
-    binary:encode_hex(Uid, lowercase).
+-spec format_uid(uid()) -> <<_:96>>.
+format_uid(Uid) when is_integer(Uid) andalso Uid >= 0 ->
+    binary:encode_hex(<<0:2, Uid:46>>, lowercase).
 
 -doc """
 Creates a basename of a file or key which corresponds to the offset with the
@@ -108,12 +111,12 @@ pad_zeroes(Offset) ->
 
 -doc "Creates the key for the given stream and UID".
 -spec manifest_key(stream_id(), uid()) -> key().
-manifest_key(StreamId, Uid) when is_binary(StreamId) andalso is_binary(Uid) ->
+manifest_key(StreamId, Uid) when is_binary(StreamId) andalso is_integer(Uid) ->
     manifest_key(StreamId, <<"root">>, Uid, <<"manifest">>).
 
 -spec manifest_key(stream_id(), binary(), uid(), binary()) -> key().
 manifest_key(StreamId, Prefix, Uid, Suffix) when
-    is_binary(StreamId) andalso is_binary(Prefix) andalso is_binary(Uid) andalso is_binary(Suffix)
+    is_binary(StreamId) andalso is_binary(Prefix) andalso is_integer(Uid) andalso is_binary(Suffix)
 ->
     <<"rabbitmq/stream/", StreamId/binary, "/metadata/", Prefix/binary, $.,
         (format_uid(Uid))/binary, $., Suffix/binary>>.
@@ -164,7 +167,7 @@ filename_offset(Basename) when is_list(Basename) ->
 -include_lib("eunit/include/eunit.hrl").
 
 format_uid_test() ->
-    ?assertEqual(<<"0000000000000000">>, format_uid(null_uid())),
+    ?assertEqual(<<"000000000000">>, format_uid(0)),
     ok.
 
 index_file_offset_test() ->

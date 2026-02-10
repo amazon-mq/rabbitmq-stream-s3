@@ -389,15 +389,7 @@ retention(Config) ->
 
     Ts = erlang:system_time(millisecond),
     Entries = <<
-        ?ENTRY(
-            (N * 20),
-            (Ts - 100 + N * 20),
-            ?MANIFEST_KIND_FRAGMENT,
-            200,
-            N,
-            rabbitmq_stream_s3:null_uid(),
-            <<>>
-        )
+        ?FRAGMENT((N * 20), (Ts - 100 + (N - 1) * 20), (Ts - 100 + N * 20), 0, 200)
      || N <- lists:seq(0, 4)
     >>,
     Manifest = #manifest{
@@ -423,7 +415,8 @@ retention(Config) ->
     Edit0 = ?MAC:new_edit(Manifest),
     Edit1 = Edit0#edit{
         first_offset = 40,
-        first_timestamp = Ts - 100 + 40,
+        first_timestamp = Ts - 100 + 20,
+        first_last_timestamp = Ts - 100 + 40,
         total_size = 600,
         %% Deletion from retention always starts at zero and goes for the
         %% number of entries being deleted. Two fragments in this edit.
@@ -457,7 +450,8 @@ retention(Config) ->
     {Writer5, Effects5} = ?MAC:apply(?META(), RetentionUpdated, Writer4),
     Edit2 = Edit1#edit{
         first_offset = 60,
-        first_timestamp = Ts - 100 + 60,
+        first_timestamp = Ts - 100 + 40,
+        first_last_timestamp = Ts - 100 + 60,
         total_size = 400,
         %% Only one fragment this time.
         len = ?ENTRY_B
@@ -512,7 +506,8 @@ retention(Config) ->
     {ok, UploadEdit} = ?MAC:apply_infos([Info], Manifest1),
     RetentionEdit = UploadEdit#edit{
         first_offset = 80,
-        first_timestamp = Ts - 100 + 80,
+        first_timestamp = Ts - 100 + 60,
+        first_last_timestamp = Ts - 100 + 80,
         total_size = 400,
         entries = <<>>,
         pos = 0,
@@ -565,6 +560,7 @@ backfill_older_segments(Config) ->
             seq_no = N rem 3,
             first_offset = N * 20,
             first_timestamp = Ts + N * 20,
+            last_timestamp = Ts + (N + 1) * 20,
             last_offset = N * 20,
             next_offset = N * 20 + 20,
             size = 200,
@@ -805,19 +801,18 @@ rebalance_group(Config) ->
     {Replica3, REffects3} = ?MAC:apply(?META(), ManifestEdited2, Replica2),
     ?assertMatch([#set_range{}, #trigger_retention{}], REffects3),
 
-    ?ENTRY(GroupOffset, GroupTs, ?MANIFEST_KIND_FRAGMENT, _Sz, _Sq, _U, _) = GroupEntries,
+    ?FRAGMENT(GroupOffset, GroupFirstTs, _, _, _, _) = GroupEntries,
+    ?FRAGMENT(_, GroupLastTs, _, _, _, _) = rabbitmq_stream_s3_array:last(?ENTRY_B, GroupEntries),
     GroupUploaded = #group_uploaded{
         stream = StreamId,
         pos = Pos,
         len = Len,
-        entry = ?ENTRY(
+        entry = ?GROUP(
             GroupOffset,
-            GroupTs,
+            GroupFirstTs,
+            GroupLastTs,
             ?MANIFEST_KIND_GROUP,
-            2000,
-            0,
-            rabbitmq_stream_s3:uid(),
-            <<>>
+            (rabbitmq_stream_s3:uid())
         )
     },
     {Writer4, WEffects4} = ?MAC:apply(?META(), GroupUploaded, Writer3),
@@ -872,10 +867,12 @@ fragment(Offset, LastOffset) ->
     fragment(Offset, LastOffset, 0).
 
 fragment(Offset, LastOffset, SeqNo) ->
+    Ts = erlang:system_time(millisecond),
     #fragment{
         segment_offset = Offset,
         first_offset = Offset,
-        first_timestamp = erlang:system_time(millisecond),
+        first_timestamp = Ts,
+        last_timestamp = Ts + 1,
         last_offset = LastOffset,
         next_offset = LastOffset + 1,
         seq_no = SeqNo,
@@ -884,16 +881,18 @@ fragment(Offset, LastOffset, SeqNo) ->
 
 fragment_to_info(#fragment{
     first_offset = O,
-    first_timestamp = T,
     next_offset = N,
+    first_timestamp = FirstTs,
+    last_timestamp = LastTs,
     seq_no = Seq,
     size = Size,
     roll_reason = RollReason
 }) ->
     #fragment_info{
-        offset = O,
-        timestamp = T,
+        first_offset = O,
         next_offset = N,
+        first_timestamp = FirstTs,
+        last_timestamp = LastTs,
         seq_no = Seq,
         size = Size,
         roll_reason = RollReason
@@ -903,19 +902,30 @@ fragments_to_manifest([
     #fragment{
         first_offset = Offset,
         next_offset = NextOffset,
-        first_timestamp = Ts,
+        first_timestamp = FirstTs,
+        last_timestamp = LastTs,
         size = Size,
         seq_no = SeqNo
     }
     | Rest
 ]) ->
+    IsSeqZero =
+        case SeqNo of
+            0 -> 1;
+            _ -> 0
+        end,
     fragments_to_manifest(Rest, #manifest{
         first_offset = Offset,
         next_offset = NextOffset,
-        first_timestamp = Ts,
+        first_timestamp = FirstTs,
+        first_last_timestamp = LastTs,
         total_size = Size,
-        entries = ?ENTRY(
-            Offset, Ts, ?MANIFEST_KIND_FRAGMENT, Size, SeqNo, rabbitmq_stream_s3:null_uid(), <<>>
+        entries = ?FRAGMENT(
+            Offset,
+            FirstTs,
+            LastTs,
+            IsSeqZero,
+            Size
         )
     }).
 
@@ -926,7 +936,8 @@ fragments_to_manifest(
         #fragment{
             first_offset = Offset,
             next_offset = NextOffset,
-            first_timestamp = Ts,
+            first_timestamp = FirstTs,
+            last_timestamp = LastTs,
             size = Size,
             seq_no = SeqNo
         }
@@ -934,20 +945,15 @@ fragments_to_manifest(
     ],
     #manifest{total_size = TotalSize0, entries = Entries0} = Manifest0
 ) ->
+    IsSeqZero =
+        case SeqNo of
+            0 -> 1;
+            _ -> 0
+        end,
     Manifest = Manifest0#manifest{
         next_offset = NextOffset,
         total_size = TotalSize0 + Size,
-        entries =
-            <<Entries0/binary,
-                (?ENTRY(
-                    Offset,
-                    Ts,
-                    ?MANIFEST_KIND_FRAGMENT,
-                    Size,
-                    SeqNo,
-                    rabbitmq_stream_s3:null_uid(),
-                    <<>>
-                ))/binary>>
+        entries = <<Entries0/binary, (?FRAGMENT(Offset, FirstTs, LastTs, IsSeqZero, Size))/binary>>
     },
     fragments_to_manifest(Rest, Manifest).
 

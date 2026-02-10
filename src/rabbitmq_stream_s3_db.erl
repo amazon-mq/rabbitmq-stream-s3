@@ -154,7 +154,7 @@ put(
     Epoch,
     ExpectedRevision,
     Uid
-) when is_binary(StreamId) andalso is_integer(ExpectedRevision) andalso is_binary(Uid) ->
+) when is_binary(StreamId) andalso is_integer(ExpectedRevision) andalso is_integer(Uid) ->
     Path = ?PATH(StreamId),
     Conditions =
         case ExpectedRevision of

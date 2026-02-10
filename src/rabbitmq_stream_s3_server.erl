@@ -348,7 +348,8 @@ execute_task(#upload_fragment{
             segment_offset = SegmentOffset,
             segment_pos = SegmentPos,
             first_offset = FragmentOffset,
-            first_timestamp = Ts,
+            first_timestamp = FirstTs,
+            last_timestamp = LastTs,
             next_offset = NextOffset,
             checksum = Checksum0,
             num_chunks = {IdxStart, IdxLen},
@@ -400,8 +401,9 @@ execute_task(#upload_fragment{
                 >>,
                 Trailer = ?FRAGMENT_TRAILER(
                     FragmentOffset,
-                    Ts,
                     NextOffset,
+                    FirstTs,
+                    LastTs,
                     SeqNo,
                     Size,
                     IdxStart,
@@ -446,25 +448,20 @@ execute_task(#upload_fragment{
 execute_task(#upload_group{
     stream = StreamId,
     kind = GroupKind,
-    entries = ?ENTRY(GroupOffset, GroupTs, _, _, _, _, _) = GroupEntries,
+    entries = ?ENTRY(GroupOffset, GroupFTs, _, _, _) = GroupEntries,
     pos = Pos,
     len = Len
 }) ->
+    ?ENTRY(_, _, GroupLTs, _, _) = rabbitmq_stream_s3_array:last(?ENTRY_B, GroupEntries),
     Uid = rabbitmq_stream_s3:uid(),
     Ext = rabbitmq_stream_s3:group_name(GroupKind),
     Key = rabbitmq_stream_s3:group_key(StreamId, Uid, GroupKind, GroupOffset),
-    GroupSize = rabbitmq_stream_s3_array:fold(
-        fun(?ENTRY(_O, _T, _K, Size, _Sq, _U, _), Acc) -> Size + Acc end,
-        0,
-        ?ENTRY_B,
-        GroupEntries
-    ),
     Data = <<
         (group_header(GroupKind))/binary,
         GroupOffset:64/unsigned,
-        GroupTs:64/signed,
+        GroupFTs:64/signed,
         0:2/signed,
-        GroupSize:70/unsigned,
+        0:70/unsigned,
         GroupEntries/binary
     >>,
 
@@ -489,7 +486,7 @@ execute_task(#upload_group{
     end,
     #group_uploaded{
         stream = StreamId,
-        entry = ?ENTRY(GroupOffset, GroupTs, GroupKind, GroupSize, 0, Uid, <<>>),
+        entry = ?GROUP(GroupOffset, GroupFTs, GroupLTs, GroupKind, Uid),
         pos = Pos,
         len = Len
     };
@@ -499,8 +496,9 @@ execute_task(#upload_manifest{
     reference = Reference,
     manifest = #manifest{
         first_offset = Offset,
-        first_timestamp = Ts,
         next_offset = NextOffset,
+        first_timestamp = FirstTs,
+        first_last_timestamp = FirstLastTs,
         total_size = Size,
         revision = ExpectedRevision,
         entries = Entries
@@ -509,7 +507,7 @@ execute_task(#upload_manifest{
     {ok, Conn} = rabbitmq_stream_s3_api:open(),
     Uid = rabbitmq_stream_s3:uid(),
     Key = rabbitmq_stream_s3:manifest_key(StreamId, Uid),
-    Data = ?MANIFEST(Offset, Ts, NextOffset, Size, Entries),
+    Data = ?MANIFEST(Offset, NextOffset, FirstTs, FirstLastTs, Size, Entries),
     try
         ?LOG_DEBUG("Uploading manifest for stream '~ts'", [StreamId]),
         {UploadMsec, ok} = timer:tc(
@@ -601,13 +599,20 @@ execute_task(#resolve_manifest{stream = StreamId}) ->
                 try
                     case rabbitmq_stream_s3_api:get(Conn, Key) of
                         {ok,
-                            ?MANIFEST(FirstOffset, FirstTimestamp, NextOffset, TotalSize, Entries) =
-                                Data} ->
+                            ?MANIFEST(
+                                FirstOffset,
+                                NextOffset,
+                                FirstTs,
+                                FirstLastTs,
+                                TotalSize,
+                                Entries
+                            ) = Data} ->
                             rabbitmq_stream_s3_counters:manifest_read(byte_size(Data)),
                             #manifest{
                                 first_offset = FirstOffset,
-                                first_timestamp = FirstTimestamp,
                                 next_offset = NextOffset,
+                                first_timestamp = FirstTs,
+                                first_last_timestamp = FirstLastTs,
                                 total_size = TotalSize,
                                 revision = Revision,
                                 entries = Entries
@@ -690,23 +695,21 @@ resolve_manifest_tail(
 ) ->
     case get_fragment_trailer(StreamId, NextOffset0) of
         {ok, #fragment_info{
-            offset = NextOffset0,
+            first_offset = NextOffset0,
             next_offset = NextOffset,
-            timestamp = Ts,
+            first_timestamp = FirstTs,
+            last_timestamp = LastTs,
             size = Size,
             seq_no = SeqNo
         }} ->
+            IsSeqZero =
+                case SeqNo of
+                    0 -> 1;
+                    _ -> 0
+                end,
             Entries =
                 <<Entries0/binary,
-                    (?ENTRY(
-                        NextOffset0,
-                        Ts,
-                        ?MANIFEST_KIND_FRAGMENT,
-                        Size,
-                        SeqNo,
-                        rabbitmq_stream_s3:uid(),
-                        <<>>
-                    ))/binary>>,
+                    ?FRAGMENT(NextOffset0, FirstTs, LastTs, IsSeqZero, Size)/binary>>,
             Manifest = Manifest0#manifest{
                 next_offset = NextOffset,
                 total_size = TotalSize0 + Size,
@@ -743,8 +746,9 @@ get_fragment_trailer(Key) ->
 fragment_trailer_to_info(
     ?FRAGMENT_TRAILER(
         Offset,
-        Ts,
         NextOffset,
+        FirstTs,
+        LastTs,
         SeqNo,
         Size,
         NumChunksInSegment,
@@ -754,9 +758,10 @@ fragment_trailer_to_info(
     )
 ) ->
     #fragment_info{
-        offset = Offset,
-        timestamp = Ts,
+        first_offset = Offset,
         next_offset = NextOffset,
+        first_timestamp = FirstTs,
+        last_timestamp = LastTs,
         seq_no = SeqNo,
         num_chunks_in_segment = NumChunksInSegment,
         segment_start_pos = SegmentStartPos,

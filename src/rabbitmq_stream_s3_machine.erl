@@ -670,8 +670,8 @@ insert_info(Info, Infos) ->
     insert_info(Info, Infos, []).
 
 insert_info(
-    #fragment_info{offset = InfoOffset} = Info,
-    [#fragment_info{offset = HeadOffset} = Head | Rest],
+    #fragment_info{first_offset = InfoOffset} = Info,
+    [#fragment_info{first_offset = HeadOffset} = Head | Rest],
     Acc
 ) when InfoOffset > HeadOffset ->
     insert_info(Info, Rest, [Head | Acc]);
@@ -699,7 +699,7 @@ split_uploaded_infos(NextTieredOffset, UploadedInfos) ->
 
 split_uploaded_infos(
     NextTieredOffset,
-    [#fragment_info{offset = FirstOffset, next_offset = NextOffset} = Info | Rest],
+    [#fragment_info{first_offset = FirstOffset, next_offset = NextOffset} = Info | Rest],
     Acc
 ) when NextTieredOffset =:= FirstOffset ->
     split_uploaded_infos(NextOffset, Rest, [Info | Acc]);
@@ -710,12 +710,14 @@ split_uploaded_infos(NextTieredOffset, PendingUploaded, Acc) ->
 new_edit(#manifest{
     first_offset = FirstOffset,
     first_timestamp = FirstTs,
+    first_last_timestamp = FirstLastTs,
     next_offset = NextOffset,
     total_size = TotalSize
 }) ->
     #edit{
         first_offset = FirstOffset,
         first_timestamp = FirstTs,
+        first_last_timestamp = FirstLastTs,
         next_offset = NextOffset,
         total_size = TotalSize
     }.
@@ -737,9 +739,10 @@ apply_infos0([], Edit) ->
 apply_infos0(
     [
         #fragment_info{
-            offset = Offset,
+            first_offset = Offset,
             next_offset = NextOffset,
-            timestamp = Ts,
+            first_timestamp = FirstTs,
+            last_timestamp = LastTs,
             seq_no = SeqNo,
             size = Size
         }
@@ -754,25 +757,24 @@ apply_infos0(
     Edit1 =
         case Offset of
             0 ->
-                %% For the very first fragment, also set the offset and timestamp.
-                Edit0#edit{first_offset = Offset, first_timestamp = Ts};
+                %% For the very first fragment, also set the offset and timestamps.
+                Edit0#edit{
+                    first_offset = Offset,
+                    first_timestamp = FirstTs,
+                    first_last_timestamp = LastTs
+                };
             _ ->
                 Edit0
+        end,
+    IsSeqZero =
+        case SeqNo of
+            0 -> 1;
+            _ -> 0
         end,
     Edit = Edit1#edit{
         next_offset = NextOffset,
         total_size = TotalSize0 + Size,
-        entries =
-            <<Entries0/binary,
-                ?ENTRY(
-                    Offset,
-                    Ts,
-                    ?MANIFEST_KIND_FRAGMENT,
-                    Size,
-                    SeqNo,
-                    rabbitmq_stream_s3:null_uid(),
-                    <<>>
-                )/binary>>
+        entries = <<Entries0/binary, ?FRAGMENT(Offset, FirstTs, LastTs, IsSeqZero, Size)/binary>>
     },
     apply_infos0(Rest, Edit);
 apply_infos0([Info | _], #edit{}) ->
@@ -787,6 +789,7 @@ apply_edit(
     #edit{
         first_offset = FirstOffset,
         first_timestamp = FirstTs,
+        first_last_timestamp = FirstLastTs,
         next_offset = NextOffset,
         total_size = TotalSize,
         entries = EditEntries,
@@ -819,6 +822,7 @@ apply_edit(
     Manifest0#manifest{
         first_offset = FirstOffset,
         first_timestamp = FirstTs,
+        first_last_timestamp = FirstLastTs,
         next_offset = NextOffset,
         total_size = TotalSize,
         entries = Entries
@@ -997,7 +1001,7 @@ evaluate_retention(
     case ExceedsRetention of
         true ->
             case Entries0 of
-                ?ENTRY(_Offset, _Timestamp, ?MANIFEST_KIND_FRAGMENT, _Size, _SeqNo, _Uid, _Rest) ->
+                ?FRAGMENT(_O, _FTs, _LTs, _Sq, _Sz, _) ->
                     %% In the common case a stream will not be so long that it
                     %% needs groups. Luckily, this means we can determine
                     %% which fragments can be deleted very efficiently by
@@ -1045,33 +1049,31 @@ evaluate_retention1(Entries, Edit, Now, RetentionSpec) ->
 %% NOTE: keep at least one entry so that we can set the `first_offset` and
 %% `first_timestamp`.
 evaluate_retention1(
-    ?ENTRY(Offset, _Ts, Kind, Size, _SeqNo, _Uid, Rest),
+    ?FRAGMENT(Offset, _FTs, _LTs, _Sq, Size, Rest),
     #edit{total_size = TotalSize0, len = Len0} = Edit0,
     Now,
     #{max_bytes := MaxBytes} = Spec,
     Offsets0
 ) when TotalSize0 > MaxBytes andalso Rest /= <<>> ->
-    ?assertEqual(Kind, ?MANIFEST_KIND_FRAGMENT),
     Edit = Edit0#edit{
         total_size = TotalSize0 - Size,
         len = Len0 + ?ENTRY_B
     },
     evaluate_retention1(Rest, Edit, Now, Spec, [Offset | Offsets0]);
 evaluate_retention1(
-    ?ENTRY(Offset, Ts, Kind, Size, _SeqNo, _Uid, Rest),
+    ?FRAGMENT(Offset, _FTs, LastTs, _Sq, Size, Rest),
     #edit{total_size = TotalSize0, len = Len0} = Edit0,
     Now,
     #{max_age := MaxAge} = Spec,
     Offsets0
-) when Now - Ts > MaxAge andalso Rest /= <<>> ->
-    ?assertEqual(Kind, ?MANIFEST_KIND_FRAGMENT),
+) when Now - LastTs > MaxAge andalso Rest /= <<>> ->
     Edit = Edit0#edit{
         total_size = TotalSize0 - Size,
         len = Len0 + ?ENTRY_B
     },
     evaluate_retention1(Rest, Edit, Now, Spec, [Offset | Offsets0]);
 evaluate_retention1(
-    ?ENTRY(Offset, Ts, ?MANIFEST_KIND_FRAGMENT, _Size, _SeqNo, _Uid, _Rest),
+    ?FRAGMENT(Offset, FTs, LTs, _Sq, _Sz, _Rest),
     Edit0,
     _Now,
     _Spec,
@@ -1079,7 +1081,8 @@ evaluate_retention1(
 ) ->
     Edit = Edit0#edit{
         first_offset = Offset,
-        first_timestamp = Ts
+        first_timestamp = FTs,
+        first_last_timestamp = LTs
     },
     %% No real point to this lists:reverse/1. It just makes it appear nicer.
     {Edit, lists:reverse(Offsets)}.
@@ -1128,7 +1131,7 @@ rebalance(Factor, Entries) ->
 rebalance(Factor, Entries, Idx) when
     byte_size(Entries) - (Idx * ?ENTRY_B) >= (Factor * ?ENTRY_B)
 ->
-    ?ENTRY(_, _, Kind, _, _, _, _) = rabbitmq_stream_s3_array:at(
+    ?ENTRY(_, _, _, Kind, _) = rabbitmq_stream_s3_array:at(
         Idx,
         ?ENTRY_B,
         Entries
@@ -1147,7 +1150,7 @@ rebalance(Factor, Entries, Idx) when
                 Idx + Factor - 1
         end,
     case rabbitmq_stream_s3_array:try_at(GroupEndIdx, ?ENTRY_B, Entries) of
-        ?ENTRY(_, _, Kind, _, _, _, _) ->
+        ?ENTRY(_, _, _, Kind, _) ->
             %% If the kind is the same, this chunk of entries can be extracted
             %% as a group.
             GroupKind = rabbitmq_stream_s3:next_group(Kind),
@@ -1157,7 +1160,7 @@ rebalance(Factor, Entries, Idx) when
             {GroupKind, GroupEntries, Pos, Len};
         _ ->
             NextSmallestIdx = rabbitmq_stream_s3_array:partition_point(
-                fun(?ENTRY(_O, _T, K, _Sz, _Sq, _U, _)) -> K >= Kind end,
+                fun(?ENTRY(_O, _FTs, _LTs, K, _)) -> K >= Kind end,
                 ?ENTRY_B,
                 Entries
             ),
@@ -1275,7 +1278,10 @@ format_stream(
             {O, N}
          || #fragment{first_offset = O, next_offset = N} <- Available
         ],
-        uploaded_fragments := [{O, N} || #fragment_info{offset = O, next_offset = N} <- Uploaded]
+        uploaded_fragments := [
+            {O, N}
+         || #fragment_info{first_offset = O, next_offset = N} <- Uploaded
+        ]
     }.
 
 format_manifest({pending, _Requesters}) ->
@@ -1283,6 +1289,7 @@ format_manifest({pending, _Requesters}) ->
 format_manifest(#manifest{
     first_offset = FirstOffset,
     first_timestamp = FirstTs,
+    first_last_timestamp = FirstLastTs,
     next_offset = NextOffset,
     total_size = TotalSize,
     revision = Revision,
@@ -1290,7 +1297,7 @@ format_manifest(#manifest{
 }) ->
     Format0 =
         case rabbitmq_stream_s3_array:last(?ENTRY_B, Entries) of
-            ?ENTRY(LastOffset, LastTs, _K, _S, _Seq, _Uid, _) ->
+            ?ENTRY(LastOffset, _FTs, LastTs, _K, _) ->
                 #{
                     last_offset => LastOffset,
                     last_timestamp => format_timestamp(LastTs)
@@ -1301,6 +1308,7 @@ format_manifest(#manifest{
     Format0#{
         first_offset => FirstOffset,
         first_timestamp => format_timestamp(FirstTs),
+        first_last_timestamp => format_timestamp(FirstLastTs),
         next_offset => NextOffset,
         total_size => format_size(TotalSize),
         revision => Revision,
@@ -1331,7 +1339,7 @@ format_entries(Entries) ->
 
 count_kinds(<<>>, Counts) ->
     Counts;
-count_kinds(?ENTRY(_O, _T, Kind, _Sz, _Sq, _U, Rest), Counts0) ->
+count_kinds(?ENTRY(_O, _FTs, _LTs, Kind, Rest), Counts0) ->
     Key =
         case Kind of
             ?MANIFEST_KIND_FRAGMENT -> fragments;
@@ -1415,8 +1423,9 @@ apply_infos_test() ->
     [I1, I2, I3] =
         Infos = [
             #fragment_info{
-                offset = N * 20,
-                timestamp = Ts + N,
+                first_offset = N * 20,
+                first_timestamp = Ts + N,
+                last_timestamp = Ts + N + 20,
                 next_offset = N * 20 + 20,
                 seq_no = N,
                 size = 200
@@ -1440,20 +1449,13 @@ apply_infos_test() ->
 evaluate_retention1_test() ->
     Ts = erlang:system_time(millisecond),
     Entries = <<
-        ?ENTRY(
-            (N * 20),
-            (Ts - 100 + N * 20),
-            ?MANIFEST_KIND_FRAGMENT,
-            200,
-            N,
-            rabbitmq_stream_s3:null_uid(),
-            <<>>
-        )
+        ?FRAGMENT((N * 20), (Ts - 100 + (N - 1) * 20), (Ts - 100 + N * 20), 0, 200)
      || N <- lists:seq(0, 4)
     >>,
     Manifest = #manifest{
         first_offset = 0,
-        first_timestamp = Ts - 100,
+        first_timestamp = Ts - 120,
+        first_last_timestamp = Ts - 100,
         next_offset = 6 * 20,
         total_size = 1000,
         entries = Entries
@@ -1518,15 +1520,7 @@ format_size_test() ->
 rebalance_group_test() ->
     Ts = erlang:system_time(millisecond),
     Entries = <<
-        ?ENTRY(
-            (N * 20),
-            (Ts - 100 + N * 20),
-            ?MANIFEST_KIND_FRAGMENT,
-            200,
-            N,
-            rabbitmq_stream_s3:null_uid(),
-            <<>>
-        )
+        ?FRAGMENT((N * 20), (Ts - 100 + N * 20), (Ts - 100 + (N + 1) * 20), 0, 200)
      || N <- lists:seq(0, 4)
     >>,
     Factor = 3,
@@ -1541,25 +1535,22 @@ rebalance_group_test() ->
 rebalance_kilo_group_test() ->
     Ts = erlang:system_time(millisecond),
     Groups = <<
-        ?ENTRY(
+        ?GROUP(
             (N * 20),
             (Ts - 100 + N * 20),
+            (Ts - 100 + (N + 1) * 20),
             ?MANIFEST_KIND_GROUP,
-            2000,
-            N,
-            rabbitmq_stream_s3:uid(),
-            <<>>
+            (rabbitmq_stream_s3:uid())
         )
      || N <- lists:seq(1, 5)
     >>,
     %% Existing kilo group is before the groups...
-    Entries = ?ENTRY(
+    Entries = ?GROUP(
         0,
         (Ts - 120),
+        (Ts - 100),
         ?MANIFEST_KIND_KILO_GROUP,
-        20_000,
-        0,
-        rabbitmq_stream_s3:uid(),
+        (rabbitmq_stream_s3:uid()),
         Groups
     ),
     Factor = 3,

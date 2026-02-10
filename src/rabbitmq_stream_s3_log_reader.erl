@@ -145,7 +145,7 @@ init_offset_reader({timestamp, Ts} = Spec, #{name := StreamId} = Config) ->
             init_remote_reader(FirstOffset, ?SEGMENT_HEADER_B, FirstOffset, Config);
         #manifest{entries = Entries} ->
             case rabbitmq_stream_s3_array:last(?ENTRY_B, Entries) of
-                ?ENTRY(_O, ETs, _, _, _, _, _) when ETs > Ts ->
+                ?ENTRY(_O, _FTs, LTs, _, _) when LTs >= Ts ->
                     {ok, ChunkId, Position, Fragment} = find_position(
                         {timestamp, Ts},
                         Entries,
@@ -647,9 +647,9 @@ find_fragment(Entries, Spec, GetGroup) ->
     PartitionPredicate =
         case Spec of
             {offset, Offset} ->
-                fun(?ENTRY(O, _T, _K, _S, _N, _U, _)) -> Offset >= O end;
+                fun(?ENTRY(O, _FTs, _LTs, _K, _)) -> Offset >= O end;
             {timestamp, Ts} ->
-                fun(?ENTRY(_O, T, _K, _S, _N, _U, _)) -> Ts >= T end
+                fun(?ENTRY(_O, FTs, _LTs, _K, _)) -> Ts >= FTs end
         end,
     Idx0 = rabbitmq_stream_s3_array:partition_point(
         PartitionPredicate,
@@ -657,20 +657,15 @@ find_fragment(Entries, Spec, GetGroup) ->
         Entries
     ),
     Idx = saturating_decr(Idx0),
-    ?ENTRY(EntryOffset, _, Kind, _, _, Uid, _) = rabbitmq_stream_s3_array:at(
-        Idx,
-        ?ENTRY_B,
-        Entries
-    ),
-    case Kind of
-        ?MANIFEST_KIND_FRAGMENT ->
+    case rabbitmq_stream_s3_array:at(Idx, ?ENTRY_B, Entries) of
+        ?FRAGMENT(EntryOffset, _FTs, _LTs, _Sq, _Sz, _) ->
             EntryOffset;
-        _ ->
+        ?GROUP(GroupOffset, _FTs, _LTs, Kind, Uid, _) ->
             %% Download the group and search recursively within that.
             ?LOG_DEBUG("Entry is not a fragment. Searching within group ~b kind ~b", [
-                EntryOffset, Kind
+                GroupOffset, Kind
             ]),
-            GroupEntries = GetGroup(Uid, Kind, EntryOffset),
+            GroupEntries = GetGroup(Uid, Kind, GroupOffset),
             find_fragment(GroupEntries, Spec, GetGroup)
     end.
 
@@ -769,16 +764,14 @@ find_fragment_test() ->
     Ts = erlang:system_time(millisecond),
     Size = 200,
     FragmentEntries = <<
-        ?ENTRY(
+        ?FRAGMENT(
             %% Fragments every 20 offsets, 0..=2000
             (N * 20),
             %% Timestamps between 2000ms ago and `Ts`
             (Ts - 2000 + N * 20),
-            ?MANIFEST_KIND_FRAGMENT,
-            Size,
-            (N rem 5),
-            rabbitmq_stream_s3:null_uid(),
-            <<>>
+            (Ts - 2000 + (N + 1) * 20),
+            0,
+            Size
         )
      || N <- lists:seq(0, 100)
     >>,
@@ -807,24 +800,15 @@ find_fragment_test() ->
 
     %% Factor out those fragments into a group.
     NextFragmentEntries = <<
-        ?ENTRY(
-            (N * 20),
-            (Ts - 2000 + N * 20),
-            ?MANIFEST_KIND_FRAGMENT,
-            Size,
-            (N rem 5),
-            rabbitmq_stream_s3:null_uid(),
-            <<>>
-        )
+        ?FRAGMENT((N * 20), (Ts - 2000 + N * 20), (Ts - 2000 + (N + 1) * 20), 0, Size)
      || N <- lists:seq(101, 150)
     >>,
     GroupUid = rabbitmq_stream_s3:uid(),
-    Entries = ?ENTRY(
+    Entries = ?GROUP(
         0,
         (Ts - 2000),
+        Ts,
         ?MANIFEST_KIND_GROUP,
-        Size,
-        0,
         GroupUid,
         NextFragmentEntries
     ),

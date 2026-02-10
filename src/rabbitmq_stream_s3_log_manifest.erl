@@ -154,6 +154,7 @@ handle_event(
     Checksum = checksum(Checksum0, Chunk),
     Fragment2 = Fragment1#fragment{
         last_offset = ChId,
+        last_timestamp = Ts,
         next_offset = ChId + NumRecords,
         num_chunks = {StartNumChunks, NumChunks},
         size = Size,
@@ -254,7 +255,7 @@ recover_fragments(
     ?LOG_DEBUG("Fragment boundary ~b (start size ~b)", [FragmentBoundary, StartFilePos]),
     case rabbitmq_stream_s3_array:try_at(FragmentBoundary, ?INDEX_RECORD_SIZE_B, IdxArray) of
         undefined ->
-            <<LastChId:64/unsigned, _LastTs:64/signed, _:64, LastFilePos:32/unsigned, _:8>> =
+            <<LastChId:64/unsigned, LastTs:64/signed, _:64, LastFilePos:32/unsigned, _:8>> =
                 rabbitmq_stream_s3_array:last(?INDEX_RECORD_SIZE_B, IdxArray),
             Len = rabbitmq_stream_s3_array:len(?INDEX_RECORD_SIZE_B, IdxArray),
 
@@ -270,6 +271,7 @@ recover_fragments(
                 num_chunks = {NumChunks0, Len},
                 first_offset = FirstChId,
                 first_timestamp = FirstTs,
+                last_timestamp = LastTs,
                 next_offset = LastChId + NumRecords,
                 last_offset = LastChId,
                 seq_no = SeqNo0,
@@ -279,7 +281,7 @@ recover_fragments(
             %% NOTE: `Fragments0` is naturally sorted descending by first offset.
             {Fragment, Fragments0};
         <<NextChId:64/unsigned, _NextTs:64/signed, _:64, NextFilePos:32/unsigned, _:8>> ->
-            <<LastChId:64/unsigned, _LastTs:64/signed, _:64, _:32/unsigned, _:8>> =
+            <<LastChId:64/unsigned, LastTs:64/signed, _:64, _:32/unsigned, _:8>> =
                 rabbitmq_stream_s3_array:at(
                     FragmentBoundary - 1, ?INDEX_RECORD_SIZE_B, IdxArray
                 ),
@@ -289,6 +291,7 @@ recover_fragments(
                 num_chunks = {NumChunks0, FragmentBoundary},
                 first_offset = FirstChId,
                 first_timestamp = FirstTs,
+                last_timestamp = LastTs,
                 next_offset = NextChId,
                 last_offset = LastChId,
                 seq_no = SeqNo0,
