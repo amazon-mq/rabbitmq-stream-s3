@@ -57,6 +57,7 @@ tier.
 
 %% osiris_log_reader
 -export([
+    resolve_offset_spec/2,
     init_offset_reader/2,
     next_offset/1,
     committed_chunk_id/1,
@@ -83,9 +84,29 @@ tier.
 %%% osiris_log_reader callbacks
 %%%===================================================================
 
-init_offset_reader(Tail, Config) when Tail =:= last orelse Tail =:= next ->
+resolve_offset_spec(OffsetSpec, Config) ->
+    case resolve_remote_location(OffsetSpec, Config) of
+        {ok, _Fragment, _Position, ChunkId} ->
+            {ok, ChunkId};
+        {local, LocalSpec} ->
+            osiris_log:resolve_offset_spec(LocalSpec, Config);
+        {error, _} = Err ->
+            Err
+    end.
+
+init_offset_reader(OffsetSpec, Config) ->
+    case resolve_remote_location(OffsetSpec, Config) of
+        {ok, Fragment, Position, ChunkId} ->
+            init_remote_reader(Fragment, Position, ChunkId, Config);
+        {local, LocalSpec} ->
+            osiris_log:init_offset_reader(LocalSpec, Config);
+        {error, _} = Err ->
+            Err
+    end.
+
+resolve_remote_location(Tail, Config) when Tail =:= last orelse Tail =:= next ->
     init_local_reader(Tail, Config);
-init_offset_reader(first, #{name := StreamId, shared := Shared} = Config) ->
+resolve_remote_location(first, #{name := StreamId, shared := Shared}) ->
     LocalFirstOffset = osiris_log_shared:first_chunk_id(Shared),
     case rabbitmq_stream_s3_server:get_manifest(StreamId) of
         #manifest{first_offset = RemoteFirstOffset} when RemoteFirstOffset < LocalFirstOffset ->
@@ -93,11 +114,11 @@ init_offset_reader(first, #{name := StreamId, shared := Shared} = Config) ->
                 "Attaching remote reader at first offset ~b pos ~b for spec 'first'",
                 [RemoteFirstOffset, ?SEGMENT_HEADER_B]
             ),
-            init_remote_reader(RemoteFirstOffset, ?SEGMENT_HEADER_B, RemoteFirstOffset, Config);
+            {ok, RemoteFirstOffset, ?SEGMENT_HEADER_B, RemoteFirstOffset};
         _ ->
-            init_local_reader(first, Config)
+            {local, first}
     end;
-init_offset_reader(Offset, #{name := StreamId, shared := Shared} = Config) when
+resolve_remote_location(Offset, #{name := StreamId, shared := Shared}) when
     is_integer(Offset)
 ->
     ?LOG_DEBUG(?MODULE_STRING ":~ts/2 finding offset ~b for stream '~ts'", [
@@ -111,7 +132,7 @@ init_offset_reader(Offset, #{name := StreamId, shared := Shared} = Config) when
                     Offset, StreamId, FirstChunkId
                 ]
             ),
-            init_local_reader(Offset, Config);
+            {local, Offset};
         false ->
             ?LOG_DEBUG(
                 "Offset ~b of stream '~ts' is not local (start ~b), trying the remote tier", [
@@ -120,21 +141,21 @@ init_offset_reader(Offset, #{name := StreamId, shared := Shared} = Config) when
             ),
             case rabbitmq_stream_s3_server:get_manifest(StreamId) of
                 undefined ->
-                    init_local_reader(next, Config);
+                    {local, next};
                 #manifest{first_offset = FirstOffset} when Offset < FirstOffset ->
                     %% Emulate osiris_log's behavior: attach at the beginning
                     %% of the stream.
-                    init_remote_reader(FirstOffset, ?SEGMENT_HEADER_B, FirstOffset, Config);
+                    {ok, FirstOffset, ?SEGMENT_HEADER_B, FirstOffset};
                 #manifest{entries = Entries} ->
                     {ok, ChunkId, Position, Fragment} = find_position(
                         {offset, Offset},
                         Entries,
                         StreamId
                     ),
-                    init_remote_reader(Fragment, Position, ChunkId, Config)
+                    {ok, Fragment, Position, ChunkId}
             end
     end;
-init_offset_reader({timestamp, Ts} = Spec, #{name := StreamId} = Config) ->
+resolve_remote_location({timestamp, Ts} = Spec, #{name := StreamId}) ->
     ?LOG_DEBUG(?MODULE_STRING ":~ts/2 finding timestamp ~b for stream '~ts'", [
         ?FUNCTION_NAME, Ts, StreamId
     ]),
@@ -142,7 +163,7 @@ init_offset_reader({timestamp, Ts} = Spec, #{name := StreamId} = Config) ->
     %% Instead try the remote tier first.
     case rabbitmq_stream_s3_server:get_manifest(StreamId) of
         #manifest{first_offset = FirstOffset, first_timestamp = FirstTs} when Ts < FirstTs ->
-            init_remote_reader(FirstOffset, ?SEGMENT_HEADER_B, FirstOffset, Config);
+            {ok, FirstOffset, ?SEGMENT_HEADER_B, FirstOffset};
         #manifest{entries = Entries} ->
             case rabbitmq_stream_s3_array:last(?ENTRY_B, Entries) of
                 ?ENTRY(_O, _FTs, LTs, _, _) when LTs >= Ts ->
@@ -151,38 +172,43 @@ init_offset_reader({timestamp, Ts} = Spec, #{name := StreamId} = Config) ->
                         Entries,
                         StreamId
                     ),
-                    init_remote_reader(Fragment, Position, ChunkId, Config);
+                    {ok, Fragment, Position, ChunkId};
                 _ ->
-                    init_local_reader(Spec, Config)
+                    {local, Spec}
             end;
         undefined ->
-            init_local_reader(Spec, Config)
+            {local, Spec}
     end;
-init_offset_reader({abs, Offset} = Spec, #{name := StreamId} = Config) ->
-    case init_local_reader(Spec, Config) of
-        {ok, _} = Ok ->
-            Ok;
-        {error, {offset_out_of_range, empty}} = Err ->
-            Err;
-        {error, {offset_out_of_range, {_LocalFirst, LocalLast}}} = Err ->
-            case rabbitmq_stream_s3_server:get_manifest(StreamId) of
-                #manifest{first_offset = RemoteFirst, entries = Entries} ->
-                    case RemoteFirst >= Offset of
-                        true ->
-                            {ok, ChunkId, Position, Fragment} = find_position(
-                                {offset, Offset},
-                                Entries,
-                                StreamId
-                            ),
-                            init_remote_reader(Fragment, Position, ChunkId, Config);
-                        false ->
-                            {error, {offset_out_of_range, {RemoteFirst, LocalLast}}}
-                    end;
-                undefined ->
-                    Err
-            end;
-        {error, _} = Err ->
-            Err
+resolve_remote_location({abs, Offset}, Config) ->
+    case total_range(Config) of
+        {First, Last} when First =< Offset andalso Offset =< Last ->
+            resolve_remote_location(Offset, Config);
+        Range ->
+            {error, {offset_out_of_range, Range}}
+    end.
+
+-doc "Finds the range of offsets in both local and remote tiers".
+-spec total_range(osiris_log:config()) -> rabbitmq_stream_s3:range().
+total_range(#{name := StreamId, shared := Shared}) ->
+    case osiris_log_shared:first_chunk_id(Shared) of
+        -1 ->
+            empty;
+        LocalFirst ->
+            LocalLast = osiris_log_shared:committed_offset(Shared),
+            case rabbitmq_stream_s3_server:get_range(StreamId) of
+                {RemoteFirst, RemoteLast} when RemoteFirst =/= -1 ->
+                    {min(LocalFirst, RemoteFirst), max(LocalLast, RemoteLast)};
+                _ ->
+                    %% The stream might be starting up and not have a range
+                    %% yet. Request the manifest so we can check the values
+                    %% ourselves.
+                    case rabbitmq_stream_s3_server:get_manifest(StreamId) of
+                        #manifest{first_offset = RemoteFirst, next_offset = RemoteNext} ->
+                            {min(LocalFirst, RemoteFirst), max(LocalLast, RemoteNext - 1)};
+                        undefined ->
+                            {LocalFirst, LocalLast}
+                    end
+            end
     end.
 
 next_offset(#?MODULE{mode = #remote{next_offset = NextOffset}}) ->

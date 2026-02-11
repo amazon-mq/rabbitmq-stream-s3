@@ -62,6 +62,8 @@ efficiently using the `rabbitmq_stream_s3_array` module.
     max_age := milliseconds()
 }.
 
+-type range() :: empty | {From :: osiris:offset(), To :: osiris:offset()}.
+
 -export_type([
     uid/0,
     key/0,
@@ -69,7 +71,8 @@ efficiently using the `rabbitmq_stream_s3_array` module.
     entries/0,
     kind/0,
     milliseconds/0,
-    retention_spec/0
+    retention_spec/0,
+    range/0
 ]).
 
 -export([

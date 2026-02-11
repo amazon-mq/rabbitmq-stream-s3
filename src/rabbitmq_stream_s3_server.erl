@@ -43,6 +43,7 @@
 %% API
 -export([
     get_manifest/1,
+    get_range/1,
     init_acceptor/2,
     init_writer/3,
     fragment_available/2,
@@ -90,6 +91,19 @@ start() ->
 -spec get_manifest(stream_id()) -> #manifest{} | undefined.
 get_manifest(StreamId) ->
     gen_server:call(?SERVER, #get_manifest{stream = StreamId}, infinity).
+
+-doc "Gets the range of offsets in the remote tier".
+-spec get_range(stream_id()) -> rabbitmq_stream_s3:range().
+get_range(StreamId) ->
+    try ets:lookup(?RANGE_TABLE, StreamId) of
+        [{StreamId, FirstOffset, NextOffset}] ->
+            {FirstOffset, NextOffset - 1};
+        [] ->
+            empty
+    catch
+        error:badarg ->
+            empty
+    end.
 
 -spec init_writer(stream_id(), osiris_log:config(), [#fragment{}]) -> ok.
 init_writer(StreamId, Config, AvailableFragments) ->
