@@ -178,6 +178,9 @@ put(Conn, Key, Data, Opts) when is_pid(Conn) andalso is_binary(Key) andalso is_m
 delete(Conn, Keys, Opts) when is_pid(Conn) andalso is_list(Keys) andalso is_map(Opts) ->
     %% <https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html>
     ?assert(length(Keys) =< 1000),
+    %% Though not documented, S3 will reject the request if the list of keys
+    %% is empty.
+    ?assertNotEqual([], Keys),
     Data = delete_many_body(Keys),
     Headers = #{
         %% A checksum header seems to be required on this endpoint...

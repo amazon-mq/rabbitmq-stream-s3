@@ -54,7 +54,9 @@
 %% Useful for other modules
 -export([
     get_fragment_trailer/1,
-    get_fragment_trailer/2
+    get_fragment_trailer/2,
+    get_group_fun/1,
+    get_group/2
 ]).
 
 %% gen_server
@@ -73,7 +75,7 @@
 -export([format_state/1]).
 
 %% Need to be exported for `erlang:apply/3`.
--export([start/0, format_osiris_event/1, execute_task/2]).
+-export([start/0, format_osiris_event/1, execute_task/1, execute_task/2]).
 
 %%----------------------------------------------------------------------------
 
@@ -232,8 +234,8 @@ handle_info(tick_timeout, State0) ->
 handle_info({'DOWN', _MRef, process, Pid, Reason}, #?MODULE{tasks = Tasks0} = State0) ->
     case maps:take(Pid, Tasks0) of
         {Effect, Tasks} ->
-            ?LOG_INFO("Task ~0p (~p) down with reason ~0p. Tasks: ~0P", [
-                Effect, Pid, Reason, Tasks0, 10
+            ?LOG_INFO("Task ~0P (~p) down with reason ~0P. Tasks: ~0P", [
+                Effect, 5, Pid, Reason, 5, Tasks0, 10
             ]),
             %% TODO: retry. We have the effect and can attempt it again.
             {noreply, State0#?MODULE{tasks = Tasks}};
@@ -338,7 +340,7 @@ apply_effect(#find_fragments{} = Effect, State) ->
     spawn_task(Effect, State);
 apply_effect(#evaluate_retention{} = Effect, State) ->
     spawn_task(Effect, State);
-apply_effect(#delete_fragments{} = Effect, State) ->
+apply_effect(#delete_objects{} = Effect, State) ->
     spawn_task(Effect, State);
 apply_effect(#delete_stream{} = Effect, State) ->
     spawn_task(Effect, State).
@@ -469,7 +471,8 @@ execute_task(#upload_group{
     ?ENTRY(_, _, GroupLTs, _, _) = rabbitmq_stream_s3_array:last(?ENTRY_B, GroupEntries),
     Uid = rabbitmq_stream_s3:uid(),
     Ext = rabbitmq_stream_s3:group_name(GroupKind),
-    Key = rabbitmq_stream_s3:group_key(StreamId, Uid, GroupKind, GroupOffset),
+    GroupRef = #group_ref{uid = Uid, kind = GroupKind, offset = GroupOffset},
+    Key = rabbitmq_stream_s3:group_key(StreamId, GroupRef),
     Data = <<
         (group_header(GroupKind))/binary,
         GroupOffset:64/unsigned,
@@ -648,12 +651,18 @@ execute_task(#resolve_manifest{stream = StreamId}) ->
         stream = StreamId,
         manifest = resolve_manifest_tail(StreamId, Manifest0)
     };
-execute_task(#delete_fragments{stream = StreamId, offsets = Offsets}) ->
-    NumFragments = length(Offsets),
-    ?LOG_DEBUG("Deleting ~b fragments for stream '~ts' with offsets ~0p", [
-        NumFragments, StreamId, Offsets
+execute_task(#delete_objects{stream = StreamId, objects = Objects}) ->
+    NumObjects = length(Objects),
+    ?LOG_DEBUG("Deleting ~b objects for stream '~ts' ~0p", [
+        NumObjects, StreamId, Objects
     ]),
-    Keys = [rabbitmq_stream_s3:fragment_key(StreamId, Offset) || Offset <- Offsets],
+    Keys = lists:map(
+        fun
+            (#group_ref{} = Ref) -> rabbitmq_stream_s3:group_key(StreamId, Ref);
+            (Offset) -> rabbitmq_stream_s3:fragment_key(StreamId, Offset)
+        end,
+        Objects
+    ),
     {ok, Conn} = rabbitmq_stream_s3_api:open(),
     try
         {DeleteMsec, ok} = timer:tc(
@@ -663,7 +672,7 @@ execute_task(#delete_fragments{stream = StreamId, offsets = Offsets}) ->
             millisecond
         ),
         ?LOG_DEBUG("Deleted ~b fragments from stream '~ts' in ~b msec", [
-            NumFragments, StreamId, DeleteMsec
+            NumObjects, StreamId, DeleteMsec
         ]),
         ok
     after
@@ -694,10 +703,30 @@ execute_task(#delete_stream{stream = StreamId}) ->
     %% LIST all keys with the prefix of this stream ID and delete 1000 objects
     %% at a time.
     ok;
-execute_task(#evaluate_retention{stream = StreamId}) ->
+execute_task(#evaluate_retention{
+    stream = StreamId,
+    manifest = #manifest{} = Manifest,
+    retention_spec = RetentionSpec,
+    now = Now
+}) ->
     ?LOG_DEBUG("Evaluating retention for stream '~ts'", [StreamId]),
-    %% TODO
-    ok.
+    {Edit, Deletions} = rabbitmq_stream_s3_machine:execute_retention(
+        Manifest,
+        Now,
+        RetentionSpec,
+        get_group_fun(StreamId)
+    ),
+    case Deletions of
+        [] ->
+            ok;
+        _ ->
+            %% Don't await deletion in this task. Object deletion can be done
+            %% in the background.
+            ExecuteDelete = #delete_objects{stream = StreamId, objects = Deletions},
+            _ = spawn(?MODULE, execute_task, [ExecuteDelete]),
+            ok
+    end,
+    #retention_executed{stream = StreamId, edit = Edit}.
 
 resolve_manifest_tail(
     StreamId,
@@ -788,6 +817,35 @@ set_tick_timer() ->
     Timeout = application:get_env(rabbitmq_stream_s3, tick_timeout_milliseconds, 5000),
     _ = erlang:send_after(Timeout, self(), tick_timeout),
     ok.
+
+get_group_fun(StreamId) ->
+    fun(#group_ref{} = Group) ->
+        get_group(StreamId, Group)
+    end.
+
+get_group(StreamId, #group_ref{offset = Offset} = GroupRef) ->
+    {ok, Conn} = rabbitmq_stream_s3_api:open(),
+    Key = rabbitmq_stream_s3:group_key(StreamId, GroupRef),
+    ?LOG_DEBUG("Looking up key ~ts (~ts)", [Key, ?FUNCTION_NAME]),
+    try
+        case rabbitmq_stream_s3_api:get(Conn, Key) of
+            {ok, Data} ->
+                <<
+                    _Magic:4/binary,
+                    _Vsn:32/unsigned,
+                    Offset:64/unsigned,
+                    _FirstTimestamp:64/unsigned,
+                    0:2/unsigned,
+                    _TotalSize:70/unsigned,
+                    GroupEntries/binary
+                >> = Data,
+                {ok, GroupEntries};
+            {error, _} = Err ->
+                Err
+        end
+    after
+        ok = rabbitmq_stream_s3_api:close(Conn)
+    end.
 
 -spec metadata() -> rabbitmq_stream_s3_machine:metadata().
 metadata() ->

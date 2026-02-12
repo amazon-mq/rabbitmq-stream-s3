@@ -99,6 +99,8 @@ for the log manifest server to execute.
 
 -export([new/0, new/1, get_manifest/2, apply/3, format/1]).
 
+-export([execute_retention/4]).
+
 %% Used by tests:
 -export([apply_infos/2, new_edit/1]).
 
@@ -420,14 +422,7 @@ apply(
     #?MODULE{streams = Streams0} = State0
 ) ->
     case Streams0 of
-        #{
-            StreamId := #{
-                kind := writer,
-                epoch := Epoch,
-                reference := Reference,
-                manifest := #manifest{revision = Revision0} = Manifest0
-            } = Writer0
-        } ->
+        #{StreamId := #{kind := writer, manifest := #manifest{} = Manifest0} = Writer0} ->
             %% NOTE: the entries array may have been modified in the meantime,
             %% but only from new fragments being uploaded and applied.
             %% (Retention and rebalancing are done exclusively of each other.)
@@ -435,17 +430,10 @@ apply(
             %% `Pos` and `Len` point to the same section of entries regardless
             %% of changes to the manifest since the group upload started.
             Edit = (new_edit(Manifest0))#edit{entries = Entry, pos = Pos, len = Len},
-            Manifest1 = apply_edit(Edit, Manifest0),
-            UploadManifest = #upload_manifest{
-                stream = StreamId,
-                epoch = Epoch,
-                reference = Reference,
-                manifest = Manifest1
-            },
-            Manifest = Manifest1#manifest{revision = Revision0 + 1},
+            Manifest = apply_edit(Edit, Manifest0),
             Writer1 = Writer0#{manifest := Manifest},
-            Effects0 = [UploadManifest],
-            {Writer, Effects} = notify_edits([Edit], false, StreamId, Writer1, Effects0),
+            {Writer2, Effects0} = upload(StreamId, Writer1, []),
+            {Writer, Effects} = notify_edits([Edit], false, StreamId, Writer2, Effects0),
             State = State0#?MODULE{streams = Streams0#{StreamId := Writer}},
             {State, Effects};
         _ ->
@@ -630,9 +618,9 @@ apply(
 ) ->
     Retention = #{K => V || {K, V} <- Retention0, K =:= max_age orelse K =:= max_bytes},
     case Streams0 of
-        #{StreamId := #{kind := writer, manifest := Manifest0} = Writer0} ->
+        #{StreamId := #{kind := writer, manifest := Manifest} = Writer0} ->
             Writer1 = Writer0#{retention := Retention},
-            case Manifest0 of
+            case Manifest of
                 #manifest{} ->
                     {Writer2, Edits, Effects0} = evaluate_retention(
                         Meta,
@@ -649,6 +637,22 @@ apply(
                     State = State0#?MODULE{streams = Streams0#{StreamId := Writer1}},
                     {State, []}
             end;
+        _ ->
+            {State0, []}
+    end;
+apply(
+    _Meta,
+    #retention_executed{stream = StreamId, edit = Edit},
+    #?MODULE{streams = Streams0} = State0
+) ->
+    case Streams0 of
+        #{StreamId := #{kind := writer, manifest := #manifest{} = Manifest0} = Writer0} ->
+            Manifest = apply_edit(Edit, Manifest0),
+            Writer1 = Writer0#{manifest := Manifest},
+            {Writer2, Effects0} = upload(StreamId, Writer1, []),
+            {Writer, Effects} = notify_edits([Edit], false, StreamId, Writer2, Effects0),
+            State = State0#?MODULE{streams = Streams0#{StreamId := Writer}},
+            {State, Effects};
         _ ->
             {State0, []}
     end;
@@ -711,15 +715,13 @@ new_edit(#manifest{
     first_offset = FirstOffset,
     first_timestamp = FirstTs,
     first_last_timestamp = FirstLastTs,
-    next_offset = NextOffset,
-    total_size = TotalSize
+    next_offset = NextOffset
 }) ->
     #edit{
         first_offset = FirstOffset,
         first_timestamp = FirstTs,
         first_last_timestamp = FirstLastTs,
-        next_offset = NextOffset,
-        total_size = TotalSize
+        next_offset = NextOffset
     }.
 
 -doc """
@@ -750,7 +752,7 @@ apply_infos0(
     ],
     #edit{
         next_offset = Offset,
-        total_size = TotalSize0,
+        size = Size0,
         entries = Entries0
     } = Edit0
 ) ->
@@ -773,7 +775,7 @@ apply_infos0(
         end,
     Edit = Edit1#edit{
         next_offset = NextOffset,
-        total_size = TotalSize0 + Size,
+        size = Size0 + Size,
         entries = <<Entries0/binary, ?FRAGMENT(Offset, FirstTs, LastTs, IsSeqZero, Size)/binary>>
     },
     apply_infos0(Rest, Edit);
@@ -790,13 +792,17 @@ apply_edit(
         first_offset = FirstOffset,
         first_timestamp = FirstTs,
         first_last_timestamp = FirstLastTs,
-        next_offset = NextOffset,
-        total_size = TotalSize,
+        next_offset = EditNextOffset,
+        size = Size,
         entries = EditEntries,
         pos = Pos,
         len = Len
     },
-    #manifest{entries = Entries0} = Manifest0
+    #manifest{
+        next_offset = ManifestNextOffset,
+        total_size = TotalSize0,
+        entries = Entries0
+    } = Manifest0
 ) ->
     Entries =
         if
@@ -819,12 +825,19 @@ apply_edit(
                     (binary:part(Entries0, Pos + Len, byte_size(Entries0) - Pos - Len))/binary
                 >>
         end,
+    NextOffset =
+        case EditNextOffset of
+            undefined ->
+                ManifestNextOffset;
+            _ when is_integer(EditNextOffset) ->
+                EditNextOffset
+        end,
     Manifest0#manifest{
         first_offset = FirstOffset,
         first_timestamp = FirstTs,
         first_last_timestamp = FirstLastTs,
         next_offset = NextOffset,
-        total_size = TotalSize,
+        total_size = TotalSize0 + Size,
         entries = Entries
     }.
 
@@ -841,7 +854,12 @@ notify_edits(
         shared := Shared,
         counter := Counter,
         replica_nodes := ReplicaNodes,
-        seq := Seq0
+        seq := Seq0,
+        manifest := #manifest{
+            first_offset = FirstOffset,
+            first_timestamp = FirstTs,
+            next_offset = NextOffset
+        }
     } = Writer0,
     Effects0
 ) ->
@@ -881,9 +899,6 @@ notify_edits(
             false ->
                 Effects1
         end,
-    %% The latest edit has the most up-to-date information on it.
-    [#edit{first_offset = FirstOffset, first_timestamp = FirstTs, next_offset = NextOffset} | _] =
-        Edits0,
     SetRange = #set_range{
         stream = StreamId,
         counter = Counter,
@@ -973,13 +988,10 @@ evaluate_retention(
     StreamId,
     #{
         pending_change := none,
-        epoch := Epoch,
-        reference := Reference,
         retention := RetentionSpec,
         manifest := #manifest{
             total_size = TotalSize0,
-            first_timestamp = FirstTs,
-            revision = Revision0,
+            first_last_timestamp = FirstLastTs,
             entries = Entries0
         } = Manifest0
     } = Writer0,
@@ -988,13 +1000,13 @@ evaluate_retention(
 ) ->
     ExceedsRetention =
         case RetentionSpec of
-            #{max_bytes := MaxBytes} when TotalSize0 > MaxBytes ->
-                true;
-            #{max_age := MaxAge} when FirstTs < Now - MaxAge ->
-                true;
-            _ when Entries0 =:= <<>> ->
+            _ when byte_size(Entries0) =< ?ENTRY_B ->
                 %% Nothing to reclaim!
                 false;
+            #{max_bytes := MaxBytes} when TotalSize0 > MaxBytes ->
+                true;
+            #{max_age := MaxAge} when Now - FirstLastTs > MaxAge ->
+                true;
             _ ->
                 false
         end,
@@ -1002,30 +1014,27 @@ evaluate_retention(
         true ->
             case Entries0 of
                 ?FRAGMENT(_O, _FTs, _LTs, _Sq, _Sz, _) ->
-                    %% In the common case a stream will not be so long that it
-                    %% needs groups. Luckily, this means we can determine
-                    %% which fragments can be deleted very efficiently by
-                    %% looking just at manifest's entries array.
-                    Edit0 = new_edit(Manifest0),
-                    {Edit, Offsets} = evaluate_retention1(
-                        Entries0,
-                        Edit0,
-                        Now,
-                        RetentionSpec
-                    ),
-                    Manifest1 = apply_edit(Edit, Manifest0),
-                    UploadManifest = #upload_manifest{
-                        stream = StreamId,
-                        epoch = Epoch,
-                        reference = Reference,
-                        manifest = Manifest1
-                    },
-                    Manifest = Manifest1#manifest{revision = Revision0 + 1},
-                    Writer = Writer0#{manifest := Manifest, pending_change := retention},
-                    DeleteFragments = #delete_fragments{stream = StreamId, offsets = Offsets},
-                    Edits = [Edit | Edits0],
-                    Effects = [UploadManifest, DeleteFragments | Effects0],
-                    {Writer, Edits, Effects};
+                    %% Groups are created at the array's beginning. If the
+                    %% first entry is a fragment then this entries array
+                    %% contains no groups.
+                    GetGroupFun = fun unreachable/1,
+                    case execute_retention(Manifest0, Now, RetentionSpec, GetGroupFun) of
+                        {_NoEdit, []} ->
+                            %% This shouldn't happen. If retention rules are
+                            %% out-of-order then we should be able to reclaim
+                            %% at least one fragment.
+                            ?LOG_WARNING(
+                                "Retention did not reclaim any fragments even though retention is required. Stream '~ts'",
+                                [StreamId]
+                            ),
+                            {Writer0, Edits0, Effects0};
+                        {Edit, Offsets} ->
+                            Manifest = apply_edit(Edit, Manifest0),
+                            Writer1 = Writer0#{manifest := Manifest},
+                            {Writer, Effects1} = upload(StreamId, Writer1, Effects0),
+                            DeleteFragments = #delete_objects{stream = StreamId, objects = Offsets},
+                            {Writer, [Edit | Edits0], [DeleteFragments | Effects1]}
+                    end;
                 _ ->
                     EvaluateRetention = #evaluate_retention{
                         stream = StreamId,
@@ -1043,49 +1052,173 @@ evaluate_retention(
 evaluate_retention(_Meta, _StreamId, Writer, Edits, Effects) ->
     {Writer, Edits, Effects}.
 
-evaluate_retention1(Entries, Edit, Now, RetentionSpec) ->
-    evaluate_retention1(Entries, Edit, Now, RetentionSpec, []).
+-spec unreachable(any()) -> no_return().
+unreachable(_) -> erlang:error(unreachable).
+
+-spec execute_retention(
+    #manifest{},
+    osiris:timestamp(),
+    rabbitmq_stream_s3:retention_spec(),
+    fun((#group_ref{}) -> rabbitmq_stream_s3:entries())
+) -> {#edit{}, [osiris:offset() | #group_ref{}]}.
+execute_retention(
+    #manifest{entries = Entries, total_size = TotalSize0} = Manifest,
+    Now,
+    RetentionSpec,
+    GetGroupFun
+) ->
+    Edit0 = new_edit(Manifest),
+    %% Retention does not affect the tail of the entries array. Clear
+    %% the next_offset to avoid clobbering edits made to the manifest
+    %% tail during asynchronous retention evaluation.
+    Edit1 = Edit0#edit{next_offset = undefined},
+    {false, Edit, _TotalSize, Deletions} = execute_retention(
+        Entries,
+        Edit1,
+        TotalSize0,
+        Now,
+        RetentionSpec,
+        GetGroupFun,
+        true,
+        []
+    ),
+    {Edit, lists:reverse(Deletions)}.
 
 %% NOTE: keep at least one entry so that we can set the `first_offset` and
-%% `first_timestamp`.
-evaluate_retention1(
+%% `first_timestamp` (`Rest /= <<>>`).
+execute_retention(
+    ?ENTRY(_, _, _, _, Rest) = Entries,
+    #edit{first_offset = FirstOffset} = Edit,
+    TotalSize,
+    Now,
+    Spec,
+    GetGroupFun,
+    IsRoot,
+    Deletions
+) ->
+    case Rest of
+        ?ENTRY(RightOffset, _, _, _, _) when RightOffset < FirstOffset ->
+            execute_retention(Rest, Edit, TotalSize, Now, Spec, GetGroupFun, IsRoot, Deletions);
+        _ ->
+            execute_retention1(Entries, Edit, TotalSize, Now, Spec, GetGroupFun, IsRoot, Deletions)
+    end;
+execute_retention(Entries, Edit, TotalSize, Now, Spec, GetGroupFun, IsRoot, Deletions) ->
+    execute_retention1(Entries, Edit, TotalSize, Now, Spec, GetGroupFun, IsRoot, Deletions).
+
+execute_retention1(
+    ?FRAGMENT(Offset, _FTs, _LTs, _Sq, _Sz, Rest),
+    #edit{first_offset = FirstOffset} = Edit,
+    TotalSize,
+    Now,
+    Spec,
+    GetGroupFun,
+    IsRoot,
+    Deletions
+) when Offset < FirstOffset ->
+    execute_retention1(Rest, Edit, TotalSize, Now, Spec, GetGroupFun, IsRoot, Deletions);
+execute_retention1(
     ?FRAGMENT(Offset, _FTs, _LTs, _Sq, Size, Rest),
-    #edit{total_size = TotalSize0, len = Len0} = Edit0,
+    #edit{size = Size0, len = Len0} = Edit0,
+    TotalSize0,
     Now,
     #{max_bytes := MaxBytes} = Spec,
-    Offsets0
-) when TotalSize0 > MaxBytes andalso Rest /= <<>> ->
-    Edit = Edit0#edit{
-        total_size = TotalSize0 - Size,
-        len = Len0 + ?ENTRY_B
-    },
-    evaluate_retention1(Rest, Edit, Now, Spec, [Offset | Offsets0]);
-evaluate_retention1(
+    GetGroupFun,
+    IsRoot,
+    Deletions
+) when TotalSize0 > MaxBytes andalso (Rest /= <<>> orelse not IsRoot) ->
+    TotalSize = TotalSize0 - Size,
+    Edit1 = Edit0#edit{size = Size0 - Size},
+    Edit =
+        case IsRoot of
+            true ->
+                Edit1#edit{len = Len0 + ?ENTRY_B};
+            false ->
+                Edit1
+        end,
+    execute_retention1(Rest, Edit, TotalSize, Now, Spec, GetGroupFun, IsRoot, [Offset | Deletions]);
+execute_retention1(
     ?FRAGMENT(Offset, _FTs, LastTs, _Sq, Size, Rest),
-    #edit{total_size = TotalSize0, len = Len0} = Edit0,
+    #edit{size = Size0, len = Len0} = Edit0,
+    TotalSize0,
     Now,
     #{max_age := MaxAge} = Spec,
-    Offsets0
-) when Now - LastTs > MaxAge andalso Rest /= <<>> ->
-    Edit = Edit0#edit{
-        total_size = TotalSize0 - Size,
-        len = Len0 + ?ENTRY_B
-    },
-    evaluate_retention1(Rest, Edit, Now, Spec, [Offset | Offsets0]);
-evaluate_retention1(
+    GetGroupFun,
+    IsRoot,
+    Deletions
+) when Now - LastTs > MaxAge andalso (Rest /= <<>> orelse not IsRoot) ->
+    TotalSize = TotalSize0 - Size,
+    Edit1 = Edit0#edit{size = Size0 - Size},
+    Edit =
+        case IsRoot of
+            true ->
+                Edit1#edit{len = Len0 + ?ENTRY_B};
+            false ->
+                Edit1
+        end,
+    execute_retention1(Rest, Edit, TotalSize, Now, Spec, GetGroupFun, IsRoot, [Offset | Deletions]);
+execute_retention1(
     ?FRAGMENT(Offset, FTs, LTs, _Sq, _Sz, _Rest),
     Edit0,
+    TotalSize,
     _Now,
     _Spec,
-    Offsets
+    _GetGroupFun,
+    _IsRoot,
+    Deletions
 ) ->
     Edit = Edit0#edit{
         first_offset = Offset,
         first_timestamp = FTs,
         first_last_timestamp = LTs
     },
-    %% No real point to this lists:reverse/1. It just makes it appear nicer.
-    {Edit, lists:reverse(Offsets)}.
+    {false, Edit, TotalSize, Deletions};
+execute_retention1(
+    ?GROUP(Offset, _FTs, _LTs, Kind, Uid, Rest),
+    #edit{len = Len0} = Edit0,
+    TotalSize0,
+    Now,
+    Spec,
+    GetGroupFun,
+    IsRoot,
+    Deletions0
+) ->
+    %% Rebalancing always keeps one fragment at the end of the root.
+    ?assert(Rest =/= <<>> orelse not IsRoot),
+    GroupRef = #group_ref{uid = Uid, kind = Kind, offset = Offset},
+    case GetGroupFun(GroupRef) of
+        {ok, ChildEntries} ->
+            {Continue, Edit1, TotalSize, Deletions1} = execute_retention(
+                ChildEntries,
+                Edit0,
+                TotalSize0,
+                Now,
+                Spec,
+                GetGroupFun,
+                false,
+                Deletions0
+            ),
+            case Continue of
+                true ->
+                    Edit =
+                        case IsRoot of
+                            true ->
+                                Edit1#edit{len = Len0 + ?ENTRY_B};
+                            false ->
+                                Edit1
+                        end,
+                    Deletions = [GroupRef | Deletions1],
+                    execute_retention1(
+                        Rest, Edit, TotalSize, Now, Spec, GetGroupFun, IsRoot, Deletions
+                    );
+                false ->
+                    {false, Edit1, TotalSize, Deletions1}
+            end;
+        {error, not_found} ->
+            execute_retention1(Rest, Edit0, TotalSize0, Now, Spec, GetGroupFun, IsRoot, Deletions0)
+    end;
+execute_retention1(<<>>, Edit, TotalSize, _Now, _Spec, _GetGroupFun, IsRoot, Deletions) ->
+    ?assertNot(IsRoot),
+    {true, Edit, TotalSize, Deletions}.
 
 -doc """
 Evaluate whether the array `#manifest.entries` is too large and a group should
@@ -1183,14 +1316,11 @@ evaluate_upload(
     StreamId,
     #{
         kind := writer,
-        manifest := #manifest{revision = Revision0} = Manifest0,
-        epoch := Epoch,
-        reference := Reference,
         modifications := Mods,
         last_uploaded := LastUploadTs,
         pending_change := none
-    } = Writer0,
-    Effects0
+    } = Writer,
+    Effects
 ) ->
     ExceedsDebounce =
         case Cfg of
@@ -1203,22 +1333,35 @@ evaluate_upload(
         end,
     case ExceedsDebounce of
         true ->
-            UploadManifest = #upload_manifest{
-                stream = StreamId,
-                epoch = Epoch,
-                reference = Reference,
-                manifest = Manifest0
-            },
-            Writer = Writer0#{
-                pending_change := upload,
-                manifest := Manifest0#manifest{revision = Revision0 + 1}
-            },
-            {Writer, [UploadManifest | Effects0]};
+            upload(StreamId, Writer, Effects);
         false ->
-            {Writer0, Effects0}
+            {Writer, Effects}
     end;
 evaluate_upload(_Cfg, _Meta, _StreamId, Writer, Effects) ->
     {Writer, Effects}.
+
+-spec upload(stream_id(), writer(), [effect()]) -> {writer(), [effect()]}.
+upload(
+    StreamId,
+    #{
+        kind := writer,
+        manifest := #manifest{revision = Revision0} = Manifest0,
+        epoch := Epoch,
+        reference := Reference
+    } = Writer0,
+    Effects0
+) ->
+    UploadManifest = #upload_manifest{
+        stream = StreamId,
+        epoch = Epoch,
+        reference = Reference,
+        manifest = Manifest0
+    },
+    Writer = Writer0#{
+        pending_change := upload,
+        manifest := Manifest0#manifest{revision = Revision0 + 1}
+    },
+    {Writer, [UploadManifest | Effects0]}.
 
 -spec maybe_find_fragments(stream_id(), writer(), [effect()]) -> [effect()].
 maybe_find_fragments(_StreamId, #{available_fragments := []}, Effects) ->
@@ -1446,7 +1589,10 @@ apply_infos_test() ->
     ),
     ok.
 
-evaluate_retention1_test() ->
+root_retention_test() ->
+    %% When a manifest root only points to fragments, we can figure out which
+    %% fragments to delete in-place without kicking off a task involving
+    %% downloading group objects.
     Ts = erlang:system_time(millisecond),
     Entries = <<
         ?FRAGMENT((N * 20), (Ts - 100 + (N - 1) * 20), (Ts - 100 + N * 20), 0, 200)
@@ -1460,49 +1606,209 @@ evaluate_retention1_test() ->
         total_size = 1000,
         entries = Entries
     },
-    Edit = new_edit(Manifest),
+    ExecuteRetention = fun(Spec) ->
+        execute_retention(Manifest, Ts, Spec, fun unreachable/1)
+    end,
     %% No retention spec, nothing to do.
     ?assertMatch(
-        {Edit, []},
-        evaluate_retention1(Entries, Edit, Ts, #{})
+        {#edit{size = 0}, []},
+        ExecuteRetention(#{})
     ),
 
     %% == MAX BYTES ==
     ?assertMatch(
-        {Edit, []},
-        evaluate_retention1(Entries, Edit, Ts, #{max_bytes => 1000})
+        {#edit{first_offset = 0, size = 0}, []},
+        ExecuteRetention(#{max_bytes => 1000})
     ),
     ?assertMatch(
-        {#edit{first_offset = 20, total_size = 800}, [0]},
-        evaluate_retention1(Entries, Edit, Ts, #{max_bytes => 900})
+        {#edit{first_offset = 20, size = -200}, [0]},
+        ExecuteRetention(#{max_bytes => 900})
     ),
     ?assertMatch(
-        {#edit{first_offset = 60, total_size = 400}, [0, 20, 40]},
-        evaluate_retention1(Entries, Edit, Ts, #{max_bytes => 500})
+        {#edit{first_offset = 60, size = -600}, [0, 20, 40]},
+        ExecuteRetention(#{max_bytes => 500})
     ),
     %% Make sure we keep at least one entry.
     ?assertMatch(
-        {#edit{first_offset = 80, total_size = 200}, [0, 20, 40, 60]},
-        evaluate_retention1(Entries, Edit, Ts, #{max_bytes => 100})
+        {#edit{first_offset = 80, size = -800}, [0, 20, 40, 60]},
+        ExecuteRetention(#{max_bytes => 100})
     ),
 
     %% == MAX AGE ==
     ?assertMatch(
-        {Edit, []},
-        evaluate_retention1(Entries, Edit, Ts, #{max_age => 100_000})
+        {#edit{first_offset = 0, size = 0}, []},
+        ExecuteRetention(#{max_age => 100_000})
     ),
     ?assertMatch(
-        {#edit{first_offset = 20, total_size = 800}, [0]},
-        evaluate_retention1(Entries, Edit, Ts, #{max_age => 99})
+        {#edit{first_offset = 20, size = -200}, [0]},
+        ExecuteRetention(#{max_age => 99})
     ),
     ?assertMatch(
-        {#edit{first_offset = 60, total_size = 400}, [0, 20, 40]},
-        evaluate_retention1(Entries, Edit, Ts, #{max_age => 59})
+        {#edit{first_offset = 60, size = -600}, [0, 20, 40]},
+        ExecuteRetention(#{max_age => 59})
     ),
     ?assertMatch(
-        {#edit{first_offset = 80, total_size = 200}, [0, 20, 40, 60]},
-        evaluate_retention1(Entries, Edit, Ts, #{max_age => 1})
+        {#edit{first_offset = 80, size = -800}, [0, 20, 40, 60]},
+        ExecuteRetention(#{max_age => 1})
     ),
+
+    ok.
+
+recursive_retention_test() ->
+    %% When a manifest contains groups we need to evaluate retention in a task,
+    %% since we need to download groups. We might need to download groups
+    %% recursively if the manifest has a kilo or mega group.
+    %%
+    %%     root
+    %%     ├── KG0
+    %%     │   ├── G0
+    %%     │   │   ├── F0 (0)
+    %%     │   │   └── F1 (20)
+    %%     │   └── G1
+    %%     │       ├── F2 (40)
+    %%     │       └── F3 (60)
+    %%     ├── G2
+    %%     │   ├── F4 (80)
+    %%     │   └── F5 (100)
+    %%     └── F6 (120)
+    Ts = erlang:system_time(millisecond),
+    %% Rebalancing factor is 2 for simplicity.
+    FragmentSize = 200,
+    [F0, F1, F2, F3, F4, F5, F6] = [
+        ?FRAGMENT(
+            (N * 20),
+            (Ts - 1000 + (N - 1) * 20),
+            (Ts - 1000 + N * 20 - 1),
+            0,
+            FragmentSize
+        )
+     || N <- lists:seq(0, 6)
+    ],
+    %% Group 0 covers fragments 0 and 1, group 2 covers fragments 2 and 3, etc..
+    [G0, G1, G2] = [
+        ?GROUP(
+            (N * 40),
+            (Ts - 1000 + ((N * 2) - 1) * 20),
+            (Ts - 1000 + (N * 2) * 20 - 1),
+            ?MANIFEST_KIND_GROUP,
+            (rabbitmq_stream_s3:uid())
+        )
+     || N <- lists:seq(0, 2)
+    ],
+    %% Kilo-group 0 covers groups 0 and 1 (i.e. fragments 1-3).
+    KG0 = ?GROUP(
+        0,
+        (Ts - 1000 + -20),
+        (Ts - 1000 + 39),
+        ?MANIFEST_KIND_KILO_GROUP,
+        (rabbitmq_stream_s3:uid())
+    ),
+    Entries = <<KG0/binary, G2/binary, F6/binary>>,
+    Manifest = #manifest{
+        first_offset = 0,
+        first_timestamp = Ts - 1000 - 20,
+        first_last_timestamp = Ts - 1000 - 1,
+        next_offset = 7 * 20,
+        total_size = 7 * 200,
+        entries = Entries
+    },
+    GetGroupFun = fun
+        (#group_ref{kind = ?MANIFEST_KIND_KILO_GROUP, offset = 0}) ->
+            %% KG0
+            {ok, <<G0/binary, G1/binary>>};
+        (#group_ref{kind = ?MANIFEST_KIND_GROUP, offset = 0}) ->
+            %% G0
+            {ok, <<F0/binary, F1/binary>>};
+        (#group_ref{kind = ?MANIFEST_KIND_GROUP, offset = 40}) ->
+            %% G1
+            {ok, <<F2/binary, F3/binary>>};
+        (#group_ref{kind = ?MANIFEST_KIND_GROUP, offset = 80}) ->
+            %% G2
+            {ok, <<F4/binary, F5/binary>>}
+    end,
+    ExecuteRetention = fun(Spec) ->
+        execute_retention(Manifest, Ts, Spec, GetGroupFun)
+    end,
+
+    %% No retention spec, no-op.
+    ?assertMatch(
+        {#edit{first_offset = 0, size = 0}, []},
+        ExecuteRetention(#{})
+    ),
+
+    %% Recursively reclaim everything but the last fragment.
+    ?assertMatch(
+        {#edit{first_offset = 120, size = -1200}, [
+            %% F0
+            0,
+            %% F1
+            20,
+            %% G0
+            #group_ref{offset = 0, kind = ?MANIFEST_KIND_GROUP},
+            %% F2
+            40,
+            %% F3
+            60,
+            %% G1
+            #group_ref{offset = 40, kind = ?MANIFEST_KIND_GROUP},
+            %% KG0
+            #group_ref{offset = 0, kind = ?MANIFEST_KIND_KILO_GROUP},
+            %% F4
+            80,
+            %% F5
+            100,
+            %% G2
+            #group_ref{offset = 80, kind = ?MANIFEST_KIND_GROUP}
+        ]},
+        ExecuteRetention(#{max_bytes => FragmentSize})
+    ),
+
+    %% Reclaim just the kilo group.
+    ?assertMatch(
+        {#edit{first_offset = 80, len = ?ENTRY_B}, [
+            %% F0
+            0,
+            %% F1
+            20,
+            %% G0
+            #group_ref{offset = 0, kind = ?MANIFEST_KIND_GROUP},
+            %% F2
+            40,
+            %% F3
+            60,
+            %% G1
+            #group_ref{offset = 40, kind = ?MANIFEST_KIND_GROUP},
+            %% KG0
+            #group_ref{offset = 0, kind = ?MANIFEST_KIND_KILO_GROUP}
+        ]},
+        ExecuteRetention(#{max_bytes => 3 * FragmentSize})
+    ),
+
+    %% Reclaim G0. Then G1 (and KG0).
+    {#edit{first_offset = 40, len = 0} = Edit1, [
+        %% F0
+        0,
+        %% F1
+        20,
+        %% G0
+        #group_ref{offset = 0, kind = ?MANIFEST_KIND_GROUP}
+    ]} = ExecuteRetention(#{max_bytes => 5 * FragmentSize}),
+    Manifest1 = apply_edit(Edit1, Manifest),
+    ?assertEqual(5 * FragmentSize, Manifest1#manifest.total_size),
+    {#edit{first_offset = 80, size = -400, len = ?ENTRY_B} = Edit3, [
+        %% G0. Returned because looking it up was successful.
+        #group_ref{offset = 0, kind = ?MANIFEST_KIND_GROUP},
+        %% F2
+        40,
+        %% F3
+        60,
+        %% G1
+        #group_ref{offset = 40, kind = ?MANIFEST_KIND_GROUP},
+        %% KG0
+        #group_ref{offset = 0, kind = ?MANIFEST_KIND_KILO_GROUP}
+    ]} = execute_retention(Manifest1, Ts, #{max_bytes => 3 * FragmentSize}, GetGroupFun),
+    Manifest2 = apply_edit(Edit3, Manifest1),
+    ?assertEqual(3 * FragmentSize, Manifest2#manifest.total_size),
 
     ok.
 

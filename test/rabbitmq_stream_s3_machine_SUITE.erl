@@ -417,7 +417,8 @@ retention(Config) ->
         first_offset = 40,
         first_timestamp = Ts - 100 + 20,
         first_last_timestamp = Ts - 100 + 40,
-        total_size = 600,
+        next_offset = undefined,
+        size = -400,
         %% Deletion from retention always starts at zero and goes for the
         %% number of entries being deleted. Two fragments in this edit.
         pos = 0,
@@ -434,8 +435,8 @@ retention(Config) ->
         [
             #set_range{first_offset = 40, next_offset = 120},
             #send{to = {_, ReplicaNode}, message = ManifestEdited1},
-            #upload_manifest{manifest = #manifest{first_offset = 40, total_size = 600}},
-            #delete_fragments{offsets = [0, 20]}
+            #delete_objects{objects = [0, 20]},
+            #upload_manifest{manifest = #manifest{first_offset = 40, total_size = 600}}
         ],
         Effects3
     ),
@@ -452,7 +453,7 @@ retention(Config) ->
         first_offset = 60,
         first_timestamp = Ts - 100 + 40,
         first_last_timestamp = Ts - 100 + 60,
-        total_size = 400,
+        size = -200,
         %% Only one fragment this time.
         len = ?ENTRY_B
     },
@@ -466,8 +467,8 @@ retention(Config) ->
         [
             #set_range{first_offset = 60, next_offset = 120},
             #send{to = {_, ReplicaNode}, message = ManifestEdited2},
-            #upload_manifest{manifest = #manifest{first_offset = 60, total_size = 400}},
-            #delete_fragments{offsets = [40]}
+            #delete_objects{objects = [40]},
+            #upload_manifest{manifest = #manifest{first_offset = 60, total_size = 400}}
         ],
         Effects5
     ),
@@ -508,7 +509,8 @@ retention(Config) ->
         first_offset = 80,
         first_timestamp = Ts - 100 + 60,
         first_last_timestamp = Ts - 100 + 80,
-        total_size = 400,
+        next_offset = undefined,
+        size = -200,
         entries = <<>>,
         pos = 0,
         len = ?ENTRY_B
@@ -524,10 +526,10 @@ retention(Config) ->
             #set_range{first_offset = 80, next_offset = 140},
             #trigger_retention{},
             #send{to = {_, ReplicaNode}, message = ManifestEdited3},
+            #delete_objects{objects = [60]},
             #upload_manifest{
                 manifest = #manifest{first_offset = 80, next_offset = 140, total_size = 400}
-            },
-            #delete_fragments{offsets = [60]}
+            }
         ],
         Effects8
     ),
@@ -688,10 +690,10 @@ manifest_upload_conflict(Config) ->
         [
             #set_range{first_offset = 40, next_offset = 80},
             #trigger_retention{},
+            #delete_objects{objects = [0, 20]},
             #upload_manifest{
                 manifest = #manifest{first_offset = 40, next_offset = 80, total_size = 400}
-            },
-            #delete_fragments{offsets = [0, 20]}
+            }
         ],
         NewEffects4
     ),
@@ -708,10 +710,10 @@ manifest_upload_conflict(Config) ->
         [
             %% Note that it does not know about F4.
             #set_range{first_offset = 20, next_offset = 60},
+            #delete_objects{objects = [0]},
             #upload_manifest{
                 manifest = #manifest{first_offset = 20, next_offset = 60, total_size = 400}
-            },
-            #delete_fragments{offsets = [0]}
+            }
         ],
         OldEffects4
     ),
@@ -828,6 +830,36 @@ rebalance_group(Config) ->
     ?assertEqual(Entries, (?MAC:get_manifest(StreamId, Replica4))#manifest.entries),
     %% Two entries in the array now, the group and fragment 6.
     ?assertEqual(2, byte_size(Entries) div ?ENTRY_B),
+
+    ManifestUploaded = #manifest_uploaded{stream = StreamId, entry = #{revision => 1}},
+    {Writer5, WEffects5} = ?MAC:apply(?META(), ManifestUploaded, Writer4),
+    ?assertMatch([], WEffects5),
+
+    %% Now evaluate retention with a spec so low that we reclaim the entire
+    %% group. The group entry should be deleted from the root of the writer
+    %% and replicas.
+    RetentionUpdated = #retention_updated{stream = StreamId, retention = [{max_bytes, 100}]},
+    {Writer6, WEffects6} = ?MAC:apply(?META(), RetentionUpdated, Writer5),
+    ?assertMatch([#evaluate_retention{}], WEffects6),
+    Edit0 = ?MAC:new_edit(?MAC:get_manifest(StreamId, Writer6)),
+    Edit = Edit0#edit{
+        %% Retention would delete everything except F6.
+        first_offset = F6#fragment.first_offset,
+        first_timestamp = F6#fragment.first_timestamp,
+        first_last_timestamp = F6#fragment.last_timestamp,
+        size = 200,
+        len = ?ENTRY_B
+    },
+    RetentionExecuted = #retention_executed{stream = StreamId, edit = Edit},
+    {_Writer7, WEffects7} = ?MAC:apply(?META(), RetentionExecuted, Writer6),
+    [
+        #set_range{first_offset = 60},
+        #send{to = {_, ReplicaNode}, message = #manifest_edited{} = ManifestEdited4},
+        #upload_manifest{}
+    ] = WEffects7,
+    {_Replica5, REffects5} = ?MAC:apply(?META(), ManifestEdited4, Replica4),
+    ?assertMatch([#set_range{}], REffects5),
+
     ok.
 
 %%----------------------------------------------------------------------------
