@@ -84,6 +84,7 @@ efficiently using the `rabbitmq_stream_s3_array` module.
     group_name/1,
     next_group/1,
     fragment_key/2,
+    stream_prefix/1,
     index_file_offset/1,
     segment_file_offset/1
 ]).
@@ -149,6 +150,10 @@ fragment_key(StreamId, Offset) when is_binary(StreamId) andalso is_integer(Offse
 -spec stream_data_key(stream_id(), filename()) -> key().
 stream_data_key(StreamId, Filename) when is_binary(StreamId) andalso is_binary(Filename) ->
     <<"rabbitmq/stream/", StreamId/binary, "/data/", Filename/binary>>.
+
+-spec stream_prefix(stream_id()) -> key().
+stream_prefix(StreamId) when is_binary(StreamId) ->
+    <<"rabbitmq/stream/", StreamId/binary>>.
 
 -doc "Extracts the first offset from a segment filename".
 -spec segment_file_offset(file:filename_all()) -> osiris:offset().

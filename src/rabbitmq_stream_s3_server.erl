@@ -695,14 +695,26 @@ execute_task(#find_fragments{stream = StreamId, dir = Dir, from = FromOffset, to
     ],
     ok;
 execute_task(#delete_stream{stream = StreamId}) ->
-    ?LOG_DEBUG("Deleting stream '~ts'", [StreamId]),
+    ?LOG_INFO("Deleting remote tier data for deleted stream '~ts'", [StreamId]),
     %% NOTE: See `rabbitmq_stream_s3_db:handle_queue_deletion/1`. The node
     %% where this task runs might not be a member of this stream. So we can't
     %% rely on information in the manifest to perform the deletion.
-    %%
-    %% LIST all keys with the prefix of this stream ID and delete 1000 objects
-    %% at a time.
-    ok;
+    Prefix = rabbitmq_stream_s3:stream_prefix(StreamId),
+    {ok, Conn} = rabbitmq_stream_s3_api:open(),
+    try
+        {DeleteMsec, {ok, Details}} = timer:tc(
+            rabbitmq_stream_s3_api,
+            delete_prefix,
+            [Conn, Prefix],
+            millisecond
+        ),
+        ?LOG_INFO("Deleted remote tier data for deleted stream '~ts' in ~b msec ~0p", [
+            StreamId, DeleteMsec, Details
+        ]),
+        ok
+    after
+        rabbitmq_stream_s3_api:close(Conn)
+    end;
 execute_task(#evaluate_retention{
     stream = StreamId,
     manifest = #manifest{} = Manifest,

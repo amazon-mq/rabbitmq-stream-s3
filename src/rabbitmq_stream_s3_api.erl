@@ -24,7 +24,9 @@ file-system operations. Use that in non-unit tests.
     put/3,
     put/4,
     delete/2,
-    delete/3
+    delete/3,
+    delete_prefix/2,
+    delete_prefix/3
 ]).
 
 %% Up to the backend exactly what this is. Could be a pid for an HTTP
@@ -108,6 +110,15 @@ put(Conn, Key, Data, Opts) when is_binary(Key) andalso is_map(Opts) ->
 delete(Conn, Keys) when is_binary(Keys) orelse is_list(Keys) ->
     delete(Conn, Keys, #{}).
 
--spec delete(connection(), key() | [key()], request_opts()) -> ok | {error, any()}.
+-spec delete(connection(), key() | [key()], request_opts()) ->
+    ok | {error, any()}.
 delete(Conn, Keys, Opts) when (is_binary(Keys) orelse is_list(Keys)) andalso is_map(Opts) ->
     (backend()):delete(Conn, Keys, Opts).
+
+-spec delete_prefix(connection(), key()) -> {ok, map()} | {error, any()}.
+delete_prefix(Conn, Prefix) ->
+    delete_prefix(Conn, Prefix, #{}).
+
+-spec delete_prefix(connection(), key(), request_opts()) -> {ok, map()} | {error, any()}.
+delete_prefix(Conn, Prefix, Opts) when is_binary(Prefix) andalso is_map(Opts) ->
+    (backend()):delete_prefix(Conn, Prefix, Opts).
