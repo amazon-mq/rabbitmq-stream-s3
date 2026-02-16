@@ -308,11 +308,21 @@
     first_offset :: osiris:offset(),
     first_timestamp :: osiris:timestamp(),
     first_last_timestamp :: osiris:timestamp(),
-    next_offset :: osiris:offset(),
-    total_size :: non_neg_integer(),
+    next_offset :: osiris:offset() | undefined,
+    %% The difference in total segment size. Adds or removes from
+    %% #manifest.total_size depending on the operation.
+    size = 0 :: integer(),
     entries = <<>> :: rabbitmq_stream_s3:entries(),
     pos = 0 :: non_neg_integer(),
     len = 0 :: non_neg_integer()
+}).
+
+%% A pointer to a group object. Together with the stream ID this has all of
+%% the necessary info to create the group's object key.
+-record(group_ref, {
+    offset :: osiris:offset(),
+    kind :: rabbitmq_stream_s3:kind(),
+    uid :: rabbitmq_stream_s3:uid()
 }).
 
 %% Events.
@@ -371,7 +381,7 @@
 %% This is somewhat similar to the append-entries RPC in raft.
 -record(manifest_edited, {
     stream :: stream_id(),
-    edits :: [#edit{}, ...],
+    edits :: nonempty_list(#edit{}),
     seq :: non_neg_integer(),
     %% Suggest that the replica triggers local retention. This is set to true
     %% when the writer finishes uploading a fragment which was taken because
@@ -388,6 +398,10 @@
     conflict :: rabbitmq_stream_s3_db:entry()
 }).
 -record(stream_deleted, {stream :: stream_id()}).
+-record(retention_executed, {
+    stream :: stream_id(),
+    edit :: #edit{}
+}).
 
 -type event() ::
     #acceptor_spawned{}
@@ -400,6 +414,7 @@
     | #manifest_resolved{}
     | #manifest_upload_rejected{}
     | #manifest_uploaded{}
+    | #retention_executed{}
     | #retention_updated{}
     | #stream_deleted{}
     | #tick{}
@@ -448,11 +463,9 @@
     %% See `erlang:send/3`.
     options = [] :: [nosuspend | noconnect | priority]
 }).
-%% TODO: include the fragment kind to make this generic for group objects
-%% as well?
--record(delete_fragments, {
+-record(delete_objects, {
     stream :: stream_id(),
-    offsets :: [osiris:offset()]
+    objects :: nonempty_list(osiris:offset() | #group_ref{})
 }).
 %% Read through the local stream data and find available fragments.
 %% This is done for the active segment when a writer spawns. This effect is
@@ -486,7 +499,7 @@
 }).
 
 -type effect() ::
-    #delete_fragments{}
+    #delete_objects{}
     | #delete_stream{}
     | #evaluate_retention{}
     | #find_fragments{}

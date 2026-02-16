@@ -80,7 +80,7 @@ efficiently using the `rabbitmq_stream_s3_array` module.
     format_uid/1,
     offset_filename/2,
     manifest_key/2,
-    group_key/4,
+    group_key/2,
     group_name/1,
     next_group/1,
     fragment_key/2,
@@ -125,8 +125,8 @@ manifest_key(StreamId, Prefix, Uid, Suffix) when
         (format_uid(Uid))/binary, $., Suffix/binary>>.
 
 -doc "Creates the key for the given group".
--spec group_key(stream_id(), uid(), kind(), osiris:offset()) -> key().
-group_key(StreamId, Uid, Kind, Offset) ->
+-spec group_key(stream_id(), #group_ref{}) -> key().
+group_key(StreamId, #group_ref{uid = Uid, kind = Kind, offset = Offset}) ->
     manifest_key(StreamId, pad_zeroes(Offset), Uid, group_name(Kind)).
 
 %% TODO: this should be private.

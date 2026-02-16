@@ -650,7 +650,7 @@ convert_remote_to_local(#?MODULE{
 ) ->
     {ok, ChunkId :: osiris:offset(), byte_offset(), Fragment :: osiris:offset()}.
 find_position(Spec, Entries, StreamId) ->
-    Fragment = find_fragment(Entries, Spec, get_group_fun(StreamId)),
+    Fragment = find_fragment(Entries, Spec, rabbitmq_stream_s3_server:get_group_fun(StreamId)),
     find_position0(Spec, Fragment, StreamId).
 
 -doc """
@@ -664,10 +664,7 @@ and then searched recursively.
 -spec find_fragment(
     rabbitmq_stream_s3:entries(),
     {offset, osiris:offset()} | {timestamp, osiris:timestamp()},
-    fun(
-        (rabbitmq_stream_s3:uid(), rabbitmq_stream_s3:kind(), osiris:offset()) ->
-            rabbitmq_stream_s3:entries()
-    )
+    fun((#group_ref{}) -> {ok, rabbitmq_stream_s3:entries()} | {error, any()})
 ) -> Fragment :: osiris:offset().
 find_fragment(Entries, Spec, GetGroup) ->
     PartitionPredicate =
@@ -691,7 +688,8 @@ find_fragment(Entries, Spec, GetGroup) ->
             ?LOG_DEBUG("Entry is not a fragment. Searching within group ~b kind ~b", [
                 GroupOffset, Kind
             ]),
-            GroupEntries = GetGroup(Uid, Kind, GroupOffset),
+            GroupRef = #group_ref{uid = Uid, kind = Kind, offset = GroupOffset},
+            {ok, GroupEntries} = GetGroup(GroupRef),
             find_fragment(GroupEntries, Spec, GetGroup)
     end.
 
@@ -758,31 +756,6 @@ index_data(StreamId, FragmentOffset, StartPos) ->
         ok = rabbitmq_stream_s3_api:close(Conn)
     end.
 
-get_group_fun(StreamId) ->
-    fun(Uid, Kind, Offset) ->
-        get_group(StreamId, Uid, Kind, Offset)
-    end.
-
-get_group(StreamId, Uid, Kind, GroupOffset) ->
-    {ok, Conn} = rabbitmq_stream_s3_api:open(),
-    Key = rabbitmq_stream_s3:group_key(StreamId, Uid, Kind, GroupOffset),
-    ?LOG_DEBUG("Looking up key ~ts (~ts)", [Key, ?FUNCTION_NAME]),
-    try
-        {ok, Data} = rabbitmq_stream_s3_api:get(Conn, Key, #{timeout => ?READ_TIMEOUT}),
-        <<
-            _Magic:4/binary,
-            _Vsn:32/unsigned,
-            GroupOffset:64/unsigned,
-            _FirstTimestamp:64/unsigned,
-            0:2/unsigned,
-            _TotalSize:70/unsigned,
-            GroupEntries/binary
-        >> = Data,
-        GroupEntries
-    after
-        ok = rabbitmq_stream_s3_api:close(Conn)
-    end.
-
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
@@ -838,11 +811,11 @@ find_fragment_test() ->
         GroupUid,
         NextFragmentEntries
     ),
-    GetGroup = fun(Uid, Kind, Offset) ->
+    GetGroup = fun(#group_ref{uid = Uid, kind = Kind, offset = Offset}) ->
         ?assertEqual(GroupUid, Uid),
         ?assertEqual(?MANIFEST_KIND_GROUP, Kind),
         ?assertEqual(0, Offset),
-        FragmentEntries
+        {ok, FragmentEntries}
     end,
     FindFragment2 = fun(Spec) ->
         find_fragment(Entries, Spec, GetGroup)
