@@ -31,6 +31,7 @@ file-system operations. Use that in non-unit tests.
 %% connection or a file descriptor for a local file.
 -type connection() :: any().
 -type key() :: rabbitmq_stream_s3:key().
+-export_type([key/0]).
 -type range_spec() ::
     {StartByte :: non_neg_integer(), EndByte :: non_neg_integer() | undefined}
     | SuffixRange :: integer().
