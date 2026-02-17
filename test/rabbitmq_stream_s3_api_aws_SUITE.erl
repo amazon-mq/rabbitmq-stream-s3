@@ -73,22 +73,30 @@ init_per_suite(Config) ->
     Cfg = {
         os:getenv("AWS_ACCESS_KEY_ID"),
         os:getenv("AWS_SECRET_ACCESS_KEY"),
+        os:getenv("AWS_SESSION_TOKEN"),
         os:getenv("AWS_REGION"),
         os:getenv("AWS_S3_BUCKET")
     },
     case Cfg of
-        {false, _, _, _} ->
+        {false, _, _, _, _} ->
             Skip;
-        {_, false, _, _} ->
+        {_, false, _, _, _} ->
             Skip;
-        {_, _, false, _} ->
+        {_, _, false, _, _} ->
             Skip;
-        {_, _, _, false} ->
+        {_, _, _, false, _} ->
             Skip;
-        {AccessKey, SecretKey, Region, Bucket} ->
+        {_, _, _, _, false} ->
+            Skip;
+        {AccessKey, SecretKey, SecurityToken, Region, Bucket} ->
             application:ensure_all_started(gun),
             ok = application:set_env(rabbitmq_stream_s3, aws_access_key, list_to_binary(AccessKey)),
             ok = application:set_env(rabbitmq_stream_s3, aws_secret_key, list_to_binary(SecretKey)),
+            ok = application:set_env(
+                rabbitmq_stream_s3,
+                aws_security_token,
+                list_to_binary(SecurityToken)
+            ),
             ok = application:set_env(rabbitmq_stream_s3, aws_region, list_to_binary(Region)),
             ok = application:set_env(rabbitmq_stream_s3, bucket, list_to_binary(Bucket)),
             Config
