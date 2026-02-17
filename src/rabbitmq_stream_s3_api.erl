@@ -61,6 +61,7 @@ atomic in a file system and S3 only supports deleting 1000 keys at a time, for
 examples.
 """.
 -callback delete(connection(), key() | [key()], request_opts()) -> ok | {error, any()}.
+-callback delete_prefix(connection(), key(), request_opts()) -> {ok, map()} | {error, any()}.
 
 backend() ->
     application:get_env(rabbitmq_stream_s3, ?MODULE, rabbitmq_stream_s3_api_aws).
