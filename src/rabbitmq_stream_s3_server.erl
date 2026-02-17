@@ -94,7 +94,7 @@ start() ->
 get_manifest(StreamId) ->
     gen_server:call(?SERVER, #get_manifest{stream = StreamId}, infinity).
 
--doc("Gets the range of offsets in the remote tier").
+-doc "Gets the range of offsets in the remote tier".
 -spec get_range(stream_id()) -> rabbitmq_stream_s3:range().
 get_range(StreamId) ->
     try ets:lookup(?RANGE_TABLE, StreamId) of
