@@ -71,7 +71,7 @@ init() ->
                 credentials,
                 AccessKey,
                 SecretKey,
-                undefined,
+                application:get_env(rabbitmq_stream_s3, aws_security_token, undefined),
                 undefined
             }),
             ok

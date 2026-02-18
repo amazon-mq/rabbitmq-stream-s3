@@ -1,6 +1,4 @@
 name: S3 Integration
-permissions:
-  contents: read
 
 # This workflow tests `test/rabbitmq_stream_s3_api_aws_SUITE.erl` specifically.
 # See the moduledoc in that file for more information about running manually.
@@ -8,11 +6,13 @@ permissions:
 # In addition to the steps there, these steps set up the secrets for use in
 # environment variables in this repository:
 #
-# 1. Go to `https://github.com/amazon-mq/rabbitmq-stream-s3/settings/secrets/actions` > New repository secret
-# 2. Create a secret `AWS_ACCESS_KEY_ID` with the Access key as the Secret.
-# 3. Create a secret `AWS_SECRET_ACCESS_KEY` with the Secret access key as the Secret.
-# 3. Create a secret `AWS_S3_BUCKET` with the bucket name.
-# 3. Create a secret `AWS_REGION` with the region of where the bucket exists.
+# 1. Follow <https://aws.amazon.com/blogs/security/use-iam-roles-to-connect-github-actions-to-actions-in-aws/>
+#    to set up an OIDC Identity provider for GitHub Actions and attach a role with the same policy documented
+#    in the SUITE.
+# 2. Go to <https://github.com/amazon-mq/rabbitmq-stream-s3/settings/secrets/actions> > New repository secret
+# 3. Create a secret `AWS_ROLE_ARN` with the ARN from IAM > Roles > Role you created.
+# 4. Create a secret `AWS_S3_BUCKET` with the bucket name.
+# 5. Create a secret `AWS_REGION` with the region of where the bucket exists.
 
 on:
   workflow_dispatch:
@@ -20,6 +20,11 @@ on:
     paths:
       - 'src/rabbitmq_stream_s3_api_aws.erl'
       - 'test/rabbitmq_stream_s3_api_aws_SUITE.erl'
+      - '.github/workflows/s3-integration.yaml'
+
+permissions:
+  id-token: write
+  contents: read
 
 jobs:
   s3-integration:
@@ -50,12 +55,15 @@ jobs:
       - uses: actions/checkout@v5
         with:
           path: rabbitmq-server/deps/rabbitmq_stream_s3
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v6.0.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
       - name: make
         run: make -C ${{ github.workspace }}/rabbitmq-server/deps/rabbitmq_stream_s3
       - name: Integration tests
         run: make -C ${{ github.workspace }}/rabbitmq-server/deps/rabbitmq_stream_s3 ct-rabbitmq_stream_s3_api_aws
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
           AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
