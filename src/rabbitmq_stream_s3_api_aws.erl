@@ -17,7 +17,9 @@ A wrapper around the AWS S3 HTTP API.
     get/3,
     get_range/4,
     put/4,
-    delete/3
+    delete/3,
+    delete_prefix/3,
+    list/4
 ]).
 
 -define(ALGORITHM, "AWS4-HMAC-SHA256").
@@ -57,6 +59,12 @@ Called "HTTP Verb" in S3 docs.
 }.
 %% Map keys must be lowercase.
 -type req_headers() :: #{binary() => binary()}.
+-type continuation_token() :: binary().
+-type objects_metadata() :: #{
+    objects := non_neg_integer(),
+    total_size := non_neg_integer(),
+    pages := non_neg_integer()
+}.
 
 -spec init() -> ok.
 init() ->
@@ -174,7 +182,8 @@ put(Conn, Key, Data, Opts) when is_pid(Conn) andalso is_binary(Key) andalso is_m
     end.
 
 -doc "Deletes the given key or list of keys".
--spec delete(connection(), key() | [key()], request_opts()) -> ok | {error, any()}.
+-spec delete(connection(), key() | [key()], request_opts()) ->
+    ok | {error, any()}.
 delete(Conn, Keys, Opts) when is_pid(Conn) andalso is_list(Keys) andalso is_map(Opts) ->
     %% <https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html>
     ?assert(length(Keys) =< 1000),
@@ -204,6 +213,117 @@ delete(Conn, Key, Opts) when is_pid(Conn) andalso is_binary(Key) andalso is_map(
         {error, _} = Err ->
             Err
     end.
+
+-doc """
+Deletes all objects which are prefixed by the given key.
+
+The S3 API doesn't provide an API for this directly so we first list a page of
+objects under the prefix and then delete the page. ListObjects returns a max of
+1000 keys which is also the max amount of keys we can pass to DeleteObjects.
+
+Because of the pagination this function is quite slow on prefixes where many
+many keys exist. So this function should only be used in the background - not
+ever blocking any other operation.
+""".
+-spec delete_prefix(connection(), key(), request_opts()) ->
+    {ok, objects_metadata()} | {error, any()}.
+delete_prefix(Conn, Prefix, Opts) when
+    is_pid(Conn) andalso is_binary(Prefix) andalso is_map(Opts)
+->
+    delete_prefix(Conn, Prefix, Opts, undefined, 0, 0, 0).
+
+delete_prefix(Conn, Prefix, Opts, Token, Objects0, TotalSize0, Pages0) ->
+    case list(Conn, Prefix, Token, Opts) of
+        {ok, {[], 0, undefined}} ->
+            Meta = #{
+                objects => Objects0,
+                total_size => TotalSize0,
+                pages => Pages0
+            },
+            {ok, Meta};
+        {ok, {PageKeys, PageSize, NextToken}} ->
+            case delete(Conn, PageKeys, Opts) of
+                ok ->
+                    Objects = Objects0 + length(PageKeys),
+                    TotalSize = TotalSize0 + PageSize,
+                    Pages = Pages0 + 1,
+                    case NextToken of
+                        undefined ->
+                            Meta = #{
+                                objects => Objects,
+                                total_size => TotalSize,
+                                pages => Pages
+                            },
+                            {ok, Meta};
+                        _ ->
+                            delete_prefix(
+                                Conn,
+                                Prefix,
+                                Opts,
+                                NextToken,
+                                Objects,
+                                TotalSize,
+                                Pages
+                            )
+                    end;
+                {error, _} = Err ->
+                    Err
+            end;
+        {error, _} = Err ->
+            Err
+    end.
+
+list(Conn, Prefix, ContinuationToken, Opts) ->
+    Params0 = [{<<"list-type">>, <<"2">>}, {<<"prefix">>, Prefix}],
+    Params1 =
+        case ContinuationToken of
+            undefined ->
+                Params0;
+            _ ->
+                [{<<"continuation-token">>, ContinuationToken} | Params0]
+        end,
+    Params = uri_string:compose_query(Params1),
+    case request(Conn, <<"GET">>, <<"/?", Params/binary>>, #{}, <<>>, Opts) of
+        {ok, #{status := 200, body := Body}} ->
+            {ok, decode_list_bucket_result(Body)};
+        {ok, Other} ->
+            {error, Other};
+        {error, _} = Err ->
+            Err
+    end.
+
+-spec decode_list_bucket_result(binary()) ->
+    {[key()], TotalSize :: non_neg_integer(), continuation_token() | undefined}.
+decode_list_bucket_result(Data) ->
+    {#xmlElement{name = 'ListBucketResult', content = Result}, []} = xmerl_scan:string(
+        binary_to_list(Data)
+    ),
+    lists:foldl(
+        fun
+            (
+                #xmlElement{name = 'NextContinuationToken', content = [#xmlText{value = T}]},
+                {Keys, TotalSize, _NextToken}
+            ) ->
+                {Keys, TotalSize, list_to_binary(T)};
+            (#xmlElement{name = 'Contents', content = Contents}, {Keys0, TotalSize0, Token}) ->
+                #xmlElement{name = 'Key', content = [#xmlText{value = Key}]} = lists:keyfind(
+                    'Key',
+                    #xmlElement.name,
+                    Contents
+                ),
+                #xmlElement{name = 'Size', content = [#xmlText{value = Size}]} = lists:keyfind(
+                    'Size',
+                    #xmlElement.name,
+                    Contents
+                ),
+                TotalSize = TotalSize0 + list_to_integer(Size),
+                {[list_to_binary(Key) | Keys0], TotalSize, Token};
+            (#xmlElement{}, Acc) ->
+                Acc
+        end,
+        {[], 0, undefined},
+        Result
+    ).
 
 -spec request(connection(), http_method(), key(), req_headers(), iodata(), request_opts()) ->
     {ok, http_response()}

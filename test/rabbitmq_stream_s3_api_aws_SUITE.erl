@@ -140,9 +140,39 @@ kick_the_tires(_Config) ->
         {error, not_found} = rabbitmq_stream_s3_api_aws:get(Conn, K2, #{}),
         {error, not_found} = rabbitmq_stream_s3_api_aws:get(Conn, K3, #{}),
 
+        Keys1 = [
+            <<"prefix/", (atom_to_binary(?FUNCTION_NAME))/binary, "-",
+                (integer_to_binary(N))/binary, "-",
+                (nonce())/binary>>
+         || N <- lists:seq(1, 10)
+        ],
+        NKeys = length(Keys1),
+        Payload = <<"Object data">>,
+        [ok = rabbitmq_stream_s3_api_aws:put(Conn, K, Payload, #{}) || K <- Keys1],
+        {ok, {ListKeys, TotalSize, undefined}} = rabbitmq_stream_s3_api_aws:list(
+            Conn,
+            <<"prefix">>,
+            undefined,
+            #{}
+        ),
+        ?assertEqual(lists:sort(Keys1), lists:sort(ListKeys)),
+        ?assertEqual(byte_size(Payload) * length(Keys1), TotalSize),
+        {ok, #{pages := 1, objects := NKeys, total_size := TotalSize}} = rabbitmq_stream_s3_api_aws:delete_prefix(
+            Conn,
+            <<"prefix">>,
+            #{}
+        ),
+        {ok, {[], 0, undefined}} = rabbitmq_stream_s3_api_aws:list(
+            Conn,
+            <<"prefix">>,
+            undefined,
+            #{}
+        ),
+
         ok
     after
         _ = rabbitmq_stream_s3_api_aws:delete(Conn, Keys, #{}),
+        _ = rabbitmq_stream_s3_api_aws:delete_prefix(Conn, <<"prefix">>, #{}),
         ok = rabbitmq_stream_s3_api_aws:close(Conn)
     end.
 

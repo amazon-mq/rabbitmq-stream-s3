@@ -165,17 +165,17 @@ tiered_data_generation(Config) ->
     amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
 
     % Wait for cleanup to complete
-    % ?awaitMatch(
-    %     {error, not_found},
-    %     rabbit_ct_broker_helpers:rpc(
-    %         Config,
-    %         0,
-    %         rabbitmq_stream_s3_api_fs,
-    %         get_stream_data,
-    %         [QName]
-    %     ),
-    %     10000
-    % ),
+    ?awaitMatch(
+        {error, not_found},
+        rabbit_ct_broker_helpers:rpc(
+            Config,
+            0,
+            rabbitmq_stream_s3_api_fs,
+            get_stream_data,
+            [QName]
+        ),
+        10000
+    ),
 
     rabbit_ct_client_helpers:close_channel(Ch),
     ok.

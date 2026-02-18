@@ -19,7 +19,8 @@ associated file in that folder.
     get/3,
     get_range/4,
     put/4,
-    delete/3
+    delete/3,
+    delete_prefix/3
 ]).
 
 % Auxiliary function for testing
@@ -145,6 +146,24 @@ delete(_Connection, Keys, Opts) when is_list(Keys) andalso is_map(Opts) ->
         case Result of
             [] -> ok;
             _ -> {error, Result}
+        end
+    end).
+
+-spec delete_prefix(connection(), key(), rabbitmq_stream_s3_api:request_opts()) ->
+    {ok, map()} | {error, any()}.
+delete_prefix(_Connection, Prefix, Opts) when is_binary(Prefix) andalso is_map(Opts) ->
+    Timeout = maps:get(timeout, Opts, 5000),
+    with_timeout(Timeout, fun() ->
+        case key_to_path(Prefix) of
+            {error, path_not_set} = Err ->
+                Err;
+            Path ->
+                case file:del_dir_r(Path) of
+                    ok ->
+                        {ok, #{}};
+                    {error, _} = Err ->
+                        Err
+                end
         end
     end).
 
