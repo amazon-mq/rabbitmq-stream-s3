@@ -234,11 +234,24 @@ handle_info(tick_timeout, State0) ->
 handle_info({'DOWN', _MRef, process, Pid, Reason}, #?MODULE{tasks = Tasks0} = State0) ->
     case maps:take(Pid, Tasks0) of
         {Effect, Tasks} ->
-            ?LOG_INFO("Task ~0P (~p) down with reason ~0P. Tasks: ~0P", [
-                Effect, 5, Pid, Reason, 5, Tasks0, 10
-            ]),
-            %% TODO: retry. We have the effect and can attempt it again.
-            {noreply, State0#?MODULE{tasks = Tasks}};
+            State1 = State0#?MODULE{tasks = Tasks},
+            case Reason of
+                {{badmatch, {error, #{status := 503}}}, _StackTrace} ->
+                    ?LOG_INFO(
+                        "Task ~0P (~p) failed with 503 Slow Down. Retrying. ~b other tasks outstanding",
+                        [Effect, 5, Pid, map_size(Tasks)]
+                    ),
+                    %% HACK: retry 503 Slow Down immediately.
+                    %% This is pretty bad. We should have some sort of control
+                    %% of outstanding tasks on a stream level maybe. I've heard
+                    %% the token bucket algorithm is good for S3.
+                    {noreply, apply_effect(Effect, State1)};
+                _ ->
+                    ?LOG_INFO("Task ~0P (~p) down with reason ~0P. ~b other tasks outstanding", [
+                        Effect, 5, Pid, Reason, 5, map_size(Tasks)
+                    ]),
+                    {noreply, State1}
+            end;
         error ->
             {noreply, State0}
     end;
