@@ -650,7 +650,8 @@ convert_remote_to_local(#?MODULE{
 ) ->
     {ok, ChunkId :: osiris:offset(), byte_offset(), Fragment :: osiris:offset()}.
 find_position(Spec, Entries, StreamId) ->
-    Fragment = find_fragment(Entries, Spec, rabbitmq_stream_s3_server:get_group_fun(StreamId)),
+    GetGroupFun = rabbitmq_stream_s3_server:get_group_fun(StreamId, resolve_offset_spec),
+    Fragment = find_fragment(Entries, Spec, GetGroupFun),
     find_position0(Spec, Fragment, StreamId).
 
 -doc """
