@@ -1458,8 +1458,11 @@ format_manifest(#manifest{
         entries => format_entries(Entries)
     }.
 
--spec format_timestamp(osiris:timestamp()) -> binary().
+-spec format_timestamp(osiris:timestamp()) -> binary() | string().
 format_timestamp(Ts) when is_integer(Ts) ->
+    %% OTP-28 adds {return,binary} to this function. OTP-27 and below discard
+    %% it. On OTP-28 this function returns a binary but on OTP-27 and below
+    %% this function returns a string.
     calendar:system_time_to_rfc3339(Ts, [{unit, millisecond}, {return, binary}, {offset, "Z"}]).
 
 -spec format_size(Bytes :: non_neg_integer()) -> binary().
