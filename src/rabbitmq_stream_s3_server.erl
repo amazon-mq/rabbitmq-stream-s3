@@ -8,7 +8,12 @@
 -include("include/rabbitmq_stream_s3.hrl").
 
 -define(SERVER, ?MODULE).
--define(RANGE_TABLE, rabbitmq_stream_s3_log_manifest_range).
+%% Protected set of {stream_id(), FirstOffset, NextOffset} used to quickly
+%% look up remote tier ranges for the sake of local retention.
+-define(RANGE_TABLE, rabbitmq_stream_s3_server_range).
+%% Public set of {stream_id(), {#group_ref{}, rabbitmq_stream_s3:entries()}}
+%% used to avoid unnecessarily re-downloading the first group in a stream.
+-define(FIRST_GROUPS, rabbitmq_stream_s3_server_first_groups).
 
 -behaviour(gen_server).
 
@@ -55,8 +60,8 @@
 -export([
     get_fragment_trailer/1,
     get_fragment_trailer/2,
-    get_group_fun/1,
-    get_group/2
+    get_group_fun/2,
+    get_group/3
 ]).
 
 %% gen_server
@@ -88,6 +93,9 @@ start() ->
 
     ok = rabbitmq_stream_s3_counters:init(),
     ok = rabbitmq_stream_s3_db:setup(),
+
+    _ = ets:new(?FIRST_GROUPS, [named_table, public]),
+
     rabbit_sup:start_child(?MODULE).
 
 -spec get_manifest(stream_id()) -> #manifest{} | undefined.
@@ -739,7 +747,7 @@ execute_task(#evaluate_retention{
         Manifest,
         Now,
         RetentionSpec,
-        get_group_fun(StreamId)
+        get_group_fun(StreamId, retention)
     ),
     case Deletions of
         [] ->
@@ -843,12 +851,41 @@ set_tick_timer() ->
     _ = erlang:send_after(Timeout, self(), tick_timeout),
     ok.
 
-get_group_fun(StreamId) ->
+get_group_fun(StreamId, Reason) ->
     fun(#group_ref{} = Group) ->
-        get_group(StreamId, Group)
+        get_group(StreamId, Group, Reason)
     end.
 
-get_group(StreamId, #group_ref{offset = Offset} = GroupRef) ->
+-spec get_group(stream_id(), #group_ref{}, retention | resolve_offset_spec) ->
+    {ok, rabbitmq_stream_s3:entries()} | {error, any()}.
+get_group(StreamId, #group_ref{kind = ?MANIFEST_KIND_GROUP} = GroupRef, retention) ->
+    case get_group_cached(StreamId, GroupRef) of
+        undefined ->
+            case get_group0(StreamId, GroupRef) of
+                {ok, Entries} = Ok ->
+                    _ = ets:insert(?FIRST_GROUPS, {StreamId, {GroupRef, Entries}}),
+                    Ok;
+                {error, _} = Err ->
+                    Err
+            end;
+        Entries ->
+            {ok, Entries}
+    end;
+get_group(StreamId, #group_ref{} = GroupRef, _Reason) ->
+    get_group0(StreamId, GroupRef).
+
+get_group_cached(StreamId, #group_ref{kind = ?MANIFEST_KIND_GROUP} = GroupRef) ->
+    try ets:lookup(?FIRST_GROUPS, StreamId) of
+        [{StreamId, {GroupRef, Entries}}] ->
+            Entries;
+        _ ->
+            undefined
+    catch
+        error:badarg ->
+            undefined
+    end.
+
+get_group0(StreamId, #group_ref{offset = Offset} = GroupRef) ->
     {ok, Conn} = rabbitmq_stream_s3_api:open(),
     Key = rabbitmq_stream_s3:group_key(StreamId, GroupRef),
     ?LOG_DEBUG("Looking up key ~ts (~ts)", [Key, ?FUNCTION_NAME]),
