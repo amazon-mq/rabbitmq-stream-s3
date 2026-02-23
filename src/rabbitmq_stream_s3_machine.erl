@@ -17,7 +17,22 @@ for the log manifest server to execute.
 %% passes without these exceptions. Once OTP 28 is required, remove these
 %% exceptions:
 -dialyzer({no_return, format_timestamp/1}).
--dialyzer({no_unused, [format_size/1, format_size/2, format_entries/1, count_kinds/2]}).
+-dialyzer(
+    {no_unused, [
+        format_size/1,
+        format_size/2,
+        format_entries/1,
+        format_retention/1,
+        format_duration_ms/1,
+        format_duration_seconds/1,
+        format_duration_minutes/1,
+        format_duration_hours/1,
+        format_duration_days/1,
+        format_duration_weeks/1,
+        format_duration_years/1,
+        count_kinds/2
+    ]}
+).
 
 -include_lib("kernel/include/logger.hrl").
 -include_lib("stdlib/include/assert.hrl").
@@ -25,6 +40,7 @@ for the log manifest server to execute.
 -include("include/rabbitmq_stream_s3.hrl").
 
 -define(SERVER, rabbitmq_stream_s3_server).
+-define(FORMAT_DURATION(D), (float_to_binary(D, [{decimals, 2}, compact])) / binary).
 
 -type cfg() :: #{
     %% The number of entries of a given `rabbitmq_stream_s3:kind()` which may
@@ -1406,7 +1422,8 @@ format_stream(
         manifest := Manifest,
         last_uploaded := LastUploaded,
         available_fragments := Available,
-        uploaded_fragments := Uploaded
+        uploaded_fragments := Uploaded,
+        retention := Retention
     } = Writer0
 ) ->
     %% No point in printing these:
@@ -1424,7 +1441,8 @@ format_stream(
         uploaded_fragments := [
             {O, N}
          || #fragment_info{first_offset = O, next_offset = N} <- Uploaded
-        ]
+        ],
+        retention := format_retention(Retention)
     }.
 
 format_manifest({pending, _Requesters}) ->
@@ -1495,6 +1513,52 @@ count_kinds(?ENTRY(_O, _FTs, _LTs, Kind, Rest), Counts0) ->
         end,
     Counts = maps:update_with(Key, fun(N) -> N + 1 end, 1, Counts0),
     count_kinds(Rest, Counts).
+
+format_retention(Retention) when map_size(Retention) =:= 0 ->
+    none;
+format_retention(Retention) ->
+    maps:map(
+        fun
+            (max_age, MaxAge) ->
+                format_duration_ms(MaxAge);
+            (max_bytes, MaxBytes) ->
+                format_size(MaxBytes)
+        end,
+        Retention
+    ).
+
+format_duration_ms(Duration) when is_integer(Duration) andalso Duration =< 1000 ->
+    <<(integer_to_binary(Duration))/binary, "msec">>;
+format_duration_ms(Duration) ->
+    format_duration_seconds(Duration / 1000).
+
+format_duration_seconds(Duration) when is_float(Duration) andalso Duration =< 60.0 ->
+    <<?FORMAT_DURATION(Duration), "sec">>;
+format_duration_seconds(Duration) when is_float(Duration) ->
+    format_duration_minutes(Duration / 60).
+
+format_duration_minutes(Duration) when is_float(Duration) andalso Duration =< 60.0 ->
+    <<?FORMAT_DURATION(Duration), "min">>;
+format_duration_minutes(Duration) when is_float(Duration) ->
+    format_duration_hours(Duration / 60).
+
+format_duration_hours(Duration) when is_float(Duration) andalso Duration =< 24.0 ->
+    <<?FORMAT_DURATION(Duration), " hours">>;
+format_duration_hours(Duration) when is_float(Duration) ->
+    format_duration_days(Duration / 24).
+
+format_duration_days(Duration) when is_float(Duration) andalso Duration =< 7.0 ->
+    <<?FORMAT_DURATION(Duration), " days">>;
+format_duration_days(Duration) when is_float(Duration) ->
+    format_duration_weeks(Duration / 7).
+
+format_duration_weeks(Duration) when is_float(Duration) andalso Duration =< 52.0 ->
+    <<?FORMAT_DURATION(Duration), " weeks">>;
+format_duration_weeks(Duration) when is_float(Duration) ->
+    format_duration_years(Duration / 52).
+
+format_duration_years(Duration) when is_float(Duration) ->
+    <<?FORMAT_DURATION(Duration), " years">>.
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
@@ -1824,6 +1888,13 @@ format_size_test() ->
     ?assertEqual(<<"1.5 GiB">>, format_size(math:pow(1024, 3) + math:pow(1024, 3) / 2)),
     ?assertEqual(<<"50.0 TiB">>, format_size(50 * math:pow(1024, 4))),
     ?assertEqual(<<"1.0 PiB">>, format_size(math:pow(1024, 5))),
+    ok.
+
+format_duration_test() ->
+    ?assertEqual(<<"3.0 hours">>, format_duration_ms(3 * 60 * 60 * 1000)),
+    ?assertEqual(<<"5.0 days">>, format_duration_ms(5 * 24 * 60 * 60 * 1000)),
+    ?assertEqual(<<"7.0 weeks">>, format_duration_ms(7 * 7 * 24 * 60 * 60 * 1000)),
+    ?assertEqual(<<"4.0 years">>, format_duration_ms(4 * 52 * 7 * 24 * 60 * 60 * 1000)),
     ok.
 
 rebalance_group_test() ->
