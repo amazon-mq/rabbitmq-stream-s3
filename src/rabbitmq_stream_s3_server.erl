@@ -78,7 +78,7 @@
 ]).
 
 %% For `sys:get_state/1` debugging.
--export([format_state/1]).
+-export([format_state/0, format_state/1]).
 
 %% Need to be exported for `erlang:apply/3`.
 -export([start/0, format_osiris_event/1, execute_task/1, execute_task/2]).
@@ -315,6 +315,9 @@ code_change(_OldVsn, State, _Extra) ->
 
 format_osiris_event(Event) ->
     Event.
+
+format_state() ->
+    format_state(sys:get_state(?MODULE)).
 
 format_state(#?MODULE{machine = Machine, tasks = Tasks}) ->
     #{
