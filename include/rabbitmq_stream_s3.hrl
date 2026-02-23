@@ -402,6 +402,7 @@
     stream :: stream_id(),
     edit :: #edit{}
 }).
+-record(member_stopped, {stream :: stream_id()}).
 
 -type event() ::
     #acceptor_spawned{}
@@ -414,6 +415,7 @@
     | #manifest_resolved{}
     | #manifest_upload_rejected{}
     | #manifest_uploaded{}
+    | #member_stopped{}
     | #retention_executed{}
     | #retention_updated{}
     | #stream_deleted{}

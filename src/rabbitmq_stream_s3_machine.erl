@@ -675,6 +675,9 @@ apply(
 apply(_Meta, #stream_deleted{stream = StreamId}, #?MODULE{streams = Streams0} = State0) ->
     State = State0#?MODULE{streams = maps:remove(StreamId, Streams0)},
     {State, []};
+apply(_Meta, #member_stopped{stream = StreamId}, #?MODULE{streams = Streams0} = State0) ->
+    State = State0#?MODULE{streams = maps:remove(StreamId, Streams0)},
+    {State, []};
 apply(_Meta, Event, State) ->
     ?LOG_WARNING(?MODULE_STRING " dropped unknown event ~W", [Event, 15]),
     {State, []}.
