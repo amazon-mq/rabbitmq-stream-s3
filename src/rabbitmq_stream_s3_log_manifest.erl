@@ -197,13 +197,9 @@ close_manifest(#log_writer{}) ->
     %% TODO: unregister writers with the server.
     ok.
 
-delete(_Config) ->
-    %% TODO use the `dir` from config to delete the remote manifest and
-    %% fragments.
-    %% TODO the stream coordinator deletes individual replicas rather than
-    %% issuing any "delete the whole stream," so we need to recognize when
-    %% membership falls to zero in order to clean up from the remote tier.
-    ok.
+delete(Config) ->
+    %% TODO: remove this callback. We don't need it.
+    osiris_log:delete(Config).
 
 %%----------------------------------------------------------------------------
 
