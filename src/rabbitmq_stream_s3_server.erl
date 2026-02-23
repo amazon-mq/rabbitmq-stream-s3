@@ -42,7 +42,8 @@
     %% stream ID associated with an offset notification `{osiris_offset,
     %% Reference, osiris:offset()}` sent by the writer (because we used
     %% `osiris:register_offset_listener/3`).
-    references = #{} :: #{stream_reference() => stream_id()}
+    references = #{} :: #{stream_reference() => stream_id()},
+    members = #{} :: #{reference() => {stream_id(), stream_reference()}}
 }).
 
 %% API
@@ -170,27 +171,40 @@ handle_call(Request, From, State) ->
     {noreply, State}.
 
 handle_cast(
-    #writer_spawned{stream = StreamId, config = #{reference := Reference}} = Event,
-    #?MODULE{references = References0} = State0
+    #writer_spawned{
+        stream = StreamId,
+        pid = Pid,
+        config = #{reference := Reference}
+    } = Event,
+    #?MODULE{members = Members0, references = References0} = State0
 ) ->
-    State1 = State0#?MODULE{references = References0#{Reference => StreamId}},
+    MRef = erlang:monitor(process, Pid),
+    State1 = State0#?MODULE{
+        members = Members0#{MRef => {StreamId, Reference}},
+        references = References0#{Reference => StreamId}
+    },
     {noreply, evolve_event(Event, State1)};
 handle_cast(
     #init_acceptor{
         stream = StreamId,
+        pid = Pid,
         config =
             #{
                 leader_pid := LeaderPid,
                 reference := Reference
             } = Config
     },
-    #?MODULE{references = References0} = State0
+    #?MODULE{members = Members0, references = References0} = State0
 ) ->
+    MRef = erlang:monitor(process, Pid),
     ok = gen_server:cast({?SERVER, node(LeaderPid)}, #manifest_requested{
         stream = StreamId,
         requester = self()
     }),
-    State1 = State0#?MODULE{references = References0#{Reference => StreamId}},
+    State1 = State0#?MODULE{
+        members = Members0#{MRef => {StreamId, Reference}},
+        references = References0#{Reference => StreamId}
+    },
     Event = #acceptor_spawned{stream = StreamId, config = Config},
     {noreply, evolve_event(Event, State1)};
 handle_cast(#manifest_requested{} = Event, State) ->
@@ -239,9 +253,17 @@ handle_info(tick_timeout, State0) ->
     State = evolve_event(#tick{}, State0),
     ok = set_tick_timer(),
     {noreply, State};
-handle_info({'DOWN', _MRef, process, Pid, Reason}, #?MODULE{tasks = Tasks0} = State0) ->
-    case maps:take(Pid, Tasks0) of
-        {Effect, Tasks} ->
+handle_info(
+    {'DOWN', MRef, process, Pid, Reason},
+    #?MODULE{
+        tasks = Tasks0,
+        references = References0,
+        members = Members0
+    } = State0
+) ->
+    case Tasks0 of
+        #{Pid := Effect} ->
+            Tasks = maps:remove(Pid, Tasks0),
             State1 = State0#?MODULE{tasks = Tasks},
             case Reason of
                 {{badmatch, {error, #{status := 503}}}, _StackTrace} ->
@@ -260,8 +282,18 @@ handle_info({'DOWN', _MRef, process, Pid, Reason}, #?MODULE{tasks = Tasks0} = St
                     ]),
                     {noreply, State1}
             end;
-        error ->
-            {noreply, State0}
+        _ ->
+            case Members0 of
+                #{MRef := {StreamId, Reference}} ->
+                    State1 = State0#?MODULE{
+                        references = maps:remove(Reference, References0),
+                        members = maps:remove(MRef, Members0)
+                    },
+                    State = evolve_event(#member_stopped{stream = StreamId}, State1),
+                    {noreply, State};
+                _ ->
+                    {noreply, State0}
+            end
     end;
 handle_info(Message, State) ->
     ?LOG_DEBUG(
