@@ -10,6 +10,7 @@ A wrapper around the AWS S3 HTTP API.
 -include_lib("stdlib/include/assert.hrl").
 -include_lib("xmerl/include/xmerl.hrl").
 
+%% API:
 -export([
     init/0,
     open/0,
@@ -22,10 +23,16 @@ A wrapper around the AWS S3 HTTP API.
     list/4
 ]).
 
+%% For apply/3:
+-export([get_credentials/1]).
+
 -define(ALGORITHM, "AWS4-HMAC-SHA256").
 -define(ISOFORMAT_BASIC, "~4.10.0b~2.10.0b~2.10.0bT~2.10.0b~2.10.0b~2.10.0bZ").
 -define(TABLE, ?MODULE).
 -define(METADATA_TOKEN_TTL_SECONDS, 60).
+%% A margin to add to a TTL. Subtracting a few seconds reduces the chances that
+%% we use a token just as it expires.
+-define(TTL_SECONDS_BUFFER, 5).
 -define(REGION_KEY, rabbitmq_stream_s3_api_aws_region).
 
 -behaviour(rabbitmq_stream_s3_api).
@@ -406,7 +413,7 @@ get_region_from_instance_metadata(Retries) ->
         false ->
             %% Another process is performing the refresh. Please wait...
             timer:sleep(100),
-            request_credentials_from_instance_metadata(Retries - 1)
+            region(Retries - 1)
     end.
 
 request_region_from_instance_metadata_locked() ->
@@ -445,22 +452,55 @@ tld(Region) ->
     {ok, AccessKey :: binary(), SecretKey :: binary(), SecurityToken :: binary() | undefined}
     | {error, any()}.
 get_credentials() ->
-    Attempts = application:get_env(rabbitmq_stream_s3, get_credentials_attempts, 10),
-    get_credentials(Attempts).
+    case get_credentials_cached() of
+        {ok, _, _, _} = Ok ->
+            Ok;
+        error ->
+            ?LOG_INFO(
+                ?MODULE_STRING
+                ": no AWS credentials available, requesting from EC2 instance metadata"
+            ),
+            Attempts = application:get_env(rabbitmq_stream_s3, get_credentials_attempts, 10),
+            {Msec, Result} = timer:tc(?MODULE, get_credentials, [Attempts], millisecond),
+            case Result of
+                {ok, _, _, _} ->
+                    ?LOG_INFO(
+                        "Successfully acquired credentials from EC2 instance metadata service in ~bms",
+                        [Msec]
+                    );
+                {error, _} ->
+                    ?LOG_ERROR(
+                        "Failed to acquire credentials from EC2 instance metadata service in ~bms",
+                        [Msec]
+                    )
+            end,
+            Result
+    end.
 
-get_credentials(Retries) ->
+get_credentials_cached() ->
     case ets:lookup(?TABLE, credentials) of
         [{credentials, AccessKey, SecretKey, SecurityToken, Expiration}] ->
-            %% TODO: rabbitmq_aws checks gregorian seconds. However, I believe
-            %% term ordering is already sufficient here. Term ordering example:
-            %% `{2, 1} > {1, 3} =:= true`.
-            case is_tuple(Expiration) andalso calendar:universal_time() > Expiration of
+            case is_expired(Expiration) of
                 true ->
-                    request_credentials_from_instance_metadata(Retries);
+                    error;
                 false ->
                     {ok, AccessKey, SecretKey, SecurityToken}
             end;
         [] ->
+            error
+    end.
+
+is_expired(Expiration) when is_integer(Expiration) ->
+    Now = calendar:datetime_to_gregorian_seconds(calendar:universal_time()),
+    Now + ?TTL_SECONDS_BUFFER > Expiration;
+is_expired(undefined) ->
+    false.
+
+get_credentials(Retries) ->
+    case get_credentials_cached() of
+        {ok, _, _, _} = Ok ->
+            Ok;
+        error ->
             request_credentials_from_instance_metadata(Retries)
     end.
 
@@ -484,7 +524,7 @@ request_credentials_from_instance_metadata(Retries) ->
         false ->
             %% Another process is performing the refresh. Please wait...
             timer:sleep(100),
-            request_credentials_from_instance_metadata(Retries - 1)
+            get_credentials(Retries - 1)
     end.
 
 request_credentials_from_instance_metadata_locked() ->
@@ -525,7 +565,7 @@ request_credentials_from_instance_metadata_locked() ->
         end
     end).
 
--spec parse_iso8601(binary()) -> calendar:datetime().
+-spec parse_iso8601(binary()) -> GregorianSeconds :: non_neg_integer().
 parse_iso8601(<<
     Year:4/binary,
     $-,
@@ -540,10 +580,12 @@ parse_iso8601(<<
     Second:2/binary,
     $Z
 >>) ->
-    {
-        {binary_to_integer(Year), binary_to_integer(Month), binary_to_integer(Day)},
-        {binary_to_integer(Hour), binary_to_integer(Minute), binary_to_integer(Second)}
-    }.
+    calendar:datetime_to_gregorian_seconds(
+        {
+            {binary_to_integer(Year), binary_to_integer(Month), binary_to_integer(Day)},
+            {binary_to_integer(Hour), binary_to_integer(Minute), binary_to_integer(Second)}
+        }
+    ).
 
 -spec get_instance_metadata(pid(), http_method(), binary(), req_headers()) ->
     {ok, http_response()} | {error, any()}.
@@ -563,8 +605,7 @@ get_instance_metadata(Conn, Method, Path, Headers) ->
 metadata_token() ->
     case ets:lookup(?TABLE, metadata_token) of
         [{metadata_token, Token, Expiration}] ->
-            Now = calendar:datetime_to_gregorian_seconds(calendar:universal_time()),
-            case Now > Expiration of
+            case is_expired(Expiration) of
                 true ->
                     get_metadata_token();
                 false ->
@@ -842,7 +883,10 @@ key_to_path(Key) ->
 -include_lib("eunit/include/eunit.hrl").
 
 parse_iso8601_test() ->
-    ?assertEqual({{2026, 1, 21}, {1, 47, 0}}, parse_iso8601(<<"2026-01-21T01:47:00Z">>)),
+    ?assertEqual(
+        calendar:datetime_to_gregorian_seconds({{2026, 1, 21}, {1, 47, 0}}),
+        parse_iso8601(<<"2026-01-21T01:47:00Z">>)
+    ),
     ok.
 
 range_spec_test() ->
