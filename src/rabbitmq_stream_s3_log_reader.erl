@@ -22,6 +22,8 @@ tier.
 -define(READAHEAD, "5MiB").
 -define(READ_TIMEOUT, 10000).
 
+%% TODO: add counters
+
 -record(remote, {
     pid :: pid(),
     stream :: stream_id(),
@@ -441,7 +443,6 @@ do_read(
                 Object,
                 {Offset, Offset + ToRead - 1}
             ),
-            rabbitmq_stream_s3_counters:read_bytes(byte_size(NewBuffer)),
             State = State0#state{
                 buffer = NewBuffer,
                 offset_start = Offset,

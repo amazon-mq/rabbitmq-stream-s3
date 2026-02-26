@@ -48,8 +48,31 @@ Zero indicates that the manifest has not been created yet.
 
 -export([get/1, list/0, count/0, put/5]).
 
+-define(C_SPROC_TRIGGERS, 1).
+-define(C_GETS, 2).
+-define(C_PUTS, 3).
+-define(C_PUT_SUCCESSES, 4).
+-define(C_PUT_CONFLICTS, 5).
+-define(C_PUT_NOT_FOUNDS, 6).
+-define(C_PUT_ERRORS, 7).
+-define(COUNTERS, [
+    {sproc_triggers, ?C_SPROC_TRIGGERS, counter, "Number of stored procedures triggered"},
+    {gets, ?C_GETS, counter, "Total number of attempted get requests"},
+    {puts, ?C_PUTS, counter, "Total number of attempted put requests"},
+    {put_successes, ?C_PUT_SUCCESSES, counter, "Number of put requests which succeeded"},
+    {put_conflicts, ?C_PUT_CONFLICTS, counter,
+        "Number of put requests which failed because the conditions did not match"},
+    {put_not_founds, ?C_PUT_NOT_FOUNDS, counter,
+        "Number of put requests which failed because the tree node was not found"},
+    {put_errors, ?C_PUT_ERRORS, counter,
+        "Number of put requests which failed for a non-conflict and non-not-found reason"}
+]).
+-define(COUNTER_KEY, {?MODULE, counter}).
+
 -spec setup() -> ok.
 setup() ->
+    Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?COUNTERS),
+    persistent_term:put(?COUNTER_KEY, Cnt),
     %% Register a stored procedure which is triggered on deletion of each
     %% stream created with `put/5`. Streams created with `put/5` are
     %% automatically deleted by keep-while conditions when a stream queue
@@ -84,6 +107,7 @@ setup() ->
 
 -spec handle_queue_deletion(sproc_props()) -> ok.
 handle_queue_deletion(#{path := ?PATH(StreamId)}) ->
+    counters:add(counter(), ?C_SPROC_TRIGGERS, 1),
     %% NOTE: A Khepri trigger executes its stored procedures on the current
     %% Khepri leader node. This may not be the same node as the stream's writer
     %% process. And in larger clusters (5, 7, 9 nodes, etc..) this might not
@@ -93,6 +117,7 @@ handle_queue_deletion(#{path := ?PATH(StreamId)}) ->
 -doc "Gets the latest-known manifest root UID and revision.".
 -spec get(stream_id()) -> {ok, entry()} | {error, not_found | any()}.
 get(StreamId) ->
+    counters:add(counter(), ?C_GETS, 1),
     Path = ?PATH(StreamId),
     case rabbit_khepri:adv_get(Path) of
         {ok, #{Path := #{data := {Uid, Epoch}, payload_version := Revision}}} ->
@@ -155,6 +180,8 @@ put(
     ExpectedRevision,
     Uid
 ) when is_binary(StreamId) andalso is_integer(ExpectedRevision) andalso is_integer(Uid) ->
+    Cnt = counter(),
+    counters:add(Cnt, ?C_PUTS, 1),
     Path = ?PATH(StreamId),
     Conditions =
         case ExpectedRevision of
@@ -184,8 +211,10 @@ put(
     },
     case rabbit_khepri:adv_put(VersionedPath, {Uid, Epoch}, Options) of
         {ok, #{Path := #{payload_version := NewRevision, data := {OldUid, OldEpoch}}}} ->
+            counters:add(Cnt, ?C_PUT_SUCCESSES, 1),
             {ok, {OldUid, OldEpoch}, NewRevision};
         {ok, #{Path := #{payload_version := NewRevision}}} ->
+            counters:add(Cnt, ?C_PUT_SUCCESSES, 1),
             {ok, undefined, NewRevision};
         {error,
             ?khepri_error(mismatching_node, #{
@@ -194,6 +223,7 @@ put(
                     data := {ActualUid, ActualEpoch}
                 }
             })} ->
+            counters:add(Cnt, ?C_PUT_CONFLICTS, 1),
             %% This branch covers a failed expectation if the node actually
             %% exists, so `data` must be defined here.
             Entry = #{revision => ActualRevision, uid => ActualUid, epoch => ActualEpoch},
@@ -201,7 +231,12 @@ put(
         {error, ?khepri_error(node_not_found, _Props)} ->
             %% The metadata store entry might've been deleted since the last
             %% update.
+            counters:add(Cnt, ?C_PUT_NOT_FOUNDS, 1),
             {error, not_found};
         {error, _} = Err ->
+            counters:add(Cnt, ?C_PUT_ERRORS, 1),
             Err
     end.
+
+counter() ->
+    persistent_term:get({?MODULE, counter}).

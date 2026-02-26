@@ -106,6 +106,7 @@ end_per_suite(Config) ->
     Config.
 
 init_per_testcase(_Testcase, Config) ->
+    ok = rabbitmq_stream_s3:setup(),
     ok = rabbitmq_stream_s3_api_aws:init(),
     Config.
 
