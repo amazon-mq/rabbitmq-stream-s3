@@ -67,3 +67,10 @@ jobs:
         env:
           AWS_REGION: ${{ secrets.AWS_REGION }}
           AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: CommonTest logs
+          if-no-files-found: ignore
+          path: ${{ github.workspace }}/rabbitmq-server/logs/
