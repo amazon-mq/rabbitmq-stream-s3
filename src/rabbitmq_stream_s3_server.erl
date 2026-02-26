@@ -34,10 +34,17 @@
 }).
 -record(get_manifest, {stream :: stream_id()}).
 -record(task_completed, {task_pid :: pid(), event :: event() | ok}).
+-record(retry_task, {task :: reference()}).
+
+-record(task, {
+    effect :: effect(),
+    failures = 0 :: non_neg_integer()
+}).
 
 -record(?MODULE, {
     machine = rabbitmq_stream_s3_machine:new() :: rabbitmq_stream_s3_machine:state(),
-    tasks = #{} :: #{pid() => effect()},
+    tasks = #{} :: #{pid() => #task{}},
+    delayed_tasks = #{} :: #{reference() => #task{}},
     %% A lookup from stream reference to ID. This is used to determine the
     %% stream ID associated with an offset notification `{osiris_offset,
     %% Reference, osiris:offset()}` sent by the writer (because we used
@@ -257,31 +264,39 @@ handle_info(
     {'DOWN', MRef, process, Pid, Reason},
     #?MODULE{
         tasks = Tasks0,
+        delayed_tasks = DelayedTasks0,
         references = References0,
         members = Members0
     } = State0
 ) ->
     case Tasks0 of
-        #{Pid := Effect} ->
+        #{Pid := #task{failures = Failures0} = Task0} ->
             Tasks = maps:remove(Pid, Tasks0),
-            State1 = State0#?MODULE{tasks = Tasks},
-            case Reason of
-                {{badmatch, {error, #{status := 503}}}, _StackTrace} ->
-                    ?LOG_INFO(
-                        "Task ~0P (~p) failed with 503 Slow Down. Retrying. ~b other tasks outstanding",
-                        [Effect, 5, Pid, map_size(Tasks)]
-                    ),
-                    %% HACK: retry 503 Slow Down immediately.
-                    %% This is pretty bad. We should have some sort of control
-                    %% of outstanding tasks on a stream level maybe. I've heard
-                    %% the token bucket algorithm is good for S3.
-                    {noreply, apply_effect(Effect, State1)};
-                _ ->
-                    ?LOG_INFO("Task ~0P (~p) down with reason ~0P. ~b other tasks outstanding", [
-                        Effect, 5, Pid, Reason, 5, map_size(Tasks)
-                    ]),
-                    {noreply, State1}
-            end;
+            Failures = Failures0 + 1,
+            Task = Task0#task{failures = Failures},
+            %% With default settings, retry after 100, 400, 900, 1600, 2500, 3600,
+            %% 4900, 5000, 5000, 5000, ... ms
+            Max = application:get_env(rabbitmq_stream_s3, task_retry_delay_max_ms, 5_000),
+            Constant = application:get_env(rabbitmq_stream_s3, task_retry_delay_constant, 10),
+            Exponent = application:get_env(rabbitmq_stream_s3, task_retry_delay_exponent, 2),
+            DelayMs = min(trunc(math:pow(Constant * Failures, Exponent)), Max),
+            TaskRef = erlang:make_ref(),
+            erlang:send_after(DelayMs, self(), #retry_task{task = TaskRef}),
+            DelayedTasks = DelayedTasks0#{TaskRef => Task},
+            ?LOG_INFO("Task ~0P (~p) down (~b other outstanding), retrying in ~bms. Reason: ~0P", [
+                Task0,
+                5,
+                Pid,
+                map_size(Tasks),
+                DelayMs,
+                Reason,
+                5
+            ]),
+            State = State0#?MODULE{
+                tasks = Tasks,
+                delayed_tasks = DelayedTasks
+            },
+            {noreply, State};
         _ ->
             case Members0 of
                 #{MRef := {StreamId, Reference}} ->
@@ -295,6 +310,13 @@ handle_info(
                     {noreply, State0}
             end
     end;
+handle_info(
+    #retry_task{task = TaskRef},
+    #?MODULE{delayed_tasks = DelayedTasks0} = State0
+) ->
+    #{TaskRef := Task} = DelayedTasks0,
+    State1 = State0#?MODULE{delayed_tasks = maps:remove(TaskRef, DelayedTasks0)},
+    {noreply, spawn_task(Task, State1)};
 handle_info(Message, State) ->
     ?LOG_DEBUG(
         ?MODULE_STRING " received unexpected message: ~W",
@@ -319,10 +341,11 @@ format_osiris_event(Event) ->
 format_state() ->
     format_state(sys:get_state(?MODULE)).
 
-format_state(#?MODULE{machine = Machine, tasks = Tasks}) ->
+format_state(#?MODULE{machine = Machine, tasks = Tasks, delayed_tasks = DelayedTasks}) ->
     #{
         machine => rabbitmq_stream_s3_machine:format(Machine),
-        tasks => map_size(Tasks)
+        tasks => map_size(Tasks),
+        delayed_tasks => map_size(DelayedTasks)
     }.
 
 -spec evolve_event(event(), #?MODULE{}) -> #?MODULE{}.
@@ -401,12 +424,15 @@ apply_effect(#delete_objects{} = Effect, State) ->
 apply_effect(#delete_stream{} = Effect, State) ->
     spawn_task(Effect, State).
 
-spawn_task(Effect, #?MODULE{tasks = Tasks0} = State0) ->
+-spec spawn_task(#task{} | effect(), #?MODULE{}) -> #?MODULE{}.
+spawn_task(#task{effect = Effect} = Task, #?MODULE{tasks = Tasks0} = State0) ->
     %% NOTE: use of `erlang:self/0` is intentional here. If we casted to the
     %% server's registered name instead, a restarted manifest server after a
     %% crash could get nonsensical task events from old incarnations.
     {TaskPid, _MRef} = spawn_monitor(?MODULE, execute_task, [Effect, self()]),
-    State0#?MODULE{tasks = Tasks0#{TaskPid => Effect}}.
+    State0#?MODULE{tasks = Tasks0#{TaskPid => Task}};
+spawn_task(Effect, State) ->
+    spawn_task(#task{effect = Effect}, State).
 
 execute_task(Effect, ManifestServer) ->
     Event = execute_task(Effect),

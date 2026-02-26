@@ -513,4 +513,5 @@
     | #set_range{}
     | #trigger_retention{}
     | #upload_fragment{}
+    | #upload_group{}
     | #upload_manifest{}.
