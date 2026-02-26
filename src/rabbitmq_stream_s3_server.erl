@@ -18,10 +18,10 @@
 -behaviour(gen_server).
 
 -rabbit_boot_step(
-    {rabbitmq_stream_s3_log_manifest, [
+    {rabbitmq_stream_s3_server, [
         {description, "tiered storage S3 coordinator"},
         {mfa, {?MODULE, start, []}},
-        {requires, pre_boot},
+        {requires, rabbitmq_stream_s3},
         {enables, core_initialized}
     ]}
 ).
@@ -84,6 +84,58 @@
     code_change/3
 ]).
 
+-define(C_ACTIVE_TASKS, 1).
+-define(C_TOTAL_TASKS, 2).
+-define(C_TASK_FAILURES, 3).
+-define(C_FRAGMENTS_CREATED, 4).
+-define(C_GROUPS_CREATED, 5).
+-define(C_KILO_GROUPS_CREATED, 6).
+-define(C_MEGA_GROUPS_CREATED, 7).
+-define(C_ROOTS_CREATED, 8).
+-define(C_MANIFESTS_RESOLVED, 9).
+-define(C_MANIFESTS_RESOLVED_EMPTY, 10).
+-define(C_FRAGMENTS_DELETED, 11).
+-define(C_GROUPS_DELETED, 12).
+-define(C_KILO_GROUPS_DELETED, 13).
+-define(C_MEGA_GROUPS_DELETED, 14).
+-define(C_STREAMS_DELETED, 15).
+-define(C_LOCAL_TIER_RETENTION_EVALUATIONS, 16).
+-define(C_REMOTE_TIER_RETENTION_EVALUATIONS, 17).
+-define(COUNTERS, [
+    {active_tasks, ?C_ACTIVE_TASKS, gauge, "Current number of tasks"},
+    {total_tasks, ?C_TOTAL_TASKS, counter, "Total number of tasks spawned"},
+    {task_failures, ?C_TASK_FAILURES, counter, "Number of times a task has crashed"},
+    {fragments_created, ?C_FRAGMENTS_CREATED, counter,
+        "Number of fragments objects created in the remote tier"},
+    {groups_created, ?C_GROUPS_CREATED, counter, "Number of group manifest objects created"},
+    {kilo_groups_created, ?C_KILO_GROUPS_CREATED, counter,
+        "Number of kilo group manifest objects created"},
+    {mega_groups_created, ?C_MEGA_GROUPS_CREATED, counter,
+        "Number of mega group manifest objects created"},
+    {roots_created, ?C_ROOTS_CREATED, counter, "Number of root manifest objects created"},
+    {manifests_resolved, ?C_MANIFESTS_RESOLVED, counter,
+        "Number of times a non-empty manifest has been resolved"},
+    {manifests_resolved_empty, ?C_MANIFESTS_RESOLVED_EMPTY, counter,
+        "Number of times a manifest has been resolved as empty/non-existent"},
+    %% NOTE: objects deleted when a stream is deleted do not count towards these
+    %% counters. Those objects are not effectively tracked in counters - the best
+    %% proxy is in `rabbitmq_stream_s3_api_aws` in LIST requests.
+    {fragments_deleted, ?C_FRAGMENTS_DELETED, counter,
+        "Number of fragment objects deleted by retention"},
+    {groups_deleted, ?C_GROUPS_DELETED, counter, "Number of group objects deleted by retention"},
+    {kilo_groups_deleted, ?C_KILO_GROUPS_DELETED, counter,
+        "Number of kilo group objects deleted by retention"},
+    {mega_groups_deleted, ?C_MEGA_GROUPS_DELETED, counter,
+        "Number of mega group objects deleted by retention"},
+    {streams_deleted, ?C_STREAMS_DELETED, counter,
+        "Number of times a stream has been successfully deleted from the remote tier"},
+    {local_tier_retention_evaluations, ?C_LOCAL_TIER_RETENTION_EVALUATIONS, counter,
+        "Number of times retention has been evaluated against the local tier"},
+    {remote_tier_retention_evaluations, ?C_REMOTE_TIER_RETENTION_EVALUATIONS, counter,
+        "Number of times retention has been evaluated against the remote tier"}
+]).
+-define(COUNTER_KEY, {?MODULE, counters}).
+
 %% For `sys:get_state/1` debugging.
 -export([format_state/0, format_state/1]).
 
@@ -97,13 +149,12 @@
 %% recover replicas before this server is started and writer_manifest/1 will
 %% fail a few times and look messy in the logs.
 start() ->
+    Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?COUNTERS),
+    persistent_term:put(?COUNTER_KEY, Cnt),
+
     ok = rabbitmq_stream_s3_api:init(),
-
-    ok = rabbitmq_stream_s3_counters:init(),
     ok = rabbitmq_stream_s3_db:setup(),
-
     _ = ets:new(?FIRST_GROUPS, [named_table, public]),
-
     rabbit_sup:start_child(?MODULE).
 
 -spec get_manifest(stream_id()) -> #manifest{} | undefined.
@@ -271,6 +322,7 @@ handle_info(
 ) ->
     case Tasks0 of
         #{Pid := #task{failures = Failures0} = Task0} ->
+            counters:add(counter(), ?C_TASK_FAILURES, 1),
             Tasks = maps:remove(Pid, Tasks0),
             Failures = Failures0 + 1,
             Task = Task0#task{failures = Failures},
@@ -399,6 +451,7 @@ apply_effect(
             is_integer(FstOff),
             is_integer(FstTs)
         ->
+            counters:add(counter(), ?C_LOCAL_TIER_RETENTION_EVALUATIONS, 1),
             osiris_log_shared:set_first_chunk_id(Shared, FstOff),
             counters:put(Cnt, ?C_OSIRIS_LOG_SEGMENTS, NumSegLeft);
         (_) ->
@@ -435,8 +488,15 @@ spawn_task(Effect, State) ->
     spawn_task(#task{effect = Effect}, State).
 
 execute_task(Effect, ManifestServer) ->
-    Event = execute_task(Effect),
-    gen_server:cast(ManifestServer, #task_completed{task_pid = self(), event = Event}).
+    Cnt = counter(),
+    counters:add(Cnt, ?C_ACTIVE_TASKS, 1),
+    counters:add(Cnt, ?C_TOTAL_TASKS, 1),
+    try
+        Event = execute_task(Effect),
+        gen_server:cast(ManifestServer, #task_completed{task_pid = self(), event = Event})
+    after
+        counters:sub(Cnt, ?C_ACTIVE_TASKS, 1)
+    end.
 
 execute_task(#upload_fragment{
     stream = StreamId,
@@ -536,8 +596,7 @@ execute_task(#upload_fragment{
         ?LOG_DEBUG("Uploaded ~ts of ~ts in ~b msec (~b bytes)", [
             FragmentFilename, SegmentFilename, UploadMSec, UploadSize
         ]),
-        %% TODO: update counters for fragments.
-        rabbitmq_stream_s3_counters:segment_uploaded(UploadSize),
+        counters:add(counter(), ?C_FRAGMENTS_CREATED, 1),
         FragmentInfo = FragmentInfo0#fragment_info{roll_reason = RollReason},
         #fragment_uploaded{stream = StreamId, info = FragmentInfo}
     after
@@ -577,8 +636,13 @@ execute_task(#upload_group{
         ?LOG_DEBUG("Uploaded ~ts for stream '~ts' in ~b msec (~b bytes)", [
             Ext, StreamId, UploadMsec, DataSize
         ]),
-        %% TODO: counters per group kind.
-        %% rabbitmq_stream_s3_counters:manifest_written(Size),
+        Counter =
+            case GroupKind of
+                ?MANIFEST_KIND_GROUP -> ?C_GROUPS_CREATED;
+                ?MANIFEST_KIND_KILO_GROUP -> ?C_KILO_GROUPS_CREATED;
+                ?MANIFEST_KIND_MEGA_GROUP -> ?C_MEGA_GROUPS_CREATED
+            end,
+        counters:add(counter(), Counter, 1),
         ok
     after
         ok = rabbitmq_stream_s3_api:close(Conn)
@@ -619,7 +683,7 @@ execute_task(#upload_manifest{
         ?LOG_DEBUG("Uploaded manifest for stream '~ts' in ~b msec (~b bytes)", [
             StreamId, UploadMsec, ManifestSize
         ]),
-        rabbitmq_stream_s3_counters:manifest_written(ManifestSize),
+        counters:add(counter(), ?C_ROOTS_CREATED, 1),
         case rabbitmq_stream_s3_db:put(StreamId, Reference, Epoch, ExpectedRevision, Uid) of
             {ok, OldInfo, NewRevision} ->
                 case OldInfo of
@@ -705,8 +769,8 @@ execute_task(#resolve_manifest{stream = StreamId}) ->
                                 FirstLastTs,
                                 TotalSize,
                                 Entries
-                            ) = Data} ->
-                            rabbitmq_stream_s3_counters:manifest_read(byte_size(Data)),
+                            )} ->
+                            counters:add(counter(), ?C_MANIFESTS_RESOLVED, 1),
                             #manifest{
                                 first_offset = FirstOffset,
                                 next_offset = NextOffset,
@@ -717,6 +781,7 @@ execute_task(#resolve_manifest{stream = StreamId}) ->
                                 entries = Entries
                             };
                         {error, not_found} ->
+                            counters:add(counter(), ?C_MANIFESTS_RESOLVED_EMPTY, 1),
                             #manifest{};
                         {error, _} = Err ->
                             exit(Err)
@@ -725,6 +790,7 @@ execute_task(#resolve_manifest{stream = StreamId}) ->
                     ok = rabbitmq_stream_s3_api:close(Conn)
                 end;
             {error, not_found} ->
+                counters:add(counter(), ?C_MANIFESTS_RESOLVED_EMPTY, 1),
                 #manifest{};
             {error, _} = Err ->
                 exit(Err)
@@ -753,15 +819,32 @@ execute_task(#delete_objects{stream = StreamId, objects = Objects}) ->
             end,
             millisecond
         ),
-        ?LOG_DEBUG("Deleted ~b fragments from stream '~ts' in ~b msec", [
+        ?LOG_DEBUG("Deleted ~b objects from stream '~ts' in ~b msec", [
             NumObjects, StreamId, DeleteMsec
         ]),
+        Counters = lists:foldl(
+            fun(Object, Acc) ->
+                Key =
+                    case Object of
+                        #group_ref{kind = ?MANIFEST_KIND_GROUP} -> ?C_GROUPS_DELETED;
+                        #group_ref{kind = ?MANIFEST_KIND_KILO_GROUP} -> ?C_KILO_GROUPS_DELETED;
+                        #group_ref{kind = ?MANIFEST_KIND_MEGA_GROUP} -> ?C_MEGA_GROUPS_DELETED;
+                        _ when is_integer(Object) -> ?C_FRAGMENTS_DELETED
+                    end,
+                maps:update_with(Key, fun(V) -> V + 1 end, 1, Acc)
+            end,
+            #{},
+            Objects
+        ),
+        Cnt = counter(),
+        maps:foreach(fun(Counter, Incr) -> counters:add(Cnt, Counter, Incr) end, Counters),
         ok
     after
         ok = rabbitmq_stream_s3_api:close(Conn)
     end,
     ok;
 execute_task(#find_fragments{stream = StreamId, dir = Dir, from = FromOffset, to = ToOffset}) ->
+    %% TODO: counters around this would be nice?
     _ = [
         gen_server:cast(?SERVER, #fragment_available{stream = StreamId, fragment = F})
      || #fragment{
@@ -793,6 +876,7 @@ execute_task(#delete_stream{stream = StreamId}) ->
         ?LOG_INFO("Deleted remote tier data for deleted stream '~ts' in ~b msec ~0p", [
             StreamId, DeleteMsec, Details
         ]),
+        counters:add(counter(), ?C_STREAMS_DELETED, 1),
         ok
     after
         rabbitmq_stream_s3_api:close(Conn)
@@ -810,6 +894,7 @@ execute_task(#evaluate_retention{
         RetentionSpec,
         get_group_fun(StreamId, retention)
     ),
+    counters:add(counter(), ?C_REMOTE_TIER_RETENTION_EVALUATIONS, 1),
     case Deletions of
         [] ->
             ok;
@@ -1005,6 +1090,9 @@ eval_local_retention([IdxFile | Rest], NextTieredOffset, ToDelete, ToKeep) ->
         false ->
             {lists:reverse(Rest), [IdxFile | ToKeep]}
     end.
+
+counter() ->
+    persistent_term:get(?COUNTER_KEY).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
