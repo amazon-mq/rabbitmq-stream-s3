@@ -25,7 +25,7 @@ A wrapper around the AWS S3 HTTP API.
 ]).
 
 %% For apply/3:
--export([get_credentials/1]).
+-export([get_credentials/0, get_credentials/1]).
 
 -define(ALGORITHM, "AWS4-HMAC-SHA256").
 -define(ISOFORMAT_BASIC, "~4.10.0b~2.10.0b~2.10.0bT~2.10.0b~2.10.0b~2.10.0bZ").
@@ -59,6 +59,8 @@ A wrapper around the AWS S3 HTTP API.
     {response_503, ?C_RESPONSE_503, counter, "Number of HTTP 503 responses"}
 ]).
 -define(COUNTER_KEY, {?MODULE, counter}).
+
+-record(container_creds_req, {host, port, path, conn, stream_ref}).
 
 -behaviour(rabbitmq_stream_s3_api).
 
@@ -512,29 +514,36 @@ tld(Region) ->
     | {error, any()}.
 get_credentials() ->
     case get_credentials_cached() of
-        {ok, _, _, _} = Ok ->
-            Ok;
-        error ->
-            ?LOG_INFO(
-                ?MODULE_STRING
-                ": no AWS credentials available, requesting from EC2 instance metadata"
-            ),
-            Attempts = application:get_env(rabbitmq_stream_s3, get_credentials_attempts, 10),
-            {Msec, Result} = timer:tc(?MODULE, get_credentials, [Attempts], millisecond),
-            case Result of
-                {ok, _, _, _} ->
-                    ?LOG_INFO(
-                        "Successfully acquired credentials from EC2 instance metadata service in ~bms",
-                        [Msec]
-                    );
-                {error, _} ->
-                    ?LOG_ERROR(
-                        "Failed to acquire credentials from EC2 instance metadata service in ~bms",
-                        [Msec]
-                    )
-            end,
-            Result
+        {ok, _, _, _} = Ok -> Ok;
+        error -> fetch_credentials(os:getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI"))
     end.
+
+fetch_credentials(false) ->
+    ?LOG_INFO(
+        ?MODULE_STRING
+        ": no AWS credentials available, requesting from EC2 instance metadata"
+    ),
+    Attempts = application:get_env(rabbitmq_stream_s3, get_credentials_attempts, 10),
+    {Msec, Result} = timer:tc(?MODULE, get_credentials, [Attempts], millisecond),
+    log_credentials_result(Result, Msec),
+    Result;
+fetch_credentials(URI) ->
+    ?LOG_INFO(
+        ?MODULE_STRING
+        ": no AWS credentials available, requesting from container credentials endpoint"
+    ),
+    request_credentials_from_container_endpoint(URI).
+
+log_credentials_result({ok, _, _, _}, Msec) ->
+    ?LOG_INFO(
+        "Successfully acquired credentials from EC2 instance metadata service in ~bms",
+        [Msec]
+    );
+log_credentials_result({error, _}, Msec) ->
+    ?LOG_ERROR(
+        "Failed to acquire credentials from EC2 instance metadata service in ~bms",
+        [Msec]
+    ).
 
 get_credentials_cached() ->
     case ets:lookup(?TABLE, credentials) of
@@ -623,6 +632,69 @@ request_credentials_from_instance_metadata_locked() ->
             {ok, AccessKey, SecretKey, SecurityToken}
         end
     end).
+
+request_credentials_from_container_endpoint(URI) ->
+    #{host := Host, port := Port, path := Path0} = uri_string:parse(URI),
+    PortInt =
+        case Port of
+            undefined -> 80;
+            _ -> Port
+        end,
+    Path =
+        case Path0 of
+            [] -> "/";
+            _ -> Path0
+        end,
+    Req = #container_creds_req{host = Host, port = PortInt, path = Path},
+    do_request_credentials_from_container_endpoint(
+        open, Req, gun:open(Host, PortInt, #{transport => tcp, protocols => [http]})
+    ).
+
+do_request_credentials_from_container_endpoint(open, _Req, {error, _} = Err) ->
+    Err;
+do_request_credentials_from_container_endpoint(open, Req, {ok, Conn}) ->
+    do_request_credentials_from_container_endpoint(
+        await_up, Req#container_creds_req{conn = Conn}, gun:await_up(Conn, 7_000)
+    );
+do_request_credentials_from_container_endpoint(
+    await_up, #container_creds_req{conn = Conn}, {error, _} = Err
+) ->
+    ok = gun:close(Conn),
+    Err;
+do_request_credentials_from_container_endpoint(
+    await_up, #container_creds_req{path = Path, conn = Conn} = Req, {ok, _}
+) ->
+    StreamRef = gun:get(Conn, Path),
+    try
+        do_request_credentials_from_container_endpoint(
+            await_response,
+            Req#container_creds_req{stream_ref = StreamRef},
+            gun:await(Conn, StreamRef, 13_000)
+        )
+    after
+        gun:close(Conn)
+    end;
+do_request_credentials_from_container_endpoint(await_response, _Req, {error, _} = Err) ->
+    Err;
+do_request_credentials_from_container_endpoint(await_response, _Req, {response, _, Status, _}) when
+    Status =/= 200
+->
+    {error, {unexpected_status, Status}};
+do_request_credentials_from_container_endpoint(
+    await_response,
+    #container_creds_req{conn = Conn, stream_ref = StreamRef},
+    {response, nofin, 200, _}
+) ->
+    {ok, Body} = gun:await_body(Conn, StreamRef, 6_000),
+    #{
+        <<"AccessKeyId">> := AccessKey,
+        <<"SecretAccessKey">> := SecretKey,
+        <<"Token">> := SecurityToken,
+        <<"Expiration">> := ExpirationIso8601
+    } = json:decode(Body),
+    Expiration = parse_iso8601(ExpirationIso8601),
+    _ = ets:insert(?TABLE, {credentials, AccessKey, SecretKey, SecurityToken, Expiration}),
+    {ok, AccessKey, SecretKey, SecurityToken}.
 
 -spec parse_iso8601(binary()) -> GregorianSeconds :: non_neg_integer().
 parse_iso8601(<<

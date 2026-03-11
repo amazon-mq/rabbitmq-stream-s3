@@ -84,13 +84,20 @@ init_per_group(integration, Config) ->
         os:getenv("AWS_REGION"),
         os:getenv("AWS_S3_BUCKET")
     },
-    Skip = {skip, "AWS access credentials are not set. Skipping this group is OK! See the moduledoc for more information."},
+    Skip =
+        {skip,
+            "AWS access credentials are not set. Skipping this group is OK! See the moduledoc for more information."},
     case Cfg of
-        {false, _, _, _, _} -> Skip;
-        {_, false, _, _, _} -> Skip;
-        {_, _, false, _, _} -> Skip;
-        {_, _, _, false, _} -> Skip;
-        {_, _, _, _, false} -> Skip;
+        {false, _, _, _, _} ->
+            Skip;
+        {_, false, _, _, _} ->
+            Skip;
+        {_, _, false, _, _} ->
+            Skip;
+        {_, _, _, false, _} ->
+            Skip;
+        {_, _, _, _, false} ->
+            Skip;
         {AccessKey, SecretKey, SecurityToken, Region, Bucket} ->
             application:ensure_all_started(gun),
             ok = application:set_env(rabbitmq_stream_s3, aws_access_key, list_to_binary(AccessKey)),
@@ -187,14 +194,18 @@ container_credentials(_Config) ->
     %% mimicking the AWS_CONTAINER_CREDENTIALS_FULL_URI endpoint format.
     {ok, ListenSock} = gen_tcp:listen(0, [binary, {active, false}, {reuseaddr, true}]),
     {ok, Port} = inet:port(ListenSock),
-    Body = <<"{\"AccessKeyId\":\"AKIAIOSFODNN7EXAMPLE\","
-             "\"SecretAccessKey\":\"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\","
-             "\"Token\":\"test-session-token\","
-             "\"Expiration\":\"2099-01-01T00:00:00Z\"}">>,
+    Body = <<
+        "{\"AccessKeyId\":\"AKIAIOSFODNN7EXAMPLE\","
+        "\"SecretAccessKey\":\"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\","
+        "\"Token\":\"test-session-token\","
+        "\"Expiration\":\"2099-01-01T00:00:00Z\"}"
+    >>,
     Resp = iolist_to_binary([
         "HTTP/1.1 200 OK\r\n",
         "Content-Type: application/json\r\n",
-        "Content-Length: ", integer_to_binary(byte_size(Body)), "\r\n",
+        "Content-Length: ",
+        integer_to_binary(byte_size(Body)),
+        "\r\n",
         "\r\n",
         Body
     ]),
@@ -210,15 +221,13 @@ container_credentials(_Config) ->
     try
         %% Remove any cached credentials so get_credentials/0 fetches fresh ones.
         ets:delete(rabbitmq_stream_s3_api_aws, credentials),
-        {ok, <<"AKIAIOSFODNN7EXAMPLE">>,
-             <<"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY">>,
-             <<"test-session-token">>} = rabbitmq_stream_s3_api_aws:get_credentials()
+        {ok, <<"AKIAIOSFODNN7EXAMPLE">>, <<"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY">>,
+            <<"test-session-token">>} = rabbitmq_stream_s3_api_aws:get_credentials()
     after
         os:unsetenv("AWS_CONTAINER_CREDENTIALS_FULL_URI")
     end.
 
 %%----------------------------------------------------------------------------
-
 
 nonce() ->
     binary:encode_hex(crypto:strong_rand_bytes(4), lowercase).
