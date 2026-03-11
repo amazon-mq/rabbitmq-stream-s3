@@ -13,6 +13,7 @@ A wrapper around the AWS S3 HTTP API.
 %% API:
 -export([
     init/0,
+    reload_config/0,
     open/0,
     close/1,
     get/3,
@@ -101,8 +102,11 @@ Called "HTTP Verb" in S3 docs.
 init() ->
     Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?COUNTERS),
     persistent_term:put(?COUNTER_KEY, Cnt),
-
     _ = ets:new(?TABLE, [public, named_table]),
+    reload_config().
+
+-spec reload_config() -> ok.
+reload_config() ->
     AccessKey0 = application:get_env(rabbitmq_stream_s3, aws_access_key),
     SecretKey0 = application:get_env(rabbitmq_stream_s3, aws_secret_key),
     case {AccessKey0, SecretKey0} of
