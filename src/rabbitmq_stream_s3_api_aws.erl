@@ -76,11 +76,7 @@ A wrapper around the AWS S3 HTTP API.
 -doc """
 Uppercase HTTP method name, as a binary.
 
-Called "HTTP Verb" in S3 docs.
-
-```
-<<"GET">> | <<"PUT">> | <<"HEAD">> | <<"POST">> | <<"DELETE">>
-```.
+Called "HTTP Verb" in S3 docs. "GET", "PUT", "HEAD", "POST", "DELETE", etc..
 """.
 -type http_method() :: binary().
 -type http_response() :: #{
