@@ -604,6 +604,7 @@ get_credentials_locked({container, URI}) ->
     request_credentials_from_container_endpoint(URI).
 
 request_credentials_from_instance_metadata_locked() ->
+    %% <https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-metadata-security-credentials.html>
     with_instance_metadata_conn(fun(Conn) ->
         maybe
             {ok, RoleResp} ?=
@@ -642,6 +643,7 @@ request_credentials_from_instance_metadata_locked() ->
     end).
 
 request_credentials_from_container_endpoint(URI) ->
+    %% <https://docs.aws.amazon.com/sdkref/latest/guide/feature-container-credentials.html>
     #{host := Host, port := Port, path := Path0} = uri_string:parse(URI),
     PortInt =
         case Port of
