@@ -63,7 +63,7 @@ jobs:
       - name: make
         run: make -C ${{ github.workspace }}/rabbitmq-server/deps/rabbitmq_stream_s3
       - name: Integration tests
-        run: make -C ${{ github.workspace }}/rabbitmq-server/deps/rabbitmq_stream_s3 ct-rabbitmq_stream_s3_api_aws
+        run: make -C ${{ github.workspace }}/rabbitmq-server/deps/rabbitmq_stream_s3 t=integration ct-rabbitmq_stream_s3_api_aws
         env:
           AWS_REGION: ${{ secrets.AWS_REGION }}
           AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
