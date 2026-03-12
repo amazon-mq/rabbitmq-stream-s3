@@ -128,8 +128,18 @@ The offset is padded with leading zeroes to a width of 20.
 offset_filename(Offset, Suffix) when is_integer(Offset) andalso is_binary(Suffix) ->
     <<(pad_zeroes(Offset))/binary, $., Suffix/binary>>.
 
+-spec pad_zeroes(osiris:offset()) -> <<_:20 * 8>>.
 pad_zeroes(Offset) ->
-    iolist_to_binary(io_lib:format("~20..0B", [Offset])).
+    %% Same as `io_lib:format("~20..0B", [Offset])` but much more efficient.
+    %% NOTE: 2^64 is 20 digits.
+    Num = integer_to_binary(Offset),
+    Pad = 20 - byte_size(Num),
+    case Pad > 0 of
+        true ->
+            <<(binary:copy(<<$0>>, Pad))/binary, Num/binary>>;
+        false ->
+            Num
+    end.
 
 -doc "Creates the key for the given stream and UID".
 -spec manifest_key(stream_id(), uid()) -> key().
