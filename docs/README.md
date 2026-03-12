@@ -102,85 +102,7 @@ Uploading fragments of segment and index files means that committed data can be 
 
 ## Manifest
 
-The manifest is a data structure which lives in the remote tier alongside stream data which helps answer questions about a stream's data.
-
-Because a stream can become practically infinitely long in the remote tier and querying the remote tier has relatively high latency, answering questions about a stream like its first offset, timestamp or total size is not straightforward. It's also trickier to determine where to start reading in a stream, for example finding where to start reading the data which was published 5 days ago. To answer all of these questions in the local tier, Osiris lists the stream directory and reads through segment and index files. Querying an object store the same way could be prohibitively expensive in terms of time and request cost.
-
-To make answering questions about a stream quick and cheap, `rabbitmq-stream-s3` stores a data structure in S3 which tracks uploaded stream data.
-
-### How much data can the remote tier hold?
-
-For some napkin math, publishing at a very very high throughput of 1 GB/sec to a single stream can publish a petabyte (PB) of data in a matter of days. An exabyte (EB) can be published in a hypothetically possible number of years (~32) and a zettabyte (ZB) would take an impossibly long time to publish. Publishing and retaining immense amounts of data like this is unlikely to happen in practice, but because storage in S3 is practically bottomless, the manifest should be able to handle these absurd sizes gracefully.
-
-### M-way tree
-
-The difficulty in tracking very large streams is the number of fragments. 1 PB of segment data at a fragment size of 64 MB would take 15,625,000 fragments to represent. To track very large numbers of fragments, `rabbitmq-stream-s3` stores a tree structure in the remote tier under each stream's `metadata` directory. Leaf nodes in this tree are records with metadata about a fragment: the offset, timestamp, file size, and sequence number within the segment. These records are individually very small - low double digits of bytes per fragment.
-
-When a fragment is uploaded, a metadata record for it is appended to the array of records in the root node. Once the root node reaches a large number of records, the writer rebalances out a _group_ of fragments. Rebalancing puts the `M` oldest fragments under a new branch and replaces the records in the root's array with a new record which points to the group. A `{first-offset}.group` object is added to the metadata directory in S3 and then the manifest is overwritten with the rebalanced set of records. Rebalancing keeps the root node small so that downloads, manipulation, and uploads remain cheap. Rebalancing away the oldest `M` records biases for recent data. Following a branch means a round-trip to S3, so fragments in the root are always fastest to look up. For larger streams, once enough groups have been rebalanced, the root can further rebalance away `M` groups into a _kilo-group_. `M` kilo-groups could also be rebalanced away into a _mega-group_, but it's unlikely to happen in practice if `M` is large.
-
-![M-way tree manifest](./ManifestMWay.svg)
-
-The branching factor will be tuned in testing but a relatively high value like `M=1024` provides a theoretically good balance. With 30 bytes of metadata per fragment, group files would take around 30 KiB to represent - small enough to be comfortably downloaded and searched in-memory. A high branching factor keeps the height of the tree low. With `M=1024` and fragments even as small as 1 MB, a lookup within the tree for one of the oldest fragments would take at-most four round-trips to S3: the root (cached), a kilo-group, a group, and the leaf (fragment). Within tree nodes, fragment metadata is naturally stored in ascending order of offset. This mitigates the high branching factor: binary search can be used on the record arrays to quickly find specific fragments or groups within each tree node.
-
-```
-rabbitmq/
-├── stream/
-│   ├── __stream-01_1745252105682952932/
-│   │   ├── data/
-│   │   │   └── ...
-│   │   └── metadata/
-│   │       ├── 00000000000000000000.kgroup
-│   │       ├── 00000000000000000000.group
-│   │       ├── 00000000000012345678.group
-│   │       ├── 00000000000091234567.group
-│   │       ├── ...
-│   │       └── manifest     // the root
-```
-
-### Resolving the manifest
-
-The writer keeps the root node cached in memory and appends to it as new fragments are uploaded. To avoid high-frequency updates during high throughput publishing, the writer debounces updates to the manifest root. This means that the remote tier copy of the manifest can lag behind the latest information. And if the writer crashes before it can upload an updated copy, the remote tier might have an out-of-date copy when the next writer starts up. When a writer starts, it _resolves_ the manifest. It downloads the current copy from the remote tier and then looks up the latest fragment's trailer data. The trailer contains the offset of the next fragment, so the writer can continue following these 'next pointers' to find all uploaded fragments and add them to the downloaded copy of the manifest.
-
-### Concurrency control
-
-If a writer node is on the minority side of a network partition then the remaining majority can elect a new writer without the deposed writer's knowledge, so two writer processes might be alive at the same time. The network partition might not affect the writers' abilities to modify the remote tier, so we need a concurrency control to prevent conflicting changes to the manifest.
-
-To handle this situation, `rabbitmq-stream-s3` uses an [optimistic concurrency control](https://en.wikipedia.org/wiki/Optimistic_concurrency_control) to make conflicting changes practically impossible. Keys of all metadata objects include a unique identifier string (UID). So in practice the metadata directory looks like this:
-
-```
-rabbitmq/
-├── stream/
-│   ├── __stream-01_1745252105682952932/
-│   │   ├── data/
-│   │   │   └── ...
-│   │   └── metadata/
-│   │       ├── 00000000000000000000.f619c0873d14edeb.kgroup
-│   │       ├── 00000000000000000000.d078ceab40232eff.group
-│   │       ├── 00000000000012345678.79425118e949e556.group
-│   │       ├── 00000000000091234567.edabc41fac4c6979.group
-│   │       ├── ...
-│   │       └── root.db868505ef4bc57a.manifest     // the root
-```
-
-The UID of the manifest root is stored in [Khepri](https://github.com/rabbitmq/khepri) (RabbitMQ's metadata store) associated with the stream name. So the Khepri tree looks like this:
-
-```
-rabbitmq
-├── rabbitmq_stream_s3
-│   └── <<"__stream-01_1745252105682952932">>
-│       Data: {Uid: db868505ef4bc57a, Epoch: 5}. Version: 10
-├── vhosts
-│   └── <<"/">>
-│       ├── queues
-│       │   └── <<"stream-01">>
-│       │       Data: ...
-│       └── ...
-└── ...
-```
-
-When updating the manifest, the writer node first creates the manifest object in the remote tier. Because of the randomness in the UID, the new object can be written without without conflict without any coordination. Then the writer updates the UID in Khepri with a conditional write: it sets a precondition that the current version of the Khepri tree node is the version it read. Khepri rejects the write if another writer has updated the tree node. When the precondition fails, the writer abandons the change, re-downloads the manifest and retries.
-
-In the precondition, the writer node also checks that the stored epoch is less than or equal to the its epoch. Because epoch numbers are monotonically increasing and incremented for each new writer, this extra check causes a deposed writer's updates to fail once the newer writer has completed at least one update. The epoch check reduces the chance of a deposed writer interrupting a newer writer.
+The _manifest_ is a data structure which tracks the data stored in the remote tier for each stream. The manifest's design and operations are covered in the [manifest](./manifest.md) doc.
 
 ## Operations
 
@@ -194,15 +116,7 @@ The implementation of the `osiris_log_manifest` behaviour (`rabbitmq_stream_s3_l
 
 `rabbitmq_stream_s3_server` tracks completed uploads and when a _run_ of fragments has been uploaded, the server applies the fragment info to its in-memory copy of the manifest and uploads the new copy of the manifest to the remote tier. A set of fragments is a run when the next offset of each fragment is equal to the first offset on the next fragment - the fragments are in sequence without any gaps between them. Uploads for the manifest are debounced to avoid high-frequency updates during high throughput publishing.
 
-#### Rebalancing
-
-When `rabbitmq_stream_s3_server` applies uploaded fragments to the manifest, it evaluates whether the manifest is 'loaded' and a group (or kilo group or mega group) should be introduced to shrink the size of the root. The server kicks off a task to upload the group object and when that completes, the server updates the in-memory copy of the manifest and kicks off a manifest upload.
-
-#### Retention
-
-After fragments have been successfully uploaded to the remote tier, `rabbitmq_stream_s3_server` evaluates whether the manifest exceeds the configured retention for the stream. Evaluating these rules is cheap since the in-memory copy of the manifest contains the total size of segment data in the stream and the first timestamp. If the retention rules are exceeded and the manifest doesn't contain any groups, the server can perform retention in-place without spawning another process to perform the task. The server splits the entries array into a list of fragment offsets which should be deleted and the remaining entries array, and then the server kicks off a task to delete the fragments and a task to upload the new copy of the manifest.
-
-For long streams where the manifest root contains groups, the manifest server kicks off a task to download the earliest group and then the task performs retention against that group, eventually updating the manifest with the new pointer to the updated group. This works recursively for kilo groups and mega groups. Performing retention in-place is an optimization for the common case since streams will typically have to exceed tens of gigabytes (1024 * ~64 MB fragments) in order to introduce a group.
+Also see the [manifest documentation](./manifest.md#operations) for details about metadata changes from publishing and retention.
 
 #### Stream deletion
 
