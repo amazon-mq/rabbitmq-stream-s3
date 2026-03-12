@@ -63,13 +63,20 @@ environment variables to give the suite access.
 
 all() ->
     [
-        kick_the_tires
+        {group, integration},
+        container_credentials
     ].
 
+groups() ->
+    [{integration, [], [kick_the_tires]}].
+
 init_per_suite(Config) ->
-    Skip =
-        {skip,
-            "AWS access credentials are not set. Skipping this suite is OK! See the moduledoc for more information."},
+    Config.
+
+end_per_suite(Config) ->
+    Config.
+
+init_per_group(integration, Config) ->
     Cfg = {
         os:getenv("AWS_ACCESS_KEY_ID"),
         os:getenv("AWS_SECRET_ACCESS_KEY"),
@@ -77,6 +84,9 @@ init_per_suite(Config) ->
         os:getenv("AWS_REGION"),
         os:getenv("AWS_S3_BUCKET")
     },
+    Skip =
+        {skip,
+            "AWS access credentials are not set. Skipping this group is OK! See the moduledoc for more information."},
     case Cfg of
         {false, _, _, _, _} ->
             Skip;
@@ -102,15 +112,17 @@ init_per_suite(Config) ->
             Config
     end.
 
-end_per_suite(Config) ->
+end_per_group(_Group, Config) ->
     Config.
 
 init_per_testcase(_Testcase, Config) ->
+    application:ensure_all_started(gun),
     ok = rabbitmq_stream_s3:setup(),
     ok = rabbitmq_stream_s3_api_aws:init(),
     Config.
 
 end_per_testcase(_Testcase, Config) ->
+    catch ets:delete(rabbitmq_stream_s3_api_aws),
     Config.
 
 %%----------------------------------------------------------------------------
@@ -177,8 +189,60 @@ kick_the_tires(_Config) ->
         ok = rabbitmq_stream_s3_api_aws:close(Conn)
     end.
 
+container_credentials(_Config) ->
+    %% Start a TCP listener that serves a single fake container credentials response,
+    %% mimicking the AWS_CONTAINER_CREDENTIALS_FULL_URI endpoint format.
+    {ok, ListenSock} = gen_tcp:listen(0, [binary, {active, false}, {reuseaddr, true}]),
+    {ok, Port} = inet:port(ListenSock),
+    Body = <<
+        "{\"AccessKeyId\":\"AKIAIOSFODNN7EXAMPLE\","
+        "\"SecretAccessKey\":\"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\","
+        "\"Token\":\"test-session-token\","
+        "\"Expiration\":\"2099-01-01T00:00:00Z\"}"
+    >>,
+    Resp = iolist_to_binary([
+        "HTTP/1.1 200 OK\r\n",
+        "Content-Type: application/json\r\n",
+        "Content-Length: ",
+        integer_to_binary(byte_size(Body)),
+        "\r\n",
+        "\r\n",
+        Body
+    ]),
+    %% Serve the response in a separate process so the test doesn't block.
+    spawn(fun() ->
+        {ok, Sock} = gen_tcp:accept(ListenSock),
+        %% Drain the HTTP request before responding. Without this, gun's send
+        %% may block waiting for the socket buffer to drain, causing a timeout.
+        drain_request(Sock),
+        ok = gen_tcp:send(Sock, Resp),
+        gen_tcp:close(Sock),
+        gen_tcp:close(ListenSock)
+    end),
+    URI = "http://127.0.0.1:" ++ integer_to_list(Port),
+    true = os:putenv("AWS_CONTAINER_CREDENTIALS_FULL_URI", URI),
+    try
+        %% Remove any cached credentials so get_credentials/0 fetches fresh ones.
+        ets:delete(rabbitmq_stream_s3_api_aws, credentials),
+        {ok, <<"AKIAIOSFODNN7EXAMPLE">>, <<"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY">>,
+            <<"test-session-token">>} = rabbitmq_stream_s3_api_aws:get_credentials()
+    after
+        os:unsetenv("AWS_CONTAINER_CREDENTIALS_FULL_URI")
+    end.
+
 %%----------------------------------------------------------------------------
 
--spec nonce() -> binary().
 nonce() ->
     binary:encode_hex(crypto:strong_rand_bytes(4), lowercase).
+
+%% Reads from the socket until the HTTP request headers end (double CRLF).
+drain_request(Sock) ->
+    drain_request(Sock, <<>>).
+
+drain_request(Sock, Acc) ->
+    {ok, Data} = gen_tcp:recv(Sock, 0, 5000),
+    Buf = <<Acc/binary, Data/binary>>,
+    case binary:match(Buf, <<"\r\n\r\n">>) of
+        nomatch -> drain_request(Sock, Buf);
+        _ -> ok
+    end.

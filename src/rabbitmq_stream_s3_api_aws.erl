@@ -25,7 +25,7 @@ A wrapper around the AWS S3 HTTP API.
 ]).
 
 %% For apply/3:
--export([get_credentials/1]).
+-export([get_credentials/0, get_credentials/2]).
 
 -define(ALGORITHM, "AWS4-HMAC-SHA256").
 -define(ISOFORMAT_BASIC, "~4.10.0b~2.10.0b~2.10.0bT~2.10.0b~2.10.0b~2.10.0bZ").
@@ -59,6 +59,8 @@ A wrapper around the AWS S3 HTTP API.
     {response_503, ?C_RESPONSE_503, counter, "Number of HTTP 503 responses"}
 ]).
 -define(COUNTER_KEY, {?MODULE, counter}).
+
+-record(container_creds_req, {host, port, path, conn, stream_ref}).
 
 -behaviour(rabbitmq_stream_s3_api).
 
@@ -508,29 +510,39 @@ tld(Region) ->
     | {error, any()}.
 get_credentials() ->
     case get_credentials_cached() of
-        {ok, _, _, _} = Ok ->
-            Ok;
-        error ->
-            ?LOG_INFO(
-                ?MODULE_STRING
-                ": no AWS credentials available, requesting from EC2 instance metadata"
-            ),
-            Attempts = application:get_env(rabbitmq_stream_s3, get_credentials_attempts, 10),
-            {Msec, Result} = timer:tc(?MODULE, get_credentials, [Attempts], millisecond),
-            case Result of
-                {ok, _, _, _} ->
-                    ?LOG_INFO(
-                        "Successfully acquired credentials from EC2 instance metadata service in ~bms",
-                        [Msec]
-                    );
-                {error, _} ->
-                    ?LOG_ERROR(
-                        "Failed to acquire credentials from EC2 instance metadata service in ~bms",
-                        [Msec]
-                    )
-            end,
-            Result
+        {ok, _, _, _} = Ok -> Ok;
+        error -> fetch_credentials(os:getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI"))
     end.
+
+fetch_credentials(false) ->
+    ?LOG_INFO(
+        ?MODULE_STRING
+        ": no AWS credentials available, requesting from EC2 instance metadata"
+    ),
+    Attempts = application:get_env(rabbitmq_stream_s3, get_credentials_attempts, 10),
+    {Msec, Result} = timer:tc(?MODULE, get_credentials, [Attempts, imds], millisecond),
+    log_credentials_result(Result, Msec, "EC2 instance metadata service"),
+    Result;
+fetch_credentials(URI) ->
+    ?LOG_INFO(
+        ?MODULE_STRING
+        ": no AWS credentials available, requesting from container credentials endpoint"
+    ),
+    Attempts = application:get_env(rabbitmq_stream_s3, get_credentials_attempts, 10),
+    {Msec, Result} = timer:tc(?MODULE, get_credentials, [Attempts, {container, URI}], millisecond),
+    log_credentials_result(Result, Msec, "container credentials endpoint"),
+    Result.
+
+log_credentials_result({ok, _, _, _}, Msec, Source) ->
+    ?LOG_INFO(
+        "Successfully acquired credentials from ~ts in ~bms",
+        [Source, Msec]
+    );
+log_credentials_result({error, _}, Msec, Source) ->
+    ?LOG_ERROR(
+        "Failed to acquire credentials from ~ts in ~bms",
+        [Source, Msec]
+    ).
 
 get_credentials_cached() ->
     case ets:lookup(?TABLE, credentials) of
@@ -551,17 +563,17 @@ is_expired(Expiration) when is_integer(Expiration) ->
 is_expired(undefined) ->
     false.
 
-get_credentials(Retries) ->
+get_credentials(Retries, Source) ->
     case get_credentials_cached() of
         {ok, _, _, _} = Ok ->
             Ok;
         error ->
-            request_credentials_from_instance_metadata(Retries)
+            get_credentials_with_lock(Retries, Source)
     end.
 
-request_credentials_from_instance_metadata(0) ->
+get_credentials_with_lock(0, _Source) ->
     {error, cannot_acquire_credential_lock};
-request_credentials_from_instance_metadata(Retries) ->
+get_credentials_with_lock(Retries, Source) ->
     %% NOTE: lock ID `global:id()` is a tuple where the second element is the
     %% requester. We don't want any other process or even code path within the
     %% current process to attempt to join this lock request, so we use a
@@ -572,17 +584,23 @@ request_credentials_from_instance_metadata(Retries) ->
             %% If we get the lock with no retries then we are the first to try,
             %% and we are in charge of the request.
             try
-                request_credentials_from_instance_metadata_locked()
+                get_credentials_locked(Source)
             after
                 global:del_lock(LockId, [node()])
             end;
         false ->
             %% Another process is performing the refresh. Please wait...
             timer:sleep(100),
-            get_credentials(Retries - 1)
+            get_credentials(Retries - 1, Source)
     end.
 
+get_credentials_locked(imds) ->
+    request_credentials_from_instance_metadata_locked();
+get_credentials_locked({container, URI}) ->
+    request_credentials_from_container_endpoint(URI).
+
 request_credentials_from_instance_metadata_locked() ->
+    %% <https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-metadata-security-credentials.html>
     with_instance_metadata_conn(fun(Conn) ->
         maybe
             {ok, RoleResp} ?=
@@ -619,6 +637,70 @@ request_credentials_from_instance_metadata_locked() ->
             {ok, AccessKey, SecretKey, SecurityToken}
         end
     end).
+
+request_credentials_from_container_endpoint(URI) ->
+    %% <https://docs.aws.amazon.com/sdkref/latest/guide/feature-container-credentials.html>
+    #{host := Host, port := Port, path := Path0} = uri_string:parse(URI),
+    PortInt =
+        case Port of
+            undefined -> 80;
+            _ -> Port
+        end,
+    Path =
+        case Path0 of
+            [] -> "/";
+            _ -> Path0
+        end,
+    Req = #container_creds_req{host = Host, port = PortInt, path = Path},
+    do_request_credentials_from_container_endpoint(
+        open, Req, gun:open(Host, PortInt, #{transport => tcp, protocols => [http]})
+    ).
+
+do_request_credentials_from_container_endpoint(open, _Req, {error, _} = Err) ->
+    Err;
+do_request_credentials_from_container_endpoint(open, Req, {ok, Conn}) ->
+    do_request_credentials_from_container_endpoint(
+        await_up, Req#container_creds_req{conn = Conn}, gun:await_up(Conn, 7_000)
+    );
+do_request_credentials_from_container_endpoint(
+    await_up, #container_creds_req{conn = Conn}, {error, _} = Err
+) ->
+    ok = gun:close(Conn),
+    Err;
+do_request_credentials_from_container_endpoint(
+    await_up, #container_creds_req{path = Path, conn = Conn} = Req, {ok, _}
+) ->
+    StreamRef = gun:get(Conn, Path),
+    try
+        do_request_credentials_from_container_endpoint(
+            await_response,
+            Req#container_creds_req{stream_ref = StreamRef},
+            gun:await(Conn, StreamRef, 13_000)
+        )
+    after
+        gun:close(Conn)
+    end;
+do_request_credentials_from_container_endpoint(await_response, _Req, {error, _} = Err) ->
+    Err;
+do_request_credentials_from_container_endpoint(await_response, _Req, {response, _, Status, _}) when
+    Status =/= 200
+->
+    {error, {unexpected_status, Status}};
+do_request_credentials_from_container_endpoint(
+    await_response,
+    #container_creds_req{conn = Conn, stream_ref = StreamRef},
+    {response, nofin, 200, _}
+) ->
+    {ok, Body} = gun:await_body(Conn, StreamRef, 6_000),
+    #{
+        <<"AccessKeyId">> := AccessKey,
+        <<"SecretAccessKey">> := SecretKey,
+        <<"Token">> := SecurityToken,
+        <<"Expiration">> := ExpirationIso8601
+    } = json:decode(Body),
+    Expiration = parse_iso8601(ExpirationIso8601),
+    _ = ets:insert(?TABLE, {credentials, AccessKey, SecretKey, SecurityToken, Expiration}),
+    {ok, AccessKey, SecretKey, SecurityToken}.
 
 -spec parse_iso8601(binary()) -> GregorianSeconds :: non_neg_integer().
 parse_iso8601(<<
