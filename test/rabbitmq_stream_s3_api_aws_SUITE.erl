@@ -212,6 +212,9 @@ container_credentials(_Config) ->
     %% Serve the response in a separate process so the test doesn't block.
     spawn(fun() ->
         {ok, Sock} = gen_tcp:accept(ListenSock),
+        %% Drain the HTTP request before responding. Without this, gun's send
+        %% may block waiting for the socket buffer to drain, causing a timeout.
+        drain_request(Sock),
         ok = gen_tcp:send(Sock, Resp),
         gen_tcp:close(Sock),
         gen_tcp:close(ListenSock)
@@ -231,3 +234,15 @@ container_credentials(_Config) ->
 
 nonce() ->
     binary:encode_hex(crypto:strong_rand_bytes(4), lowercase).
+
+%% Reads from the socket until the HTTP request headers end (double CRLF).
+drain_request(Sock) ->
+    drain_request(Sock, <<>>).
+
+drain_request(Sock, Acc) ->
+    {ok, Data} = gen_tcp:recv(Sock, 0, 5000),
+    Buf = <<Acc/binary, Data/binary>>,
+    case binary:match(Buf, <<"\r\n\r\n">>) of
+        nomatch -> drain_request(Sock, Buf);
+        _ -> ok
+    end.

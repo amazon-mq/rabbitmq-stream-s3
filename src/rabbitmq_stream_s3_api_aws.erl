@@ -25,7 +25,7 @@ A wrapper around the AWS S3 HTTP API.
 ]).
 
 %% For apply/3:
--export([get_credentials/0, get_credentials/1]).
+-export([get_credentials/0, get_credentials/2]).
 
 -define(ALGORITHM, "AWS4-HMAC-SHA256").
 -define(ISOFORMAT_BASIC, "~4.10.0b~2.10.0b~2.10.0bT~2.10.0b~2.10.0b~2.10.0bZ").
@@ -524,25 +524,28 @@ fetch_credentials(false) ->
         ": no AWS credentials available, requesting from EC2 instance metadata"
     ),
     Attempts = application:get_env(rabbitmq_stream_s3, get_credentials_attempts, 10),
-    {Msec, Result} = timer:tc(?MODULE, get_credentials, [Attempts], millisecond),
-    log_credentials_result(Result, Msec),
+    {Msec, Result} = timer:tc(?MODULE, get_credentials, [Attempts, imds], millisecond),
+    log_credentials_result(Result, Msec, "EC2 instance metadata service"),
     Result;
 fetch_credentials(URI) ->
     ?LOG_INFO(
         ?MODULE_STRING
         ": no AWS credentials available, requesting from container credentials endpoint"
     ),
-    request_credentials_from_container_endpoint(URI).
+    Attempts = application:get_env(rabbitmq_stream_s3, get_credentials_attempts, 10),
+    {Msec, Result} = timer:tc(?MODULE, get_credentials, [Attempts, {container, URI}], millisecond),
+    log_credentials_result(Result, Msec, "container credentials endpoint"),
+    Result.
 
-log_credentials_result({ok, _, _, _}, Msec) ->
+log_credentials_result({ok, _, _, _}, Msec, Source) ->
     ?LOG_INFO(
-        "Successfully acquired credentials from EC2 instance metadata service in ~bms",
-        [Msec]
+        "Successfully acquired credentials from ~ts in ~bms",
+        [Source, Msec]
     );
-log_credentials_result({error, _}, Msec) ->
+log_credentials_result({error, _}, Msec, Source) ->
     ?LOG_ERROR(
-        "Failed to acquire credentials from EC2 instance metadata service in ~bms",
-        [Msec]
+        "Failed to acquire credentials from ~ts in ~bms",
+        [Source, Msec]
     ).
 
 get_credentials_cached() ->
@@ -564,17 +567,17 @@ is_expired(Expiration) when is_integer(Expiration) ->
 is_expired(undefined) ->
     false.
 
-get_credentials(Retries) ->
+get_credentials(Retries, Source) ->
     case get_credentials_cached() of
         {ok, _, _, _} = Ok ->
             Ok;
         error ->
-            request_credentials_from_instance_metadata(Retries)
+            get_credentials_with_lock(Retries, Source)
     end.
 
-request_credentials_from_instance_metadata(0) ->
+get_credentials_with_lock(0, _Source) ->
     {error, cannot_acquire_credential_lock};
-request_credentials_from_instance_metadata(Retries) ->
+get_credentials_with_lock(Retries, Source) ->
     %% NOTE: lock ID `global:id()` is a tuple where the second element is the
     %% requester. We don't want any other process or even code path within the
     %% current process to attempt to join this lock request, so we use a
@@ -585,15 +588,20 @@ request_credentials_from_instance_metadata(Retries) ->
             %% If we get the lock with no retries then we are the first to try,
             %% and we are in charge of the request.
             try
-                request_credentials_from_instance_metadata_locked()
+                get_credentials_locked(Source)
             after
                 global:del_lock(LockId, [node()])
             end;
         false ->
             %% Another process is performing the refresh. Please wait...
             timer:sleep(100),
-            get_credentials(Retries - 1)
+            get_credentials(Retries - 1, Source)
     end.
+
+get_credentials_locked(imds) ->
+    request_credentials_from_instance_metadata_locked();
+get_credentials_locked({container, URI}) ->
+    request_credentials_from_container_endpoint(URI).
 
 request_credentials_from_instance_metadata_locked() ->
     with_instance_metadata_conn(fun(Conn) ->
