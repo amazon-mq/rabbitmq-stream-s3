@@ -467,6 +467,7 @@
 }).
 -record(delete_objects, {
     stream :: stream_id(),
+    %% Assumed to be sorted increasing by offset.
     objects :: nonempty_list(osiris:offset() | #group_ref{})
 }).
 %% Read through the local stream data and find available fragments.
