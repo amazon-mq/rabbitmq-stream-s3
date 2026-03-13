@@ -66,7 +66,9 @@ To support practically infinitely long streams, we can factor out `m` groups int
 
 ### Choosing `m`
 
-An `m` which is too small increases the number of requests to the remote tier during factoring and search, but reduces memory footprint. And vice versa for an `m` which is too large. We're using `1024` as a nice round power of two, though this could be tuned in the future. With `m=1024` and 30 bytes for each array entry, each (kilo-/mega-)group object only takes 30 kiB, which is small enough to fit into memory comfortably even when there are many streams. The root can grow beyond this, but remains small anyways. Small streams (less than 1024 fragments) do not need any groups at all and can store all metadata in the root.
+An `m` which is too small increases the number of requests to the remote tier during factoring and search, but reduces memory footprint. And vice versa for an `m` which is too large. We're using `1024` as a nice round power of two, though this could be tuned in the future. With `m=1024` and 30 bytes for each array entry, each (kilo-/mega-)group object only takes 30 kiB, which is small enough to fit into memory comfortably even when there are many streams. The root can grow beyond this, but remains small anyways. Small streams (less than 1024 fragments) do not need any groups at all and can store all metadata in the root. If `m=1024` and mega-groups are the largest kind of group, a 'fully loaded' root of 1024 mega-groups points to 1024^4 fragments. At an average fragment size of 64 MiB this covers 70 EiB of data in a single stream, which is a large enough amount that publishing it is very difficult in the first place.
+
+A large `m` makes lookup fast. With mega-groups being the largest kind of group, lookup within even EiB of data would make 3 round-trips to the remote tier to determine the fragment for a given offset or timestamp. The root is cached, then one round trip gets the mega-group, another gets the right kilo-group, another gets the right group and then search within that group finds the right fragment. If the remote tier has reasonably low latency (10-100ms) then lookup is always sub-second.
 
 ### Complexity
 
@@ -75,10 +77,10 @@ An `m` which is too small increases the number of requests to the remote tier du
 | Characteristic                        | Complexity | Notes
 |---                                    |---         |---
 | Space                                 | O(n)       | The manifest tracks all fragments uploaded for a stream. The oldest objects are deleted when the oldest fragments in the stream are deleted by retention.
-| Memory footprint                      | O(1)       | The tree's root is held in memory. The root has an upper bound on size and factoring out groups keeps the practical size small.
-| Lookup (offset/timestamp resolution)  | O(log(n))  | The tree structure makes descending from object to object cheap. Each manifest object is sorted by offset/timestamp ascending, so offsets/timestamps can be found within objects with binary search.
-| Calculate total stream size           | O(1)       | Total size is tracked in the manifest root.
-| Find oldest fragment's last timestamp | O(1)       | Oldest fragment's last timestamp is also tracked in the root.
+| Memory footprint                      | O(1)       | The tree's root is held in memory. The root has an upper bound on size and factoring out groups keeps the practical size small. The first group may also be cached in memory to make repeated retention evaluations cheaper.
+| Lookup (offset/timestamp resolution)  | O(log(n))  | The tree structure makes descending from object to object cheap. Each manifest object is sorted by offset/timestamp ascending, so offsets/timestamps can be found within objects with binary search. Lookups of older data take longer while lookup of recently-written data is cheaper.
+| Calculate total stream size           | O(1)       | Total size is stored in the manifest root and updated gradually as fragments are added or removed from the manifest.
+| Find oldest fragment's last timestamp | O(1)       | Oldest fragment's last timestamp is also tracked in the root and is updated when retention removes fragment(s).
 
 ## Operations
 
@@ -87,6 +89,10 @@ When the next fragment of stream data has been successfully uploaded, the coordi
 Periodically the server evaluates whether the stream's retention rules should delete fragments. If the root has no groups, the server decides which fragments to delete, removes them from the root array, and deletes them in the background. If there are groups, the server downloads the first group object and evaluates retention against the fragments within. Once that process completes, the server updates the total-size and oldest-last-timestamp metadata in the root. Group objects are never updated after being written, but once all fragments pointed to by a group (or all groups pointed to by a kilo-group, etc.) are deleted, the group object is deleted and removed from the root.
 
 Changes to the manifest are made only by the server on the stream writer's node. Nodes with replica copies receive metadata about changes to each manifest through a generic edit type which can express the three kinds of changes: 1/ appending new fragments, 2/ factoring out groups and 3/ changes caused by retention. Since all stream members know information about the data in the remote tier, all members can perform local retention to evict fully uploaded segments aggressively.
+
+### Resolving the manifest
+
+When a writer or replica starts up for a stream, `rabbitmq_stream_s3_server` must download the manifest root from the remote tier to determine what local data needs to be uploaded and what is redundant. Since uploads of the manifest are debounced, the last writer may have shut down before it uploaded an updated copy. _Resolving_ the manifest is downloading the current root from the remote tier and then attempting to find any fragments which were uploaded by the last writer. The _resolving_ process reads the trailer of the last fragment in the root to find the next fragment's offset, and then repeats that process to discover any fragments which were successfully uploaded but not yet applied to the manifest. These fragments are appended to the end of the in-memory copy of the root.
 
 ## Concurrency control
 
