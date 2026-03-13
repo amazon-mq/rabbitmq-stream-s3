@@ -804,6 +804,25 @@ execute_task(#delete_objects{stream = StreamId, objects = Objects}) ->
     ?LOG_DEBUG("Deleting ~b objects for stream '~ts' ~0p", [
         NumObjects, StreamId, Objects
     ]),
+    %% If one of the objects being deleted is a group, attempt to clear it from
+    %% the FIRST_GROUPS ETS cache. This ensures that a stream which only has
+    %% one group does not keep the group object cached indefinitely after it
+    %% is deleted by retention.
+    FirstGroup = lists:search(
+        fun
+            (#group_ref{kind = ?MANIFEST_KIND_GROUP}) -> true;
+            (_) -> false
+        end,
+        Objects
+    ),
+    case FirstGroup of
+        {value, GroupRef} ->
+            _ = catch ets:match_delete(?FIRST_GROUPS, {StreamId, {GroupRef, '_'}}),
+            ok;
+        false ->
+            ok
+    end,
+    %% Then delete all keys.
     Keys = lists:map(
         fun
             (#group_ref{} = Ref) -> rabbitmq_stream_s3:group_key(StreamId, Ref);
@@ -1009,7 +1028,7 @@ get_group(StreamId, #group_ref{kind = ?MANIFEST_KIND_GROUP} = GroupRef, retentio
         undefined ->
             case get_group0(StreamId, GroupRef) of
                 {ok, Entries} = Ok ->
-                    _ = ets:insert(?FIRST_GROUPS, {StreamId, {GroupRef, Entries}}),
+                    _ = catch ets:insert(?FIRST_GROUPS, {StreamId, {GroupRef, Entries}}),
                     Ok;
                 {error, _} = Err ->
                     Err
