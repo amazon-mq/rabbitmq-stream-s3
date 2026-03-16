@@ -82,6 +82,10 @@ tier.
     code_change/3
 ]).
 
+-ifdef(TEST).
+-export([find_fragment/3, find_index_position/2]).
+-endif.
+
 %%%===================================================================
 %%% osiris_log_reader callbacks
 %%%===================================================================
@@ -101,7 +105,7 @@ init_offset_reader(OffsetSpec, Config) ->
         {ok, Fragment, Position, ChunkId} ->
             init_remote_reader(Fragment, Position, ChunkId, Config);
         {local, LocalSpec} ->
-            osiris_log:init_offset_reader(LocalSpec, Config);
+            init_local_reader(LocalSpec, Config);
         {error, _} = Err ->
             Err
     end.
@@ -674,14 +678,19 @@ find_fragment(Entries, Spec, GetGroup) ->
             {offset, Offset} ->
                 fun(?ENTRY(O, _FTs, _LTs, _K, _)) -> Offset >= O end;
             {timestamp, Ts} ->
-                fun(?ENTRY(_O, FTs, _LTs, _K, _)) -> Ts >= FTs end
+                fun(?ENTRY(_O, _FTs, LTs, _K, _)) -> Ts >= LTs end
         end,
     Idx0 = rabbitmq_stream_s3_array:partition_point(
         PartitionPredicate,
         ?ENTRY_B,
         Entries
     ),
-    Idx = saturating_decr(Idx0),
+    NumEntries = byte_size(Entries) div ?ENTRY_B,
+    Idx =
+        case Spec of
+            {offset, _} -> saturating_decr(Idx0);
+            {timestamp, _} -> min(Idx0, NumEntries - 1)
+        end,
     case rabbitmq_stream_s3_array:at(Idx, ?ENTRY_B, Entries) of
         ?FRAGMENT(EntryOffset, _FTs, _LTs, _Sq, _Sz, _) ->
             EntryOffset;
@@ -766,9 +775,7 @@ find_fragment_test() ->
     Size = 200,
     FragmentEntries = <<
         ?FRAGMENT(
-            %% Fragments every 20 offsets, 0..=2000
             (N * 20),
-            %% Timestamps between 2000ms ago and `Ts`
             (Ts - 2000 + N * 20),
             (Ts - 2000 + (N + 1) * 20),
             0,
@@ -776,29 +783,6 @@ find_fragment_test() ->
         )
      || N <- lists:seq(0, 100)
     >>,
-
-    FindFragment1 = fun(Spec) ->
-        find_fragment(
-            FragmentEntries,
-            Spec,
-            %% There are only fragments in this manifest.
-            fun(_, _, _) -> erlang:error(unimplemented) end
-        )
-    end,
-    %% Offsets:
-    ?assertEqual(0, FindFragment1({offset, 0})),
-    ?assertEqual(40, FindFragment1({offset, 50})),
-    ?assertEqual(100, FindFragment1({offset, 100})),
-    ?assertEqual(2_000, FindFragment1({offset, 10_000})),
-    %% Timestamps:
-    ?assertEqual(0, FindFragment1({timestamp, Ts - 2000})),
-    %% When placed between two chunks timestamp search prefers the later chunk.
-    %% But when searching in fragments we want to prefer the earlier fragment
-    %% since it most likely contains the target timestamp.
-    ?assertEqual(40, FindFragment1({timestamp, Ts - 2000 + 50})),
-    ?assertEqual(100, FindFragment1({timestamp, Ts - 2000 + 100})),
-    ?assertEqual(2_000, FindFragment1({timestamp, Ts - 2000 + 10_000})),
-
     %% Factor out those fragments into a group.
     NextFragmentEntries = <<
         ?FRAGMENT((N * 20), (Ts - 2000 + N * 20), (Ts - 2000 + (N + 1) * 20), 0, Size)
@@ -829,7 +813,8 @@ find_fragment_test() ->
     ?assertEqual(0, FindFragment2({offset, 0})),
     ?assertEqual(40, FindFragment2({offset, 50})),
     ?assertEqual(40, FindFragment2({timestamp, Ts - 2000 + 50})),
-
+    %% Offset and timestamp assertions on flat fragment lists are omitted here;
+    %% they are covered by the property-based tests in unit_SUITE.
     ok.
 
 find_index_position_test() ->

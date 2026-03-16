@@ -78,6 +78,7 @@ end_per_suite(Config) ->
 
 init_per_group(integration, Config) ->
     Cfg = {
+        os:getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI"),
         os:getenv("AWS_ACCESS_KEY_ID"),
         os:getenv("AWS_SECRET_ACCESS_KEY"),
         os:getenv("AWS_SESSION_TOKEN"),
@@ -88,18 +89,24 @@ init_per_group(integration, Config) ->
         {skip,
             "AWS access credentials are not set. Skipping this group is OK! See the moduledoc for more information."},
     case Cfg of
-        {false, _, _, _, _} ->
+        {AwsCredentialsUri, _, _, _, _, Bucket0} when
+            AwsCredentialsUri =/= false andalso Bucket0 =/= false
+        ->
+            {ok, _} = application:ensure_all_started(gun),
+            ok = application:set_env(rabbitmq_stream_s3, bucket, list_to_binary(Bucket0)),
+            Config;
+        {_, false, _, _, _, _} ->
             Skip;
-        {_, false, _, _, _} ->
+        {_, _, false, _, _, _} ->
             Skip;
-        {_, _, false, _, _} ->
+        {_, _, _, false, _, _} ->
             Skip;
-        {_, _, _, false, _} ->
+        {_, _, _, _, false, _} ->
             Skip;
-        {_, _, _, _, false} ->
+        {_, _, _, _, _, false} ->
             Skip;
-        {AccessKey, SecretKey, SecurityToken, Region, Bucket} ->
-            application:ensure_all_started(gun),
+        {_, AccessKey, SecretKey, SecurityToken, Region, Bucket1} ->
+            {ok, _} = application:ensure_all_started(gun),
             ok = application:set_env(rabbitmq_stream_s3, aws_access_key, list_to_binary(AccessKey)),
             ok = application:set_env(rabbitmq_stream_s3, aws_secret_key, list_to_binary(SecretKey)),
             ok = application:set_env(
@@ -108,7 +115,7 @@ init_per_group(integration, Config) ->
                 list_to_binary(SecurityToken)
             ),
             ok = application:set_env(rabbitmq_stream_s3, aws_region, list_to_binary(Region)),
-            ok = application:set_env(rabbitmq_stream_s3, bucket, list_to_binary(Bucket)),
+            ok = application:set_env(rabbitmq_stream_s3, bucket, list_to_binary(Bucket1)),
             Config
     end.
 

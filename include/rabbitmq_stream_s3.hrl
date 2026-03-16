@@ -258,8 +258,12 @@
 -define(MAX_FRAGMENT_SIZE_B, 67_108_864).
 %% %% 1 GiB (2^30 B)
 %% -define(MAX_SEGMENT_SIZE_BYTES, 1_073_741_824).
-%% 1/G GiB (2^29 B)
+%% 1/2 GiB (2^29 B), reduced to 1 MiB in tests to trigger segment rolls.
+-ifdef(TEST).
+-define(MAX_SEGMENT_SIZE_BYTES, 1_048_576).
+-else.
 -define(MAX_SEGMENT_SIZE_BYTES, 536_870_912).
+-endif.
 
 -type byte_offset() :: non_neg_integer().
 -type checksum() :: non_neg_integer().

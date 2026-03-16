@@ -49,5 +49,11 @@ jobs:
         run: make -C ${{ github.workspace }}/rabbitmq-server/deps/rabbitmq_stream_s3
       - name: tests
         run: make -C ${{ github.workspace }}/rabbitmq-server/deps/rabbitmq_stream_s3 tests
+      - name: maybe upload CT logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ct-logs-${{ matrix.rmq-version }}-otp-${{ matrix.otp-version }}
+          path: ${{ github.workspace }}/rabbitmq-server/logs/
       - name: dialyze
         run: make -C ${{ github.workspace }}/rabbitmq-server/deps/rabbitmq_stream_s3 dialyze

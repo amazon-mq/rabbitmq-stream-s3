@@ -30,6 +30,10 @@ associated file in that folder.
     set_data_dir/1
 ]).
 
+-ifdef(TEST).
+-export([range_spec_to_location_number/2]).
+-endif.
+
 -behaviour(rabbitmq_stream_s3_api).
 
 -type connection() :: rabbitmq_stream_s3_api:connection().
@@ -238,16 +242,16 @@ with_timeout(Timeout, Fun) ->
 range_spec_to_location_number(FileSize, SuffixRange) when
     is_integer(SuffixRange), SuffixRange < 0
 ->
-    Location = FileSize - SuffixRange,
+    Location = FileSize + SuffixRange,
     {Location, -SuffixRange};
 range_spec_to_location_number(FileSize, SuffixRange) when is_integer(SuffixRange) ->
     Location = 0,
     Number = min(SuffixRange, FileSize),
     {Location, Number};
-range_spec_to_location_number(_FileSize, {StartByte, EndByte}) ->
+range_spec_to_location_number(FileSize, {StartByte, EndByte}) ->
     Number =
         case EndByte of
-            undefined -> infinity;
+            undefined -> FileSize - StartByte;
             _ -> EndByte - StartByte + 1
         end,
     {StartByte, Number}.

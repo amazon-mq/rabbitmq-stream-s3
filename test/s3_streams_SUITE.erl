@@ -8,6 +8,7 @@
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("amqp_client/include/amqp_client.hrl").
+-include_lib("amqp10_common/include/amqp10_framing.hrl").
 -include_lib("rabbitmq_ct_helpers/include/rabbit_assert.hrl").
 -include("rabbitmq_stream_s3.hrl").
 
@@ -20,7 +21,9 @@ all() ->
 groups() ->
     [
         {cluster_size_1, [], [
-            tiered_data_generation
+            tiered_data_generation,
+            read_from_remote_tier_by_offset,
+            read_from_remote_tier_by_timestamp
         ]},
         {cluster_size_3, [], [
             transfer_leadership
@@ -102,6 +105,7 @@ end_per_testcase(Testcase, Config) ->
 %% -------------------------------------------------------------------
 %% Testcases
 %% -------------------------------------------------------------------
+
 tiered_data_generation(Config) ->
     % Generate payloads
     Payload1K = <<0:(1024 * 8)>>,
@@ -305,9 +309,240 @@ transfer_leadership(Config) ->
     ct:pal("Test completed successfully"),
     ok.
 
+read_from_remote_tier_by_offset(Config) ->
+    Payload1K = binary:copy(<<0>>, 1024),
+    %% 2MB: large enough to exceed the 1MB test segment size limit (triggering
+    %% a segment roll with roll_reason = segment_roll), but small enough to
+    %% stay under the 64MB fragment size limit.
+    PayloadLarge = binary:copy(<<1>>, 2 * 1024 * 1024),
+    Payload2K = binary:copy(<<2>>, 2048),
+
+    QName = <<"stream_read_offset">>,
+
+    %% Delete any leftover stream from a previous run, ignoring errors.
+    {ok, S0, C0} = stream_test_utils:connect(Config, 0),
+    catch stream_test_utils:delete_stream(S0, C0, QName),
+    gen_tcp:close(S0),
+
+    {ok, S, C1} = stream_test_utils:connect(Config, 0),
+    {ok, C2} = stream_test_utils:create_stream(S, C1, QName),
+
+    ct:pal("Publishing messages to trigger first segment roll"),
+    PubId = 1,
+    {ok, C3} = stream_test_utils:declare_publisher(S, C2, QName, PubId),
+    {ok, C4} = stream_test_utils:publish(S, C3, PubId, 1, [Payload1K]),
+    {ok, C5} = stream_test_utils:publish(S, C4, PubId, 2, [PayloadLarge]),
+    {ok, C6} = stream_test_utils:publish(S, C5, PubId, 3, [Payload2K]),
+
+    ct:pal("Waiting for first fragment to be uploaded"),
+    ?awaitMatch(
+        {ok, _Manifest, [_Fragment | _]} when _Manifest /= undefined,
+        rabbit_ct_broker_helpers:rpc(
+            Config, 0, rabbitmq_stream_s3_api_fs, get_stream_data, [QName]
+        ),
+        5000
+    ),
+
+    %% Two segment rolls are needed: the first makes segment 0 eligible for
+    %% deletion, the second creates the active segment that keeps segment 1
+    %% as the boundary, allowing segment 0 to be deleted.
+    ct:pal("Publishing extra messages to trigger second and third segment rolls"),
+    {ok, C7} = stream_test_utils:publish(S, C6, PubId, 4, [PayloadLarge]),
+    {ok, C8} = stream_test_utils:publish(S, C7, PubId, 5, [Payload1K]),
+    {ok, C9} = stream_test_utils:delete_publisher(S, C8, PubId),
+
+    ct:pal("Waiting for local segment deletion"),
+    ?awaitMatch(
+        {ok, _Manifest, [_Fragment | _]} when _Manifest /= undefined,
+        rabbit_ct_broker_helpers:rpc(
+            Config, 0, rabbitmq_stream_s3_api_fs, get_stream_data, [QName]
+        ),
+        5000
+    ),
+    %% Wait until the local segment 0 is deleted and first_chunk_id is updated,
+    %% confirming reads will go to the remote tier.
+    ?awaitMatch(
+        [],
+        rabbit_ct_broker_helpers:rpc(
+            Config,
+            0,
+            filelib,
+            wildcard,
+            [
+                rabbit_ct_broker_helpers:get_node_config(Config, 0, data_dir) ++
+                    "/../stream/*/00000000000000000000.segment"
+            ]
+        ),
+        15000
+    ),
+    %% Wait until the manifest is loaded in the server, confirming the remote
+    %% tier is active and timestamp/offset routing will work correctly.
+    RName = rabbit_misc:r(<<"/">>, queue, QName),
+    ?awaitMatch(
+        {0, _},
+        rabbit_ct_broker_helpers:rpc(
+            Config, 0, rabbitmq_stream_s3_server, get_range_by_reference, [RName]
+        ),
+        5000
+    ),
+
+    SubId = 1,
+
+    ct:pal("Consuming from offset 0 (beginning, remote tier)"),
+    {ok, C10} = stream_test_utils:subscribe(S, C9, QName, SubId, 1, #{}, 0),
+    ct:pal("Subscribed, socket=~p, waiting for deliver", [S]),
+    {C11, Chunk0} = receive_deliver(S, C10, SubId),
+    ?assertEqual(Payload1K, extract_payload(Chunk0)),
+
+    ct:pal("Consuming from offset 1 (middle, remote tier)"),
+    {ok, C12} = stream_test_utils:unsubscribe(S, C11, SubId),
+    {ok, C13} = stream_test_utils:subscribe(S, C12, QName, SubId, 1, #{}, 1),
+    {C14, Chunk1} = receive_deliver(S, C13, SubId),
+    ?assertEqual(byte_size(PayloadLarge), byte_size(extract_payload(Chunk1))),
+
+    ct:pal("Consuming from offset 2 (end, remote tier)"),
+    {ok, C15} = stream_test_utils:unsubscribe(S, C14, SubId),
+    {ok, C16} = stream_test_utils:subscribe(S, C15, QName, SubId, 1, #{}, 2),
+    {C17, Chunk2} = receive_deliver(S, C16, SubId),
+    ?assertEqual(Payload2K, extract_payload(Chunk2)),
+
+    {ok, C18} = stream_test_utils:unsubscribe(S, C17, SubId),
+    {ok, C19} = stream_test_utils:delete_stream(S, C18, QName),
+    stream_test_utils:close(S, C19),
+    ok.
+
+read_from_remote_tier_by_timestamp(Config) ->
+    Payload1K = binary:copy(<<0>>, 1024),
+    %% 2MB: large enough to exceed the 1MB test segment size limit (triggering
+    %% a segment roll with roll_reason = segment_roll), but small enough to
+    %% stay under the 64MB fragment size limit.
+    PayloadLarge = binary:copy(<<1>>, 2 * 1024 * 1024),
+    Payload2K = binary:copy(<<2>>, 2048),
+
+    QName = <<"stream_read_timestamp">>,
+
+    %% Delete any leftover stream from a previous run, ignoring errors.
+    {ok, S0, C0} = stream_test_utils:connect(Config, 0),
+    catch stream_test_utils:delete_stream(S0, C0, QName),
+    gen_tcp:close(S0),
+
+    {ok, S, C1} = stream_test_utils:connect(Config, 0),
+    {ok, C2} = stream_test_utils:create_stream(S, C1, QName),
+
+    PubId = 1,
+    {ok, C3} = stream_test_utils:declare_publisher(S, C2, QName, PubId),
+
+    ct:pal("Publishing first message and recording timestamp"),
+    Timestamp1 = erlang:system_time(millisecond),
+    {ok, C4} = stream_test_utils:publish(S, C3, PubId, 1, [Payload1K]),
+    timer:sleep(200),
+
+    ct:pal("Publishing large message to trigger first segment roll"),
+    Timestamp2 = erlang:system_time(millisecond),
+    {ok, C5} = stream_test_utils:publish(S, C4, PubId, 2, [PayloadLarge]),
+    timer:sleep(200),
+
+    ct:pal("Publishing third message"),
+    timer:sleep(200),
+    Timestamp3 = erlang:system_time(millisecond),
+    {ok, C6} = stream_test_utils:publish(S, C5, PubId, 3, [Payload2K]),
+    ct:pal("Captured T1=~p T2=~p T3=~p", [Timestamp1, Timestamp2, Timestamp3]),
+
+    ct:pal("Waiting for first fragment to be uploaded"),
+    ?awaitMatch(
+        {ok, _Manifest, [_Fragment | _]} when _Manifest /= undefined,
+        rabbit_ct_broker_helpers:rpc(
+            Config, 0, rabbitmq_stream_s3_api_fs, get_stream_data, [QName]
+        ),
+        5000
+    ),
+
+    %% Two segment rolls are needed: the first makes segment 0 eligible for
+    %% deletion, the second creates the active segment that keeps segment 1
+    %% as the boundary, allowing segment 0 to be deleted.
+    ct:pal("Publishing extra messages to trigger second and third segment rolls"),
+    {ok, C7} = stream_test_utils:publish(S, C6, PubId, 4, [PayloadLarge]),
+    {ok, C8} = stream_test_utils:publish(S, C7, PubId, 5, [Payload1K]),
+    {ok, C9} = stream_test_utils:delete_publisher(S, C8, PubId),
+
+    ct:pal("Waiting for local segment deletion and remote tier activation"),
+    ?awaitMatch(
+        {ok, _Manifest, [_Fragment | _]} when _Manifest /= undefined,
+        rabbit_ct_broker_helpers:rpc(
+            Config, 0, rabbitmq_stream_s3_api_fs, get_stream_data, [QName]
+        ),
+        5000
+    ),
+    ?awaitMatch(
+        [],
+        rabbit_ct_broker_helpers:rpc(
+            Config,
+            0,
+            filelib,
+            wildcard,
+            [
+                rabbit_ct_broker_helpers:get_node_config(Config, 0, data_dir) ++
+                    "/../stream/*/00000000000000000000.segment"
+            ]
+        ),
+        15000
+    ),
+    %% Wait until the manifest is loaded in the server, confirming the remote
+    %% tier is active and timestamp/offset routing will work correctly.
+    RName = rabbit_misc:r(<<"/">>, queue, QName),
+    ?awaitMatch(
+        {0, _},
+        rabbit_ct_broker_helpers:rpc(
+            Config, 0, rabbitmq_stream_s3_server, get_range_by_reference, [RName]
+        ),
+        5000
+    ),
+    #manifest{next_offset = NextOffset, entries = Entries} = rabbit_ct_broker_helpers:rpc(
+        Config, 0, rabbitmq_stream_s3_server, get_manifest_by_reference, [RName]
+    ),
+    ct:pal(
+        "Manifest next_offset=~p entries=~p",
+        [NextOffset, decode_entries(Entries)]
+    ),
+
+    SubId = 1,
+
+    ct:pal("Consuming from timestamp ~p (first message, remote tier)", [Timestamp1]),
+    {ok, C10} = stream_test_utils:subscribe(S, C9, QName, SubId, 1, #{}, {timestamp, Timestamp1}),
+    {C11, Chunk0} = receive_deliver(S, C10, SubId),
+    ?assertEqual(Payload1K, extract_payload(Chunk0)),
+
+    ct:pal("Consuming from timestamp ~p (second message, remote tier)", [Timestamp2]),
+    {ok, C12} = stream_test_utils:unsubscribe(S, C11, SubId),
+    {ok, C13} = stream_test_utils:subscribe(S, C12, QName, SubId, 1, #{}, {timestamp, Timestamp2}),
+    {C14, Chunk1} = receive_deliver(S, C13, SubId),
+    ?assertEqual(byte_size(PayloadLarge), byte_size(extract_payload(Chunk1))),
+
+    ct:pal("Consuming from timestamp ~p (third message, remote tier)", [Timestamp3]),
+    #manifest{next_offset = NextOffset3, entries = Entries3} = rabbit_ct_broker_helpers:rpc(
+        Config, 0, rabbitmq_stream_s3_server, get_manifest_by_reference, [RName]
+    ),
+    ct:pal(
+        "Manifest at T3 subscription: next_offset=~p entries=~p",
+        [NextOffset3, decode_entries(Entries3)]
+    ),
+    {ok, C15} = stream_test_utils:unsubscribe(S, C14, SubId),
+    {ok, C16} = stream_test_utils:subscribe(S, C15, QName, SubId, 1, #{}, {timestamp, Timestamp3}),
+    {C17, Chunk2} = receive_deliver(S, C16, SubId),
+    ct:pal("Chunk2 first entry size: ~p, expected: ~p", [
+        byte_size(extract_payload(Chunk2)), byte_size(Payload2K)
+    ]),
+    ?assertEqual(Payload2K, extract_payload(Chunk2)),
+
+    {ok, C18} = stream_test_utils:unsubscribe(S, C17, SubId),
+    {ok, C19} = stream_test_utils:delete_stream(S, C18, QName),
+    stream_test_utils:close(S, C19),
+    ok.
+
 %% -------------------------------------------------------------------
 %% Private functions
 %% -------------------------------------------------------------------
+
 test_data_dir(Testcase, Config) ->
     BasePart = rabbit_ct_helpers:get_config(Config, priv_dir),
     TestcasePart = rabbit_ct_helpers:config_to_testcase_name(Config, Testcase),
@@ -389,3 +624,41 @@ find_available_node_loop(NodesCount, StoppedNode, Idx) when Idx < NodesCount ->
     end;
 find_available_node_loop(_NodesCount, _StoppedNode, _Idx) ->
     error(no_available_node).
+
+%% Receive a deliver or deliver_v2 command and return the chunk binary.
+%% Uses a custom loop to handle large chunks that require many recv calls.
+receive_deliver(S, C0, SubId) ->
+    receive_deliver_loop(S, C0, SubId).
+
+receive_deliver_loop(S, C0, SubId) ->
+    case rabbit_stream_core:next_command(C0) of
+        {{deliver, SubId, Chunk}, C1} ->
+            {C1, Chunk};
+        {{deliver_v2, SubId, _CommittedOffset, Chunk}, C1} ->
+            {C1, Chunk};
+        empty ->
+            case gen_tcp:recv(S, 0, 5000) of
+                {ok, Data} ->
+                    C1 = rabbit_stream_core:incoming_data(Data, C0),
+                    receive_deliver_loop(S, C1, SubId);
+                {error, Err} ->
+                    ct:fail("error receiving stream data ~w", [Err])
+            end;
+        {_Other, C1} ->
+            %% Skip non-deliver commands (e.g. metadata updates).
+            receive_deliver_loop(S, C1, SubId)
+    end.
+
+%% Extract the raw payload from an osiris chunk.
+extract_payload(Chunk) ->
+    <<_Mag:4, _Ver:4, _Type:8, _NumEntries:16, _NumRecords:32, _Timestamp:64, _Epoch:64,
+        _ChunkId:64, _Crc:32, _DataLength:32, _TrailerLength:32, BloomSize:16, _Reserved:16,
+        _Bloom:BloomSize/binary, 0:1, EntrySize:31, Entry:EntrySize/binary, _/binary>> = Chunk,
+    Sections = amqp10_framing:decode_bin(Entry),
+    #'v1_0.data'{content = Payload} = lists:keyfind('v1_0.data', 1, Sections),
+    Payload.
+
+decode_entries(<<>>) ->
+    [];
+decode_entries(<<O:64/unsigned, FTs:64/signed, LTs:64/signed, _:48, Rest/binary>>) ->
+    [{O, FTs, LTs} | decode_entries(Rest)].
