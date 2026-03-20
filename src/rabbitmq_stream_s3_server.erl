@@ -618,6 +618,7 @@ execute_task(#upload_group{
         (group_header(GroupKind))/binary,
         GroupOffset:64/unsigned,
         GroupFTs:64/signed,
+        %% TODO: remove these bytes? They are unused.
         0:2/signed,
         0:70/unsigned,
         GroupEntries/binary

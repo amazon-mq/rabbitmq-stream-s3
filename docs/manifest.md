@@ -23,7 +23,7 @@ At a high level, the manifest tracks a sorted array of metadata about every frag
 }
 ```
 
-_JSON is just for display - the actual manifest uses a compact binary representation._
+_JSON is just for display - the actual manifest uses a compact binary representation. See the [Representation section](#representation) below._
 
 As new objects are uploaded, they are appended to the array in ascending order. This array can be quickly binary searched to find a given offset or timestamp. And we can quickly check the head of the array to see if max-age retention should delete the first fragment. We could also track the total size of the stream alongside this array to make max-bytes retention quick. The offset metadata about a fragment acts as a kind of pointer - the offset plus stream ID gives us enough information to create the fragment object's key.
 
@@ -82,18 +82,6 @@ A large `m` makes lookup fast. With mega-groups being the largest kind of group,
 | Calculate total stream size           | O(1)       | Total size is stored in the manifest root and updated gradually as fragments are added or removed from the manifest.
 | Find oldest fragment's last timestamp | O(1)       | Oldest fragment's last timestamp is also tracked in the root and is updated when retention removes fragment(s).
 
-## Operations
-
-When the next fragment of stream data has been successfully uploaded, the coordination server `rabbitmq_stream_s3_server` appends the fragment's metadata to its in-memory copy of the root and evaluates whether the root has grown too large. The server debounces uploads of the updated root to the remote tier to keep requests-per-second low. Once the root is too large, the server uploads a new group object and once that has been successfully uploaded, the server replaces the fragments in its cached copy of the root with the new group's metadata.
-
-Periodically the server evaluates whether the stream's retention rules should delete fragments. If the root has no groups, the server decides which fragments to delete, removes them from the root array, and deletes them in the background. If there are groups, the server downloads the first group object and evaluates retention against the fragments within. Once that process completes, the server updates the total-size and oldest-last-timestamp metadata in the root. Group objects are never updated after being written, but once all fragments pointed to by a group (or all groups pointed to by a kilo-group, etc.) are deleted, the group object is deleted and removed from the root.
-
-Changes to the manifest are made only by the server on the stream writer's node. Nodes with replica copies receive metadata about changes to each manifest through a generic edit type which can express the three kinds of changes: 1/ appending new fragments, 2/ factoring out groups and 3/ changes caused by retention. Since all stream members know information about the data in the remote tier, all members can perform local retention to evict fully uploaded segments aggressively.
-
-### Resolving the manifest
-
-When a writer or replica starts up for a stream, `rabbitmq_stream_s3_server` must download the manifest root from the remote tier to determine what local data needs to be uploaded and what is redundant. Since uploads of the manifest are debounced, the last writer may have shut down before it uploaded an updated copy. _Resolving_ the manifest is downloading the current root from the remote tier and then attempting to find any fragments which were uploaded by the last writer. The _resolving_ process reads the trailer of the last fragment in the root to find the next fragment's offset, and then repeats that process to discover any fragments which were successfully uploaded but not yet applied to the manifest. These fragments are appended to the end of the in-memory copy of the root.
-
 ### Representation
 
 Manifest objects are serialized in a custom binary format to minimize memory and network footprint. This representation is not guaranteed to be stable - it might change over time. Stream readers should rely on RabbitMQ to read and write these objects instead of interacting with the remote tier objects directly.
@@ -115,9 +103,6 @@ Manifest objects are serialized in a custom binary format to minimize memory and
 |                                                               |
 +---------------------------------------------------------------+
 | First timestamp (i64)                                         |
-|                                                               |
-+---------------------------------------------------------------+
-| First-last timestamp (i64)                                    |
 |                                                               |
 +---------------------------------------------------------------+
 | First-last timestamp (i64)                                    |
@@ -183,13 +168,54 @@ Group entry:
 
 </details>
 
-<details><summary>Group objects...</summary>
+<details><summary>Group...</summary>
 
-TODO. It's nearly the same as a root but without the tracking of total size and first-last timestamp.
+```
+|0              |1              |2              |3              | Bytes
+|0 1 2 3 4 5 6 7|0 1 2 3 4 5 6 7|0 1 2 3 4 5 6 7|0 1 2 3 4 5 6 7| Bits
++---------------+---------------+---------------+---------------+
+| Group  magic                                                  |
++---------------------------------------------------------------+
+| Group version (0x00000001)                                    |
++---------------------------------------------------------------+
+| First offset (u64)                                            |
+|                                                               |
++---------------------------------------------------------------+
+| First timestamp (i64)                                         |
+|                                                               |
++---------------------------------------------------------------+
+| First-last timestamp (i64)                                    |
+|                                                               |
++---------------------------------------------------------------+
+| First-last timestamp (i64)                                    |
+|                                                               |
++---------------------------------------------------------------+
+| 0 (u72)                                                       |
+|                                                               |
+|                                                               |
+|               +-----------------------------------------------|
++---------------+                                               |
+| Contiguous list of entries                                    |
+: (until EOF)                                                   :
+:                                                               :
++---------------------------------------------------------------+
+```
 
 ---
 
 </details>
+
+## Operations
+
+When the next fragment of stream data has been successfully uploaded, the coordination server `rabbitmq_stream_s3_server` appends the fragment's metadata to its in-memory copy of the root and evaluates whether the root has grown too large. The server debounces uploads of the updated root to the remote tier to keep requests-per-second low. Once the root is too large, the server uploads a new group object and once that has been successfully uploaded, the server replaces the fragments in its cached copy of the root with the new group's metadata.
+
+Periodically the server evaluates whether the stream's retention rules should delete fragments. If the root has no groups, the server decides which fragments to delete, removes them from the root array, and deletes them in the background. If there are groups, the server downloads the first group object and evaluates retention against the fragments within. Once that process completes, the server updates the total-size and oldest-last-timestamp metadata in the root. Group objects are never updated after being written, but once all fragments pointed to by a group (or all groups pointed to by a kilo-group, etc.) are deleted, the group object is deleted and removed from the root.
+
+Changes to the manifest are made only by the server on the stream writer's node. Nodes with replica copies receive metadata about changes to each manifest through a generic edit type which can express the three kinds of changes: 1/ appending new fragments, 2/ factoring out groups and 3/ changes caused by retention. Since all stream members know information about the data in the remote tier, all members can perform local retention to evict fully uploaded segments aggressively.
+
+### Resolving the manifest
+
+When a writer or replica starts up for a stream, `rabbitmq_stream_s3_server` must download the manifest root from the remote tier to determine what local data needs to be uploaded and what is redundant. Since uploads of the manifest are debounced, the last writer may have shut down before it uploaded an updated copy. _Resolving_ the manifest is downloading the current root from the remote tier and then attempting to find any fragments which were uploaded by the last writer. The _resolving_ process reads the trailer of the last fragment in the root to find the next fragment's offset, and then repeats that process to discover any fragments which were successfully uploaded but not yet applied to the manifest. These fragments are appended to the end of the in-memory copy of the root.
 
 ## Concurrency control
 
