@@ -94,6 +94,103 @@ Changes to the manifest are made only by the server on the stream writer's node.
 
 When a writer or replica starts up for a stream, `rabbitmq_stream_s3_server` must download the manifest root from the remote tier to determine what local data needs to be uploaded and what is redundant. Since uploads of the manifest are debounced, the last writer may have shut down before it uploaded an updated copy. _Resolving_ the manifest is downloading the current root from the remote tier and then attempting to find any fragments which were uploaded by the last writer. The _resolving_ process reads the trailer of the last fragment in the root to find the next fragment's offset, and then repeats that process to discover any fragments which were successfully uploaded but not yet applied to the manifest. These fragments are appended to the end of the in-memory copy of the root.
 
+### Representation
+
+Manifest objects are serialized in a custom binary format to minimize memory and network footprint. This representation is not guaranteed to be stable - it might change over time. Stream readers should rely on RabbitMQ to read and write these objects instead of interacting with the remote tier objects directly.
+
+<details><summary>Root...</summary>
+
+```
+|0              |1              |2              |3              | Bytes
+|0 1 2 3 4 5 6 7|0 1 2 3 4 5 6 7|0 1 2 3 4 5 6 7|0 1 2 3 4 5 6 7| Bits
++---------------+---------------+---------------+---------------+
+| Manifest magic (0x4f534952 = "OSIR")                          |
++---------------------------------------------------------------+
+| Manifest version (0x00000001)                                 |
++---------------------------------------------------------------+
+| First offset (u64)                                            |
+|                                                               |
++---------------------------------------------------------------+
+| Next offset (u64)                                             |
+|                                                               |
++---------------------------------------------------------------+
+| First timestamp (i64)                                         |
+|                                                               |
++---------------------------------------------------------------+
+| First-last timestamp (i64)                                    |
+|                                                               |
++---------------------------------------------------------------+
+| First-last timestamp (i64)                                    |
+|                                                               |
++----+----------------------------------------------------------+
++ 0  + Total size (u70)                                         |
++----+                                                          |
+|                                                               |
+|               +-----------------------------------------------|
++---------------+                                               |
+| Contiguous list of entries                                    |
+: (until EOF)                                                   :
+:                                                               :
++---------------------------------------------------------------+
+```
+
+---
+
+</details>
+
+<details><summary>Array entries...</summary>
+
+Fragment entry:
+
+```
+|0              |1              |2              |3              | Bytes
+|0 1 2 3 4 5 6 7|0 1 2 3 4 5 6 7|0 1 2 3 4 5 6 7|0 1 2 3 4 5 6 7| Bits
++---------------+---------------+---------------+---------------+
+| First offset (u64)                                            |
+|                                                               |
++---------------------------------------------------------------+
+| First timestamp (i64)                                         |
+|                                                               |
++---------------------------------------------------------------+
+| Last timestamp (i64)                                          |
+|                                                               |
++----+-+--------------------------------------------------------+
++  0 +i+ Size (u45)                                             |
++----+-+--------------------------------------------------------+
+i: boolean, 1 = is sequence zero of source segment, 0 otherwise
+```
+
+Group entry:
+
+```
+|0              |1              |2              |3              | Bytes
+|0 1 2 3 4 5 6 7|0 1 2 3 4 5 6 7|0 1 2 3 4 5 6 7|0 1 2 3 4 5 6 7| Bits
++---------------+---------------+---------------+---------------+
+| First offset (u64)                                            |
+|                                                               |
++---------------------------------------------------------------+
+| First timestamp (i64)                                         |
+|                                                               |
++---------------------------------------------------------------+
+| Last timestamp (i64)                                          |
+|                                                               |
++------+--------------------------------------------------------+
++ Kind + UID (u46)                                              |
++------+--------------------------------------------------------+
+```
+
+---
+
+</details>
+
+<details><summary>Group objects...</summary>
+
+TODO. It's nearly the same as a root but without the tracking of total size and first-last timestamp.
+
+---
+
+</details>
+
 ## Concurrency control
 
 A network partition might elect a new leader on the majority side while a deposed writer continues running on the minority side. Both writers might have access to S3, so both writers may modify the manifest. `rabbitmq-stream-s3` uses an [optimistic concurrency control](https://en.wikipedia.org/wiki/Optimistic_concurrency_control) to avoid conflicting writes. Keys of all metadata objects include a unique identifier string (UID). In practice the metadata directory looks like this:
