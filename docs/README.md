@@ -53,7 +53,7 @@ data/
 
 Each stream uses a directory under the `stream/` directory in the format `{vhost}_{stream-name}_{created-timestamp}`. Messages published to streams are stored in segment files. Segment files are named with the offset of the first entry in the segment. Messages are batched together by the writer process into chunks and appended to the latest segment file. Once the segment file exceeds a max size or a max number of chunks, the segment is closed and a new one is opened. Every segment has a corresponding index file with the same offset. The index file contains a small record for each chunk in the segment with metadata like the offset, timestamp, and byte offset of the chunk within the segment file. The default max size of a segment file is 500 MB. The size of the index depends on the number of chunks in the segment file. Publishing at high throughput results in smaller index files since there are fewer, larger chunks.
 
-Segment and index files are identical between cluster members of a stream. All records are send to a writer member which writes the records as chunks. Any number of replica members then replicate the chunks from the writer's log. When a majority of members have written a chunk, publishers receive confirms that their messages have been written and the messages may then be read by consumers. Cluster membership, epoch numbers and writer/replica roles are decided by a Raft system.
+Segment and index files are identical between cluster members of a stream. All records are sent to a writer member which writes the records as chunks. Any number of replica members then replicate the chunks from the writer's log. When a majority of members have written a chunk, publishers receive confirms that their messages have been written and the messages may then be read by consumers. Cluster membership, epoch numbers and writer/replica roles are decided by a Raft system.
 
 ### Remote-tier storage
 
@@ -61,7 +61,7 @@ Segment and index files are identical between cluster members of a stream. All r
 
 ### S3 bucket layout
 
-`rabbitmq-stream-s3` uses one S3 bucket per cluster. The remote tier uses one [prefix](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-prefixes.html) per stream similar to the local tier's use of directories. Under this prefix there prefixes `data` to store stream data like segment and index file contents, and `metadata` to store tracking information used for consumers and retention.
+`rabbitmq-stream-s3` uses one S3 bucket per cluster. The remote tier uses one [prefix](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-prefixes.html) per stream similar to the local tier's use of directories. Under this prefix there are prefixes `data` to store stream data like segment and index file contents, and `metadata` to store tracking information used for consumers and retention.
 
 <!-- NOTE: it would be easy to also support multi-tenant buckets by adding config for a prefix to use within a bucket. We wouldn't use this feature ourselves though. -->
 
@@ -77,7 +77,7 @@ rabbitmq/
 
 ### Fragments
 
-The data representation between the local and remote tiers are separate. The local tier contains segment and index files while the remote tier contains smaller objects called _fragments_ which concatenate smaller sections of segment and index data together. Where a segment file typically reaches 500 MB, fragments store a smaller section of a segment around 64 MB of chunk-aligned segment data and their accompanying records from the index file. NOTE: the 64 MB figure will be tuned in testing. We expect a size in the range of 10 MB - 128 MB to be ideal.
+The data representation between the local and remote tiers are separate. The local tier contains segment and index files while the remote tier contains smaller objects called _fragments_ which concatenate smaller sections of segment and index data together. Where a segment file typically reaches 500 MB, fragments store a smaller section of a segment around 64 MiB of chunk-aligned segment data and their accompanying records from the index file. NOTE: the 64 MiB figure will be tuned in testing. We expect a size in the range of 10 MiB - 128 MiB to be ideal.
 
 ![Fragment layout](./Fragment.svg)
 
@@ -120,7 +120,7 @@ Also see the [manifest documentation](./manifest.md#operations) for details abou
 
 #### Stream deletion
 
-`rabbitmq-stream-s3` leverages [the data stored in Khepri](#concurrency-control) to automatically kick off tasks to delete stream data from the remote tier. The `rabbitmq_stream_s3_db` module covers the plugin's interactions with Khepri. When storing data in Khepri, `rabbitmq_stream_s3_db` sets a Khepri _keep-while condition_ that ties together the lifetime of the entry for the stream ID with the stream queue's metadata. When the stream queue is deleted from the metadata store, the plugin's data for the stream ID is automatically deleted as well. `rabbitmq_stream_s3_db` also sets a Khepri _trigger_ on the stream ID path of the tree which watches for deletions of those tree nodes and executes a _stored procedure_. The stored procedure kicks off a task to perform the deletion of remote tier objects.
+`rabbitmq-stream-s3` leverages the data stored in Khepri to automatically kick off tasks to delete stream data from the remote tier. The `rabbitmq_stream_s3_db` module covers the plugin's interactions with Khepri. When storing data in Khepri, `rabbitmq_stream_s3_db` sets a Khepri _keep-while condition_ that ties together the lifetime of the entry for the stream ID with the stream queue's metadata. When the stream queue is deleted from the metadata store, the plugin's data for the stream ID is automatically deleted as well. `rabbitmq_stream_s3_db` also sets a Khepri _trigger_ on the stream ID path of the tree which watches for deletions of those tree nodes and executes a _stored procedure_. The stored procedure kicks off a task to perform the deletion of remote tier objects.
 
 For more details about keep-while conditions, triggers and stored procedures, see the [Khepri overview documentation](https://hexdocs.pm/khepri/).
 
