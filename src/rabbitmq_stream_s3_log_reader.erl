@@ -106,8 +106,8 @@ init_offset_reader(OffsetSpec, Config) ->
             Err
     end.
 
-resolve_remote_location(Tail, Config) when Tail =:= last orelse Tail =:= next ->
-    init_local_reader(Tail, Config);
+resolve_remote_location(Spec, _Config) when Spec =:= last orelse Spec =:= next ->
+    {local, Spec};
 resolve_remote_location(first, #{name := StreamId, shared := Shared}) ->
     LocalFirstOffset = osiris_log_shared:first_chunk_id(Shared),
     case rabbitmq_stream_s3_server:get_manifest(StreamId) of
