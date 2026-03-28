@@ -361,27 +361,22 @@ read_from_remote_tier_by_offset(Config) ->
     ),
     %% Wait until the local segment 0 is deleted and first_chunk_id is updated,
     %% confirming reads will go to the remote tier.
+    StreamId = get_stream_id(Config, QName),
+    DataDir = rabbit_ct_broker_helpers:get_node_config(Config, 0, data_dir),
+    Segment0Pattern = filename:join([
+        DataDir, "..", "stream", binary_to_list(StreamId), "00000000000000000000.segment"
+    ]),
     ?awaitMatch(
         [],
-        rabbit_ct_broker_helpers:rpc(
-            Config,
-            0,
-            filelib,
-            wildcard,
-            [
-                rabbit_ct_broker_helpers:get_node_config(Config, 0, data_dir) ++
-                    "/../stream/*/00000000000000000000.segment"
-            ]
-        ),
+        rabbit_ct_broker_helpers:rpc(Config, 0, filelib, wildcard, [Segment0Pattern]),
         15000
     ),
     %% Wait until the manifest is loaded in the server, confirming the remote
     %% tier is active and timestamp/offset routing will work correctly.
-    RName = rabbit_misc:r(<<"/">>, queue, QName),
     ?awaitMatch(
         {0, _},
         rabbit_ct_broker_helpers:rpc(
-            Config, 0, rabbitmq_stream_s3_server, get_range_by_reference, [RName]
+            Config, 0, rabbitmq_stream_s3_server, get_range, [StreamId]
         ),
         5000
     ),
@@ -473,32 +468,27 @@ read_from_remote_tier_by_timestamp(Config) ->
         ),
         5000
     ),
+    StreamId = get_stream_id(Config, QName),
+    DataDir = rabbit_ct_broker_helpers:get_node_config(Config, 0, data_dir),
+    Segment0Pattern = filename:join([
+        DataDir, "..", "stream", binary_to_list(StreamId), "00000000000000000000.segment"
+    ]),
     ?awaitMatch(
         [],
-        rabbit_ct_broker_helpers:rpc(
-            Config,
-            0,
-            filelib,
-            wildcard,
-            [
-                rabbit_ct_broker_helpers:get_node_config(Config, 0, data_dir) ++
-                    "/../stream/*/00000000000000000000.segment"
-            ]
-        ),
+        rabbit_ct_broker_helpers:rpc(Config, 0, filelib, wildcard, [Segment0Pattern]),
         15000
     ),
     %% Wait until the manifest is loaded in the server, confirming the remote
     %% tier is active and timestamp/offset routing will work correctly.
-    RName = rabbit_misc:r(<<"/">>, queue, QName),
     ?awaitMatch(
         {0, _},
         rabbit_ct_broker_helpers:rpc(
-            Config, 0, rabbitmq_stream_s3_server, get_range_by_reference, [RName]
+            Config, 0, rabbitmq_stream_s3_server, get_range, [StreamId]
         ),
         5000
     ),
     #manifest{next_offset = NextOffset, entries = Entries} = rabbit_ct_broker_helpers:rpc(
-        Config, 0, rabbitmq_stream_s3_server, get_manifest_by_reference, [RName]
+        Config, 0, rabbitmq_stream_s3_server, get_manifest, [StreamId]
     ),
     ct:pal(
         "Manifest next_offset=~p entries=~p",
@@ -520,7 +510,7 @@ read_from_remote_tier_by_timestamp(Config) ->
 
     ct:pal("Consuming from timestamp ~p (third message, remote tier)", [Timestamp3]),
     #manifest{next_offset = NextOffset3, entries = Entries3} = rabbit_ct_broker_helpers:rpc(
-        Config, 0, rabbitmq_stream_s3_server, get_manifest_by_reference, [RName]
+        Config, 0, rabbitmq_stream_s3_server, get_manifest, [StreamId]
     ),
     ct:pal(
         "Manifest at T3 subscription: next_offset=~p entries=~p",
@@ -662,3 +652,9 @@ decode_entries(<<>>) ->
     [];
 decode_entries(<<O:64/unsigned, FTs:64/signed, LTs:64/signed, _:48, Rest/binary>>) ->
     [{O, FTs, LTs} | decode_entries(Rest)].
+
+get_stream_id(Config, QName) ->
+    RName = rabbit_misc:r(<<"/">>, queue, QName),
+    {ok, Q} = rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_amqqueue, lookup, [RName]),
+    TypeState = rabbit_ct_broker_helpers:rpc(Config, 0, amqqueue, get_type_state, [Q]),
+    list_to_binary(maps:get(name, TypeState)).

@@ -64,10 +64,6 @@
     delete_stream/1
 ]).
 
--ifdef(TEST).
--export([get_range_by_reference/1, get_manifest_by_reference/1]).
--endif.
-
 %% Useful for other modules
 -export([
     get_fragment_trailer/1,
@@ -228,29 +224,6 @@ handle_call(#get_manifest{stream = StreamId}, From, State) ->
     %% readers to find anything within branches.
     Event = #manifest_requested{stream = StreamId, requester = From},
     {noreply, evolve_event(Event, State)};
-handle_call(
-    {get_range_by_reference, Reference},
-    _From,
-    #?MODULE{references = References} = State
-) ->
-    Range =
-        case References of
-            #{Reference := StreamId} -> get_range(StreamId);
-            _ -> empty
-        end,
-    {reply, Range, State};
-handle_call(
-    {get_manifest_by_reference, Reference},
-    From,
-    #?MODULE{references = References} = State
-) ->
-    case References of
-        #{Reference := StreamId} ->
-            Event = #manifest_requested{stream = StreamId, requester = From},
-            {noreply, evolve_event(Event, State)};
-        _ ->
-            {reply, undefined, State}
-    end;
 handle_call(Request, From, State) ->
     ?LOG_INFO(?MODULE_STRING " received unexpected call from ~p: ~W", [From, Request, 10]),
     {noreply, State}.
@@ -1154,14 +1127,6 @@ counter() ->
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
-
--spec get_range_by_reference(stream_reference()) -> rabbitmq_stream_s3:range().
-get_range_by_reference(Reference) ->
-    gen_server:call(?SERVER, {get_range_by_reference, Reference}, infinity).
-
--spec get_manifest_by_reference(stream_reference()) -> #manifest{} | undefined.
-get_manifest_by_reference(Reference) ->
-    gen_server:call(?SERVER, {get_manifest_by_reference, Reference}, infinity).
 
 eval_local_retention_test() ->
     IdxFiles = [
