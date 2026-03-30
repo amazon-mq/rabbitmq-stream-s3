@@ -120,3 +120,25 @@ end}.
 {mapping, "streams.log_manifest", "osiris.log_manifest", [
     {datatype, {enum, [osiris_log, rabbitmq_stream_s3_log_manifest]}}
 ]}.
+
+%%
+%% Stream membership reconciliation
+%%
+
+{mapping, "stream.continuous_membership_reconciliation.enabled", "rabbitmq_stream_s3.membership_reconciliation_enabled", [
+    {datatype, {enum, [true, false]}}]}.
+
+{mapping, "stream.continuous_membership_reconciliation.auto_remove", "rabbitmq_stream_s3.membership_reconciliation_auto_remove", [
+    {datatype, {enum, [true, false]}}]}.
+
+{mapping, "stream.continuous_membership_reconciliation.interval", "rabbitmq_stream_s3.membership_reconciliation_interval", [
+    {datatype, integer}, {validators, ["non_negative_integer"]}
+]}.
+
+{mapping, "stream.continuous_membership_reconciliation.trigger_interval", "rabbitmq_stream_s3.membership_reconciliation_trigger_interval", [
+    {datatype, integer}, {validators, ["non_negative_integer"]}
+]}.
+
+{mapping, "stream.continuous_membership_reconciliation.target_group_size", "rabbitmq_stream_s3.membership_reconciliation_target_group_size", [
+    {datatype, integer}, {validators, ["non_negative_integer"]}
+]}.

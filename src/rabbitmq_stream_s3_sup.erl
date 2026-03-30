@@ -11,13 +11,16 @@ start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 init([]) ->
-    %% TODO we don't really need this outer supervisor anymore now that
-    %% the manifest worker is started by a boot step.
     SupFlags = #{strategy => one_for_one, intensity => 1, period => 5},
     LogReaderSup = #{
         id => rabbitmq_stream_s3_log_reader_sup,
         type => supervisor,
         start => {rabbitmq_stream_s3_log_reader_sup, start_link, []}
     },
-    Procs = [LogReaderSup],
+    MembershipReconciliation = #{
+        id => rabbitmq_stream_s3_membership_reconciliation,
+        type => worker,
+        start => {rabbitmq_stream_s3_membership_reconciliation, start_link, []}
+    },
+    Procs = [LogReaderSup, MembershipReconciliation],
     {ok, {SupFlags, Procs}}.
