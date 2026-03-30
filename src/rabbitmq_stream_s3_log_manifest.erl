@@ -227,6 +227,18 @@ recover_fragments(IdxFile, Acc) ->
     ).
 
 recover_fragments(
+    _Threshold0,
+    _SegmentFile,
+    SegmentOffset,
+    SeqNo0,
+    _NumChunks0,
+    Fragments0,
+    <<>>
+) ->
+    %% The index file exists but contains no records yet (e.g. the stream was
+    %% created but no segment has been flushed). Treat as an empty fragment.
+    {#fragment{segment_offset = SegmentOffset, seq_no = SeqNo0}, Fragments0};
+recover_fragments(
     Threshold0,
     SegmentFile,
     SegmentOffset,
