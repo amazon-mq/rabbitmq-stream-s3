@@ -49,7 +49,6 @@ Evaluates all streams with writers on this node immediately, even if automatic
 evaluation is not enabled.
 """.
 evaluate_membership() ->
-    ?LOG_DEBUG(?MODULE_STRING ": evaluating membership"),
     Qs = [
         Q
      || Q <- rabbit_amqqueue:list_by_type(rabbit_stream_queue),
