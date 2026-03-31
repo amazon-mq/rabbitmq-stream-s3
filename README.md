@@ -1,5 +1,7 @@
 ## rabbitmq-stream-s3
 
+[![CI](https://github.com/amazon-mq/rabbitmq-stream-s3/actions/workflows/build-test.yaml/badge.svg)](https://github.com/amazon-mq/rabbitmq-stream-s3/actions/workflows/build-test.yaml)
+
 RabbitMQ Streams stores data in an append-only log on local disk, managed by the [osiris](https://github.com/rabbitmq/osiris) library. Each stream is a sequence of segments; old segments are deleted by retention policies. Once a segment is deleted locally, any consumer that hasn't read it yet loses access to that data permanently.
 
 `rabbitmq_stream_s3` adds a **remote tier** by hooking into osiris via two plugin behaviours:
