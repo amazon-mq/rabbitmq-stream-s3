@@ -85,6 +85,7 @@ init_manifest(#{name := StreamId0, dir := Dir0} = Config0, writer) ->
                 recover_fragments(LastIdxFile)
         end,
     ok = rabbitmq_stream_s3_server:init_writer(StreamId, Config1, Available),
+    ok = rabbitmq_stream_s3_membership_reconciliation:writer_started(),
     Manifest = #log_writer{
         type = writer,
         stream = StreamId,
