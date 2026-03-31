@@ -2,7 +2,7 @@
 
 This file covers the `rabbitmq_stream_s3` plugin specifically. For general
 RabbitMQ conventions (comments, git, building, testing), see the parent
-repository's `AGENTS.md` at the root of `rabbitmq/rabbitmq-server`.
+repository's `AGENTS.md` at the root of [`rabbitmq/rabbitmq-server`](https://github.com/rabbitmq/rabbitmq-server).
 
 ## Overview
 
