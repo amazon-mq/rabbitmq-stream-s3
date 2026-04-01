@@ -914,17 +914,22 @@ execute_task(#delete_stream{stream = StreamId}) ->
     Prefix = rabbitmq_stream_s3:stream_prefix(StreamId),
     {ok, Conn} = rabbitmq_stream_s3_api:open(),
     try
-        {DeleteMsec, {ok, Details}} = timer:tc(
+        {DeleteMsec, Result} = timer:tc(
             rabbitmq_stream_s3_api,
             delete_prefix,
             [Conn, Prefix],
             millisecond
         ),
-        ?LOG_INFO("Deleted remote tier data for deleted stream '~ts' in ~b msec ~0p", [
-            StreamId, DeleteMsec, Details
-        ]),
-        counters:add(counter(), ?C_STREAMS_DELETED, 1),
-        ok
+        case Result of
+            {ok, Details} ->
+                ?LOG_INFO("Deleted remote tier data for deleted stream '~ts' in ~b msec ~0p", [
+                    StreamId, DeleteMsec, Details
+                ]),
+                counters:add(counter(), ?C_STREAMS_DELETED, 1),
+                ok;
+            {error, _} = Err ->
+                exit(Err)
+        end
     after
         rabbitmq_stream_s3_api:close(Conn)
     end;
