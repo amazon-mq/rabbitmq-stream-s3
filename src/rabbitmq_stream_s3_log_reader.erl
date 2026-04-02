@@ -22,6 +22,7 @@ tier.
 
 -define(READAHEAD, "5MiB").
 -define(READ_TIMEOUT, 10000).
+-define(SLOW_READ_THRESHOLD_MS, 10_000).
 
 %% TODO: add counters
 
@@ -256,9 +257,13 @@ send_file(Socket, #?MODULE{mode = #remote{} = Remote0} = State0, Callback) ->
             {ToSkip, ToSend} = select_amount_to_send(ChunkSelector, Header),
             DataPos = Position + ?CHUNK_HEADER_B + ToSkip,
             PrefixData = Callback(Header, ToSend + byte_size(HeaderData)),
-            {ok, Data} = gen_server:call(
-                Pid, {read, DataPos, ToSend, within_chunk}, ?GEN_SERVER_CALL_TIMEOUT
+            {ReadMsec, {ok, Data}} = timer:tc(
+                gen_server,
+                call,
+                [Pid, {read, DataPos, ToSend, within_chunk}, ?GEN_SERVER_CALL_TIMEOUT],
+                millisecond
             ),
+            validate_read_timing(ReadMsec, ToSend, DataPos),
             case send(Transport, Socket, [PrefixData, HeaderData, Data]) of
                 ok ->
                     Remote = Remote1#remote{
@@ -304,9 +309,13 @@ chunk_iterator(#?MODULE{mode = #remote{} = Remote0} = State0, Credit, _PrevIter)
             } = Header,
             #remote{pid = Pid} = Remote1} ->
             DataPos = Position + ?CHUNK_HEADER_B + FilterSize,
-            {ok, Data} = gen_server:call(
-                Pid, {read, DataPos, DataSize, within_chunk}, ?GEN_SERVER_CALL_TIMEOUT
+            {ReadMsec, {ok, Data}} = timer:tc(
+                gen_server,
+                call,
+                [Pid, {read, DataPos, DataSize, within_chunk}, ?GEN_SERVER_CALL_TIMEOUT],
+                millisecond
             ),
+            validate_read_timing(ReadMsec, DataPos),
             Iter = #remote_iterator{
                 next_offset = ChId,
                 data = Data
@@ -495,13 +504,18 @@ read_header1(
     %% over-reading is faster.
     %% TODO: make sure that over-reading is handled gracefully: as much of the
     %% binary should be returned as possible.
-    case
-        gen_server:call(
+    {ReadMsec, ReadResult} = timer:tc(
+        gen_server,
+        call,
+        [
             Pid0,
             {read, Position, ?CHUNK_HEADER_B + ?MAX_FILTER_SIZE, chunk_boundary},
             ?GEN_SERVER_CALL_TIMEOUT
-        )
-    of
+        ],
+        millisecond
+    ),
+    validate_read_timing(ReadMsec),
+    case ReadResult of
         {ok, Header} ->
             read_header2(Remote0, Header);
         eof ->
@@ -771,6 +785,21 @@ index_data(StreamId, FragmentOffset, StartPos) ->
     after
         ok = rabbitmq_stream_s3_api:close(Conn)
     end.
+
+validate_read_timing(ReadMsec) when ReadMsec > ?SLOW_READ_THRESHOLD_MS ->
+    ?LOG_WARNING("Slow remote tier read: ~bms", [ReadMsec]);
+validate_read_timing(_) ->
+    ok.
+
+validate_read_timing(ReadMsec, DataPos) when ReadMsec > ?SLOW_READ_THRESHOLD_MS ->
+    ?LOG_WARNING("Slow remote tier read: ~bms (offset ~b)", [ReadMsec, DataPos]);
+validate_read_timing(_, _) ->
+    ok.
+
+validate_read_timing(ReadMsec, ToSend, DataPos) when ReadMsec > ?SLOW_READ_THRESHOLD_MS ->
+    ?LOG_WARNING("Slow remote tier read: ~bms (~b bytes at offset ~b)", [ReadMsec, ToSend, DataPos]);
+validate_read_timing(_, _, _) ->
+    ok.
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
