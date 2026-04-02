@@ -98,7 +98,7 @@ Called "HTTP Verb" in S3 docs. "GET", "PUT", "HEAD", "POST", "DELETE", etc..
 
 -spec init() -> ok.
 init() ->
-    Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?COUNTERS),
+    Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?COUNTERS, #{module => ?MODULE}),
     persistent_term:put(?COUNTER_KEY, Cnt),
     _ = ets:new(?TABLE, [public, named_table]),
     reload_config().

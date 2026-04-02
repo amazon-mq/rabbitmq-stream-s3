@@ -71,7 +71,7 @@ Zero indicates that the manifest has not been created yet.
 
 -spec setup() -> ok.
 setup() ->
-    Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?COUNTERS),
+    Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?COUNTERS, #{module => ?MODULE}),
     persistent_term:put(?COUNTER_KEY, Cnt),
     %% Register a stored procedure which is triggered on deletion of each
     %% stream created with `put/5`. Streams created with `put/5` are
