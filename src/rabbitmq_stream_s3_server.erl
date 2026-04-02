@@ -590,16 +590,23 @@ execute_task(#upload_fragment{
                     end,
                 %% TODO: should be able to upload this in chunks. Gun should
                 %% support that.
-                ok = rabbitmq_stream_s3_api:put(
-                    Conn,
-                    Key,
-                    Data,
-                    #{
-                        unsigned_payload => true,
-                        crc32 => Checksum,
-                        timeout => Timeout
-                    }
-                ),
+                case
+                    rabbitmq_stream_s3_api:put(
+                        Conn,
+                        Key,
+                        Data,
+                        #{
+                            unsigned_payload => true,
+                            crc32 => Checksum,
+                            timeout => Timeout
+                        }
+                    )
+                of
+                    ok ->
+                        ok;
+                    {error, _} = Err ->
+                        exit(Err)
+                end,
                 {iolist_size(Data), fragment_trailer_to_info(Trailer)}
             end,
             millisecond
@@ -640,7 +647,10 @@ execute_task(#upload_group{
         ?LOG_DEBUG("rebalancing: adding a ~ts to the manifest for stream '~ts'", [Ext, StreamId]),
         {UploadMsec, ok} = timer:tc(
             fun() ->
-                ok = rabbitmq_stream_s3_api:put(Conn, Key, Data)
+                case rabbitmq_stream_s3_api:put(Conn, Key, Data) of
+                    ok -> ok;
+                    {error, _} = Err -> exit(Err)
+                end
             end,
             millisecond
         ),
@@ -687,7 +697,10 @@ execute_task(#upload_manifest{
         ?LOG_DEBUG("Uploading manifest for stream '~ts'", [StreamId]),
         {UploadMsec, ok} = timer:tc(
             fun() ->
-                ok = rabbitmq_stream_s3_api:put(Conn, Key, Data)
+                case rabbitmq_stream_s3_api:put(Conn, Key, Data) of
+                    ok -> ok;
+                    {error, _} = Err -> exit(Err)
+                end
             end,
             millisecond
         ),
@@ -846,7 +859,10 @@ execute_task(#delete_objects{stream = StreamId, objects = Objects}) ->
     try
         {DeleteMsec, ok} = timer:tc(
             fun() ->
-                ok = rabbitmq_stream_s3_api:delete(Conn, Keys)
+                case rabbitmq_stream_s3_api:delete(Conn, Keys) of
+                    ok -> ok;
+                    {error, _} = Err -> exit(Err)
+                end
             end,
             millisecond
         ),
@@ -898,17 +914,22 @@ execute_task(#delete_stream{stream = StreamId}) ->
     Prefix = rabbitmq_stream_s3:stream_prefix(StreamId),
     {ok, Conn} = rabbitmq_stream_s3_api:open(),
     try
-        {DeleteMsec, {ok, Details}} = timer:tc(
+        {DeleteMsec, Result} = timer:tc(
             rabbitmq_stream_s3_api,
             delete_prefix,
             [Conn, Prefix],
             millisecond
         ),
-        ?LOG_INFO("Deleted remote tier data for deleted stream '~ts' in ~b msec ~0p", [
-            StreamId, DeleteMsec, Details
-        ]),
-        counters:add(counter(), ?C_STREAMS_DELETED, 1),
-        ok
+        case Result of
+            {ok, Details} ->
+                ?LOG_INFO("Deleted remote tier data for deleted stream '~ts' in ~b msec ~0p", [
+                    StreamId, DeleteMsec, Details
+                ]),
+                counters:add(counter(), ?C_STREAMS_DELETED, 1),
+                ok;
+            {error, _} = Err ->
+                exit(Err)
+        end
     after
         rabbitmq_stream_s3_api:close(Conn)
     end;
