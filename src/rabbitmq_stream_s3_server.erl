@@ -4,6 +4,7 @@
 -module(rabbitmq_stream_s3_server).
 
 -include_lib("kernel/include/logger.hrl").
+-include_lib("rabbit_common/include/rabbit.hrl").
 
 -include("include/rabbitmq_stream_s3.hrl").
 
@@ -159,7 +160,7 @@ start() ->
 
 -spec get_manifest(stream_id()) -> #manifest{} | undefined.
 get_manifest(StreamId) ->
-    gen_server:call(?SERVER, #get_manifest{stream = StreamId}, infinity).
+    gen_server:call(?SERVER, #get_manifest{stream = StreamId}, ?GEN_SERVER_CALL_TIMEOUT).
 
 -doc "Gets the range of offsets in the remote tier".
 -spec get_range(stream_id()) -> rabbitmq_stream_s3:range().

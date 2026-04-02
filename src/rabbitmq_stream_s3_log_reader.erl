@@ -13,6 +13,7 @@ tier.
 """.
 
 -include_lib("kernel/include/logger.hrl").
+-include_lib("rabbit_common/include/rabbit.hrl").
 
 -include("include/rabbitmq_stream_s3.hrl").
 
@@ -255,7 +256,9 @@ send_file(Socket, #?MODULE{mode = #remote{} = Remote0} = State0, Callback) ->
             {ToSkip, ToSend} = select_amount_to_send(ChunkSelector, Header),
             DataPos = Position + ?CHUNK_HEADER_B + ToSkip,
             PrefixData = Callback(Header, ToSend + byte_size(HeaderData)),
-            {ok, Data} = gen_server:call(Pid, {read, DataPos, ToSend, within_chunk}),
+            {ok, Data} = gen_server:call(
+                Pid, {read, DataPos, ToSend, within_chunk}, ?GEN_SERVER_CALL_TIMEOUT
+            ),
             case send(Transport, Socket, [PrefixData, HeaderData, Data]) of
                 ok ->
                     Remote = Remote1#remote{
@@ -301,7 +304,9 @@ chunk_iterator(#?MODULE{mode = #remote{} = Remote0} = State0, Credit, _PrevIter)
             } = Header,
             #remote{pid = Pid} = Remote1} ->
             DataPos = Position + ?CHUNK_HEADER_B + FilterSize,
-            {ok, Data} = gen_server:call(Pid, {read, DataPos, DataSize, within_chunk}),
+            {ok, Data} = gen_server:call(
+                Pid, {read, DataPos, DataSize, within_chunk}, ?GEN_SERVER_CALL_TIMEOUT
+            ),
             Iter = #remote_iterator{
                 next_offset = ChId,
                 data = Data
@@ -494,7 +499,7 @@ read_header1(
         gen_server:call(
             Pid0,
             {read, Position, ?CHUNK_HEADER_B + ?MAX_FILTER_SIZE, chunk_boundary},
-            infinity
+            ?GEN_SERVER_CALL_TIMEOUT
         )
     of
         {ok, Header} ->
