@@ -1,8 +1,9 @@
 # Prometheus Metrics
 
-The `rabbitmq_stream_s3` plugin depends on `rabbitmq_prometheus`, which is
+The `rabbitmq_stream_s3` plugin depends on
+[`rabbitmq_prometheus`](https://www.rabbitmq.com/docs/prometheus), which is
 implicitly enabled when `rabbitmq_stream_s3` is enabled. Metrics are exposed
-at the Prometheus endpoint `/metrics` (port 15692).
+at the Prometheus endpoint `/metrics` (port 15692, or 15691 for TLS).
 
 All metrics use the `rabbitmq_stream_s3_` prefix and carry a `module` label
 identifying the source module.

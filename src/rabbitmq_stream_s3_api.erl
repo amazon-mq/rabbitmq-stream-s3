@@ -155,10 +155,12 @@ delete_prefix(Conn, Prefix, Opts) when is_binary(Prefix) andalso is_map(Opts) ->
     observe(write, fun() -> (backend()):delete_prefix(Conn, Prefix, Opts) end).
 
 observe(Kind, Fun) ->
-    T0 = erlang:monotonic_time(millisecond),
+    T0 = erlang:monotonic_time(),
     try
         Fun()
     after
-        DurationMs = erlang:monotonic_time(millisecond) - T0,
+        DurationMs = erlang:convert_time_unit(
+            erlang:monotonic_time() - T0, native, millisecond
+        ),
         rabbitmq_stream_s3_request_metrics:observe(Kind, DurationMs)
     end.
