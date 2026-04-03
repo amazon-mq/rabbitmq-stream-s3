@@ -1,9 +1,11 @@
 %% Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 %% SPDX-License-Identifier: Apache-2.0
 
-%% Tracks S3 request duration distribution as a histogram.
-%% A histogram is represented by a set of counters, one per bucket.
 -module(rabbitmq_stream_s3_request_metrics).
+-moduledoc """
+Tracks S3 request duration distribution as a histogram.
+A histogram is represented by a set of counters, one per bucket.
+""".
 
 -export([
     init/0,
