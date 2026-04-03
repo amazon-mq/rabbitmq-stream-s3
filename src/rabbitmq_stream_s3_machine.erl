@@ -553,8 +553,7 @@ apply(
                         ?assertEqual(undefined, Seq0),
                         WriterSeq0 + 1;
                     _ ->
-                        ?assertNotEqual(undefined, Seq0),
-                        Seq0
+                        resolve_replica_seq(Seq0, Stream1)
                 end,
             Event = Event0#manifest_resolved{seq = Seq},
             Stream2 = Stream1#{seq := Seq},
@@ -1562,6 +1561,16 @@ format_duration_weeks(Duration) when is_float(Duration) ->
 
 format_duration_years(Duration) when is_float(Duration) ->
     <<?FORMAT_DURATION(Duration), " years">>.
+
+%% When a replica resolves its manifest from S3 (initial resolution on
+%% startup), the seq is undefined because the task does not know the writer's
+%% seq. Fall back to the stream's current seq and let the out-of-sequence edit
+%% detection re-request the manifest from the writer.
+%% See amazon-mq/rabbitmq-stream-s3#83.
+resolve_replica_seq(undefined, Stream) ->
+    maps:get(seq, Stream);
+resolve_replica_seq(Seq, _Stream) ->
+    Seq.
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
