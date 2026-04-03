@@ -16,10 +16,14 @@ A wrapper around the AWS S3 HTTP API.
     reload_config/0,
     get/2,
     get_range/3,
+    get_range_async/3,
     put/3,
     delete/2,
     delete_prefix/2,
-    list/3
+    list/3,
+    match_async/2,
+    handle_async/3,
+    cancel_async/2
 ]).
 
 %% For apply/3:
@@ -38,6 +42,10 @@ A wrapper around the AWS S3 HTTP API.
 -define(REGION_KEY, rabbitmq_stream_s3_api_aws_region).
 -define(GENERAL_POOL, rabbitmq_stream_s3_general_pool).
 -define(UPLOAD_POOL, rabbitmq_stream_s3_upload_pool).
+%% Amount of data to buffer in async state before giving it to the remote
+%% reader process. See the async_state() type.
+%% 1024^2 (1 MiB).
+-define(BUFFER_PENDING_DATA_BYTES, 1_048_576).
 
 -define(C_ACTIVE_REQUESTS, 1).
 -define(C_TOTAL_REQUESTS, 2).
@@ -82,6 +90,23 @@ Called "HTTP Verb" in S3 docs. "GET", "PUT", "HEAD", "POST", "DELETE", etc..
     total_size := non_neg_integer(),
     pages := non_neg_integer()
 }.
+-type async_state() :: #{
+    conn := pid(),
+    stream_ref := gun:stream_ref(),
+    %% PERF: The remote tier sends relatively small binaries when reading with
+    %% chunked transfer-encoding. Appending these binaries to the remote
+    %% reader's buffer individually creates a lot of binary garbage, which
+    %% results in long GC times for the reader process. This very significantly
+    %% impacts consumption throughput and memory overhead.
+    %%
+    %% To avoid the garbage overhead, we prepend data sent in gun_data messages
+    %% to this list and reverse and concatenate the binaries into one large
+    %% binary when a fairly large amount of data has been collected.
+    data => [binary()],
+    pending_bytes => non_neg_integer()
+}.
+%% Re-use the gun stream ref since it's already a reference.
+-type async_req() :: gun:stream_ref().
 
 -spec init() -> ok.
 init() ->
@@ -169,6 +194,12 @@ get_range(Key, Range, Opts) when is_binary(Key) andalso is_map(Opts) ->
         {error, _} = Err ->
             Err
     end.
+
+-spec get_range_async(key(), rabbitmq_stream_s3_api:range_spec(), request_opts()) ->
+    {ok, async_req(), async_state()} | {error, any()}.
+get_range_async(Key, Range, Opts) when is_binary(Key) andalso is_map(Opts) ->
+    Headers = #{<<"range">> => range_specifier(Range)},
+    request_async(<<"GET">>, key_to_path(Key), Headers, <<>>, Opts).
 
 -doc "Uploads the given `Data` as an object at key `Key`".
 -spec put(key(), iodata(), request_opts()) -> ok | {error, any()}.
@@ -340,6 +371,136 @@ log_unexpected_status(Function, Status) ->
 log_unexpected_status(Function, Status, Key) ->
     ?LOG_DEBUG("~ts unexpected HTTP status ~b for key ~ts", [Function, Status, Key]).
 
+-spec match_async(Msg :: term(), #{async_req() := async_state()}) ->
+    {ok, async_req()} | error.
+match_async({gun_error, Conn, _Reason}, Reqs) ->
+    maps:fold(
+        fun
+            (Req, #{conn := C}, error) when C =:= Conn -> {ok, Req};
+            (_, _, Acc) -> Acc
+        end,
+        error,
+        Reqs
+    );
+match_async(Msg, Reqs) ->
+    Req =
+        case Msg of
+            {gun_error, _, StreamRef, _} -> StreamRef;
+            {gun_response, _, StreamRef, _, _, _} -> StreamRef;
+            {gun_data, _, StreamRef, _, _} -> StreamRef;
+            _ -> undefined
+        end,
+    case Reqs of
+        #{Req := _} -> {ok, Req};
+        _ -> error
+    end.
+
+-spec handle_async(Msg :: term(), async_req(), async_state()) ->
+    {continue, async_state()}
+    | {data, binary(), async_state()}
+    | {done, ok | {error, any()}}
+    | ignore.
+handle_async(
+    {gun_error, Conn, StreamRef, Reason},
+    StreamRef,
+    #{conn := Conn, stream_ref := StreamRef} = State
+) ->
+    ?LOG_DEBUG("Received stream error on ~tw/~tw from gun: ~0p", [Conn, StreamRef, Reason]),
+    finish_async(State),
+    {done, {error, stream_error}};
+handle_async(
+    {gun_error, Conn, Reason},
+    _StreamRef,
+    #{conn := Conn} = State
+) ->
+    ?LOG_DEBUG("Received connection error on ~tw from gun: ~0p", [Conn, Reason]),
+    finish_async(State),
+    {done, {error, connection_error}};
+handle_async(
+    {gun_response, Conn, StreamRef, fin, Status, Headers},
+    StreamRef,
+    #{conn := Conn, stream_ref := StreamRef} = State
+) ->
+    Result =
+        case Status of
+            200 ->
+                ok;
+            404 ->
+                {error, not_found};
+            500 ->
+                {error, internal_error};
+            503 ->
+                {error, slow_down};
+            _ ->
+                {error, #{status => Status, headers => Headers}}
+        end,
+    finish_async(State),
+    {done, Result};
+handle_async(
+    {gun_response, Conn, StreamRef, nofin, Status, Headers},
+    StreamRef,
+    #{conn := Conn, stream_ref := StreamRef} = State0
+) ->
+    case Status of
+        200 ->
+            State = State0#{data => [], pending_bytes => 0},
+            {continue, State};
+        206 ->
+            State = State0#{data => [], pending_bytes => 0},
+            {continue, State};
+        404 ->
+            finish_async(State0),
+            {done, {error, not_found}};
+        500 ->
+            finish_async(State0),
+            {done, {error, internal_error}};
+        503 ->
+            finish_async(State0),
+            {done, {error, slow_down}};
+        _ ->
+            finish_async(State0),
+            {done, {error, #{status => Status, headers => Headers}}}
+    end;
+handle_async(
+    {gun_data, Conn, StreamRef, nofin, Data},
+    StreamRef,
+    #{
+        conn := Conn,
+        stream_ref := StreamRef,
+        pending_bytes := PendingBytes0,
+        data := PendingData0
+    } = State0
+) ->
+    case PendingBytes0 > ?BUFFER_PENDING_DATA_BYTES of
+        true ->
+            AllData = iolist_to_binary(lists:reverse(PendingData0, [Data])),
+            State = State0#{data := [], pending_bytes := 0},
+            {data, AllData, State};
+        false ->
+            State = State0#{
+                data := [Data | PendingData0],
+                pending_bytes := PendingBytes0 + byte_size(Data)
+            },
+            {continue, State}
+    end;
+handle_async(
+    {gun_data, Conn, StreamRef, fin, Data},
+    StreamRef,
+    #{conn := Conn, stream_ref := StreamRef, data := Data0} = State
+) ->
+    finish_async(State),
+    PendingData = iolist_to_binary(lists:reverse(Data0, [Data])),
+    {data, PendingData, done}.
+
+-spec cancel_async(async_req(), async_state()) -> ok.
+cancel_async(StreamRef, #{conn := Conn, stream_ref := StreamRef} = State) ->
+    gun:cancel(Conn, StreamRef),
+    ok = finish_async(State).
+
+finish_async(#{conn := Conn}) ->
+    counters:sub(counter(), ?C_ACTIVE_REQUESTS, 1),
+    ok = rabbitmq_stream_s3_api_aws_pool:checkin(?GENERAL_POOL, Conn).
+
 -spec request(http_method(), key(), req_headers(), iodata(), request_opts()) ->
     {ok, http_response()}
     | {error, any()}.
@@ -413,6 +574,31 @@ postprocess_response(#{status := 500}) ->
     counters:add(counter(), ?C_RESPONSE_500, 1);
 postprocess_response(_) ->
     ok.
+
+request_async(Method, Path, Headers0, Body, Opts) ->
+    case get_credentials() of
+        {ok, AccessKey, SecretKey, SecurityToken} ->
+            Headers = sign_headers(
+                Headers0,
+                AccessKey,
+                SecretKey,
+                SecurityToken,
+                Method,
+                Path,
+                Body,
+                Opts
+            ),
+            Cnt = counter(),
+            counters:add(Cnt, ?C_ACTIVE_REQUESTS, 1),
+            counters:add(Cnt, ?C_TOTAL_REQUESTS, 1),
+            Conn = rabbitmq_stream_s3_api_aws_pool:checkout(?GENERAL_POOL, 10_000),
+            %% NOTE: no need to wrap this in try/catch and checkin the conn
+            %% since gun:request/5 cannot exit/error/throw.
+            StreamRef = gun:request(Conn, Method, Path, Headers, Body),
+            {ok, StreamRef, #{conn => Conn, stream_ref => StreamRef}};
+        {error, _} = Err ->
+            Err
+    end.
 
 -spec hostname() -> binary().
 hostname() ->
