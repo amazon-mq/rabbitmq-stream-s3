@@ -13,14 +13,11 @@ tier.
 """.
 
 -include_lib("kernel/include/logger.hrl").
--include_lib("rabbit_common/include/rabbit.hrl").
 
 -include("include/rabbitmq_stream_s3.hrl").
 
 -behaviour(osiris_log_reader).
--behaviour(gen_server).
 
--define(READAHEAD, "5MiB").
 -define(READ_TIMEOUT, 10000).
 -define(SLOW_READ_THRESHOLD_MS, 10_000).
 
@@ -48,25 +45,6 @@ tier.
     data :: binary()
 }).
 
--record(state, {
-    buffer = <<>> :: binary(),
-    offset_start :: byte_offset() | undefined,
-    offset_end :: byte_offset() | undefined,
-    read_size :: pos_integer(),
-    object :: binary(),
-    index_start_pos :: byte_offset(),
-    next_fragment_offset :: osiris:offset()
-}).
-
--record(remote_location, {
-    fragment :: osiris:offset(),
-    position :: byte_offset(),
-    chunk_id :: osiris:offset(),
-    %% This may be undefined if we are starting at the first offset in a
-    %% fragment and didn't download any of its data.
-    fragment_info :: #fragment_info{} | undefined
-}).
-
 %% osiris_log_reader
 -export([
     resolve_offset_spec/2,
@@ -78,18 +56,6 @@ tier.
     send_file/3,
     chunk_iterator/3,
     iterator_next/1
-]).
-
-%% gen_server
--export([
-    start_link/1,
-    init/1,
-    handle_call/3,
-    handle_cast/2,
-    handle_info/2,
-    terminate/2,
-    format_status/1,
-    code_change/3
 ]).
 
 -ifdef(TEST).
@@ -256,9 +222,9 @@ send_file(Socket, #?MODULE{mode = #remote{} = Remote0} = State0, Callback) ->
             DataPos = Position + ?CHUNK_HEADER_B + ToSkip,
             PrefixData = Callback(Header, ToSend + byte_size(HeaderData)),
             {ReadMsec, {ok, Data}} = timer:tc(
-                gen_server,
-                call,
-                [Pid, {read, DataPos, ToSend, within_chunk}, ?GEN_SERVER_CALL_TIMEOUT],
+                rabbitmq_stream_s3_remote_reader,
+                read,
+                [Pid, DataPos, ToSend, within_chunk],
                 millisecond
             ),
             validate_read_timing(ReadMsec, ToSend, DataPos),
@@ -308,9 +274,9 @@ chunk_iterator(#?MODULE{mode = #remote{} = Remote0} = State0, Credit, _PrevIter)
             #remote{pid = Pid} = Remote1} ->
             DataPos = Position + ?CHUNK_HEADER_B + FilterSize,
             {ReadMsec, {ok, Data}} = timer:tc(
-                gen_server,
-                call,
-                [Pid, {read, DataPos, DataSize, within_chunk}, ?GEN_SERVER_CALL_TIMEOUT],
+                rabbitmq_stream_s3_remote_reader,
+                read,
+                [Pid, DataPos, DataSize, within_chunk],
                 millisecond
             ),
             validate_read_timing(ReadMsec, DataPos),
@@ -363,81 +329,6 @@ iterator_next(#remote_iterator{next_offset = NextOffset0, data = Data0} = Iter0)
 iterator_next(Local) ->
     osiris_log:iterator_next(Local).
 
-%%%===================================================================
-%%% gen_server callbacks
-%%%===================================================================
-
-start_link(Config) ->
-    gen_server:start_link(?MODULE, Config, []).
-
-init(#{
-    reader := Reader,
-    stream := StreamId,
-    location := #remote_location{fragment = Fragment, fragment_info = Info0}
-}) ->
-    erlang:monitor(process, Reader),
-    Key = rabbitmq_stream_s3:fragment_key(StreamId, Fragment),
-    Info =
-        case Info0 of
-            #fragment_info{} ->
-                {ok, Info0};
-            undefined ->
-                rabbitmq_stream_s3_server:get_fragment_info(Key)
-        end,
-    case Info of
-        {ok, #fragment_info{index_start_pos = IdxStartPos, next_offset = NextOffset}} ->
-            {ok, ReadSize} = rabbit_resource_monitor_misc:parse_information_unit(?READAHEAD),
-            {ok, #state{
-                object = Key,
-                index_start_pos = IdxStartPos,
-                read_size = ReadSize,
-                next_fragment_offset = NextOffset
-            }};
-        {error, not_found} ->
-            %% The fragment was deleted by retention before this reader could
-            %% open it. Stop normally so the supervisor does not restart us.
-            %% TODO: transition to the first available fragment.
-            {stop, normal}
-    end.
-
-handle_call({read, Offset, Bytes, Hint}, _From, State0) ->
-    %% TODO: while reading, start a request for the next range of data when
-    %% we near the end of the current section.
-    case do_read(State0, Offset, Bytes) of
-        {State, ?IDX_HEADER(_)} when Hint =:= chunk_boundary ->
-            %% The reader has reached the section of the
-            {reply, eof, State};
-        {State, Data} ->
-            {reply, {ok, Data}, State};
-        eof ->
-            {reply, eof, State0}
-    end;
-handle_call(Request, From, State) ->
-    {stop, {unknown_call, From, Request}, State}.
-
-handle_cast(close, State) ->
-    {stop, normal, State};
-handle_cast(Message, State) ->
-    ?LOG_DEBUG(?MODULE_STRING " received unexpected cast: ~W", [Message, 10]),
-    {noreply, State}.
-
-handle_info({'DOWN', _Ref, process, _Pid, _Reason}, State) ->
-    {stop, normal, State};
-handle_info(Message, State) ->
-    ?LOG_DEBUG(?MODULE_STRING " received unexpected message: ~W", [Message, 10]),
-    {noreply, State}.
-
-terminate(_Reason, _State) ->
-    ok.
-
-format_status(#{state := #state{buffer = Buffer} = State0} = Status0) ->
-    %% Avoid formatting the buffer - it can be large.
-    Size = <<(integer_to_binary(byte_size(Buffer)))/binary, " bytes">>,
-    Status0#{state := State0#state{buffer = Size}}.
-
-code_change(_, _, State) ->
-    {ok, State}.
-
 %%---------------------------------------------------------------------------
 %% Helpers
 
@@ -445,39 +336,6 @@ send(tcp, Socket, Data) ->
     gen_tcp:send(Socket, Data);
 send(ssl, Socket, Data) ->
     ssl:send(Socket, Data).
-
-do_read(#state{index_start_pos = IdxStartPos}, Offset, _Bytes) when Offset >= IdxStartPos ->
-    eof;
-do_read(
-    #state{
-        object = Object,
-        buffer = Buffer,
-        read_size = ReadSize,
-        offset_start = BufStart,
-        offset_end = BufEnd
-    } = State0,
-    Offset,
-    Bytes
-) ->
-    End = Offset + Bytes - 1,
-    case (Offset >= BufStart) and (End =< BufEnd) of
-        % Data is in buffer
-        true ->
-            OffsetInBuf = Offset - BufStart,
-            {State0, binary:part(Buffer, OffsetInBuf, Bytes)};
-        false ->
-            ToRead = max(ReadSize, Bytes),
-            {ok, NewBuffer} = rabbitmq_stream_s3_api:get_range(
-                Object,
-                {Offset, Offset + ToRead - 1}
-            ),
-            State = State0#state{
-                buffer = NewBuffer,
-                offset_start = Offset,
-                offset_end = Offset + ToRead - 1
-            },
-            {State, binary:part(NewBuffer, 0, Bytes)}
-    end.
 
 %% This helper is mostly the same as osiris_log:read_header0/1. There are some
 %% simplifications:
@@ -515,13 +373,9 @@ read_header1(
     %% TODO: make sure that over-reading is handled gracefully: as much of the
     %% binary should be returned as possible.
     {ReadMsec, ReadResult} = timer:tc(
-        gen_server,
-        call,
-        [
-            Pid0,
-            {read, Position, ?CHUNK_HEADER_B + ?MAX_FILTER_SIZE, chunk_boundary},
-            ?GEN_SERVER_CALL_TIMEOUT
-        ],
+        rabbitmq_stream_s3_remote_reader,
+        read,
+        [Pid0, Position, ?CHUNK_HEADER_B + ?MAX_FILTER_SIZE, chunk_boundary],
         millisecond
     ),
     validate_read_timing(ReadMsec),
@@ -544,7 +398,7 @@ read_header1(
                         stream => StreamId,
                         location => remote_location_first(NextChId)
                     },
-                    case rabbitmq_stream_s3_log_reader_sup:add_child(Conf) of
+                    case rabbitmq_stream_s3_remote_reader_sup:add_child(Conf) of
                         {ok, Pid} ->
                             ok = gen_server:cast(Pid0, close),
                             Remote = Remote0#remote{
@@ -654,7 +508,7 @@ init_remote_reader(
         stream => StreamId,
         location => Location
     },
-    case rabbitmq_stream_s3_log_reader_sup:add_child(Conf) of
+    case rabbitmq_stream_s3_remote_reader_sup:add_child(Conf) of
         {ok, Pid} ->
             Reader = #?MODULE{
                 config = Config,
