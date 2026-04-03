@@ -38,23 +38,11 @@ A wrapper around the AWS S3 HTTP API.
 
 -define(C_ACTIVE_REQUESTS, 1).
 -define(C_TOTAL_REQUESTS, 2).
--define(C_GET, 3).
--define(C_GET_RANGE, 4).
--define(C_PUT, 5).
--define(C_DELETE_MANY, 6).
--define(C_DELETE_ONE, 7).
--define(C_LIST, 8).
--define(C_RESPONSE_500, 9).
--define(C_RESPONSE_503, 10).
+-define(C_RESPONSE_500, 3).
+-define(C_RESPONSE_503, 4).
 -define(COUNTERS, [
     {active_requests, ?C_ACTIVE_REQUESTS, gauge, "Current number of requests to S3"},
     {total_requests, ?C_TOTAL_REQUESTS, counter, "Total number of requests to S3"},
-    {get, ?C_GET, counter, "Number of full-object GET requests"},
-    {get_range, ?C_GET_RANGE, counter, "Number of range GET requests"},
-    {put, ?C_PUT, counter, "Number of PUT requests"},
-    {delete_many, ?C_DELETE_MANY, counter, "Number of multi-object DELETE requests"},
-    {delete_one, ?C_DELETE_ONE, counter, "Number of single-object DELETE requests"},
-    {list, ?C_LIST, counter, "Number of LIST requests"},
     {response_500, ?C_RESPONSE_500, counter, "Number of HTTP 500 responses"},
     {response_503, ?C_RESPONSE_503, counter, "Number of HTTP 503 responses"}
 ]).
@@ -98,7 +86,7 @@ Called "HTTP Verb" in S3 docs. "GET", "PUT", "HEAD", "POST", "DELETE", etc..
 
 -spec init() -> ok.
 init() ->
-    Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?COUNTERS),
+    Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?COUNTERS, #{module => ?MODULE}),
     persistent_term:put(?COUNTER_KEY, Cnt),
     _ = ets:new(?TABLE, [public, named_table]),
     reload_config().
@@ -163,7 +151,6 @@ close(Conn) when is_pid(Conn) ->
 -doc "Gets the body of an object at key `Key`".
 -spec get(connection(), key(), request_opts()) -> {ok, binary()} | {error, any()}.
 get(Conn, Key, Opts) when is_pid(Conn) andalso is_binary(Key) andalso is_map(Opts) ->
-    counters:add(counter(), ?C_GET, 1),
     case request(Conn, <<"GET">>, key_to_path(Key), #{}, <<>>, Opts) of
         {ok, #{status := 200, body := Data}} ->
             {ok, Data};
@@ -185,7 +172,6 @@ range.
 -spec get_range(connection(), key(), rabbitmq_stream_s3_api:range_spec(), request_opts()) ->
     {ok, binary()} | {error, any()}.
 get_range(Conn, Key, Range, Opts) when is_pid(Conn) andalso is_binary(Key) andalso is_map(Opts) ->
-    counters:add(counter(), ?C_GET_RANGE, 1),
     Headers = #{<<"range">> => range_specifier(Range)},
     case request(Conn, <<"GET">>, key_to_path(Key), Headers, <<>>, Opts) of
         %% HTTP Range requests must return 206 if only a partial range is served,
@@ -203,7 +189,6 @@ get_range(Conn, Key, Range, Opts) when is_pid(Conn) andalso is_binary(Key) andal
 -doc "Uploads the given `Data` as an object at key `Key`".
 -spec put(connection(), key(), iodata(), request_opts()) -> ok | {error, any()}.
 put(Conn, Key, Data, Opts) when is_pid(Conn) andalso is_binary(Key) andalso is_map(Opts) ->
-    counters:add(counter(), ?C_PUT, 1),
     Headers =
         case Opts of
             #{crc32 := Checksum} ->
@@ -229,7 +214,6 @@ delete(Conn, Keys, Opts) when is_pid(Conn) andalso is_list(Keys) andalso is_map(
     %% Though not documented, S3 will reject the request if the list of keys
     %% is empty.
     ?assertNotEqual([], Keys),
-    counters:add(counter(), ?C_DELETE_MANY, 1),
     Data = delete_many_body(Keys),
     Headers = #{
         %% A checksum header seems to be required on this endpoint...
@@ -244,7 +228,6 @@ delete(Conn, Keys, Opts) when is_pid(Conn) andalso is_list(Keys) andalso is_map(
             Err
     end;
 delete(Conn, Key, Opts) when is_pid(Conn) andalso is_binary(Key) andalso is_map(Opts) ->
-    counters:add(counter(), ?C_DELETE_ONE, 1),
     %% <https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObject.html>.
     case request(Conn, <<"DELETE">>, key_to_path(Key), #{}, <<>>, Opts) of
         {ok, #{status := 204}} ->
@@ -315,7 +298,6 @@ delete_prefix(Conn, Prefix, Opts, Token, Objects0, TotalSize0, Pages0) ->
     end.
 
 list(Conn, Prefix, ContinuationToken, Opts) ->
-    counters:add(counter(), ?C_LIST, 1),
     Params0 = [{<<"list-type">>, <<"2">>}, {<<"prefix">>, Prefix}],
     Params1 =
         case ContinuationToken of

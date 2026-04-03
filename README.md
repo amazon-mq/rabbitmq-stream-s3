@@ -13,6 +13,12 @@ Streams can retain data indefinitely in S3 at low cost, while local disk only ho
 
 For a detailed description of the design, see [docs/README.md](docs/README.md).
 
+## Important: `rabbitmq_prometheus` dependency
+
+This plugin depends on `rabbitmq_prometheus`. Enabling `rabbitmq_stream_s3`
+**implicitly enables** `rabbitmq_prometheus`, which opens the Prometheus
+metrics endpoint on port 15692.
+
 ## Project Maturity
 
 rabbitmq-stream-s3 is not stable, with frequent changes in design and functionality.

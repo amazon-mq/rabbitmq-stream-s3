@@ -150,7 +150,7 @@
 %% recover replicas before this server is started and writer_manifest/1 will
 %% fail a few times and look messy in the logs.
 start() ->
-    Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?COUNTERS),
+    Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?COUNTERS, #{module => ?MODULE}),
     persistent_term:put(?COUNTER_KEY, Cnt),
 
     ok = rabbitmq_stream_s3_api:init(),
