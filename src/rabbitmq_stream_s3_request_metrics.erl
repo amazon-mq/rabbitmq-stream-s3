@@ -7,9 +7,12 @@
 
 -export([
     init/0,
-    observe/1,
+    observe/2,
     prometheus_format/0
 ]).
+
+-type kind() :: read | write.
+-export_type([kind/0]).
 
 %% Buckets in milliseconds (standard Prometheus HTTP duration buckets).
 -define(BUCKET_1, 10).
@@ -38,39 +41,49 @@
 
 -define(POS_SUM, 11).
 -define(COUNTER_SIZE, 11).
--define(COUNTER_KEY, {?MODULE, counters}).
 
 -spec init() -> ok.
 init() ->
-    Counters = counters:new(?COUNTER_SIZE, [write_concurrency]),
-    persistent_term:put(?COUNTER_KEY, Counters),
+    lists:foreach(
+        fun(Kind) ->
+            Counters = counters:new(?COUNTER_SIZE, [write_concurrency]),
+            persistent_term:put({?MODULE, Kind}, Counters)
+        end,
+        [read, write]
+    ),
     ok.
 
--spec observe(non_neg_integer()) -> ok.
-observe(DurationMs) ->
+-spec observe(kind(), non_neg_integer()) -> ok.
+observe(Kind, DurationMs) ->
     Pos = find_bucket_pos(DurationMs),
-    Counters = persistent_term:get(?COUNTER_KEY),
+    Counters = persistent_term:get({?MODULE, Kind}),
     counters:add(Counters, Pos, 1),
     counters:add(Counters, ?POS_SUM, DurationMs).
 
 -spec prometheus_format() -> map().
 prometheus_format() ->
-    Counters = persistent_term:get(?COUNTER_KEY),
-    {Buckets, Count} = lists:mapfoldl(
-        fun({UpperBound, NumObservations}, Acc0) ->
-            Acc = Acc0 + NumObservations,
-            {{UpperBound, Acc}, Acc}
+    Values = lists:map(
+        fun(Kind) ->
+            Counters = persistent_term:get({?MODULE, Kind}),
+            {Buckets, Count} = lists:mapfoldl(
+                fun({UpperBound, NumObservations}, Acc0) ->
+                    Acc = Acc0 + NumObservations,
+                    {{UpperBound, Acc}, Acc}
+                end,
+                0,
+                raw_buckets(Counters)
+            ),
+            Sum = counters:get(Counters, ?POS_SUM) / 1000,
+            {[{kind, Kind}], Buckets, Count, Sum}
         end,
-        0,
-        raw_buckets(Counters)
+        [read, write]
     ),
-    Sum = counters:get(Counters, ?POS_SUM) / 1000,
     #{
         request_duration_seconds =>
             #{
                 type => histogram,
                 help => <<"Duration of S3 API requests in seconds">>,
-                values => [{[], Buckets, Count, Sum}]
+                values => Values
             }
     }.
 

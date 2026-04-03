@@ -424,11 +424,16 @@ request(Conn, Method, Path, Headers0, Body, Opts) when
             after
                 counters:sub(Cnt, ?C_ACTIVE_REQUESTS, 1),
                 DurationMs = erlang:monotonic_time(millisecond) - T0,
-                rabbitmq_stream_s3_request_metrics:observe(DurationMs)
+                rabbitmq_stream_s3_request_metrics:observe(method_to_kind(Method), DurationMs)
             end;
         {error, _} = Err ->
             Err
     end.
+
+method_to_kind(<<"GET">>) ->
+    read;
+method_to_kind(_) ->
+    write.
 
 postprocess_response(#{status := 503}) ->
     counters:add(counter(), ?C_RESPONSE_503, 1);

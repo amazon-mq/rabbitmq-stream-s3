@@ -65,8 +65,8 @@ identifying the source module.
 rabbitmq_stream_s3_request_duration_seconds
 ```
 
-A histogram of S3 API request duration in seconds. Covers all request types
-(GET, PUT, DELETE, LIST). Use the per-operation counters above to understand
-the request type breakdown.
+A histogram of S3 API request duration in seconds with a `kind` label:
+- `kind="read"` — GET requests (full-object and range)
+- `kind="write"` — PUT, DELETE, and POST requests
 
 Buckets: 10ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s, +Inf
