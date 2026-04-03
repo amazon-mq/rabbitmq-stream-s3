@@ -358,7 +358,7 @@ apply(
                     ),
                     Effect = #manifest_requested{stream = StreamId, requester = self()},
                     Replica = Replica0#{manifest := {pending, []}},
-                    {Replica, [Effect]}
+                    {State0#?MODULE{streams = Streams0#{StreamId := Replica}}, [Effect]}
             end;
         _ ->
             {State0, []}
