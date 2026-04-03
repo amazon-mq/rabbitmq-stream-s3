@@ -43,18 +43,23 @@ identifying the source module.
 | `put_not_founds` | counter | Khepri put-not-found errors |
 | `put_errors` | counter | Khepri put errors |
 
-### S3 API (`rabbitmq_stream_s3_api_aws`)
+### Per-Operation (`rabbitmq_stream_s3_api`)
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `active_requests` | gauge | Current number of in-flight S3 requests |
-| `total_requests` | counter | Total S3 API requests |
 | `get` | counter | Full-object GET requests |
 | `get_range` | counter | Range GET requests (remote tier reads) |
 | `put` | counter | PUT requests (fragment and manifest uploads) |
 | `delete_many` | counter | Multi-object DELETE requests (retention) |
 | `delete_one` | counter | Single-object DELETE requests |
-| `list` | counter | LIST requests |
+| `list` | counter | LIST requests (`delete_prefix` counts as one regardless of pagination) |
+
+### HTTP Transport (`rabbitmq_stream_s3_api_aws`)
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `active_requests` | gauge | Current number of in-flight S3 requests |
+| `total_requests` | counter | Total S3 API requests (includes internal pagination) |
 | `response_500` | counter | HTTP 500 responses from S3 |
 | `response_503` | counter | HTTP 503 responses from S3 |
 

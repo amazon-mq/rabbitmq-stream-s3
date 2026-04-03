@@ -23,7 +23,8 @@ groups() ->
         {cluster_size_1, [], [
             tiered_data_generation,
             read_from_remote_tier_by_offset,
-            read_from_remote_tier_by_timestamp
+            read_from_remote_tier_by_timestamp,
+            prometheus_metrics
         ]},
         {cluster_size_3, [], [
             transfer_leadership
@@ -35,6 +36,7 @@ groups() ->
 %% -------------------------------------------------------------------
 init_per_suite(Config) ->
     rabbit_ct_helpers:log_environment(),
+    inets:start(),
     Config.
 
 end_per_suite(Config) ->
@@ -181,6 +183,104 @@ tiered_data_generation(Config) ->
         10000
     ),
 
+    rabbit_ct_client_helpers:close_channel(Ch),
+    ok.
+
+prometheus_metrics(Config) ->
+    Payload1K = <<0:(1024 * 8)>>,
+    Payload64M = <<1:(64 * 1024 * 1024 * 8)>>,
+
+    Ch = rabbit_ct_client_helpers:open_channel(Config),
+    QName = <<"prometheus_test_stream">>,
+    ?assertEqual(ok, stream_declare(Ch, QName)),
+
+    ?assertEqual(
+        ok,
+        amqp_channel:call(
+            Ch,
+            #'basic.publish'{routing_key = QName},
+            #amqp_msg{payload = Payload1K}
+        )
+    ),
+    ?assertEqual(
+        ok,
+        amqp_channel:call(
+            Ch,
+            #'basic.publish'{routing_key = QName},
+            #amqp_msg{payload = Payload64M}
+        )
+    ),
+
+    % Wait for at least one fragment to be uploaded
+    ?awaitMatch(
+        {ok, Manifest, [_Fragment | _]} when Manifest /= undefined,
+        rabbit_ct_broker_helpers:rpc(
+            Config,
+            0,
+            rabbitmq_stream_s3_api_fs,
+            get_stream_data,
+            [QName]
+        ),
+        500
+    ),
+
+    % Scrape the Prometheus endpoint
+    Port = rabbit_ct_broker_helpers:get_node_config(Config, 0, tcp_port_prometheus),
+    URI = lists:flatten(io_lib:format("http://localhost:~b/metrics", [Port])),
+    {ok, {{_, 200, _}, _, Body}} = httpc:request(get, {URI, []}, [], []),
+
+    % Verify seshat counters from rabbitmq_stream_s3_server
+    ?assertMatch(
+        match, re:run(Body, "^rabbitmq_stream_s3_active_tasks\\{", [{capture, none}, multiline])
+    ),
+    ?assertMatch(
+        match,
+        re:run(Body, "^rabbitmq_stream_s3_fragments_created\\{", [{capture, none}, multiline])
+    ),
+    ?assertMatch(
+        match,
+        re:run(Body, "^rabbitmq_stream_s3_task_failures\\{", [{capture, none}, multiline])
+    ),
+    ?assertMatch(
+        match,
+        re:run(Body, "^rabbitmq_stream_s3_roots_created\\{", [{capture, none}, multiline])
+    ),
+
+    % Verify seshat counters from rabbitmq_stream_s3_db
+    ?assertMatch(match, re:run(Body, "^rabbitmq_stream_s3_puts\\{", [{capture, none}, multiline])),
+    ?assertMatch(
+        match,
+        re:run(Body, "^rabbitmq_stream_s3_put_successes\\{", [{capture, none}, multiline])
+    ),
+
+    % Verify per-operation counters from rabbitmq_stream_s3_api
+    ?assertMatch(match, re:run(Body, "^rabbitmq_stream_s3_put\\{", [{capture, none}, multiline])),
+    ?assertMatch(
+        match,
+        re:run(Body, "^rabbitmq_stream_s3_get\\{", [{capture, none}, multiline])
+    ),
+
+    % Verify request duration histogram with kind label
+    ?assertMatch(
+        match,
+        re:run(Body, "^rabbitmq_stream_s3_request_duration_seconds_bucket\\{kind=\"write\"", [
+            {capture, none}, multiline
+        ])
+    ),
+    ?assertMatch(
+        match,
+        re:run(Body, "^rabbitmq_stream_s3_request_duration_seconds_count\\{kind=\"write\"\\}", [
+            {capture, none}, multiline
+        ])
+    ),
+    ?assertMatch(
+        match,
+        re:run(Body, "^rabbitmq_stream_s3_request_duration_seconds_bucket\\{kind=\"read\"", [
+            {capture, none}, multiline
+        ])
+    ),
+
+    amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
     rabbit_ct_client_helpers:close_channel(Ch),
     ok.
 
