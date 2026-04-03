@@ -83,7 +83,7 @@ The data representation between the local and remote tiers are separate. The loc
 
 ![Fragments from segments](./FragmentsFromSegment.svg)
 
-Fragments start with a header, contain a sequence of one-or-more chunks and then contain the index header, a sequence of index records and finally a trailer. The trailer contains metadata like pointers to the beginning of the index within the fragment, the fragment's sequence number and offset into the segment file, offset of the next fragment, etc..
+Fragments start with a header, contain a sequence of one-or-more chunks and then contain the index header and finally a sequence of index records. The header contains metadata like pointers to the beginning of the index within the fragment, the fragment's sequence number and offset into the segment file, offset of the next fragment, etc..
 
 ```
 rabbitmq/

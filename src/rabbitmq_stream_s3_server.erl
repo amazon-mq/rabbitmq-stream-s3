@@ -67,8 +67,8 @@
 
 %% Useful for other modules
 -export([
-    get_fragment_trailer/1,
-    get_fragment_trailer/2,
+    get_fragment_info/1,
+    get_fragment_info/2,
     get_group_fun/2,
     get_group/3
 ]).
@@ -521,7 +521,7 @@ execute_task(#upload_fragment{
             first_timestamp = FirstTs,
             last_timestamp = LastTs,
             next_offset = NextOffset,
-            checksum = Checksum0,
+            checksum = SegmentDataCrc,
             num_chunks = {IdxStart, IdxLen},
             seq_no = SeqNo,
             size = Size,
@@ -559,7 +559,7 @@ execute_task(#upload_fragment{
                     <<
                         IdxChId:64/unsigned,
                         IdxTs:64/signed,
-                        (SegmentFilePos - SegmentPos + ?SEGMENT_HEADER_B):32/unsigned
+                        (SegmentFilePos - SegmentPos + ?FRAGMENT_HEADER_B):32/unsigned
                     >>
                  || <<
                         IdxChId:64/unsigned,
@@ -569,25 +569,28 @@ execute_task(#upload_fragment{
                         _ChType:8/unsigned
                     >> <= IdxData0
                 >>,
-                Trailer = ?FRAGMENT_TRAILER(
+                Header = ?FRAGMENT_HEADER(
                     FragmentOffset,
                     NextOffset,
                     FirstTs,
                     LastTs,
                     SeqNo,
-                    Size,
-                    IdxStart,
+                    SegmentOffset,
                     SegmentPos,
-                    (?SEGMENT_HEADER_B + Size + ?IDX_HEADER_B),
-                    (byte_size(IdxData))
+                    (?FRAGMENT_HEADER_B + Size),
+                    <<>>
                 ),
-                Data = [?SEGMENT_HEADER, SegData, ?IDX_HEADER, IdxData, Trailer],
-                Checksum =
-                    case Checksum0 of
+                Data = [Header, SegData, ?IDX_HEADER, IdxData],
+                Crc =
+                    case SegmentDataCrc of
                         undefined ->
+                            %% TODO: If there is no CRC32 cached then we need
+                            %% to validate chunks data during the upload and
+                            %% rebuild the index from the segment data.
                             erlang:crc32(Data);
                         _ ->
-                            erlang:crc32(Checksum0, [?IDX_HEADER, IdxData, Trailer])
+                            Crc0 = erlang:crc32_combine(erlang:crc32(Header), SegmentDataCrc, Size),
+                            erlang:crc32(Crc0, [?IDX_HEADER, IdxData])
                     end,
                 %% TODO: should be able to upload this in chunks. Gun should
                 %% support that.
@@ -598,7 +601,7 @@ execute_task(#upload_fragment{
                         Data,
                         #{
                             unsigned_payload => true,
-                            crc32 => Checksum,
+                            crc32 => Crc,
                             timeout => Timeout
                         }
                     )
@@ -608,7 +611,7 @@ execute_task(#upload_fragment{
                     {error, _} = Err ->
                         exit(Err)
                 end,
-                {iolist_size(Data), fragment_trailer_to_info(Trailer)}
+                {iolist_size(Data), fragment_header_to_info(Header)}
             end,
             millisecond
         ),
@@ -968,7 +971,7 @@ resolve_manifest_tail(
         total_size = TotalSize0
     } = Manifest0
 ) ->
-    case get_fragment_trailer(StreamId, NextOffset0) of
+    case get_fragment_info(StreamId, NextOffset0) of
         {ok, #fragment_info{
             first_offset = NextOffset0,
             next_offset = NextOffset,
@@ -1002,34 +1005,33 @@ group_header(?MANIFEST_KIND_KILO_GROUP) ->
 group_header(?MANIFEST_KIND_MEGA_GROUP) ->
     <<?MANIFEST_MEGA_GROUP_MAGIC, ?MANIFEST_MEGA_GROUP_VERSION:32/unsigned>>.
 
-get_fragment_trailer(StreamId, FragmentOffset) ->
-    get_fragment_trailer(rabbitmq_stream_s3:fragment_key(StreamId, FragmentOffset)).
+get_fragment_info(StreamId, FragmentOffset) ->
+    Key = rabbitmq_stream_s3:fragment_key(StreamId, FragmentOffset),
+    get_fragment_info(Key).
 
-get_fragment_trailer(Key) ->
+get_fragment_info(Key) ->
     {ok, Conn} = rabbitmq_stream_s3_api:open(),
-    ?LOG_DEBUG("Looking up key ~ts (~ts)", [Key, ?FUNCTION_NAME]),
-    try rabbitmq_stream_s3_api:get_range(Conn, Key, -?FRAGMENT_TRAILER_B) of
+    try rabbitmq_stream_s3_api:get_range(Conn, Key, {0, ?FRAGMENT_HEADER_B}) of
         {ok, Data} ->
-            {ok, fragment_trailer_to_info(Data)};
+            {ok, fragment_header_to_info(Data)};
         {error, _} = Err ->
             Err
     after
         ok = rabbitmq_stream_s3_api:close(Conn)
     end.
 
--spec fragment_trailer_to_info(binary()) -> #fragment_info{}.
-fragment_trailer_to_info(
-    ?FRAGMENT_TRAILER(
+-spec fragment_header_to_info(binary()) -> #fragment_info{}.
+fragment_header_to_info(
+    ?FRAGMENT_HEADER(
         Offset,
         NextOffset,
         FirstTs,
         LastTs,
         SeqNo,
-        Size,
-        NumChunksInSegment,
+        SegmentOffset,
         SegmentStartPos,
         IdxStartPos,
-        IdxSize
+        _
     )
 ) ->
     #fragment_info{
@@ -1038,11 +1040,10 @@ fragment_trailer_to_info(
         first_timestamp = FirstTs,
         last_timestamp = LastTs,
         seq_no = SeqNo,
-        num_chunks_in_segment = NumChunksInSegment,
+        segment_offset = SegmentOffset,
         segment_start_pos = SegmentStartPos,
-        size = Size,
-        index_start_pos = IdxStartPos,
-        index_size = IdxSize
+        size = IdxStartPos - ?FRAGMENT_HEADER_B,
+        index_start_pos = IdxStartPos
     }.
 
 set_tick_timer() ->

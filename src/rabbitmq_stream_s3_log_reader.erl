@@ -120,9 +120,9 @@ resolve_remote_location(first, #{name := StreamId, shared := Shared}) ->
         #manifest{first_offset = RemoteFirstOffset} when RemoteFirstOffset < LocalFirstOffset ->
             ?LOG_DEBUG(
                 "Attaching remote reader at first offset ~b pos ~b for spec 'first'",
-                [RemoteFirstOffset, ?SEGMENT_HEADER_B]
+                [RemoteFirstOffset, ?FRAGMENT_HEADER_B]
             ),
-            {ok, RemoteFirstOffset, ?SEGMENT_HEADER_B, RemoteFirstOffset};
+            {ok, RemoteFirstOffset, ?FRAGMENT_HEADER_B, RemoteFirstOffset};
         _ ->
             {local, first}
     end;
@@ -153,7 +153,7 @@ resolve_remote_location(Offset, #{name := StreamId, shared := Shared}) when
                 #manifest{first_offset = FirstOffset} when Offset < FirstOffset ->
                     %% Emulate osiris_log's behavior: attach at the beginning
                     %% of the stream.
-                    {ok, FirstOffset, ?SEGMENT_HEADER_B, FirstOffset};
+                    {ok, FirstOffset, ?FRAGMENT_HEADER_B, FirstOffset};
                 #manifest{entries = Entries} ->
                     {ok, ChunkId, Position, Fragment} = find_position(
                         {offset, Offset},
@@ -171,7 +171,7 @@ resolve_remote_location({timestamp, Ts} = Spec, #{name := StreamId}) ->
     %% Instead try the remote tier first.
     case rabbitmq_stream_s3_server:get_manifest(StreamId) of
         #manifest{first_offset = FirstOffset, first_timestamp = FirstTs} when Ts < FirstTs ->
-            {ok, FirstOffset, ?SEGMENT_HEADER_B, FirstOffset};
+            {ok, FirstOffset, ?FRAGMENT_HEADER_B, FirstOffset};
         #manifest{entries = Entries} ->
             case rabbitmq_stream_s3_array:last(?ENTRY_B, Entries) of
                 ?ENTRY(_O, _FTs, LTs, _, _) when LTs >= Ts ->
@@ -375,7 +375,7 @@ start_link(Reader, Key) ->
 init({Reader, Key}) ->
     erlang:monitor(process, Reader),
     {ok, Conn} = rabbitmq_stream_s3_api:open(),
-    {ok, #fragment_info{size = SegmentDataSize, next_offset = NextOffset}} = rabbitmq_stream_s3_server:get_fragment_trailer(
+    {ok, #fragment_info{size = SegmentDataSize, next_offset = NextOffset}} = rabbitmq_stream_s3_server:get_fragment_info(
         Key
     ),
     {ok, ReadSize} =
@@ -434,7 +434,9 @@ send(tcp, Socket, Data) ->
 send(ssl, Socket, Data) ->
     ssl:send(Socket, Data).
 
-do_read(#state{segment_data_size = Size}, Offset, _Bytes) when Offset >= Size + ?SEGMENT_HEADER_B ->
+do_read(#state{segment_data_size = Size}, Offset, _Bytes) when
+    Offset >= Size + ?FRAGMENT_HEADER_B
+->
     eof;
 do_read(
     #state{
@@ -536,7 +538,7 @@ read_header1(
                             Remote = Remote0#remote{
                                 pid = Pid,
                                 fragment = NextChId,
-                                position = ?SEGMENT_HEADER_B
+                                position = ?FRAGMENT_HEADER_B
                             },
                             read_header1(Remote);
                         {error, not_found} ->
@@ -724,8 +726,7 @@ find_fragment(Entries, Spec, GetGroup) ->
     end.
 
 find_position0(Spec, Fragment, StreamId) ->
-    %% TODO: pass in size now that we have it.
-    {ok, #fragment_info{index_start_pos = IdxStartPos}} = rabbitmq_stream_s3_server:get_fragment_trailer(
+    {ok, #fragment_info{index_start_pos = IdxStartPos}} = rabbitmq_stream_s3_server:get_fragment_info(
         StreamId,
         Fragment
     ),
@@ -778,10 +779,10 @@ index_data(StreamId, FragmentOffset, StartPos) ->
         {ok, Data} = rabbitmq_stream_s3_api:get_range(
             Conn,
             Key,
-            {StartPos, undefined},
+            {StartPos + ?IDX_HEADER_B, undefined},
             #{timeout => ?READ_TIMEOUT}
         ),
-        binary:part(Data, 0, byte_size(Data) - ?FRAGMENT_TRAILER_B)
+        Data
     after
         ok = rabbitmq_stream_s3_api:close(Conn)
     end.

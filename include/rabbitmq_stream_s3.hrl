@@ -17,7 +17,6 @@
 -define(SEGMENT_HEADER_B, 8).
 -define(SEGMENT_VERSION, 1).
 -define(SEGMENT_HEADER, <<"OSIL", ?SEGMENT_VERSION:32/unsigned>>).
--define(SEGMENT_HEADER_HASH, erlang:crc32(?SEGMENT_HEADER)).
 -define(IDX_HEADER_B, 8).
 -define(IDX_VERSION, 1).
 -define(IDX_HEADER, ?IDX_HEADER(<<>>)).
@@ -55,63 +54,70 @@
 -define(C_OSIRIS_LOG_CHUNKS, 4).
 -define(C_OSIRIS_LOG_SEGMENTS, 5).
 
+%% * "OSIF" (4)
+%% * version (4)
 %% * first offset (8)
 %% * next offset (8)
 %% * first timestamp (8)
 %% * last timestamp (8)
 %% * seq no (2)
-%% * size (4)
+%% * segment offset (8)
 %% * segment start pos (4)
-%% * num chunks in segment (4)
-%% * index byte offset (4)
-%% * index size (4)
-%% = 54.
--define(FRAGMENT_TRAILER_B, 54).
--define(FRAGMENT_TRAILER(
+%% * index start pos (4)
+%% = 58.
+-define(FRAGMENT_HEADER_B, 58).
+-define(FRAGMENT_VERSION, 1).
+-define(FRAGMENT_HEADER(
     FirstOffset,
     NextOffset,
     FirstTs,
     LastTs,
     SeqNo,
-    Size,
+    SegmentOffset,
     SegmentStartPos,
-    NumChunksInSegment,
     IdxStartPos,
-    IdxSize
+    Rem
 ),
     <<
+        "OSIF",
+        ?FRAGMENT_VERSION:32/unsigned,
         FirstOffset:64/unsigned,
         NextOffset:64/unsigned,
         FirstTs:64/signed,
         LastTs:64/signed,
         SeqNo:16/unsigned,
-        Size:32/unsigned,
+        SegmentOffset:64/unsigned,
         SegmentStartPos:32/unsigned,
-        NumChunksInSegment:32/unsigned,
         IdxStartPos:32/unsigned,
-        IdxSize:32/unsigned
+        Rem/binary
     >>
 ).
-%% Info stored in a fragment's trailer. Nicer version of the above.
+%% Info stored in a fragment's header. This record is a more convenient way to
+%% work with the above macro's data.
 -record(fragment_info, {
+    %% Offset of the first chunk in the fragment.
     first_offset :: osiris:offset(),
+    %% Offset of the first chunk in the subsequent fragment.
     next_offset :: osiris:offset(),
+    %% Timestamp of the first chunk in the fragment.
     first_timestamp :: osiris:timestamp(),
+    %% Timestamp of the last chunk in the fragment.
     last_timestamp :: osiris:timestamp(),
     %% Zero-based sequence number within the segment.
     seq_no :: non_neg_integer(),
+    %% TODO: these next two fields could be used to convert a remote reader
+    %% into a local reader cheaply.
+    %% The offset of the segment file from which this fragment was extracted.
+    segment_offset :: osiris:offset(),
     %% The position into the segment file where this fragment data started.
-    segment_start_pos :: pos_integer(),
-    %% Number of chunks in the segment before this fragment.
-    num_chunks_in_segment :: non_neg_integer(),
-    %% Size of the fragment data. Doesn't including headers, index or trailers.
+    segment_start_pos :: byte_offset(),
+    %% Size of the fragment data. Doesn't including headers or index data.
     size :: pos_integer(),
-    %% Position into the fragment file where the index starts.
-    index_start_pos :: pos_integer(),
-    index_size :: pos_integer(),
+    %% Position into the fragment object where the index header starts.
+    index_start_pos :: byte_offset(),
     %% Copied from `#fragment.roll_reason`. Only defined when the info record
     %% is created by an upload task. Not defined when the info record comes
-    %% from reading an existing fragment's trailer.
+    %% from reading an existing fragment's header.
     roll_reason :: size | segment_roll | undefined
 }).
 
@@ -244,7 +250,7 @@
     %% to the remote tier.
     next_offset = 0 :: osiris:offset(),
     %% Total size of segment data in the remote tier. This does not count
-    %% headers, index data or trailers. This is the summed `#fragment.size` of
+    %% headers or index data. This is the summed `#fragment.size` of
     %% all fragments in the remote tier.
     total_size = 0 :: non_neg_integer(),
     %% The revision the manifest was last fetched or uploaded at.
@@ -276,6 +282,9 @@
 %% creation timestamp, concatenated with "_".
 -type stream_id() :: binary().
 
+%% Same as erlang:crc32(<<>>).
+-define(EMPTY_CRC32, 0).
+
 -record(fragment, {
     first_offset :: osiris:offset() | undefined,
     last_offset :: osiris:offset() | undefined,
@@ -291,7 +300,7 @@
     %% NOTE: `#fragment.size` is the bytes of segment data, not headers or
     %% index data.
     size = 0 :: non_neg_integer(),
-    checksum = ?SEGMENT_HEADER_HASH :: checksum() | undefined,
+    checksum = ?EMPTY_CRC32 :: checksum() | undefined,
     %% The reason that the fragment was considered complete / "rolled" (like a
     %% segment file). Fragments are capped by max size or rolled over with a
     %% segment. Tracking the roll reason lets us delete local tier data
