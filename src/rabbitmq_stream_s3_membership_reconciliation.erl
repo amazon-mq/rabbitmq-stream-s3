@@ -81,7 +81,7 @@ handle_cast(
     {schedule, Reason},
     #?MODULE{timer = Timer} = State0
 ) ->
-    ?LOG_DEBUG("Delayed exchange membership reconciliation scheduled because of ~0p", [Reason]),
+    ?LOG_DEBUG("Stream membership reconciliation scheduled because of ~0p", [Reason]),
     _ = erlang:cancel_timer(Timer),
     {noreply, State0#?MODULE{timer = erlang:send_after(trigger_interval(), self(), ?EVAL)}};
 handle_cast(_Msg, State) ->
