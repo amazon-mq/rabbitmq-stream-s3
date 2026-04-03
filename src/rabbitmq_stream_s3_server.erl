@@ -69,6 +69,7 @@
 -export([
     get_fragment_info/1,
     get_fragment_info/2,
+    split_fragment_info/1,
     get_group_fun/2,
     get_group/3
 ]).
@@ -1020,8 +1021,8 @@ get_fragment_info(Key) ->
         ok = rabbitmq_stream_s3_api:close(Conn)
     end.
 
--spec fragment_header_to_info(binary()) -> #fragment_info{}.
-fragment_header_to_info(
+-spec split_fragment_info(binary()) -> {#fragment_info{}, binary()}.
+split_fragment_info(
     ?FRAGMENT_HEADER(
         Offset,
         NextOffset,
@@ -1031,10 +1032,10 @@ fragment_header_to_info(
         SegmentOffset,
         SegmentStartPos,
         IdxStartPos,
-        _
+        Rem
     )
 ) ->
-    #fragment_info{
+    Info = #fragment_info{
         first_offset = Offset,
         next_offset = NextOffset,
         first_timestamp = FirstTs,
@@ -1044,7 +1045,13 @@ fragment_header_to_info(
         segment_start_pos = SegmentStartPos,
         size = IdxStartPos - ?FRAGMENT_HEADER_B,
         index_start_pos = IdxStartPos
-    }.
+    },
+    {Info, Rem}.
+
+-spec fragment_header_to_info(binary()) -> #fragment_info{}.
+fragment_header_to_info(Data) ->
+    {Info, _} = split_fragment_info(Data),
+    Info.
 
 set_tick_timer() ->
     Timeout = application:get_env(rabbitmq_stream_s3, tick_timeout_milliseconds, 5000),
