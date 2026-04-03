@@ -101,6 +101,7 @@ init() ->
     Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?COUNTERS, #{module => ?MODULE}),
     persistent_term:put(?COUNTER_KEY, Cnt),
     _ = ets:new(?TABLE, [public, named_table]),
+    ok = rabbitmq_stream_s3_request_metrics:init(),
     reload_config().
 
 -spec reload_config() -> ok.
@@ -393,6 +394,7 @@ request(Conn, Method, Path, Headers0, Body, Opts) when
             Cnt = counter(),
             counters:add(Cnt, ?C_ACTIVE_REQUESTS, 1),
             counters:add(Cnt, ?C_TOTAL_REQUESTS, 1),
+            T0 = erlang:monotonic_time(millisecond),
             try
                 Timeout = maps:get(timeout, Opts, 5_000),
                 T1 = start_timeout_window(Timeout),
@@ -420,7 +422,9 @@ request(Conn, Method, Path, Headers0, Body, Opts) when
                         Err
                 end
             after
-                counters:sub(Cnt, ?C_ACTIVE_REQUESTS, 1)
+                counters:sub(Cnt, ?C_ACTIVE_REQUESTS, 1),
+                DurationMs = erlang:monotonic_time(millisecond) - T0,
+                rabbitmq_stream_s3_request_metrics:observe(DurationMs)
             end;
         {error, _} = Err ->
             Err
