@@ -299,7 +299,7 @@ transfer_leadership(Config) ->
     Payload32M = <<2:(32 * 1024 * 1024 * 8)>>,
 
     % Open channel on node 0
-    Ch = rabbit_ct_client_helpers:open_channel(Config, 0),
+    {Conn, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config, 0),
     #'basic.qos_ok'{} = amqp_channel:call(Ch, #'basic.qos'{prefetch_count = 1}),
 
     QName = <<"stream_transfer_leadership">>,
@@ -330,6 +330,7 @@ transfer_leadership(Config) ->
     ct:pal("Stream leader is on node ~p", [LeaderNode]),
 
     ct:pal("Stopping leader node ~p to force writer transfer", [LeaderNode]),
+    ok = rabbit_ct_client_helpers:close_connection_and_channel(Conn, Ch),
     ok = rabbit_ct_broker_helpers:stop_node(Config, LeaderNode),
 
     % Wait for new leader to be elected
