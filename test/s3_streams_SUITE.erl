@@ -259,6 +259,14 @@ prometheus_metrics(Config) ->
         match,
         re:run(Body, "^rabbitmq_stream_s3_get\\{", [{capture, none}, multiline])
     ),
+    ?assertMatch(
+        match,
+        re:run(Body, "^rabbitmq_stream_s3_bytes_sent\\{", [{capture, none}, multiline])
+    ),
+    ?assertMatch(
+        match,
+        re:run(Body, "^rabbitmq_stream_s3_bytes_received\\{", [{capture, none}, multiline])
+    ),
 
     % Verify request duration histogram with kind label
     ?assertMatch(
