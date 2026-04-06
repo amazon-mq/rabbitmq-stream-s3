@@ -353,7 +353,7 @@ prop_find_index_position_offset() ->
             {ChunkId, _Ts, _Pos} = rabbitmq_stream_s3_log_reader:find_index_position(
                 IndexData, {offset, QueryOffset}
             ),
-            Offsets = [O || {O, _Ts} <- Chunks],
+            Offsets = [O || {O, _T} <- Chunks],
             %% Expected: last offset =< QueryOffset, or first offset if all are greater.
             Expected =
                 case lists:takewhile(fun(O) -> O =< QueryOffset end, Offsets) of
@@ -384,7 +384,7 @@ prop_find_index_position_timestamp() ->
             Expected =
                 case lists:dropwhile(fun({_O, Ts}) -> Ts < QueryTs end, Chunks) of
                     [] -> element(1, lists:last(Chunks));
-                    [{O, _Ts} | _] -> O
+                    [{O, _T} | _] -> O
                 end,
             ChunkId =:= Expected
         end
