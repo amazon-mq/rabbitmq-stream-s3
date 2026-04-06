@@ -276,10 +276,7 @@ apply(
                         modifications := Modifications0 + length(Finished),
                         uploaded_fragments := Pending
                     },
-                    TriggerRetention = lists:any(
-                        fun(#fragment_info{roll_reason = Reason}) -> Reason =:= segment_roll end,
-                        Finished
-                    ),
+                    TriggerRetention = true,
                     {Writer2, Edits, Effects0} = evaluate_writer(
                         Cfg,
                         Meta,

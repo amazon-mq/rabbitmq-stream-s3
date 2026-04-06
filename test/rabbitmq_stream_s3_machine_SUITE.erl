@@ -234,6 +234,7 @@ recover_uploaded_fragments(Config) ->
     ?assertMatch(
         [
             #set_range{next_offset = 20},
+            #trigger_retention{},
             #upload_manifest{
                 manifest = #manifest{
                     first_offset = 0,
@@ -785,11 +786,12 @@ rebalance_group(Config) ->
     {Writer2, WEffects2} = ?MAC:apply(?META(), F5Uploaded, Writer1),
     [
         #set_range{},
+        #trigger_retention{},
         #send{to = {_, ReplicaNode}, message = #manifest_edited{} = ManifestEdited1}
     ] = WEffects2,
 
     {Replica2, REffects2} = ?MAC:apply(?META(), ManifestEdited1, Replica1),
-    ?assertMatch([#set_range{}], REffects2),
+    ?assertMatch([#set_range{}, #trigger_retention{}], REffects2),
 
     F6Uploaded = #fragment_uploaded{stream = StreamId, info = fragment_to_info(F6)},
     {Writer3, WEffects3} = ?MAC:apply(?META(), F6Uploaded, Writer2),
