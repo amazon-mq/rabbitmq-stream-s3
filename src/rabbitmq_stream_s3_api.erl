@@ -69,13 +69,17 @@ examples.
 -define(C_DELETE_MANY, 4).
 -define(C_DELETE_ONE, 5).
 -define(C_LIST, 6).
+-define(C_BYTES_RECEIVED, 7).
+-define(C_BYTES_SENT, 8).
 -define(COUNTERS, [
     {get, ?C_GET, counter, "Number of full-object GET requests"},
     {get_range, ?C_GET_RANGE, counter, "Number of range GET requests"},
     {put, ?C_PUT, counter, "Number of PUT requests"},
     {delete_many, ?C_DELETE_MANY, counter, "Number of multi-object DELETE requests"},
     {delete_one, ?C_DELETE_ONE, counter, "Number of single-object DELETE requests"},
-    {list, ?C_LIST, counter, "Number of LIST requests"}
+    {list, ?C_LIST, counter, "Number of LIST requests"},
+    {bytes_received, ?C_BYTES_RECEIVED, counter, "Total bytes received from S3"},
+    {bytes_sent, ?C_BYTES_SENT, counter, "Total bytes sent to S3"}
 ]).
 -define(COUNTER_KEY, {?MODULE, counter}).
 
@@ -108,7 +112,12 @@ get(Conn, Key) when is_binary(Key) ->
 -spec get(connection(), key(), request_opts()) -> {ok, binary()} | {error, any()}.
 get(Conn, Key, Opts) when is_binary(Key) andalso is_map(Opts) ->
     counters:add(counter(), ?C_GET, 1),
-    observe(read, fun() -> (backend()):get(Conn, Key, Opts) end).
+    Result = observe(read, fun() -> (backend()):get(Conn, Key, Opts) end),
+    case Result of
+        {ok, Data} -> counters:add(counter(), ?C_BYTES_RECEIVED, byte_size(Data));
+        _ -> ok
+    end,
+    Result.
 
 -doc #{equiv => get_range(Conn, Key, Range, #{})}.
 -spec get_range(connection(), key(), range_spec()) -> {ok, binary()} | {error, any()}.
@@ -119,7 +128,12 @@ get_range(Conn, Key, Range) when is_binary(Key) ->
     {ok, binary()} | {error, any()}.
 get_range(Conn, Key, Range, Opts) when is_binary(Key) andalso is_map(Opts) ->
     counters:add(counter(), ?C_GET_RANGE, 1),
-    observe(read, fun() -> (backend()):get_range(Conn, Key, Range, Opts) end).
+    Result = observe(read, fun() -> (backend()):get_range(Conn, Key, Range, Opts) end),
+    case Result of
+        {ok, Data} -> counters:add(counter(), ?C_BYTES_RECEIVED, byte_size(Data));
+        _ -> ok
+    end,
+    Result.
 
 -doc #{equiv => put(Conn, Key, Data, #{})}.
 -spec put(connection(), key(), iodata()) -> ok | {error, any()}.
@@ -129,6 +143,7 @@ put(Conn, Key, Data) when is_binary(Key) ->
 -spec put(connection(), key(), iodata(), request_opts()) -> ok | {error, any()}.
 put(Conn, Key, Data, Opts) when is_binary(Key) andalso is_map(Opts) ->
     counters:add(counter(), ?C_PUT, 1),
+    counters:add(counter(), ?C_BYTES_SENT, iolist_size(Data)),
     observe(write, fun() -> (backend()):put(Conn, Key, Data, Opts) end).
 
 -doc #{equiv => delete(Conn, Keys, #{})}.
