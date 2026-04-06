@@ -1137,7 +1137,10 @@ eval_local_retention([], _NextTieredOffset, ToDelete, ToKeep) ->
     {lists:reverse(ToDelete), ToKeep};
 eval_local_retention([IdxFile | Rest], NextTieredOffset, ToDelete, ToKeep) ->
     Offset = rabbitmq_stream_s3:index_file_offset(IdxFile),
-    case Offset >= NextTieredOffset of
+    %% NOTE: if `Offset =:= NextTieredOffset`, then the segment file before
+    %% this was fully uploaded since `NextTieredOffset` is the last offset to
+    %% be successfully uploaded, plus one.
+    case Offset > NextTieredOffset of
         true ->
             eval_local_retention(Rest, NextTieredOffset, ToDelete, [IdxFile | ToKeep]);
         false ->
