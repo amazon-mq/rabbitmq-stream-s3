@@ -559,8 +559,6 @@ advance_fragment(
         _ when NextChId > LastChId ->
             {end_of_stream, Remote0};
         _ ->
-            %% TODO: what if retention takes away fragments? We need to
-            %% jump ahead to the start of the log.
             Key = rabbitmq_stream_s3:fragment_key(StreamId, NextChId),
             case rabbitmq_stream_s3_log_reader_sup:add_child(self(), Key) of
                 {ok, Pid} ->
@@ -572,7 +570,17 @@ advance_fragment(
                     },
                     read_header1(Remote);
                 {error, not_found} ->
-                    {end_of_stream, Remote0}
+                    %% The fragment at NextChId was deleted by retention.
+                    %% Jump to the oldest fragment still in S3. The guard
+                    %% ensures first_offset strictly increases on each
+                    %% recursion, so this terminates.
+                    case rabbitmq_stream_s3_server:get_manifest(StreamId) of
+                        #manifest{first_offset = FirstOffset}
+                          when FirstOffset > NextChId ->
+                            advance_fragment(Remote0#remote{next_offset = FirstOffset});
+                        _ ->
+                            {end_of_stream, Remote0}
+                    end
             end
     end.
 
