@@ -575,8 +575,9 @@ advance_fragment(
                     %% ensures first_offset strictly increases on each
                     %% recursion, so this terminates.
                     case rabbitmq_stream_s3_server:get_manifest(StreamId) of
-                        #manifest{first_offset = FirstOffset}
-                          when FirstOffset > NextChId ->
+                        #manifest{first_offset = FirstOffset} when
+                            FirstOffset > NextChId
+                        ->
                             advance_fragment(Remote0#remote{next_offset = FirstOffset});
                         _ ->
                             {end_of_stream, Remote0}

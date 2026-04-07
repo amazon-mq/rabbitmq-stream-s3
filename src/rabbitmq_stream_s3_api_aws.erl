@@ -156,7 +156,11 @@ get(Conn, Key, Opts) when is_pid(Conn) andalso is_binary(Key) andalso is_map(Opt
             {ok, Data};
         {ok, #{status := 404}} ->
             {error, not_found};
-        {ok, Other} ->
+        {ok, #{status := Status} = Other} ->
+            ?LOG_DEBUG(
+                "rabbitmq_stream_s3_api_aws:get/3 unexpected status ~b for key ~ts",
+                [Status, Key]
+            ),
             {error, Other};
         {error, _} = Err ->
             Err
@@ -180,7 +184,11 @@ get_range(Conn, Key, Range, Opts) when is_pid(Conn) andalso is_binary(Key) andal
             {ok, Data};
         {ok, #{status := 404}} ->
             {error, not_found};
-        {ok, Other} ->
+        {ok, #{status := Status} = Other} ->
+            ?LOG_DEBUG(
+                "rabbitmq_stream_s3_api_aws:get_range/4 unexpected status ~b for key ~ts",
+                [Status, Key]
+            ),
             {error, Other};
         {error, _} = Err ->
             Err
@@ -199,7 +207,11 @@ put(Conn, Key, Data, Opts) when is_pid(Conn) andalso is_binary(Key) andalso is_m
     case request(Conn, <<"PUT">>, key_to_path(Key), Headers, Data, Opts) of
         {ok, #{status := 200}} ->
             ok;
-        {ok, Other} ->
+        {ok, #{status := Status} = Other} ->
+            ?LOG_DEBUG(
+                "rabbitmq_stream_s3_api_aws:put/4 unexpected status ~b for key ~ts",
+                [Status, Key]
+            ),
             {error, Other};
         {error, _} = Err ->
             Err
@@ -222,7 +234,11 @@ delete(Conn, Keys, Opts) when is_pid(Conn) andalso is_list(Keys) andalso is_map(
     case request(Conn, <<"POST">>, <<"/?delete=">>, Headers, Data, Opts) of
         {ok, #{status := 200}} ->
             ok;
-        {ok, Other} ->
+        {ok, #{status := Status} = Other} ->
+            ?LOG_DEBUG(
+                "rabbitmq_stream_s3_api_aws:delete/3 (multi) unexpected status ~b",
+                [Status]
+            ),
             {error, Other};
         {error, _} = Err ->
             Err
@@ -232,7 +248,11 @@ delete(Conn, Key, Opts) when is_pid(Conn) andalso is_binary(Key) andalso is_map(
     case request(Conn, <<"DELETE">>, key_to_path(Key), #{}, <<>>, Opts) of
         {ok, #{status := 204}} ->
             ok;
-        {ok, Other} ->
+        {ok, #{status := Status} = Other} ->
+            ?LOG_DEBUG(
+                "rabbitmq_stream_s3_api_aws:delete/3 unexpected status ~b for key ~ts",
+                [Status, Key]
+            ),
             {error, Other};
         {error, _} = Err ->
             Err
