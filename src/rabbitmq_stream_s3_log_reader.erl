@@ -257,22 +257,29 @@ send_file(Socket, #?MODULE{mode = #remote{} = Remote0} = State0, Callback) ->
             {ToSkip, ToSend} = select_amount_to_send(ChunkSelector, Header),
             DataPos = Position + ?CHUNK_HEADER_B + ToSkip,
             PrefixData = Callback(Header, ToSend + byte_size(HeaderData)),
-            {ReadMsec, {ok, Data}} = timer:tc(
+            {ReadMsec, ReadResult} = timer:tc(
                 gen_server,
                 call,
                 [Pid, {read, DataPos, ToSend, within_chunk}, ?GEN_SERVER_CALL_TIMEOUT],
                 millisecond
             ),
             validate_read_timing(ReadMsec, ToSend, DataPos),
-            case send(Transport, Socket, [PrefixData, HeaderData, Data]) of
-                ok ->
-                    Remote = Remote1#remote{
-                        next_offset = ChId + NumRecords,
-                        position = NextPosition
-                    },
-                    {ok, State0#?MODULE{mode = Remote}};
-                {error, _} = Err ->
-                    Err
+            case ReadResult of
+                {ok, Data} ->
+                    case send(Transport, Socket, [PrefixData, HeaderData, Data]) of
+                        ok ->
+                            Remote = Remote1#remote{
+                                next_offset = ChId + NumRecords,
+                                position = NextPosition
+                            },
+                            {ok, State0#?MODULE{mode = Remote}};
+                        {error, _} = Err ->
+                            Err
+                    end;
+                {error, _} ->
+                    %% The fragment was deleted by retention while being read,
+                    %% or another S3 error occurred.
+                    {end_of_stream, State0#?MODULE{mode = Remote1}}
             end;
         {local, Remote} ->
             case convert_remote_to_local(State0#?MODULE{mode = Remote}) of
@@ -400,6 +407,8 @@ handle_call({read, Offset, Bytes, Hint}, _From, State0) ->
         {State, ?IDX_HEADER(_)} when Hint =:= chunk_boundary ->
             %% The reader has reached the section of the
             {reply, eof, State};
+        {error, _} = Err ->
+            {reply, Err, State0};
         {State, Data} ->
             {reply, {ok, Data}, State};
         eof ->
@@ -456,24 +465,30 @@ do_read(
     Bytes
 ) ->
     End = Offset + Bytes - 1,
-    case (Offset >= BufStart) and (End =< BufEnd) of
+    case (Offset >= BufStart) andalso (End =< BufEnd) of
         % Data is in buffer
         true ->
             OffsetInBuf = Offset - BufStart,
             {State0, binary:part(Buffer, OffsetInBuf, Bytes)};
         false ->
             ToRead = max(ReadSize, Bytes),
-            {ok, NewBuffer} = rabbitmq_stream_s3_api:get_range(
-                Connection,
-                Object,
-                {Offset, Offset + ToRead - 1}
-            ),
-            State = State0#state{
-                buffer = NewBuffer,
-                offset_start = Offset,
-                offset_end = Offset + ToRead - 1
-            },
-            {State, binary:part(NewBuffer, 0, Bytes)}
+            case
+                rabbitmq_stream_s3_api:get_range(
+                    Connection,
+                    Object,
+                    {Offset, Offset + ToRead - 1}
+                )
+            of
+                {ok, NewBuffer} ->
+                    State = State0#state{
+                        buffer = NewBuffer,
+                        offset_start = Offset,
+                        offset_end = Offset + ToRead - 1
+                    },
+                    {State, binary:part(NewBuffer, 0, Bytes)};
+                {error, _} = Err ->
+                    Err
+            end
     end.
 
 %% This helper is mostly the same as osiris_log:read_header0/1. There are some
@@ -500,10 +515,7 @@ read_header(#remote{shared = Shared, next_offset = NextOffset} = Remote) ->
 read_header1(
     #remote{
         pid = Pid0,
-        stream = StreamId,
-        position = Position,
-        next_offset = NextChId,
-        shared = Shared
+        position = Position
     } = Remote0
 ) ->
     %% Over-read the chunk header so that the filter (if it exists) is always
@@ -526,29 +538,41 @@ read_header1(
         {ok, Header} ->
             read_header2(Remote0, Header);
         eof ->
-            FirstChId = osiris_log_shared:first_chunk_id(Shared),
-            LastChId = osiris_log_shared:last_chunk_id(Shared),
-            case NextChId of
-                FirstChId ->
-                    {local, Remote0};
-                _ when NextChId > LastChId ->
-                    {end_of_stream, Remote0};
-                _ ->
-                    %% TODO: what if retention takes away fragments? We need to
-                    %% jump ahead to the start of the log.
-                    Key = rabbitmq_stream_s3:fragment_key(StreamId, NextChId),
-                    case rabbitmq_stream_s3_log_reader_sup:add_child(self(), Key) of
-                        {ok, Pid} ->
-                            ok = gen_server:cast(Pid0, close),
-                            Remote = Remote0#remote{
-                                pid = Pid,
-                                fragment = NextChId,
-                                position = ?FRAGMENT_HEADER_B
-                            },
-                            read_header1(Remote);
-                        {error, _} ->
-                            {end_of_stream, Remote0}
-                    end
+            advance_fragment(Remote0);
+        {error, _} ->
+            advance_fragment(Remote0)
+    end.
+
+advance_fragment(
+    #remote{
+        pid = Pid0,
+        stream = StreamId,
+        next_offset = NextChId,
+        shared = Shared
+    } = Remote0
+) ->
+    FirstChId = osiris_log_shared:first_chunk_id(Shared),
+    LastChId = osiris_log_shared:last_chunk_id(Shared),
+    case NextChId of
+        FirstChId ->
+            {local, Remote0};
+        _ when NextChId > LastChId ->
+            {end_of_stream, Remote0};
+        _ ->
+            %% TODO: what if retention takes away fragments? We need to
+            %% jump ahead to the start of the log.
+            Key = rabbitmq_stream_s3:fragment_key(StreamId, NextChId),
+            case rabbitmq_stream_s3_log_reader_sup:add_child(self(), Key) of
+                {ok, Pid} ->
+                    ok = gen_server:cast(Pid0, close),
+                    Remote = Remote0#remote{
+                        pid = Pid,
+                        fragment = NextChId,
+                        position = ?SEGMENT_HEADER_B
+                    },
+                    read_header1(Remote);
+                {error, not_found} ->
+                    {end_of_stream, Remote0}
             end
     end.
 
