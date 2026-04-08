@@ -20,6 +20,27 @@ stream data aggressively.
 %% <https://github.com/amazon-mq/rabbitmq-stream-s3/issues/95>
 -define(READAHEAD, "16MiB").
 
+-define(C_BUFFER_HIT, 1).
+-define(C_BUFFER_MISS, 2).
+-define(C_FRAGMENT_TRANSITION, 3).
+-define(C_REQUESTS_IN_FLIGHT, 4).
+-define(C_AWAIT_DURATION_MS, 5).
+-define(C_AWAIT, 6).
+-define(C_READ_DURATION_MS, 7).
+-define(C_READ, 8).
+-define(COUNTERS, [
+    {buffer_hit, ?C_BUFFER_HIT, counter, "Number of reads served from the buffer"},
+    {buffer_miss, ?C_BUFFER_MISS, counter, "Number of reads that had to await async data"},
+    {fragment_transition, ?C_FRAGMENT_TRANSITION, counter, "Number of fragment transitions"},
+    {requests_in_flight, ?C_REQUESTS_IN_FLIGHT, gauge,
+        "Current number of in-flight async requests"},
+    {await_duration_ms, ?C_AWAIT_DURATION_MS, counter,
+        "Total milliseconds spent awaiting async data"},
+    {await, ?C_AWAIT, counter, "Number of awaits"},
+    {read_duration_ms, ?C_READ_DURATION_MS, counter, "Total milliseconds spent in read calls"},
+    {read, ?C_READ, counter, "Number of read/4,5 calls"}
+]).
+
 %% API
 -record(read, {
     offset :: byte_offset(),
@@ -32,7 +53,9 @@ stream data aggressively.
 %% from a pre-fetched buffer.
 -record(pending_read, {
     read :: #read{},
-    from :: gen_server:from()
+    from :: gen_server:from(),
+    %% erlang:monotonic_time/0 since the read started
+    since :: integer()
 }).
 
 %% A request to the remote tier which is running in the background.
@@ -79,6 +102,10 @@ stream data aggressively.
 
 -export_type([config/0, hint/0]).
 
+-define(COUNTER_KEY, {?MODULE, counter}).
+
+-export([init_counters/0]).
+
 %% API
 -export([
     read/4,
@@ -99,6 +126,12 @@ stream data aggressively.
 
 %%----------------------------------------------------------------------------
 
+-spec init_counters() -> ok.
+init_counters() ->
+    Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?COUNTERS, #{module => ?MODULE}),
+    persistent_term:put(?COUNTER_KEY, Cnt),
+    ok.
+
 -spec read(pid(), byte_offset(), pos_integer(), hint()) ->
     {ok, binary()}
     | {next_fragment, osiris:offset()}
@@ -113,7 +146,12 @@ read(Server, Offset, Bytes, Hint) ->
     | {become_local, osiris:offset()}
     | end_of_stream.
 read(Server, Offset, Bytes, Hint, Timeout) ->
-    gen_server:call(Server, #read{offset = Offset, bytes = Bytes, hint = Hint}, Timeout).
+    T0 = erlang:monotonic_time(),
+    Result = gen_server:call(Server, #read{offset = Offset, bytes = Bytes, hint = Hint}, Timeout),
+    Duration = erlang:convert_time_unit(erlang:monotonic_time() - T0, native, millisecond),
+    counters:add(counter(), ?C_READ_DURATION_MS, Duration),
+    counters:add(counter(), ?C_READ, 1),
+    Result.
 
 %%----------------------------------------------------------------------------
 
@@ -152,7 +190,13 @@ handle_call(#read{} = Read, From, State0) ->
     ?assertEqual(undefined, State0#?MODULE.pending_read),
     case maybe_reply(Read, State0) of
         {noreply, State1} ->
-            State = State1#?MODULE{pending_read = #pending_read{read = Read, from = From}},
+            State = State1#?MODULE{
+                pending_read = #pending_read{
+                    read = Read,
+                    from = From,
+                    since = erlang:monotonic_time()
+                }
+            },
             {noreply, State};
         Reply ->
             Reply
@@ -179,6 +223,7 @@ handle_info(Msg, #?MODULE{requests = Requests0} = State0) ->
                     Requests =
                         case Result of
                             done ->
+                                counters:sub(counter(), ?C_REQUESTS_IN_FLIGHT, 1),
                                 maps:remove(RequestId, Requests0);
                             ReqState ->
                                 Requests0#{RequestId := Req0#request{state = ReqState}}
@@ -188,10 +233,15 @@ handle_info(Msg, #?MODULE{requests = Requests0} = State0) ->
                     State3 = maybe_start_request(State2),
                     maybe_reply_pending(State3);
                 {done, ok} ->
+                    %% A 200 with no body on a range GET is abnormal.
+                    %% Retry the request.
+                    counters:sub(counter(), ?C_REQUESTS_IN_FLIGHT, 1),
+                    ?LOG_WARNING("Received empty response for ~ts", [Req0#request.fragment]),
                     State1 = State0#?MODULE{requests = maps:remove(RequestId, Requests0)},
                     State2 = maybe_start_request(State1),
                     maybe_reply_pending(State2);
                 {done, {error, Reason}} ->
+                    counters:sub(counter(), ?C_REQUESTS_IN_FLIGHT, 1),
                     Requests = maps:remove(RequestId, Requests0),
                     State1 = State0#?MODULE{requests = Requests},
                     case {Reason, Req0#request.fragment =:= State1#?MODULE.fragment} of
@@ -224,6 +274,7 @@ terminate(_Reason, #?MODULE{requests = Requests}) ->
         rabbitmq_stream_s3_api:cancel_async(RequestId, ReqState)
      || RequestId := #request{state = ReqState} <- Requests
     ],
+    counters:put(counter(), ?C_REQUESTS_IN_FLIGHT, 0),
     ok.
 
 format_status(#{state := #?MODULE{} = State} = Status0) ->
@@ -266,6 +317,7 @@ maybe_start_current_request(
             Range = {0, ReadSize + ?FRAGMENT_HEADER_B},
             {ok, RequestId, AsyncState} = rabbitmq_stream_s3_api:get_range_async(CurrentKey, Range),
             Request = #request{fragment = Fragment, range = Range, state = AsyncState},
+            counters:add(counter(), ?C_REQUESTS_IN_FLIGHT, 1),
             State0#?MODULE{requests = Requests0#{RequestId => Request}}
     end;
 maybe_start_current_request(
@@ -287,6 +339,7 @@ maybe_start_current_request(
             Range = {EndPos, min(EndPos + ReadSize, IdxStartPos - 1)},
             {ok, RequestId, AsyncState} = rabbitmq_stream_s3_api:get_range_async(CurrentKey, Range),
             Request = #request{fragment = Fragment, range = Range, state = AsyncState},
+            counters:add(counter(), ?C_REQUESTS_IN_FLIGHT, 1),
             State0#?MODULE{requests = Requests0#{RequestId => Request}}
     end;
 maybe_start_current_request(State) ->
@@ -310,6 +363,7 @@ maybe_start_next_request(
             Range = {0, ReadSize + ?FRAGMENT_HEADER_B},
             {ok, RequestId, AsyncState} = rabbitmq_stream_s3_api:get_range_async(Key, Range),
             Request = #request{fragment = NextOffset, range = Range, state = AsyncState},
+            counters:add(counter(), ?C_REQUESTS_IN_FLIGHT, 1),
             State0#?MODULE{requests = Requests0#{RequestId => Request}}
     end;
 maybe_start_next_request(State) ->
@@ -381,12 +435,20 @@ maybe_reply_pending(
     #?MODULE{
         pending_read = #pending_read{
             read = #read{} = Read,
-            from = From
+            from = From,
+            since = Since
         }
     } = State0
 ) ->
     case maybe_reply(Read, State0) of
         {reply, Reply, State1} ->
+            Duration = erlang:convert_time_unit(
+                erlang:monotonic_time() - Since,
+                native,
+                millisecond
+            ),
+            counters:add(counter(), ?C_AWAIT_DURATION_MS, Duration),
+            counters:add(counter(), ?C_AWAIT, 1),
             gen_server:reply(From, Reply),
             State = State1#?MODULE{pending_read = undefined},
             {noreply, State};
@@ -407,9 +469,11 @@ maybe_reply(#read{offset = Offset, bytes = Bytes, hint = Hint}, #?MODULE{} = Sta
             %% with debugging.
             erlang:error(unreachable);
         {ok, State1, Data} ->
+            counters:add(counter(), ?C_BUFFER_HIT, 1),
             State = maybe_start_request(State1),
             {reply, {ok, Data}, State};
         {next_fragment, State1, NextOffset} ->
+            counters:add(counter(), ?C_FRAGMENT_TRANSITION, 1),
             State = maybe_start_request(State1),
             {reply, {next_fragment, NextOffset}, State};
         {become_local, #?MODULE{fragment = Off} = State} ->
@@ -417,6 +481,7 @@ maybe_reply(#read{offset = Offset, bytes = Bytes, hint = Hint}, #?MODULE{} = Sta
         {end_of_stream, State} ->
             {reply, end_of_stream, State};
         {await, State1} ->
+            counters:add(counter(), ?C_BUFFER_MISS, 1),
             State = maybe_start_request(State1),
             {noreply, State}
     end.
@@ -648,3 +713,6 @@ format_fragment_info(#fragment_info{
         index_start_pos => IdxStartPos,
         roll_reason => RollReason
     }.
+
+counter() ->
+    persistent_term:get(?COUNTER_KEY).
