@@ -764,8 +764,7 @@ find_fragment(Entries, Spec, GetGroup) ->
     end.
 
 find_position0(Spec, Fragment, StreamId) ->
-    %% TODO: pass in size now that we have it.
-    {ok, #fragment_info{index_start_pos = IdxStartPos}} = rabbitmq_stream_s3_server:get_fragment_trailer(
+    {ok, #fragment_info{index_start_pos = IdxStartPos}} = rabbitmq_stream_s3_server:get_fragment_info(
         StreamId,
         Fragment
     ),
