@@ -537,6 +537,11 @@ read_header1(
         millisecond
     ),
     validate_read_timing(ReadMsec),
+    ?LOG_DEBUG(
+        "read_header1 position ~b next_offset ~b result ~w",
+        [Position, Remote0#remote.next_offset,
+         case ReadResult of {ok, B} -> {ok, binary:part(B, 0, min(16, byte_size(B)))}; _ -> ReadResult end]
+    ),
     case ReadResult of
         {ok, Header} ->
             read_header2(Remote0, Header);
@@ -598,7 +603,19 @@ read_header2(
     HeaderBin
 ) ->
     <<HeaderBin1:?CHUNK_HEADER_B/binary, _/binary>> = HeaderBin,
-    {ok, Header} = osiris_log:parse_header(HeaderBin1, Position0),
+    Header =
+        case osiris_log:parse_header(HeaderBin1, Position0) of
+            {error, invalid_chunk_header} ->
+                ?LOG_ERROR(
+                    "invalid_chunk_header at position ~b next_offset ~b fragment ~w "
+                    "first_bytes ~w",
+                    [Position0, NextChId0, Remote0#remote.fragment,
+                     binary:part(HeaderBin1, 0, min(16, byte_size(HeaderBin1)))]
+                ),
+                error({badmatch, {error, invalid_chunk_header}});
+            {ok, H} ->
+                H
+        end,
     #{
         type := ChunkType,
         chunk_id := NextChId0,
@@ -773,6 +790,10 @@ find_position0(Spec, Fragment, StreamId) ->
     ),
     IndexData = index_data(StreamId, Fragment, IdxStartPos),
     {ChunkId, _, Pos} = find_index_position(IndexData, Spec),
+    ?LOG_DEBUG(
+        "find_position0 spec ~w fragment ~b -> chunk_id ~b pos ~b",
+        [Spec, Fragment, ChunkId, Pos]
+    ),
     {ok, ChunkId, Pos, Fragment}.
 
 find_index_position(IndexData, Spec) ->
