@@ -106,9 +106,11 @@ checkin(Pool, Conn) ->
 -spec with(pool(), timeout(), fun((conn()) -> term())) -> term().
 with(Pool, Timeout, Fun) ->
     Conn = checkout(Pool, Timeout),
-    Result = Fun(Conn),
-    ok = checkin(Pool, Conn),
-    Result.
+    try
+        Fun(Conn)
+    after
+        ok = checkin(Pool, Conn)
+    end.
 
 %%---------------------------------------------------------------------------
 

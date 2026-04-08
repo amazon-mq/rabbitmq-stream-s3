@@ -14,14 +14,12 @@ A wrapper around the AWS S3 HTTP API.
 -export([
     init/0,
     reload_config/0,
-    open/0,
-    close/1,
-    get/3,
-    get_range/4,
-    put/4,
-    delete/3,
-    delete_prefix/3,
-    list/4
+    get/2,
+    get_range/3,
+    put/3,
+    delete/2,
+    delete_prefix/2,
+    list/3
 ]).
 
 %% For apply/3:
@@ -38,6 +36,8 @@ A wrapper around the AWS S3 HTTP API.
 %% we use a token just as it expires.
 -define(TTL_SECONDS_BUFFER, 5).
 -define(REGION_KEY, rabbitmq_stream_s3_api_aws_region).
+-define(GENERAL_POOL, rabbitmq_stream_s3_general_pool).
+-define(UPLOAD_POOL, rabbitmq_stream_s3_upload_pool).
 
 -define(C_ACTIVE_REQUESTS, 1).
 -define(C_TOTAL_REQUESTS, 2).
@@ -54,10 +54,6 @@ A wrapper around the AWS S3 HTTP API.
 -record(container_creds_req, {host, port, path, conn, stream_ref}).
 
 -behaviour(rabbitmq_stream_s3_api).
-
-%% NOTE: the `rabbitmq_stream_s3_api:connection()` type is a `pid()` here - the
-%% gun connection PID.
--type connection() :: rabbitmq_stream_s3_api:connection().
 
 -type key() :: rabbitmq_stream_s3:key().
 -type request_opts() ::
@@ -124,7 +120,7 @@ reload_config() ->
 -doc """
 Opens a connection to S3 in the configured region.
 """.
--spec open() -> {ok, connection()} | {error, any()}.
+-spec open() -> {ok, pid()} | {error, any()}.
 open() ->
     %% NOTE: unfortunately, `inet:hostname()` is a string not a binary.
     Host = binary_to_list(hostname()),
@@ -132,29 +128,12 @@ open() ->
     %% support HTTP/2 (from what I heard). TODO: Evaluate HTTP/2 on other
     %% providers. Maybe just pin to HTTP/1.1.
     Opts = #{transport => tls, protocols => [http2, http]},
-    case gun:open(Host, 443, Opts) of
-        {ok, Conn} ->
-            case gun:await_up(Conn) of
-                {ok, _Protocol} ->
-                    {ok, Conn};
-                {error, _} = Err ->
-                    Err
-            end;
-        {error, _} = Err ->
-            Err
-    end.
-
--doc """
-Closes a connection created with `open_connection/0`.
-""".
--spec close(connection()) -> ok.
-close(Conn) when is_pid(Conn) ->
-    gun:close(Conn).
+    gun:open(Host, 443, Opts).
 
 -doc "Gets the body of an object at key `Key`".
--spec get(connection(), key(), request_opts()) -> {ok, binary()} | {error, any()}.
-get(Conn, Key, Opts) when is_pid(Conn) andalso is_binary(Key) andalso is_map(Opts) ->
-    case request(Conn, <<"GET">>, key_to_path(Key), #{}, <<>>, Opts) of
+-spec get(key(), request_opts()) -> {ok, binary()} | {error, any()}.
+get(Key, Opts) when is_binary(Key) andalso is_map(Opts) ->
+    case request(<<"GET">>, key_to_path(Key), #{}, <<>>, Opts) of
         {ok, #{status := 200, body := Data}} ->
             {ok, Data};
         {ok, #{status := 404}} ->
@@ -172,11 +151,11 @@ See the `range_spec()` type: this can be used to read starting at a given byte
 number, read a number of bytes from end of the object, or read an absolute
 range.
 """.
--spec get_range(connection(), key(), rabbitmq_stream_s3_api:range_spec(), request_opts()) ->
+-spec get_range(key(), rabbitmq_stream_s3_api:range_spec(), request_opts()) ->
     {ok, binary()} | {error, any()}.
-get_range(Conn, Key, Range, Opts) when is_pid(Conn) andalso is_binary(Key) andalso is_map(Opts) ->
+get_range(Key, Range, Opts) when is_binary(Key) andalso is_map(Opts) ->
     Headers = #{<<"range">> => range_specifier(Range)},
-    case request(Conn, <<"GET">>, key_to_path(Key), Headers, <<>>, Opts) of
+    case request(<<"GET">>, key_to_path(Key), Headers, <<>>, Opts) of
         %% HTTP Range requests must return 206 if only a partial range is served,
         %% according to the RFC.
         {ok, #{status := Status, body := Data}} when Status =:= 200 orelse Status =:= 206 ->
@@ -190,8 +169,8 @@ get_range(Conn, Key, Range, Opts) when is_pid(Conn) andalso is_binary(Key) andal
     end.
 
 -doc "Uploads the given `Data` as an object at key `Key`".
--spec put(connection(), key(), iodata(), request_opts()) -> ok | {error, any()}.
-put(Conn, Key, Data, Opts) when is_pid(Conn) andalso is_binary(Key) andalso is_map(Opts) ->
+-spec put(key(), iodata(), request_opts()) -> ok | {error, any()}.
+put(Key, Data, Opts) when is_binary(Key) andalso is_map(Opts) ->
     Headers =
         case Opts of
             #{crc32 := Checksum} ->
@@ -199,7 +178,7 @@ put(Conn, Key, Data, Opts) when is_pid(Conn) andalso is_binary(Key) andalso is_m
             _ ->
                 #{}
         end,
-    case request(Conn, <<"PUT">>, key_to_path(Key), Headers, Data, Opts) of
+    case request(<<"PUT">>, key_to_path(Key), Headers, Data, Opts) of
         {ok, #{status := 200}} ->
             ok;
         {ok, Other} ->
@@ -209,9 +188,9 @@ put(Conn, Key, Data, Opts) when is_pid(Conn) andalso is_binary(Key) andalso is_m
     end.
 
 -doc "Deletes the given key or list of keys".
--spec delete(connection(), key() | [key()], request_opts()) ->
+-spec delete(key() | [key()], request_opts()) ->
     ok | {error, any()}.
-delete(Conn, Keys, Opts) when is_pid(Conn) andalso is_list(Keys) andalso is_map(Opts) ->
+delete(Keys, Opts) when is_list(Keys) andalso is_map(Opts) ->
     %% <https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html>
     ?assert(length(Keys) =< 1000),
     %% Though not documented, S3 will reject the request if the list of keys
@@ -222,7 +201,7 @@ delete(Conn, Keys, Opts) when is_pid(Conn) andalso is_list(Keys) andalso is_map(
         %% A checksum header seems to be required on this endpoint...
         <<"x-amz-checksum-crc32">> => base64:encode(<<(erlang:crc32(Data)):32/unsigned>>)
     },
-    case request(Conn, <<"POST">>, <<"/?delete=">>, Headers, Data, Opts) of
+    case request(<<"POST">>, <<"/?delete=">>, Headers, Data, Opts) of
         {ok, #{status := 200}} ->
             ok;
         {ok, Other} ->
@@ -230,9 +209,9 @@ delete(Conn, Keys, Opts) when is_pid(Conn) andalso is_list(Keys) andalso is_map(
         {error, _} = Err ->
             Err
     end;
-delete(Conn, Key, Opts) when is_pid(Conn) andalso is_binary(Key) andalso is_map(Opts) ->
+delete(Key, Opts) when is_binary(Key) andalso is_map(Opts) ->
     %% <https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObject.html>.
-    case request(Conn, <<"DELETE">>, key_to_path(Key), #{}, <<>>, Opts) of
+    case request(<<"DELETE">>, key_to_path(Key), #{}, <<>>, Opts) of
         {ok, #{status := 204}} ->
             ok;
         {ok, Other} ->
@@ -252,15 +231,13 @@ Because of the pagination this function is quite slow on prefixes where many
 many keys exist. So this function should only be used in the background - not
 ever blocking any other operation.
 """.
--spec delete_prefix(connection(), key(), request_opts()) ->
+-spec delete_prefix(key(), request_opts()) ->
     {ok, objects_metadata()} | {error, any()}.
-delete_prefix(Conn, Prefix, Opts) when
-    is_pid(Conn) andalso is_binary(Prefix) andalso is_map(Opts)
-->
-    delete_prefix(Conn, Prefix, Opts, undefined, 0, 0, 0).
+delete_prefix(Prefix, Opts) when is_binary(Prefix) andalso is_map(Opts) ->
+    delete_prefix(Prefix, Opts, undefined, 0, 0, 0).
 
-delete_prefix(Conn, Prefix, Opts, Token, Objects0, TotalSize0, Pages0) ->
-    case list(Conn, Prefix, Token, Opts) of
+delete_prefix(Prefix, Opts, Token, Objects0, TotalSize0, Pages0) ->
+    case list(Prefix, Token, Opts) of
         {ok, {[], 0, undefined}} ->
             Meta = #{
                 objects => Objects0,
@@ -269,7 +246,7 @@ delete_prefix(Conn, Prefix, Opts, Token, Objects0, TotalSize0, Pages0) ->
             },
             {ok, Meta};
         {ok, {PageKeys, PageSize, NextToken}} ->
-            case delete(Conn, PageKeys, Opts) of
+            case delete(PageKeys, Opts) of
                 ok ->
                     Objects = Objects0 + length(PageKeys),
                     TotalSize = TotalSize0 + PageSize,
@@ -284,7 +261,6 @@ delete_prefix(Conn, Prefix, Opts, Token, Objects0, TotalSize0, Pages0) ->
                             {ok, Meta};
                         _ ->
                             delete_prefix(
-                                Conn,
                                 Prefix,
                                 Opts,
                                 NextToken,
@@ -300,7 +276,7 @@ delete_prefix(Conn, Prefix, Opts, Token, Objects0, TotalSize0, Pages0) ->
             Err
     end.
 
-list(Conn, Prefix, ContinuationToken, Opts) ->
+list(Prefix, ContinuationToken, Opts) ->
     Params0 = [{<<"list-type">>, <<"2">>}, {<<"prefix">>, Prefix}],
     Params1 =
         case ContinuationToken of
@@ -310,7 +286,7 @@ list(Conn, Prefix, ContinuationToken, Opts) ->
                 [{<<"continuation-token">>, ContinuationToken} | Params0]
         end,
     Params = uri_string:compose_query(Params1),
-    case request(Conn, <<"GET">>, <<"/?", Params/binary>>, #{}, <<>>, Opts) of
+    case request(<<"GET">>, <<"/?", Params/binary>>, #{}, <<>>, Opts) of
         {ok, #{status := 200, body := Body}} ->
             {ok, decode_list_bucket_result(Body)};
         {ok, Other} ->
@@ -352,12 +328,11 @@ decode_list_bucket_result(Data) ->
         Result
     ).
 
--spec request(connection(), http_method(), key(), req_headers(), iodata(), request_opts()) ->
+-spec request(http_method(), key(), req_headers(), iodata(), request_opts()) ->
     {ok, http_response()}
     | {error, any()}.
-request(Conn, Method, Path, Headers0, Body, Opts) when
-    is_pid(Conn) andalso
-        is_binary(Method) andalso
+request(Method, Path, Headers0, Body, Opts) when
+    is_binary(Method) andalso
         is_binary(Path) andalso
         is_map(Headers0) andalso
         is_map(Opts)
@@ -379,37 +354,46 @@ request(Conn, Method, Path, Headers0, Body, Opts) when
             counters:add(Cnt, ?C_ACTIVE_REQUESTS, 1),
             counters:add(Cnt, ?C_TOTAL_REQUESTS, 1),
             try
-                Timeout = maps:get(timeout, Opts, 5_000),
-                T1 = start_timeout_window(Timeout),
-                StreamRef = gun:request(Conn, Method, Path, Headers, Body),
-                case gun:await(Conn, StreamRef, Timeout) of
-                    {response, fin, Status, RespHeaders} ->
-                        Response = #{status => Status, headers => RespHeaders},
-                        postprocess_response(Response),
-                        {ok, Response};
-                    {response, nofin, Status, RespHeaders} ->
-                        Timeout1 = end_timeout_window(Timeout, T1),
-                        case gun:await_body(Conn, StreamRef, Timeout1) of
-                            {ok, RespBody} ->
-                                Response = #{
-                                    status => Status,
-                                    headers => RespHeaders,
-                                    body => RespBody
-                                },
-                                postprocess_response(Response),
-                                {ok, Response};
-                            {error, _} = Err ->
-                                Err
-                        end;
-                    {error, _} = Err ->
-                        Err
-                end
+                request0(Method, Path, Headers, Body, Opts)
             after
                 counters:sub(Cnt, ?C_ACTIVE_REQUESTS, 1)
             end;
         {error, _} = Err ->
             Err
     end.
+
+request0(Method, Path, Headers, Body, Opts) ->
+    Pool =
+        case Method of
+            <<"PUT">> -> ?UPLOAD_POOL;
+            _ -> ?GENERAL_POOL
+        end,
+    Timeout = maps:get(timeout, Opts, 5_000),
+    T1 = start_timeout_window(Timeout),
+    rabbitmq_stream_s3_api_aws_pool:with(Pool, Timeout, fun(Conn) ->
+        StreamRef = gun:request(Conn, Method, Path, Headers, Body),
+        case gun:await(Conn, StreamRef, end_timeout_window(Timeout, T1)) of
+            {response, fin, Status, RespHeaders} ->
+                Response = #{status => Status, headers => RespHeaders},
+                postprocess_response(Response),
+                {ok, Response};
+            {response, nofin, Status, RespHeaders} ->
+                case gun:await_body(Conn, StreamRef, end_timeout_window(Timeout, T1)) of
+                    {ok, RespBody} ->
+                        Response = #{
+                            status => Status,
+                            headers => RespHeaders,
+                            body => RespBody
+                        },
+                        postprocess_response(Response),
+                        {ok, Response};
+                    {error, _} = Err ->
+                        Err
+                end;
+            {error, _} = Err ->
+                Err
+        end
+    end).
 
 postprocess_response(#{status := 503}) ->
     counters:add(counter(), ?C_RESPONSE_503, 1);

@@ -135,30 +135,36 @@ end_per_testcase(_Testcase, Config) ->
 %%----------------------------------------------------------------------------
 
 kick_the_tires(_Config) ->
+    {ok, _} = rabbitmq_stream_s3_api_aws_pool:start_link(
+        rabbitmq_stream_s3_upload_pool,
+        #{min_size => 1, max_size => 3}
+    ),
+    {ok, _} = rabbitmq_stream_s3_api_aws_pool:start_link(
+        rabbitmq_stream_s3_general_pool,
+        #{min_size => 1, max_size => 3}
+    ),
     Keys =
         [K1, K2, K3] = [
             <<(atom_to_binary(?FUNCTION_NAME))/binary, "-", (nonce())/binary>>
          || _ <- lists:seq(1, 3)
         ],
-    {ok, Conn} = rabbitmq_stream_s3_api_aws:open(),
-
     try
-        ok = rabbitmq_stream_s3_api_aws:put(Conn, K1, <<"Hello, S3!">>, #{}),
-        {ok, <<"Hello, S3!">>} = rabbitmq_stream_s3_api_aws:get(Conn, K1, #{}),
+        ok = rabbitmq_stream_s3_api_aws:put(K1, <<"Hello, S3!">>, #{}),
+        {ok, <<"Hello, S3!">>} = rabbitmq_stream_s3_api_aws:get(K1, #{}),
 
-        {ok, <<"Hello,">>} = rabbitmq_stream_s3_api_aws:get_range(Conn, K1, {0, 5}, #{}),
-        {ok, <<"S3!">>} = rabbitmq_stream_s3_api_aws:get_range(Conn, K1, -3, #{}),
-        {ok, <<"lo, S3!">>} = rabbitmq_stream_s3_api_aws:get_range(Conn, K1, {3, undefined}, #{}),
+        {ok, <<"Hello,">>} = rabbitmq_stream_s3_api_aws:get_range(K1, {0, 5}, #{}),
+        {ok, <<"S3!">>} = rabbitmq_stream_s3_api_aws:get_range(K1, -3, #{}),
+        {ok, <<"lo, S3!">>} = rabbitmq_stream_s3_api_aws:get_range(K1, {3, undefined}, #{}),
 
-        ok = rabbitmq_stream_s3_api_aws:put(Conn, K2, <<"Object 2">>, #{}),
-        ok = rabbitmq_stream_s3_api_aws:put(Conn, K3, <<"Object 3">>, #{}),
+        ok = rabbitmq_stream_s3_api_aws:put(K2, <<"Object 2">>, #{}),
+        ok = rabbitmq_stream_s3_api_aws:put(K3, <<"Object 3">>, #{}),
 
-        ok = rabbitmq_stream_s3_api_aws:delete(Conn, K1, #{}),
-        {error, not_found} = rabbitmq_stream_s3_api_aws:get(Conn, K1, #{}),
+        ok = rabbitmq_stream_s3_api_aws:delete(K1, #{}),
+        {error, not_found} = rabbitmq_stream_s3_api_aws:get(K1, #{}),
 
-        ok = rabbitmq_stream_s3_api_aws:delete(Conn, [K2, K3], #{}),
-        {error, not_found} = rabbitmq_stream_s3_api_aws:get(Conn, K2, #{}),
-        {error, not_found} = rabbitmq_stream_s3_api_aws:get(Conn, K3, #{}),
+        ok = rabbitmq_stream_s3_api_aws:delete([K2, K3], #{}),
+        {error, not_found} = rabbitmq_stream_s3_api_aws:get(K2, #{}),
+        {error, not_found} = rabbitmq_stream_s3_api_aws:get(K3, #{}),
 
         Keys1 = [
             <<"prefix/", (atom_to_binary(?FUNCTION_NAME))/binary, "-",
@@ -168,9 +174,8 @@ kick_the_tires(_Config) ->
         ],
         NKeys = length(Keys1),
         Payload = <<"Object data">>,
-        [ok = rabbitmq_stream_s3_api_aws:put(Conn, K, Payload, #{}) || K <- Keys1],
+        [ok = rabbitmq_stream_s3_api_aws:put(K, Payload, #{}) || K <- Keys1],
         {ok, {ListKeys, TotalSize, undefined}} = rabbitmq_stream_s3_api_aws:list(
-            Conn,
             <<"prefix">>,
             undefined,
             #{}
@@ -178,22 +183,16 @@ kick_the_tires(_Config) ->
         ?assertEqual(lists:sort(Keys1), lists:sort(ListKeys)),
         ?assertEqual(byte_size(Payload) * length(Keys1), TotalSize),
         {ok, #{pages := 1, objects := NKeys, total_size := TotalSize}} = rabbitmq_stream_s3_api_aws:delete_prefix(
-            Conn,
             <<"prefix">>,
             #{}
         ),
-        {ok, {[], 0, undefined}} = rabbitmq_stream_s3_api_aws:list(
-            Conn,
-            <<"prefix">>,
-            undefined,
-            #{}
-        ),
+        {ok, {[], 0, undefined}} = rabbitmq_stream_s3_api_aws:list(<<"prefix">>, undefined, #{}),
 
         ok
     after
-        _ = rabbitmq_stream_s3_api_aws:delete(Conn, Keys, #{}),
-        _ = rabbitmq_stream_s3_api_aws:delete_prefix(Conn, <<"prefix">>, #{}),
-        ok = rabbitmq_stream_s3_api_aws:close(Conn)
+        _ = rabbitmq_stream_s3_api_aws:delete(Keys, #{}),
+        _ = rabbitmq_stream_s3_api_aws:delete_prefix(<<"prefix">>, #{}),
+        ok
     end.
 
 container_credentials(_Config) ->
