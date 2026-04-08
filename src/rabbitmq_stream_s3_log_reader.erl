@@ -375,18 +375,23 @@ start_link(Reader, Key) ->
 init({Reader, Key}) ->
     erlang:monitor(process, Reader),
     {ok, Conn} = rabbitmq_stream_s3_api:open(),
-    {ok, #fragment_info{size = SegmentDataSize, next_offset = NextOffset}} = rabbitmq_stream_s3_server:get_fragment_info(
-        Key
-    ),
-    {ok, ReadSize} =
-        rabbit_resource_monitor_misc:parse_information_unit(?READAHEAD),
-    {ok, #state{
-        connection = Conn,
-        object = Key,
-        segment_data_size = SegmentDataSize,
-        read_size = ReadSize,
-        next_fragment_offset = NextOffset
-    }}.
+    case rabbitmq_stream_s3_server:get_fragment_info(Key) of
+        {ok, #fragment_info{size = SegmentDataSize, next_offset = NextOffset}} ->
+            {ok, ReadSize} =
+                rabbit_resource_monitor_misc:parse_information_unit(?READAHEAD),
+            {ok, #state{
+                connection = Conn,
+                object = Key,
+                segment_data_size = SegmentDataSize,
+                read_size = ReadSize,
+                next_fragment_offset = NextOffset
+            }};
+        {error, not_found} ->
+            %% The fragment was deleted by retention before this reader could
+            %% open it. Stop normally so the supervisor does not restart us.
+            ok = rabbitmq_stream_s3_api:close(Conn),
+            {stop, normal}
+    end.
 
 handle_call({read, Offset, Bytes, Hint}, _From, State0) ->
     %% TODO: while reading, start a request for the next range of data when
@@ -541,7 +546,7 @@ read_header1(
                                 position = ?FRAGMENT_HEADER_B
                             },
                             read_header1(Remote);
-                        {error, not_found} ->
+                        {error, _} ->
                             {end_of_stream, Remote0}
                     end
             end
