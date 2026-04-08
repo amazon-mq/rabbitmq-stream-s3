@@ -571,36 +571,16 @@ advance_fragment(
                     read_header1(Remote);
                 {error, not_found} ->
                     %% The fragment at NextChId was deleted by retention.
-                    %% Use the manifest to find the correct fragment for
-                    %% NextChId, or jump to first_offset if it has been
-                    %% deleted.
+                    %% Jump to the oldest fragment still in S3. The guard
+                    %% ensures first_offset strictly increases on each
+                    %% recursion, so this terminates.
                     case rabbitmq_stream_s3_server:get_manifest(StreamId) of
-                        undefined ->
-                            {end_of_stream, Remote0};
-                        #manifest{first_offset = FirstOffset}
-                          when NextChId < FirstOffset ->
+                        #manifest{first_offset = FirstOffset} when
+                            FirstOffset > NextChId
+                        ->
                             advance_fragment(Remote0#remote{next_offset = FirstOffset});
-                        #manifest{next_offset = ManifestNext, entries = Entries}
-                          when NextChId < ManifestNext ->
-                            case find_position({offset, NextChId}, Entries, StreamId) of
-                                {ok, ChunkId, Position, Fragment} ->
-                                    FragKey = rabbitmq_stream_s3:fragment_key(StreamId, Fragment),
-                                    case rabbitmq_stream_s3_log_reader_sup:add_child(self(), FragKey) of
-                                        {ok, Pid} ->
-                                            ok = gen_server:cast(Pid0, close),
-                                            Remote = Remote0#remote{
-                                                pid = Pid,
-                                                fragment = Fragment,
-                                                next_offset = ChunkId,
-                                                position = Position
-                                            },
-                                            read_header1(Remote);
-                                        {error, not_found} ->
-                                            {end_of_stream, Remote0}
-                                    end;
-                                _ ->
-                                    {end_of_stream, Remote0}
-                            end
+                        _ ->
+                            {end_of_stream, Remote0}
                     end
             end
     end.
@@ -785,10 +765,6 @@ find_fragment(Entries, Spec, GetGroup) ->
 
 find_position0(Spec, Fragment, StreamId) ->
     %% TODO: pass in size now that we have it.
-    %% TODO: TOCTOU risk — the manifest may list Fragment as existing, but
-    %% remote retention could delete it between the manifest fetch and this
-    %% get_fragment_trailer call. The badmatch would crash the caller.
-    %% Fix: handle {error, _} here and propagate it instead of crashing.
     {ok, #fragment_info{index_start_pos = IdxStartPos}} = rabbitmq_stream_s3_server:get_fragment_trailer(
         StreamId,
         Fragment
