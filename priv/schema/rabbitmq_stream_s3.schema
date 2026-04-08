@@ -142,3 +142,19 @@ end}.
 {mapping, "stream.continuous_membership_reconciliation.target_group_size", "rabbitmq_stream_s3.membership_reconciliation_target_group_size", [
     {datatype, integer}, {validators, ["non_negative_integer"]}
 ]}.
+
+%% Verbose logging — when enabled, log messages that normally truncate
+%% large terms (such as S3 error responses) will print them in full.
+
+{mapping, "s3.verbose_logging", "rabbitmq_stream_s3.verbose_logging", [
+    {datatype, {enum, [true, false]}},
+    {default, false}
+]}.
+
+{translation, "rabbitmq_stream_s3.verbose_logging",
+fun(Conf) ->
+    case cuttlefish:conf_get("rabbitmq_stream_s3.verbose_logging", Conf, false) of
+        false -> cuttlefish:unset();
+        Value -> Value
+    end
+end}.
