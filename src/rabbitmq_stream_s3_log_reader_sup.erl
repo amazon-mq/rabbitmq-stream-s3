@@ -11,13 +11,13 @@
 
 -export([init/1]).
 
--export([add_child/2]).
+-export([add_child/1]).
 
 start_link() ->
     supervisor:start_link({local, ?SERVER}, ?MODULE, []).
 
-add_child(Reader, Key) ->
-    supervisor:start_child(?MODULE, [Reader, Key]).
+add_child(Config) ->
+    supervisor:start_child(?MODULE, [Config]).
 
 init([]) ->
     ChildSpec = #{
