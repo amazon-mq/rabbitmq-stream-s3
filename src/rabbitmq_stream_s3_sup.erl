@@ -37,15 +37,15 @@ init([]) ->
                 }
             ]}
     },
-    LogReaderSup = #{
-        id => rabbitmq_stream_s3_log_reader_sup,
+    RemoteReaderSup = #{
+        id => rabbitmq_stream_s3_remote_reader_sup,
         type => supervisor,
-        start => {rabbitmq_stream_s3_log_reader_sup, start_link, []}
+        start => {rabbitmq_stream_s3_remote_reader_sup, start_link, []}
     },
     MembershipReconciliation = #{
         id => rabbitmq_stream_s3_membership_reconciliation,
         type => worker,
         start => {rabbitmq_stream_s3_membership_reconciliation, start_link, []}
     },
-    Procs = [UploadPoolSup, GeneralPoolSup, LogReaderSup, MembershipReconciliation],
+    Procs = [UploadPoolSup, GeneralPoolSup, RemoteReaderSup, MembershipReconciliation],
     {ok, {SupFlags, Procs}}.

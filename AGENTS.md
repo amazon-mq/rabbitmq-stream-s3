@@ -37,7 +37,8 @@ Read the relevant doc before modifying any module.
 | `rabbitmq_stream_s3_db.erl` | Khepri interactions: stream ID storage, triggers, keep-while conditions |
 | `rabbitmq_stream_s3_log_manifest.erl` | `osiris_log_manifest` behaviour: local tier interface, fragment recovery on boot |
 | `rabbitmq_stream_s3_log_reader.erl` | `osiris_log_reader` behaviour: reads from local or remote tier |
-| `rabbitmq_stream_s3_log_reader_sup.erl` | Supervisor for remote reader `gen_server` processes |
+| `rabbitmq_stream_s3_remote_reader.erl` | `gen_server` that pre-fetches and buffers data from the remote tier for a single consumer |
+| `rabbitmq_stream_s3_remote_reader_sup.erl` | Supervisor for remote reader `gen_server` processes |
 | `rabbitmq_stream_s3_machine.erl` | Manifest state machine: fragment tracking, retention, groups |
 | `rabbitmq_stream_s3_server.erl` | `gen_server` coordinating uploads, deletions, manifest updates |
 | `rabbitmq_stream_s3_sup.erl` | Top-level supervisor |

@@ -121,6 +121,15 @@
     roll_reason :: size | segment_roll | undefined
 }).
 
+-record(remote_location, {
+    fragment :: osiris:offset(),
+    position :: byte_offset(),
+    chunk_id :: osiris:offset(),
+    %% This may be undefined if we are starting at the first offset in a
+    %% fragment and didn't download any of its data.
+    fragment_info :: #fragment_info{} | undefined
+}).
+
 -define(INDEX_RECORD(Offset, Timestamp, FragmentFilePos), <<
     Offset:64/unsigned,
     Timestamp:64/signed,
