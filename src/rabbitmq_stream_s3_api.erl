@@ -15,23 +15,20 @@ file-system operations. Use that in non-unit tests.
 """.
 -export([
     init/0,
-    open/0,
-    close/1,
+    get/1,
     get/2,
-    get/3,
+    get_range/2,
     get_range/3,
-    get_range/4,
+    put/2,
     put/3,
-    put/4,
+    delete/1,
     delete/2,
-    delete/3,
-    delete_prefix/2,
-    delete_prefix/3
+    delete_prefix/1,
+    delete_prefix/2
 ]).
 
-%% Up to the backend exactly what this is. Could be a pid for an HTTP
-%% connection or a file descriptor for a local file.
--type connection() :: any().
+-export([backend/0]).
+
 -type key() :: rabbitmq_stream_s3:key().
 -export_type([key/0]).
 -type range_spec() ::
@@ -43,15 +40,13 @@ file-system operations. Use that in non-unit tests.
     unsigned_payload => boolean()
 }.
 
--export_type([connection/0, range_spec/0, request_opts/0]).
+-export_type([range_spec/0, request_opts/0]).
 
 -callback init() -> ok.
--callback open() -> {ok, connection()} | {error, any()}.
--callback close(connection()) -> ok.
--callback get(connection(), key(), request_opts()) -> {ok, binary()} | {error, any()}.
--callback get_range(connection(), key(), range_spec(), request_opts()) ->
+-callback get(key(), request_opts()) -> {ok, binary()} | {error, any()}.
+-callback get_range(key(), range_spec(), request_opts()) ->
     {ok, binary()} | {error, any()}.
--callback put(connection(), key(), iodata(), request_opts()) -> ok | {error, any()}.
+-callback put(key(), iodata(), request_opts()) -> ok | {error, any()}.
 -doc """
 Delete the given key or all of the listed keys from the remote tier.
 
@@ -60,8 +55,8 @@ only allowed for the sake of reducing requests where possible. It would not be
 atomic in a file system and S3 only supports deleting 1000 keys at a time, for
 examples.
 """.
--callback delete(connection(), key() | [key()], request_opts()) -> ok | {error, any()}.
--callback delete_prefix(connection(), key(), request_opts()) -> {ok, map()} | {error, any()}.
+-callback delete(key() | [key()], request_opts()) -> ok | {error, any()}.
+-callback delete_prefix(key(), request_opts()) -> {ok, map()} | {error, any()}.
 
 -define(C_GET, 1).
 -define(C_GET_RANGE, 2).
@@ -96,78 +91,70 @@ init() ->
     ok = rabbitmq_stream_s3_request_metrics:init(),
     (backend()):init().
 
--spec open() -> {ok, connection()} | {error, any()}.
-open() ->
-    (backend()):open().
+-doc #{equiv => get(Key, #{})}.
+-spec get(key()) -> {ok, binary()} | {error, any()}.
+get(Key) when is_binary(Key) ->
+    get(Key, #{}).
 
--spec close(connection()) -> ok.
-close(Conn) ->
-    (backend()):close(Conn).
-
--doc #{equiv => get(Conn, Key, #{})}.
--spec get(connection(), key()) -> {ok, binary()} | {error, any()}.
-get(Conn, Key) when is_binary(Key) ->
-    get(Conn, Key, #{}).
-
--spec get(connection(), key(), request_opts()) -> {ok, binary()} | {error, any()}.
-get(Conn, Key, Opts) when is_binary(Key) andalso is_map(Opts) ->
+-spec get(key(), request_opts()) -> {ok, binary()} | {error, any()}.
+get(Key, Opts) when is_binary(Key) andalso is_map(Opts) ->
     counters:add(counter(), ?C_GET, 1),
-    Result = observe(read, fun() -> (backend()):get(Conn, Key, Opts) end),
+    Result = observe(read, fun() -> (backend()):get(Key, Opts) end),
     case Result of
         {ok, Data} -> counters:add(counter(), ?C_BYTES_RECEIVED, byte_size(Data));
         _ -> ok
     end,
     Result.
 
--doc #{equiv => get_range(Conn, Key, Range, #{})}.
--spec get_range(connection(), key(), range_spec()) -> {ok, binary()} | {error, any()}.
-get_range(Conn, Key, Range) when is_binary(Key) ->
-    get_range(Conn, Key, Range, #{}).
+-doc #{equiv => get_range(Key, Range, #{})}.
+-spec get_range(key(), range_spec()) -> {ok, binary()} | {error, any()}.
+get_range(Key, Range) when is_binary(Key) ->
+    get_range(Key, Range, #{}).
 
--spec get_range(connection(), key(), range_spec(), request_opts()) ->
+-spec get_range(key(), range_spec(), request_opts()) ->
     {ok, binary()} | {error, any()}.
-get_range(Conn, Key, Range, Opts) when is_binary(Key) andalso is_map(Opts) ->
+get_range(Key, Range, Opts) when is_binary(Key) andalso is_map(Opts) ->
     counters:add(counter(), ?C_GET_RANGE, 1),
-    Result = observe(read, fun() -> (backend()):get_range(Conn, Key, Range, Opts) end),
+    Result = observe(read, fun() -> (backend()):get_range(Key, Range, Opts) end),
     case Result of
         {ok, Data} -> counters:add(counter(), ?C_BYTES_RECEIVED, byte_size(Data));
         _ -> ok
     end,
     Result.
 
--doc #{equiv => put(Conn, Key, Data, #{})}.
--spec put(connection(), key(), iodata()) -> ok | {error, any()}.
-put(Conn, Key, Data) when is_binary(Key) ->
-    put(Conn, Key, Data, #{}).
+-doc #{equiv => put(Key, Data, #{})}.
+-spec put(key(), iodata()) -> ok | {error, any()}.
+put(Key, Data) when is_binary(Key) ->
+    put(Key, Data, #{}).
 
--spec put(connection(), key(), iodata(), request_opts()) -> ok | {error, any()}.
-put(Conn, Key, Data, Opts) when is_binary(Key) andalso is_map(Opts) ->
+-spec put(key(), iodata(), request_opts()) -> ok | {error, any()}.
+put(Key, Data, Opts) when is_binary(Key) andalso is_map(Opts) ->
     counters:add(counter(), ?C_PUT, 1),
     counters:add(counter(), ?C_BYTES_SENT, iolist_size(Data)),
-    observe(write, fun() -> (backend()):put(Conn, Key, Data, Opts) end).
+    observe(write, fun() -> (backend()):put(Key, Data, Opts) end).
 
--doc #{equiv => delete(Conn, Keys, #{})}.
--spec delete(connection(), key() | [key()]) -> ok | {error, any()}.
-delete(Conn, Keys) when is_binary(Keys) orelse is_list(Keys) ->
-    delete(Conn, Keys, #{}).
+-doc #{equiv => delete(Keys, #{})}.
+-spec delete(key() | [key()]) -> ok | {error, any()}.
+delete(Keys) when is_binary(Keys) orelse is_list(Keys) ->
+    delete(Keys, #{}).
 
--spec delete(connection(), key() | [key()], request_opts()) ->
+-spec delete(key() | [key()], request_opts()) ->
     ok | {error, any()}.
-delete(Conn, Keys, Opts) when is_list(Keys) andalso is_map(Opts) ->
+delete(Keys, Opts) when is_list(Keys) andalso is_map(Opts) ->
     counters:add(counter(), ?C_DELETE_MANY, 1),
-    observe(write, fun() -> (backend()):delete(Conn, Keys, Opts) end);
-delete(Conn, Key, Opts) when is_binary(Key) andalso is_map(Opts) ->
+    observe(write, fun() -> (backend()):delete(Keys, Opts) end);
+delete(Key, Opts) when is_binary(Key) andalso is_map(Opts) ->
     counters:add(counter(), ?C_DELETE_ONE, 1),
-    observe(write, fun() -> (backend()):delete(Conn, Key, Opts) end).
+    observe(write, fun() -> (backend()):delete(Key, Opts) end).
 
--spec delete_prefix(connection(), key()) -> {ok, map()} | {error, any()}.
-delete_prefix(Conn, Prefix) ->
-    delete_prefix(Conn, Prefix, #{}).
+-spec delete_prefix(key()) -> {ok, map()} | {error, any()}.
+delete_prefix(Prefix) ->
+    delete_prefix(Prefix, #{}).
 
--spec delete_prefix(connection(), key(), request_opts()) -> {ok, map()} | {error, any()}.
-delete_prefix(Conn, Prefix, Opts) when is_binary(Prefix) andalso is_map(Opts) ->
+-spec delete_prefix(key(), request_opts()) -> {ok, map()} | {error, any()}.
+delete_prefix(Prefix, Opts) when is_binary(Prefix) andalso is_map(Opts) ->
     counters:add(counter(), ?C_LIST, 1),
-    observe(write, fun() -> (backend()):delete_prefix(Conn, Prefix, Opts) end).
+    observe(write, fun() -> (backend()):delete_prefix(Prefix, Opts) end).
 
 observe(Kind, Fun) ->
     T0 = erlang:monotonic_time(),

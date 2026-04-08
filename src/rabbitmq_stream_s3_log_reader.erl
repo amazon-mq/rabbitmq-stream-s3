@@ -49,7 +49,6 @@ tier.
 }).
 
 -record(state, {
-    connection :: rabbitmq_stream_s3_api:connection(),
     buffer = <<>> :: binary(),
     offset_start :: byte_offset() | undefined,
     offset_end :: byte_offset() | undefined,
@@ -374,13 +373,11 @@ start_link(Reader, Key) ->
 
 init({Reader, Key}) ->
     erlang:monitor(process, Reader),
-    {ok, Conn} = rabbitmq_stream_s3_api:open(),
     case rabbitmq_stream_s3_server:get_fragment_info(Key) of
         {ok, #fragment_info{size = SegmentDataSize, next_offset = NextOffset}} ->
             {ok, ReadSize} =
                 rabbit_resource_monitor_misc:parse_information_unit(?READAHEAD),
             {ok, #state{
-                connection = Conn,
                 object = Key,
                 segment_data_size = SegmentDataSize,
                 read_size = ReadSize,
@@ -389,7 +386,6 @@ init({Reader, Key}) ->
         {error, not_found} ->
             %% The fragment was deleted by retention before this reader could
             %% open it. Stop normally so the supervisor does not restart us.
-            ok = rabbitmq_stream_s3_api:close(Conn),
             {stop, normal}
     end.
 
@@ -420,8 +416,8 @@ handle_info(Message, State) ->
     ?LOG_DEBUG(?MODULE_STRING " received unexpected message: ~W", [Message, 10]),
     {noreply, State}.
 
-terminate(_Reason, #state{connection = Connection}) ->
-    ok = rabbitmq_stream_s3_api:close(Connection).
+terminate(_Reason, _State) ->
+    ok.
 
 format_status(#{state := #state{buffer = Buffer} = State0} = Status0) ->
     %% Avoid formatting the buffer - it can be large.
@@ -445,7 +441,6 @@ do_read(#state{segment_data_size = Size}, Offset, _Bytes) when
     eof;
 do_read(
     #state{
-        connection = Connection,
         object = Object,
         buffer = Buffer,
         read_size = ReadSize,
@@ -464,7 +459,6 @@ do_read(
         false ->
             ToRead = max(ReadSize, Bytes),
             {ok, NewBuffer} = rabbitmq_stream_s3_api:get_range(
-                Connection,
                 Object,
                 {Offset, Offset + ToRead - 1}
             ),
@@ -777,20 +771,14 @@ saturating_decr(0) -> 0;
 saturating_decr(N) -> N - 1.
 
 index_data(StreamId, FragmentOffset, StartPos) ->
-    {ok, Conn} = rabbitmq_stream_s3_api:open(),
     Key = rabbitmq_stream_s3:fragment_key(StreamId, FragmentOffset),
     ?LOG_DEBUG("Looking up key ~ts (~ts)", [Key, ?FUNCTION_NAME]),
-    try
-        {ok, Data} = rabbitmq_stream_s3_api:get_range(
-            Conn,
-            Key,
-            {StartPos + ?IDX_HEADER_B, undefined},
-            #{timeout => ?READ_TIMEOUT}
-        ),
-        Data
-    after
-        ok = rabbitmq_stream_s3_api:close(Conn)
-    end.
+    {ok, Data} = rabbitmq_stream_s3_api:get_range(
+        Key,
+        {StartPos + ?IDX_HEADER_B, undefined},
+        #{timeout => ?READ_TIMEOUT}
+    ),
+    Data.
 
 validate_read_timing(ReadMsec) when ReadMsec > ?SLOW_READ_THRESHOLD_MS ->
     ?LOG_WARNING("Slow remote tier read: ~bms", [ReadMsec]);

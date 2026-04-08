@@ -539,7 +539,6 @@ execute_task(#upload_fragment{
         } = Fragment
 }) ->
     Timeout = application:get_env(rabbitmq_stream_s3, segment_upload_timeout, 45_000),
-    {ok, Conn} = rabbitmq_stream_s3_api:open(),
     FragmentFilename = rabbitmq_stream_s3:offset_filename(FragmentOffset, <<"fragment">>),
     SegmentFilename = rabbitmq_stream_s3:offset_filename(SegmentOffset, <<"segment">>),
     IndexFilename = rabbitmq_stream_s3:offset_filename(SegmentOffset, <<"index">>),
@@ -550,90 +549,76 @@ execute_task(#upload_fragment{
         ]
     ),
 
-    try
-        {UploadMSec, {UploadSize, FragmentInfo0}} = timer:tc(
-            fun() ->
-                {ok, SegFd} = file:open(filename:join(Dir, SegmentFilename), [read, raw, binary]),
-                {ok, IdxFd} = file:open(filename:join(Dir, IndexFilename), [read, raw, binary]),
+    {UploadMSec, {UploadSize, FragmentInfo0}} = timer:tc(
+        fun() ->
+            {ok, SegFd} = file:open(filename:join(Dir, SegmentFilename), [read, raw, binary]),
+            {ok, IdxFd} = file:open(filename:join(Dir, IndexFilename), [read, raw, binary]),
 
-                {ok, SegData} = file:pread(SegFd, SegmentPos, Size),
-                {ok, IdxData0} = file:pread(
-                    IdxFd,
-                    ?IDX_HEADER_B + (IdxStart * ?INDEX_RECORD_SIZE_B),
-                    IdxLen * ?INDEX_RECORD_SIZE_B
-                ),
-                %% Convert from osiris index style to fragment index. We can
-                %% drop epoch since it's not necessary after commit. TODO: right?
-                %% TODO: this is pretty messy. Use the INDEX_RECORD macro.
-                IdxData = <<
-                    <<
-                        IdxChId:64/unsigned,
-                        IdxTs:64/signed,
-                        (SegmentFilePos - SegmentPos + ?FRAGMENT_HEADER_B):32/unsigned
-                    >>
-                 || <<
-                        IdxChId:64/unsigned,
-                        IdxTs:64/signed,
-                        _Epoch:64/unsigned,
-                        SegmentFilePos:32/unsigned,
-                        _ChType:8/unsigned
-                    >> <= IdxData0
-                >>,
-                Header = ?FRAGMENT_HEADER(
-                    FragmentOffset,
-                    NextOffset,
-                    FirstTs,
-                    LastTs,
-                    SeqNo,
-                    SegmentOffset,
-                    SegmentPos,
-                    (?FRAGMENT_HEADER_B + Size),
-                    <<>>
-                ),
-                Data = [Header, SegData, ?IDX_HEADER, IdxData],
-                Crc =
-                    case SegmentDataCrc of
-                        undefined ->
-                            %% TODO: If there is no CRC32 cached then we need
-                            %% to validate chunks data during the upload and
-                            %% rebuild the index from the segment data.
-                            erlang:crc32(Data);
-                        _ ->
-                            Crc0 = erlang:crc32_combine(erlang:crc32(Header), SegmentDataCrc, Size),
-                            erlang:crc32(Crc0, [?IDX_HEADER, IdxData])
-                    end,
-                %% TODO: should be able to upload this in chunks. Gun should
-                %% support that.
-                case
-                    rabbitmq_stream_s3_api:put(
-                        Conn,
-                        Key,
-                        Data,
-                        #{
-                            unsigned_payload => true,
-                            crc32 => Crc,
-                            timeout => Timeout
-                        }
-                    )
-                of
-                    ok ->
-                        ok;
-                    {error, _} = Err ->
-                        exit(Err)
+            {ok, SegData} = file:pread(SegFd, SegmentPos, Size),
+            {ok, IdxData0} = file:pread(
+                IdxFd,
+                ?IDX_HEADER_B + (IdxStart * ?INDEX_RECORD_SIZE_B),
+                IdxLen * ?INDEX_RECORD_SIZE_B
+            ),
+            %% Convert from osiris index style to fragment index. We can
+            %% drop epoch since it's not necessary after commit. TODO: right?
+            %% TODO: this is pretty messy. Use the INDEX_RECORD macro.
+            IdxData = <<
+                <<
+                    IdxChId:64/unsigned,
+                    IdxTs:64/signed,
+                    (SegmentFilePos - SegmentPos + ?FRAGMENT_HEADER_B):32/unsigned
+                >>
+             || <<
+                    IdxChId:64/unsigned,
+                    IdxTs:64/signed,
+                    _Epoch:64/unsigned,
+                    SegmentFilePos:32/unsigned,
+                    _ChType:8/unsigned
+                >> <= IdxData0
+            >>,
+            Header = ?FRAGMENT_HEADER(
+                FragmentOffset,
+                NextOffset,
+                FirstTs,
+                LastTs,
+                SeqNo,
+                SegmentOffset,
+                SegmentPos,
+                (?FRAGMENT_HEADER_B + Size),
+                <<>>
+            ),
+            Data = [Header, SegData, ?IDX_HEADER, IdxData],
+            Crc =
+                case SegmentDataCrc of
+                    undefined ->
+                        %% TODO: If there is no CRC32 cached then we need
+                        %% to validate chunks data during the upload and
+                        %% rebuild the index from the segment data.
+                        erlang:crc32(Data);
+                    _ ->
+                        Crc0 = erlang:crc32_combine(erlang:crc32(Header), SegmentDataCrc, Size),
+                        erlang:crc32(Crc0, [?IDX_HEADER, IdxData])
                 end,
-                {iolist_size(Data), fragment_header_to_info(Header)}
+            %% TODO: should be able to upload this in chunks. Gun should
+            %% support that.
+            ReqOpts = #{unsigned_payload => true, crc32 => Crc, timeout => Timeout},
+            case rabbitmq_stream_s3_api:put(Key, Data, ReqOpts) of
+                ok ->
+                    ok;
+                {error, _} = Err ->
+                    exit(Err)
             end,
-            millisecond
-        ),
-        ?LOG_DEBUG("Uploaded ~ts of ~ts in ~b msec (~b bytes)", [
-            FragmentFilename, SegmentFilename, UploadMSec, UploadSize
-        ]),
-        counters:add(counter(), ?C_FRAGMENTS_CREATED, 1),
-        FragmentInfo = FragmentInfo0#fragment_info{roll_reason = RollReason},
-        #fragment_uploaded{stream = StreamId, info = FragmentInfo}
-    after
-        ok = rabbitmq_stream_s3_api:close(Conn)
-    end;
+            {iolist_size(Data), fragment_header_to_info(Header)}
+        end,
+        millisecond
+    ),
+    ?LOG_DEBUG("Uploaded ~ts of ~ts in ~b msec (~b bytes)", [
+        FragmentFilename, SegmentFilename, UploadMSec, UploadSize
+    ]),
+    counters:add(counter(), ?C_FRAGMENTS_CREATED, 1),
+    FragmentInfo = FragmentInfo0#fragment_info{roll_reason = RollReason},
+    #fragment_uploaded{stream = StreamId, info = FragmentInfo};
 execute_task(#upload_group{
     stream = StreamId,
     kind = GroupKind,
@@ -656,33 +641,27 @@ execute_task(#upload_group{
         GroupEntries/binary
     >>,
 
-    {ok, Conn} = rabbitmq_stream_s3_api:open(),
-    try
-        ?LOG_DEBUG("rebalancing: adding a ~ts to the manifest for stream '~ts'", [Ext, StreamId]),
-        {UploadMsec, ok} = timer:tc(
-            fun() ->
-                case rabbitmq_stream_s3_api:put(Conn, Key, Data) of
-                    ok -> ok;
-                    {error, _} = Err -> exit(Err)
-                end
-            end,
-            millisecond
-        ),
-        DataSize = iolist_size(Data),
-        ?LOG_DEBUG("Uploaded ~ts for stream '~ts' in ~b msec (~b bytes)", [
-            Ext, StreamId, UploadMsec, DataSize
-        ]),
-        Counter =
-            case GroupKind of
-                ?MANIFEST_KIND_GROUP -> ?C_GROUPS_CREATED;
-                ?MANIFEST_KIND_KILO_GROUP -> ?C_KILO_GROUPS_CREATED;
-                ?MANIFEST_KIND_MEGA_GROUP -> ?C_MEGA_GROUPS_CREATED
-            end,
-        counters:add(counter(), Counter, 1),
-        ok
-    after
-        ok = rabbitmq_stream_s3_api:close(Conn)
-    end,
+    ?LOG_DEBUG("rebalancing: adding a ~ts to the manifest for stream '~ts'", [Ext, StreamId]),
+    {UploadMsec, ok} = timer:tc(
+        fun() ->
+            case rabbitmq_stream_s3_api:put(Key, Data) of
+                ok -> ok;
+                {error, _} = Err -> exit(Err)
+            end
+        end,
+        millisecond
+    ),
+    DataSize = iolist_size(Data),
+    ?LOG_DEBUG("Uploaded ~ts for stream '~ts' in ~b msec (~b bytes)", [
+        Ext, StreamId, UploadMsec, DataSize
+    ]),
+    Counter =
+        case GroupKind of
+            ?MANIFEST_KIND_GROUP -> ?C_GROUPS_CREATED;
+            ?MANIFEST_KIND_KILO_GROUP -> ?C_KILO_GROUPS_CREATED;
+            ?MANIFEST_KIND_MEGA_GROUP -> ?C_MEGA_GROUPS_CREATED
+        end,
+    counters:add(counter(), Counter, 1),
     #group_uploaded{
         stream = StreamId,
         entry = ?GROUP(GroupOffset, GroupFTs, GroupLTs, GroupKind, Uid),
@@ -703,130 +682,120 @@ execute_task(#upload_manifest{
         entries = Entries
     }
 }) ->
-    {ok, Conn} = rabbitmq_stream_s3_api:open(),
     Uid = rabbitmq_stream_s3:uid(),
     Key = rabbitmq_stream_s3:manifest_key(StreamId, Uid),
     Data = ?MANIFEST(Offset, NextOffset, FirstTs, FirstLastTs, Size, Entries),
-    try
-        ?LOG_DEBUG("Uploading manifest for stream '~ts'", [StreamId]),
-        {UploadMsec, ok} = timer:tc(
-            fun() ->
-                case rabbitmq_stream_s3_api:put(Conn, Key, Data) of
-                    ok -> ok;
-                    {error, _} = Err -> exit(Err)
-                end
+    ?LOG_DEBUG("Uploading manifest for stream '~ts'", [StreamId]),
+    {UploadMsec, ok} = timer:tc(
+        fun() ->
+            case rabbitmq_stream_s3_api:put(Key, Data) of
+                ok -> ok;
+                {error, _} = Err -> exit(Err)
+            end
+        end,
+        millisecond
+    ),
+    ManifestSize = iolist_size(Data),
+    ?LOG_DEBUG("Uploaded manifest for stream '~ts' in ~b msec (~b bytes)", [
+        StreamId, UploadMsec, ManifestSize
+    ]),
+    counters:add(counter(), ?C_ROOTS_CREATED, 1),
+    case rabbitmq_stream_s3_db:put(StreamId, Reference, Epoch, ExpectedRevision, Uid) of
+        {ok, OldInfo, NewRevision} ->
+            case OldInfo of
+                undefined ->
+                    ?LOG_DEBUG("Initial manifest created for stream '~ts' at epoch ~b", [
+                        StreamId, Epoch
+                    ]),
+                    ok;
+                {OldUid, OldEpoch} ->
+                    ?LOG_DEBUG(
+                        "Manifest updated for stream '~ts', epoch ~b->~b, uid '~ts'->'~ts'", [
+                            StreamId,
+                            OldEpoch,
+                            Epoch,
+                            rabbitmq_stream_s3:format_uid(OldUid),
+                            rabbitmq_stream_s3:format_uid(Uid)
+                        ]
+                    ),
+                    OldKey = rabbitmq_stream_s3:manifest_key(StreamId, OldUid),
+                    case rabbitmq_stream_s3_api:delete(OldKey) of
+                        ok ->
+                            ?LOG_DEBUG("Cleaned up old manifest with uid '~ts'", [
+                                rabbitmq_stream_s3:format_uid(OldUid)
+                            ]),
+                            ok;
+                        {error, _} = Err ->
+                            ?LOG_DEBUG("Failed to clean up old manifest with uid '~ts': ~0p", [
+                                rabbitmq_stream_s3:format_uid(OldUid), Err
+                            ]),
+                            ok
+                    end
             end,
-            millisecond
-        ),
-        ManifestSize = iolist_size(Data),
-        ?LOG_DEBUG("Uploaded manifest for stream '~ts' in ~b msec (~b bytes)", [
-            StreamId, UploadMsec, ManifestSize
-        ]),
-        counters:add(counter(), ?C_ROOTS_CREATED, 1),
-        case rabbitmq_stream_s3_db:put(StreamId, Reference, Epoch, ExpectedRevision, Uid) of
-            {ok, OldInfo, NewRevision} ->
-                case OldInfo of
-                    undefined ->
-                        ?LOG_DEBUG("Initial manifest created for stream '~ts' at epoch ~b", [
-                            StreamId, Epoch
-                        ]),
-                        ok;
-                    {OldUid, OldEpoch} ->
-                        ?LOG_DEBUG(
-                            "Manifest updated for stream '~ts', epoch ~b->~b, uid '~ts'->'~ts'", [
-                                StreamId,
-                                OldEpoch,
-                                Epoch,
-                                rabbitmq_stream_s3:format_uid(OldUid),
-                                rabbitmq_stream_s3:format_uid(Uid)
-                            ]
-                        ),
-                        OldKey = rabbitmq_stream_s3:manifest_key(StreamId, OldUid),
-                        case rabbitmq_stream_s3_api:delete(Conn, OldKey) of
-                            ok ->
-                                ?LOG_DEBUG("Cleaned up old manifest with uid '~ts'", [
-                                    rabbitmq_stream_s3:format_uid(OldUid)
-                                ]),
-                                ok;
-                            {error, _} = Err ->
-                                ?LOG_DEBUG("Failed to clean up old manifest with uid '~ts': ~0p", [
-                                    rabbitmq_stream_s3:format_uid(OldUid), Err
-                                ]),
-                                ok
-                        end
-                end,
-                Entry = #{uid => Uid, epoch => Epoch, revision => NewRevision},
-                #manifest_uploaded{stream = StreamId, entry = Entry};
-            {error,
-                {conflict,
-                    #{uid := ActualUid, epoch := ActualEpoch, revision := ActualRevision} =
-                        Entry}} ->
-                ?LOG_INFO(
-                    "An uploaded manifest was rejected by the metadata store's optimistic lock. Expected revision ~b actual ~b, uid '~ts' actual '~ts', epoch ~b actual ~b)",
-                    [
-                        ExpectedRevision,
-                        ActualRevision,
-                        rabbitmq_stream_s3:format_uid(Uid),
-                        rabbitmq_stream_s3:format_uid(ActualUid),
-                        Epoch,
-                        ActualEpoch
-                    ]
-                ),
-                #manifest_upload_rejected{
-                    stream = StreamId,
-                    conflict = Entry
-                };
-            {error, not_found} ->
-                ?LOG_INFO(
-                    "An uploaded manifest was rejected by the metadata store's optimistic lock. Expected revision ~b, uid '~ts', epoch ~b but found no entry",
-                    [
-                        ExpectedRevision,
-                        rabbitmq_stream_s3:format_uid(Uid),
-                        Epoch
-                    ]
-                ),
-                #stream_deleted{stream = StreamId};
-            {error, _} = Err ->
-                exit(Err)
-        end
-    after
-        ok = rabbitmq_stream_s3_api:close(Conn)
+            Entry = #{uid => Uid, epoch => Epoch, revision => NewRevision},
+            #manifest_uploaded{stream = StreamId, entry = Entry};
+        {error,
+            {conflict,
+                #{uid := ActualUid, epoch := ActualEpoch, revision := ActualRevision} =
+                    Entry}} ->
+            ?LOG_INFO(
+                "An uploaded manifest was rejected by the metadata store's optimistic lock. Expected revision ~b actual ~b, uid '~ts' actual '~ts', epoch ~b actual ~b)",
+                [
+                    ExpectedRevision,
+                    ActualRevision,
+                    rabbitmq_stream_s3:format_uid(Uid),
+                    rabbitmq_stream_s3:format_uid(ActualUid),
+                    Epoch,
+                    ActualEpoch
+                ]
+            ),
+            #manifest_upload_rejected{
+                stream = StreamId,
+                conflict = Entry
+            };
+        {error, not_found} ->
+            ?LOG_INFO(
+                "An uploaded manifest was rejected by the metadata store's optimistic lock. Expected revision ~b, uid '~ts', epoch ~b but found no entry",
+                [
+                    ExpectedRevision,
+                    rabbitmq_stream_s3:format_uid(Uid),
+                    Epoch
+                ]
+            ),
+            #stream_deleted{stream = StreamId};
+        {error, _} = Err ->
+            exit(Err)
     end;
 execute_task(#resolve_manifest{stream = StreamId}) ->
     Manifest0 =
         case rabbitmq_stream_s3_db:get(StreamId) of
             {ok, #{uid := Uid, revision := Revision}} ->
                 Key = rabbitmq_stream_s3:manifest_key(StreamId, Uid),
-                {ok, Conn} = rabbitmq_stream_s3_api:open(),
-                try
-                    case rabbitmq_stream_s3_api:get(Conn, Key) of
-                        {ok,
-                            ?MANIFEST(
-                                FirstOffset,
-                                NextOffset,
-                                FirstTs,
-                                FirstLastTs,
-                                TotalSize,
-                                Entries
-                            )} ->
-                            counters:add(counter(), ?C_MANIFESTS_RESOLVED, 1),
-                            #manifest{
-                                first_offset = FirstOffset,
-                                next_offset = NextOffset,
-                                first_timestamp = FirstTs,
-                                first_last_timestamp = FirstLastTs,
-                                total_size = TotalSize,
-                                revision = Revision,
-                                entries = Entries
-                            };
-                        {error, not_found} ->
-                            counters:add(counter(), ?C_MANIFESTS_RESOLVED_EMPTY, 1),
-                            #manifest{};
-                        {error, _} = Err ->
-                            exit(Err)
-                    end
-                after
-                    ok = rabbitmq_stream_s3_api:close(Conn)
+                case rabbitmq_stream_s3_api:get(Key) of
+                    {ok,
+                        ?MANIFEST(
+                            FirstOffset,
+                            NextOffset,
+                            FirstTs,
+                            FirstLastTs,
+                            TotalSize,
+                            Entries
+                        )} ->
+                        counters:add(counter(), ?C_MANIFESTS_RESOLVED, 1),
+                        #manifest{
+                            first_offset = FirstOffset,
+                            next_offset = NextOffset,
+                            first_timestamp = FirstTs,
+                            first_last_timestamp = FirstLastTs,
+                            total_size = TotalSize,
+                            revision = Revision,
+                            entries = Entries
+                        };
+                    {error, not_found} ->
+                        counters:add(counter(), ?C_MANIFESTS_RESOLVED_EMPTY, 1),
+                        #manifest{};
+                    {error, _} = Err ->
+                        exit(Err)
                 end;
             {error, not_found} ->
                 counters:add(counter(), ?C_MANIFESTS_RESOLVED_EMPTY, 1),
@@ -869,40 +838,34 @@ execute_task(#delete_objects{stream = StreamId, objects = Objects}) ->
         end,
         Objects
     ),
-    {ok, Conn} = rabbitmq_stream_s3_api:open(),
-    try
-        {DeleteMsec, ok} = timer:tc(
-            fun() ->
-                case rabbitmq_stream_s3_api:delete(Conn, Keys) of
-                    ok -> ok;
-                    {error, _} = Err -> exit(Err)
-                end
-            end,
-            millisecond
-        ),
-        ?LOG_DEBUG("Deleted ~b objects from stream '~ts' in ~b msec", [
-            NumObjects, StreamId, DeleteMsec
-        ]),
-        Counters = lists:foldl(
-            fun(Object, Acc) ->
-                Key =
-                    case Object of
-                        #group_ref{kind = ?MANIFEST_KIND_GROUP} -> ?C_GROUPS_DELETED;
-                        #group_ref{kind = ?MANIFEST_KIND_KILO_GROUP} -> ?C_KILO_GROUPS_DELETED;
-                        #group_ref{kind = ?MANIFEST_KIND_MEGA_GROUP} -> ?C_MEGA_GROUPS_DELETED;
-                        _ when is_integer(Object) -> ?C_FRAGMENTS_DELETED
-                    end,
-                maps:update_with(Key, fun(V) -> V + 1 end, 1, Acc)
-            end,
-            #{},
-            Objects
-        ),
-        Cnt = counter(),
-        maps:foreach(fun(Counter, Incr) -> counters:add(Cnt, Counter, Incr) end, Counters),
-        ok
-    after
-        ok = rabbitmq_stream_s3_api:close(Conn)
-    end,
+    {DeleteMsec, ok} = timer:tc(
+        fun() ->
+            case rabbitmq_stream_s3_api:delete(Keys) of
+                ok -> ok;
+                {error, _} = Err -> exit(Err)
+            end
+        end,
+        millisecond
+    ),
+    ?LOG_DEBUG("Deleted ~b objects from stream '~ts' in ~b msec", [
+        NumObjects, StreamId, DeleteMsec
+    ]),
+    Counters = lists:foldl(
+        fun(Object, Acc) ->
+            Key =
+                case Object of
+                    #group_ref{kind = ?MANIFEST_KIND_GROUP} -> ?C_GROUPS_DELETED;
+                    #group_ref{kind = ?MANIFEST_KIND_KILO_GROUP} -> ?C_KILO_GROUPS_DELETED;
+                    #group_ref{kind = ?MANIFEST_KIND_MEGA_GROUP} -> ?C_MEGA_GROUPS_DELETED;
+                    _ when is_integer(Object) -> ?C_FRAGMENTS_DELETED
+                end,
+            maps:update_with(Key, fun(V) -> V + 1 end, 1, Acc)
+        end,
+        #{},
+        Objects
+    ),
+    Cnt = counter(),
+    maps:foreach(fun(Counter, Incr) -> counters:add(Cnt, Counter, Incr) end, Counters),
     ok;
 execute_task(#find_fragments{stream = StreamId, dir = Dir, from = FromOffset, to = ToOffset}) ->
     %% TODO: counters around this would be nice?
@@ -926,26 +889,21 @@ execute_task(#delete_stream{stream = StreamId}) ->
     %% where this task runs might not be a member of this stream. So we can't
     %% rely on information in the manifest to perform the deletion.
     Prefix = rabbitmq_stream_s3:stream_prefix(StreamId),
-    {ok, Conn} = rabbitmq_stream_s3_api:open(),
-    try
-        {DeleteMsec, Result} = timer:tc(
-            rabbitmq_stream_s3_api,
-            delete_prefix,
-            [Conn, Prefix],
-            millisecond
-        ),
-        case Result of
-            {ok, Details} ->
-                ?LOG_INFO("Deleted remote tier data for deleted stream '~ts' in ~b msec ~0p", [
-                    StreamId, DeleteMsec, Details
-                ]),
-                counters:add(counter(), ?C_STREAMS_DELETED, 1),
-                ok;
-            {error, _} = Err ->
-                exit(Err)
-        end
-    after
-        rabbitmq_stream_s3_api:close(Conn)
+    {DeleteMsec, Result} = timer:tc(
+        rabbitmq_stream_s3_api,
+        delete_prefix,
+        [Prefix],
+        millisecond
+    ),
+    case Result of
+        {ok, Details} ->
+            ?LOG_INFO("Deleted remote tier data for deleted stream '~ts' in ~b msec ~0p", [
+                StreamId, DeleteMsec, Details
+            ]),
+            counters:add(counter(), ?C_STREAMS_DELETED, 1),
+            ok;
+        {error, _} = Err ->
+            exit(Err)
     end;
 execute_task(#evaluate_retention{
     stream = StreamId,
@@ -1020,14 +978,11 @@ get_fragment_info(StreamId, FragmentOffset) ->
     get_fragment_info(Key).
 
 get_fragment_info(Key) ->
-    {ok, Conn} = rabbitmq_stream_s3_api:open(),
-    try rabbitmq_stream_s3_api:get_range(Conn, Key, {0, ?FRAGMENT_HEADER_B}) of
+    case rabbitmq_stream_s3_api:get_range(Key, {0, ?FRAGMENT_HEADER_B}) of
         {ok, Data} ->
             {ok, fragment_header_to_info(Data)};
         {error, _} = Err ->
             Err
-    after
-        ok = rabbitmq_stream_s3_api:close(Conn)
     end.
 
 -spec split_fragment_info(binary()) -> {#fragment_info{}, binary()}.
@@ -1102,27 +1057,22 @@ get_group_cached(StreamId, #group_ref{kind = ?MANIFEST_KIND_GROUP} = GroupRef) -
     end.
 
 get_group0(StreamId, #group_ref{offset = Offset} = GroupRef) ->
-    {ok, Conn} = rabbitmq_stream_s3_api:open(),
     Key = rabbitmq_stream_s3:group_key(StreamId, GroupRef),
     ?LOG_DEBUG("Looking up key ~ts (~ts)", [Key, ?FUNCTION_NAME]),
-    try
-        case rabbitmq_stream_s3_api:get(Conn, Key) of
-            {ok, Data} ->
-                <<
-                    _Magic:4/binary,
-                    _Vsn:32/unsigned,
-                    Offset:64/unsigned,
-                    _FirstTimestamp:64/unsigned,
-                    0:2/unsigned,
-                    _TotalSize:70/unsigned,
-                    GroupEntries/binary
-                >> = Data,
-                {ok, GroupEntries};
-            {error, _} = Err ->
-                Err
-        end
-    after
-        ok = rabbitmq_stream_s3_api:close(Conn)
+    case rabbitmq_stream_s3_api:get(Key) of
+        {ok, Data} ->
+            <<
+                _Magic:4/binary,
+                _Vsn:32/unsigned,
+                Offset:64/unsigned,
+                _FirstTimestamp:64/unsigned,
+                0:2/unsigned,
+                _TotalSize:70/unsigned,
+                GroupEntries/binary
+            >> = Data,
+            {ok, GroupEntries};
+        {error, _} = Err ->
+            Err
     end.
 
 -spec metadata() -> rabbitmq_stream_s3_machine:metadata().

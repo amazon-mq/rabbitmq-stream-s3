@@ -14,13 +14,11 @@ associated file in that folder.
 
 -export([
     init/0,
-    open/0,
-    close/1,
-    get/3,
-    get_range/4,
-    put/4,
-    delete/3,
-    delete_prefix/3
+    get/2,
+    get_range/3,
+    put/3,
+    delete/2,
+    delete_prefix/2
 ]).
 
 % Auxiliary function for testing
@@ -36,7 +34,6 @@ associated file in that folder.
 
 -behaviour(rabbitmq_stream_s3_api).
 
--type connection() :: rabbitmq_stream_s3_api:connection().
 -type key() :: rabbitmq_stream_s3_api:key().
 
 -spec init() -> ok.
@@ -44,21 +41,9 @@ init() ->
     ?LOG_INFO(?MODULE_STRING ": initializing"),
     ok.
 
--doc """
-""".
--spec open() -> {ok, connection()} | {error, any()}.
-open() ->
-    ?LOG_INFO(?MODULE_STRING ": opening connection"),
-    {ok, ok}.
-
--spec close(connection()) -> ok.
-close(_Connection) ->
-    ?LOG_INFO(?MODULE_STRING ": closing connection"),
-    ok.
-
--spec get(connection(), key(), rabbitmq_stream_s3_api:request_opts()) ->
+-spec get(key(), rabbitmq_stream_s3_api:request_opts()) ->
     {ok, binary()} | {error, any()}.
-get(_Connection, Key, Opts) ->
+get(Key, Opts) ->
     Timeout = maps:get(timeout, Opts, 5000),
     with_timeout(Timeout, fun() ->
         ?LOG_INFO("Trying to find file ~p in : ~p", [Key, data_dir()]),
@@ -76,13 +61,12 @@ get(_Connection, Key, Opts) ->
     end).
 
 -spec get_range(
-    connection(),
     key(),
     rabbitmq_stream_s3_api:range_spec(),
     rabbitmq_stream_s3_api:request_opts()
 ) ->
     {ok, binary()} | {error, any()}.
-get_range(_Connection, Key, RangeSpec, Opts) ->
+get_range(Key, RangeSpec, Opts) ->
     Timeout = maps:get(timeout, Opts, 5000),
     with_timeout(Timeout, fun() ->
         case key_to_path(Key) of
@@ -109,9 +93,9 @@ get_range(_Connection, Key, RangeSpec, Opts) ->
         end
     end).
 
--spec put(connection(), key(), iodata(), rabbitmq_stream_s3_api:request_opts()) ->
+-spec put(key(), iodata(), rabbitmq_stream_s3_api:request_opts()) ->
     ok | {error, any()}.
-put(_Connection, Key, Data, Opts) ->
+put(Key, Data, Opts) ->
     Timeout = maps:get(timeout, Opts, 5000),
     with_timeout(Timeout, fun() ->
         ?LOG_INFO("Writing file ~p in : ~p", [Key, data_dir()]),
@@ -126,11 +110,11 @@ put(_Connection, Key, Data, Opts) ->
         end
     end).
 
--spec delete(connection(), key() | [key()], rabbitmq_stream_s3_api:request_opts()) ->
+-spec delete(key() | [key()], rabbitmq_stream_s3_api:request_opts()) ->
     ok | {error, any()}.
-delete(Connection, Key, Opts) when is_binary(Key) andalso is_map(Opts) ->
-    delete(Connection, [Key], Opts);
-delete(_Connection, Keys, Opts) when is_list(Keys) andalso is_map(Opts) ->
+delete(Key, Opts) when is_binary(Key) andalso is_map(Opts) ->
+    delete([Key], Opts);
+delete(Keys, Opts) when is_list(Keys) andalso is_map(Opts) ->
     Timeout = maps:get(timeout, Opts, 5000),
     with_timeout(Timeout, fun() ->
         Result = lists:filtermap(
@@ -153,9 +137,9 @@ delete(_Connection, Keys, Opts) when is_list(Keys) andalso is_map(Opts) ->
         end
     end).
 
--spec delete_prefix(connection(), key(), rabbitmq_stream_s3_api:request_opts()) ->
+-spec delete_prefix(key(), rabbitmq_stream_s3_api:request_opts()) ->
     {ok, map()} | {error, any()}.
-delete_prefix(_Connection, Prefix, Opts) when is_binary(Prefix) andalso is_map(Opts) ->
+delete_prefix(Prefix, Opts) when is_binary(Prefix) andalso is_map(Opts) ->
     Timeout = maps:get(timeout, Opts, 5000),
     with_timeout(Timeout, fun() ->
         case key_to_path(Prefix) of
