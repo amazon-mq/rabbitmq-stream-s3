@@ -23,6 +23,9 @@ tier.
 -define(READAHEAD, "5MiB").
 -define(READ_TIMEOUT, 10000).
 -define(SLOW_READ_THRESHOLD_MS, 10_000).
+%% Byte position of the first chunk within a fragment object.
+%% Layout: [?FRAGMENT_HEADER_B fragment header][?SEGMENT_HEADER_B segment header][chunks...]
+-define(FRAGMENT_FIRST_CHUNK_POS, (?FRAGMENT_HEADER_B + ?SEGMENT_HEADER_B)).
 
 %% TODO: add counters
 
@@ -120,9 +123,9 @@ resolve_remote_location(first, #{name := StreamId, shared := Shared}) ->
         #manifest{first_offset = RemoteFirstOffset} when RemoteFirstOffset < LocalFirstOffset ->
             ?LOG_DEBUG(
                 "Attaching remote reader at first offset ~b pos ~b for spec 'first'",
-                [RemoteFirstOffset, ?FRAGMENT_HEADER_B]
+                [RemoteFirstOffset, ?FRAGMENT_FIRST_CHUNK_POS]
             ),
-            {ok, RemoteFirstOffset, ?FRAGMENT_HEADER_B, RemoteFirstOffset};
+            {ok, RemoteFirstOffset, ?FRAGMENT_FIRST_CHUNK_POS, RemoteFirstOffset};
         _ ->
             {local, first}
     end;
@@ -153,7 +156,7 @@ resolve_remote_location(Offset, #{name := StreamId, shared := Shared}) when
                 #manifest{first_offset = FirstOffset} when Offset < FirstOffset ->
                     %% Emulate osiris_log's behavior: attach at the beginning
                     %% of the stream.
-                    {ok, FirstOffset, ?FRAGMENT_HEADER_B, FirstOffset};
+                    {ok, FirstOffset, ?FRAGMENT_FIRST_CHUNK_POS, FirstOffset};
                 #manifest{entries = Entries} ->
                     {ok, ChunkId, Position, Fragment} = find_position(
                         {offset, Offset},
@@ -171,7 +174,7 @@ resolve_remote_location({timestamp, Ts} = Spec, #{name := StreamId}) ->
     %% Instead try the remote tier first.
     case rabbitmq_stream_s3_server:get_manifest(StreamId) of
         #manifest{first_offset = FirstOffset, first_timestamp = FirstTs} when Ts < FirstTs ->
-            {ok, FirstOffset, ?FRAGMENT_HEADER_B, FirstOffset};
+            {ok, FirstOffset, ?FRAGMENT_FIRST_CHUNK_POS, FirstOffset};
         #manifest{entries = Entries} ->
             case rabbitmq_stream_s3_array:last(?ENTRY_B, Entries) of
                 ?ENTRY(_O, _FTs, LTs, _, _) when LTs >= Ts ->
@@ -566,7 +569,7 @@ advance_fragment(
                     Remote = Remote0#remote{
                         pid = Pid,
                         fragment = NextChId,
-                        position = ?SEGMENT_HEADER_B
+                        position = ?FRAGMENT_FIRST_CHUNK_POS
                     },
                     read_header1(Remote);
                 {error, _} ->
