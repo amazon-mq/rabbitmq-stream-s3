@@ -569,7 +569,7 @@ advance_fragment(
                         position = ?SEGMENT_HEADER_B
                     },
                     read_header1(Remote);
-                {error, not_found} ->
+                {error, _} ->
                     %% The fragment at NextChId was deleted by retention.
                     %% Jump to the oldest fragment still in S3. The guard
                     %% ensures first_offset strictly increases on each
