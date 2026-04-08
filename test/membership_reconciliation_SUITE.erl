@@ -40,6 +40,9 @@ init_per_testcase(Testcase, Config0) ->
     Config = rabbit_ct_helpers:merge_app_env(
         Config2,
         {rabbitmq_stream_s3, [
+            %% This suite doesn't write stream data, but all test suites should
+            %% use the FS backend.
+            {rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_fs},
             {membership_reconciliation_auto_remove, true}
         ]}
     ),
