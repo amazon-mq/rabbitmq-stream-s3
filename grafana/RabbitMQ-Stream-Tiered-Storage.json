@@ -382,7 +382,7 @@
             "lineWidth": 1,
             "pointSize": 5,
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "none"
             },
@@ -458,7 +458,7 @@
             "lineWidth": 1,
             "pointSize": 5,
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "none"
             },
