@@ -146,7 +146,7 @@ end}.
 %% Verbose logging — when enabled, log messages that normally truncate
 %% large terms (such as S3 error responses) will print them in full.
 
-{mapping, "s3.verbose_logging", "rabbitmq_stream_s3.verbose_logging", [
+{mapping, "rabbitmq_stream_s3.verbose_logging", "rabbitmq_stream_s3.verbose_logging", [
     {datatype, {enum, [true, false]}},
     {default, false}
 ]}.
