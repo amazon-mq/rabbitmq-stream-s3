@@ -27,6 +27,9 @@ A wrapper around the AWS S3 HTTP API.
 %% For apply/3:
 -export([get_credentials/0, get_credentials/2]).
 
+%% For the pool. Not to be called by anyone else.
+-export([open/0]).
+
 -define(ALGORITHM, "AWS4-HMAC-SHA256").
 -define(ISOFORMAT_BASIC, "~4.10.0b~2.10.0b~2.10.0bT~2.10.0b~2.10.0b~2.10.0bZ").
 -define(TABLE, ?MODULE).
