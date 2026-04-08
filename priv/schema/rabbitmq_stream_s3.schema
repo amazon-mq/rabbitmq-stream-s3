@@ -3,31 +3,31 @@
 %% vim:ft=erlang:
 %% -*- mode: erlang; -*-
 
-{mapping, "s3.region", "rabbitmq_stream_s3.aws_region", [
+{mapping, "stream_s3.region", "rabbitmq_stream_s3.aws_region", [
     {datatype, binary}
 ]}.
 
 {translation, "rabbitmq_stream_s3.aws_region",
 fun(Conf) ->
-    case cuttlefish:conf_get("s3.region", Conf, undefined) of
+    case cuttlefish:conf_get("stream_s3.region", Conf, undefined) of
         undefined -> cuttlefish:unset();
         Value     -> Value
     end
 end}.
 
 %% A mapping between region name and top-level domain names.
-{mapping, "s3.region_endpoints.$region", "rabbitmq_stream_s3.aws_region_endpoints", [
+{mapping, "stream_s3.region_endpoints.$region", "rabbitmq_stream_s3.aws_region_endpoints", [
     {datatype, [binary]}
 ]}.
 
 {translation, "rabbitmq_stream_s3.aws_region_endpoints",
 fun(Conf) ->
-    case cuttlefish_variable:filter_by_prefix("s3.region_endpoints", Conf) of
+    case cuttlefish_variable:filter_by_prefix("stream_s3.region_endpoints", Conf) of
         [] ->
             cuttlefish:unset();
         Settings ->
             lists:foldl(
-              fun ({["s3", "region_endpoints", Region0], TLD}, Acc) ->
+              fun ({["stream_s3", "region_endpoints", Region0], TLD}, Acc) ->
                       Acc#{list_to_binary(Region0) => TLD};
                   (Other, _Acc) ->
                       cuttlefish:invalid(
@@ -38,13 +38,13 @@ end}.
 
 %% access_key_id
 
-{mapping, "s3.access_key_id", "rabbitmq_stream_s3.aws_access_key", [
+{mapping, "stream_s3.access_key_id", "rabbitmq_stream_s3.aws_access_key", [
     {datatype, binary}
 ]}.
 
 {translation, "rabbitmq_stream_s3.aws_access_key",
 fun(Conf) ->
-    case cuttlefish:conf_get("s3.access_key_id", Conf, undefined) of
+    case cuttlefish:conf_get("stream_s3.access_key_id", Conf, undefined) of
         undefined -> cuttlefish:unset();
         Value     -> Value
     end
@@ -52,44 +52,44 @@ end}.
 
 %% secret_key
 
-{mapping, "s3.secret_key", "rabbitmq_stream_s3.aws_secret_key", [
+{mapping, "stream_s3.secret_key", "rabbitmq_stream_s3.aws_secret_key", [
     {datatype, binary}
 ]}.
 
 {translation, "rabbitmq_stream_s3.aws_secret_key",
 fun(Conf) ->
-    case cuttlefish:conf_get("s3.secret_key", Conf, undefined) of
+    case cuttlefish:conf_get("stream_s3.secret_key", Conf, undefined) of
         undefined -> cuttlefish:unset();
         Value     -> Value
     end
 end}.
 
-{mapping, "s3.account_id", "rabbitmq_stream_s3.aws_account_id", [
+{mapping, "stream_s3.account_id", "rabbitmq_stream_s3.aws_account_id", [
     {datatype, binary}
 ]}.
 
 {translation, "rabbitmq_stream_s3.aws_account_id",
 fun(Conf) ->
-    case cuttlefish:conf_get("s3.account_id", Conf, undefined) of
+    case cuttlefish:conf_get("stream_s3.account_id", Conf, undefined) of
         undefined -> cuttlefish:unset();
         Value     -> Value
     end
 end}.
 
-{mapping, "s3.bucket", "rabbitmq_stream_s3.bucket", [
+{mapping, "stream_s3.bucket", "rabbitmq_stream_s3.bucket", [
     {datatype, binary}
 ]}.
 
 {translation, "rabbitmq_stream_s3.bucket",
 fun(Conf) ->
-    case cuttlefish:conf_get("s3.bucket", Conf, undefined) of
+    case cuttlefish:conf_get("stream_s3.bucket", Conf, undefined) of
         undefined -> cuttlefish:unset();
         Value     -> Value
     end
 end}.
 
 
-{mapping, "s3.read_ahead", "rabbitmq_stream_s3.read_ahead", [
+{mapping, "stream_s3.read_ahead", "rabbitmq_stream_s3.read_ahead", [
     {datatype, string},
     {validators, ["is_supported_information_unit"]}
 ]}.
@@ -125,35 +125,35 @@ end}.
 %% Stream membership reconciliation
 %%
 
-{mapping, "stream.continuous_membership_reconciliation.enabled", "rabbitmq_stream_s3.membership_reconciliation_enabled", [
+{mapping, "stream_s3.continuous_membership_reconciliation.enabled", "rabbitmq_stream_s3.membership_reconciliation_enabled", [
     {datatype, {enum, [true, false]}}]}.
 
-{mapping, "stream.continuous_membership_reconciliation.auto_remove", "rabbitmq_stream_s3.membership_reconciliation_auto_remove", [
+{mapping, "stream_s3.continuous_membership_reconciliation.auto_remove", "rabbitmq_stream_s3.membership_reconciliation_auto_remove", [
     {datatype, {enum, [true, false]}}]}.
 
-{mapping, "stream.continuous_membership_reconciliation.interval", "rabbitmq_stream_s3.membership_reconciliation_interval", [
+{mapping, "stream_s3.continuous_membership_reconciliation.interval", "rabbitmq_stream_s3.membership_reconciliation_interval", [
     {datatype, integer}, {validators, ["non_negative_integer"]}
 ]}.
 
-{mapping, "stream.continuous_membership_reconciliation.trigger_interval", "rabbitmq_stream_s3.membership_reconciliation_trigger_interval", [
+{mapping, "stream_s3.continuous_membership_reconciliation.trigger_interval", "rabbitmq_stream_s3.membership_reconciliation_trigger_interval", [
     {datatype, integer}, {validators, ["non_negative_integer"]}
 ]}.
 
-{mapping, "stream.continuous_membership_reconciliation.target_group_size", "rabbitmq_stream_s3.membership_reconciliation_target_group_size", [
+{mapping, "stream_s3.continuous_membership_reconciliation.target_group_size", "rabbitmq_stream_s3.membership_reconciliation_target_group_size", [
     {datatype, integer}, {validators, ["non_negative_integer"]}
 ]}.
 
 %% Verbose logging — when enabled, log messages that normally truncate
 %% large terms (such as S3 error responses) will print them in full.
 
-{mapping, "rabbitmq_stream_s3.verbose_logging", "rabbitmq_stream_s3.verbose_logging", [
+{mapping, "stream_s3.verbose_logging", "rabbitmq_stream_s3.verbose_logging", [
     {datatype, {enum, [true, false]}},
     {default, false}
 ]}.
 
 {translation, "rabbitmq_stream_s3.verbose_logging",
 fun(Conf) ->
-    case cuttlefish:conf_get("rabbitmq_stream_s3.verbose_logging", Conf, false) of
+    case cuttlefish:conf_get("stream_s3.verbose_logging", Conf, false) of
         false -> cuttlefish:unset();
         Value -> Value
     end
