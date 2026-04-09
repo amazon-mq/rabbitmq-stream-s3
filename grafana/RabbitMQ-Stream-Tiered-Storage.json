@@ -449,6 +449,7 @@
           "calcs": [
             "mean",
             "max",
+            "min",
             "last"
           ],
           "displayMode": "table",
@@ -525,6 +526,7 @@
           "calcs": [
             "mean",
             "max",
+            "min",
             "last"
           ],
           "displayMode": "table",
@@ -614,6 +616,7 @@
           "calcs": [
             "mean",
             "max",
+            "min",
             "last"
           ],
           "displayMode": "table",
@@ -691,6 +694,7 @@
           "calcs": [
             "mean",
             "max",
+            "min",
             "last"
           ],
           "displayMode": "table",
@@ -768,6 +772,7 @@
           "calcs": [
             "mean",
             "max",
+            "min",
             "last"
           ],
           "displayMode": "table",
@@ -845,6 +850,7 @@
           "calcs": [
             "mean",
             "max",
+            "min",
             "last"
           ],
           "displayMode": "table",
@@ -934,6 +940,7 @@
           "calcs": [
             "mean",
             "max",
+            "min",
             "last"
           ],
           "displayMode": "table",
@@ -1011,6 +1018,7 @@
           "calcs": [
             "mean",
             "max",
+            "min",
             "last"
           ],
           "displayMode": "table",
@@ -1083,6 +1091,7 @@
           "calcs": [
             "mean",
             "max",
+            "min",
             "last"
           ],
           "displayMode": "table",
@@ -1149,6 +1158,7 @@
           "calcs": [
             "mean",
             "max",
+            "min",
             "last"
           ],
           "displayMode": "table",
@@ -1333,6 +1343,7 @@
           "calcs": [
             "mean",
             "max",
+            "min",
             "last"
           ],
           "displayMode": "table",
@@ -1404,6 +1415,7 @@
           "calcs": [
             "mean",
             "max",
+            "min",
             "last"
           ],
           "displayMode": "table",
@@ -1475,6 +1487,7 @@
           "calcs": [
             "mean",
             "max",
+            "min",
             "last"
           ],
           "displayMode": "table",
@@ -1546,6 +1559,7 @@
           "calcs": [
             "mean",
             "max",
+            "min",
             "last"
           ],
           "displayMode": "table",
@@ -1632,6 +1646,7 @@
           "calcs": [
             "mean",
             "max",
+            "min",
             "last"
           ],
           "displayMode": "table",
@@ -1828,6 +1843,7 @@
           "calcs": [
             "mean",
             "max",
+            "min",
             "last"
           ],
           "displayMode": "table",
@@ -1894,6 +1910,7 @@
           "calcs": [
             "mean",
             "max",
+            "min",
             "last"
           ],
           "displayMode": "table",
@@ -1960,6 +1977,7 @@
           "calcs": [
             "mean",
             "max",
+            "min",
             "last"
           ],
           "displayMode": "table",
