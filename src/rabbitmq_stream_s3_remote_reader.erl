@@ -6,7 +6,11 @@
 A gen_server process which reads stream data from the remote tier.
 
 Reads from the remote tier suffer from high latency, so this server pre-fetches
-stream data aggressively.
+stream data aggressively. The pre-fetch amount is adjusted dynamically based on
+the log reader's demand and S3's supply following a basic additive increase /
+multiplicative decrease ([AIMD]) algorithm.
+
+[AIMD]: https://en.wikipedia.org/wiki/Additive_increase/multiplicative_decrease
 """.
 
 -include_lib("kernel/include/logger.hrl").
@@ -16,9 +20,16 @@ stream data aggressively.
 
 -behaviour(gen_server).
 
-%% TODO: this should be adjusted dynamically based on demand.
-%% <https://github.com/amazon-mq/rabbitmq-stream-s3/issues/95>
--define(READAHEAD, "16MiB").
+%% 1 MiB
+-define(MIN_READ_SIZE, 1048576).
+%% 64 MiB
+-define(MAX_READ_SIZE, 67108864).
+%% 4 MiB
+-define(INITIAL_READ_SIZE, 4194304).
+%% Number of consecutive buffer hits before we increase read_size.
+-define(HITS_TO_GROW, 8).
+%% Additive increase step size (1 MiB in bytes).
+-define(GROW_STEP, 1048576).
 
 -define(C_BUFFER_HIT, 1).
 -define(C_BUFFER_MISS, 2).
@@ -70,6 +81,10 @@ stream data aggressively.
 -record(?MODULE, {
     stream :: stream_id(),
     read_size :: pos_integer(),
+    read_size_min :: pos_integer(),
+    read_size_max :: pos_integer(),
+    %% Consecutive buffer hits since the last miss. Used for AIMD.
+    hits_since_last_miss = 0 :: non_neg_integer(),
     reader_ref :: reference(),
 
     %% Current fragment state.
@@ -169,10 +184,11 @@ init(#{
     }
 }) ->
     Key = rabbitmq_stream_s3:fragment_key(StreamId, Fragment),
-    {ok, ReadSize} = rabbit_resource_monitor_misc:parse_information_unit(?READAHEAD),
     State0 = #?MODULE{
         stream = StreamId,
-        read_size = ReadSize,
+        read_size = ?INITIAL_READ_SIZE,
+        read_size_min = ?MIN_READ_SIZE,
+        read_size_max = ?MAX_READ_SIZE,
         reader_ref = erlang:monitor(process, Reader),
         start_pos = Pos,
         current_pos = Pos,
@@ -470,7 +486,8 @@ maybe_reply(#read{offset = Offset, bytes = Bytes, hint = Hint}, #?MODULE{} = Sta
             erlang:error(unreachable);
         {ok, State1, Data} ->
             counters:add(counter(), ?C_BUFFER_HIT, 1),
-            State = maybe_start_request(State1),
+            State2 = adjust_read_size(hit, State1),
+            State = maybe_start_request(State2),
             {reply, {ok, Data}, State};
         {next_fragment, State1, NextOffset} ->
             counters:add(counter(), ?C_FRAGMENT_TRANSITION, 1),
@@ -482,9 +499,28 @@ maybe_reply(#read{offset = Offset, bytes = Bytes, hint = Hint}, #?MODULE{} = Sta
             {reply, end_of_stream, State};
         {await, State1} ->
             counters:add(counter(), ?C_BUFFER_MISS, 1),
-            State = maybe_start_request(State1),
+            State2 = adjust_read_size(miss, State1),
+            State = maybe_start_request(State2),
             {noreply, State}
     end.
+
+%% AIMD read-ahead adjustment.
+%% On miss: multiplicative decrease (halve), reset hit counter.
+%% On hit: after HITS_TO_GROW consecutive hits, additive increase by GROW_STEP.
+adjust_read_size(miss, #?MODULE{read_size = Current, read_size_min = Min} = State) ->
+    State#?MODULE{
+        read_size = max(Min, Current div 2),
+        hits_since_last_miss = 0
+    };
+adjust_read_size(hit, #?MODULE{hits_since_last_miss = Hits} = State) when
+    Hits + 1 < ?HITS_TO_GROW
+->
+    State#?MODULE{hits_since_last_miss = Hits + 1};
+adjust_read_size(hit, #?MODULE{read_size = Current, read_size_max = Max} = State) ->
+    State#?MODULE{
+        read_size = min(Max, Current + ?GROW_STEP),
+        hits_since_last_miss = 0
+    }.
 
 -spec try_read(#?MODULE{}, byte_offset(), NumBytes :: pos_integer()) ->
     {ok, #?MODULE{}, binary()}
@@ -649,6 +685,9 @@ goto_next_fragment(
 format_state(#?MODULE{
     stream = StreamId,
     read_size = ReadSize,
+    read_size_min = ReadSizeMin,
+    read_size_max = ReadSizeMax,
+    hits_since_last_miss = Hits,
     buffer = Buffer,
     start_pos = StartPos,
     current_pos = CurrentPos,
@@ -677,6 +716,9 @@ format_state(#?MODULE{
     #{
         stream => StreamId,
         read_size => ReadSize,
+        read_size_min => ReadSizeMin,
+        read_size_max => ReadSizeMax,
+        hits_since_last_miss => Hits,
         buffer => <<(integer_to_binary(byte_size(Buffer)))/binary, " bytes">>,
         start_pos => StartPos,
         current_pos => CurrentPos,
