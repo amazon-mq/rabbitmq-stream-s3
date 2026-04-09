@@ -111,6 +111,7 @@ init() ->
     Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?COUNTERS, #{module => ?MODULE}),
     persistent_term:put(?COUNTER_KEY, Cnt),
     ok = rabbitmq_stream_s3_remote_reader:init_counters(),
+    ok = rabbitmq_stream_s3_log_reader:init_counters(),
     ok = rabbitmq_stream_s3_request_metrics:init(),
     (backend()):init().
 

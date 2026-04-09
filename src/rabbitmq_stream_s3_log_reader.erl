@@ -21,7 +21,45 @@ tier.
 -define(READ_TIMEOUT, 10000).
 -define(SLOW_READ_THRESHOLD_MS, 10_000).
 
-%% TODO: add counters
+-define(C_REMOTE_INIT, 1).
+-define(C_LOCAL_INIT, 2).
+-define(C_REMOTE_CLOSE, 3).
+-define(C_LOCAL_CLOSE, 4).
+-define(C_RESOLVE_REMOTE_FIRST, 5).
+-define(C_RESOLVE_REMOTE_NEXT, 6).
+-define(C_RESOLVE_REMOTE_LAST, 7).
+-define(C_RESOLVE_REMOTE_OFFSET, 8).
+-define(C_RESOLVE_REMOTE_TIMESTAMP, 9).
+-define(C_RESOLVE_LOCAL, 10).
+-define(C_RESOLVE_DURATION_MS, 11).
+-define(C_RESOLVE, 12).
+-define(COUNTERS, [
+    {remote_init, ?C_REMOTE_INIT, counter, "Readers initialized in remote mode"},
+    {local_init, ?C_LOCAL_INIT, counter, "Readers initialized in local mode"},
+    %% A become_local transition increments both remote_close and local_init.
+    %% In the future we could support a become_remote transition (local_close +
+    %% remote_init) for when local segments are deleted before the consumer
+    %% finishes reading them.
+    {remote_close, ?C_REMOTE_CLOSE, counter, "Remote readers closed"},
+    {local_close, ?C_LOCAL_CLOSE, counter, "Local readers closed"},
+    {resolve_remote_first, ?C_RESOLVE_REMOTE_FIRST, counter,
+        "Offset specs resolved to remote tier (first)"},
+    {resolve_remote_next, ?C_RESOLVE_REMOTE_NEXT, counter,
+        "Offset specs resolved to remote tier (next)"},
+    {resolve_remote_last, ?C_RESOLVE_REMOTE_LAST, counter,
+        "Offset specs resolved to remote tier (last)"},
+    {resolve_remote_offset, ?C_RESOLVE_REMOTE_OFFSET, counter,
+        "Offset specs resolved to remote tier (absolute offset)"},
+    {resolve_remote_timestamp, ?C_RESOLVE_REMOTE_TIMESTAMP, counter,
+        "Offset specs resolved to remote tier (timestamp)"},
+    {resolve_local, ?C_RESOLVE_LOCAL, counter, "Offset specs resolved to local tier"},
+    {resolve_duration_ms, ?C_RESOLVE_DURATION_MS, counter,
+        "Total milliseconds spent resolving offset specs"},
+    {resolve, ?C_RESOLVE, counter, "Number of offset spec resolutions"}
+]).
+-define(COUNTER_KEY, {?MODULE, counter}).
+
+-export([init_counters/0]).
 
 -record(remote, {
     pid :: pid(),
@@ -63,6 +101,40 @@ tier.
 -endif.
 
 %%%===================================================================
+%%% Counters
+%%%===================================================================
+
+-spec init_counters() -> ok.
+init_counters() ->
+    Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?COUNTERS, #{module => ?MODULE}),
+    persistent_term:put(?COUNTER_KEY, Cnt),
+    ok.
+
+counter() ->
+    persistent_term:get(?COUNTER_KEY).
+
+record_resolve(T0, Tier, OffsetSpec) ->
+    Cnt = counter(),
+    Duration = erlang:convert_time_unit(erlang:monotonic_time() - T0, native, millisecond),
+    counters:add(Cnt, ?C_RESOLVE_DURATION_MS, Duration),
+    counters:add(Cnt, ?C_RESOLVE, 1),
+    case Tier of
+        local ->
+            counters:add(Cnt, ?C_RESOLVE_LOCAL, 1);
+        remote ->
+            C =
+                case OffsetSpec of
+                    first -> ?C_RESOLVE_REMOTE_FIRST;
+                    next -> ?C_RESOLVE_REMOTE_NEXT;
+                    last -> ?C_RESOLVE_REMOTE_LAST;
+                    {timestamp, _} -> ?C_RESOLVE_REMOTE_TIMESTAMP;
+                    {abs, _} -> ?C_RESOLVE_REMOTE_OFFSET;
+                    N when is_integer(N) -> ?C_RESOLVE_REMOTE_OFFSET
+                end,
+            counters:add(Cnt, C, 1)
+    end.
+
+%%%===================================================================
 %%% osiris_log_reader callbacks
 %%%===================================================================
 
@@ -77,10 +149,13 @@ resolve_offset_spec(OffsetSpec, Config) ->
     end.
 
 init_offset_reader(OffsetSpec, Config) ->
+    T0 = erlang:monotonic_time(),
     case resolve_remote_location(OffsetSpec, Config) of
         {ok, Location} ->
+            record_resolve(T0, remote, OffsetSpec),
             init_remote_reader(Location, Config);
         {local, LocalSpec} ->
+            record_resolve(T0, local, OffsetSpec),
             init_local_reader(LocalSpec, Config);
         {error, _} = Err ->
             Err
@@ -201,8 +276,10 @@ committed_offset(#?MODULE{mode = Local}) ->
 %% The remote reader monitors the log reader process and stops when it exits,
 %% so no explicit close is needed.
 close(#?MODULE{mode = #remote{}}) ->
+    counters:add(counter(), ?C_REMOTE_CLOSE, 1),
     ok;
 close(#?MODULE{mode = Local}) ->
+    counters:add(counter(), ?C_LOCAL_CLOSE, 1),
     ok = osiris_log:close(Local).
 
 send_file(
@@ -248,6 +325,7 @@ send_file(
                     },
                     send_file(Socket, State, Callback);
                 {become_local, Offset} ->
+                    counters:add(counter(), ?C_REMOTE_CLOSE, 1),
                     case init_local_reader(Offset, Config) of
                         {ok, State} ->
                             send_file(Socket, State, Callback);
@@ -258,6 +336,7 @@ send_file(
                     {end_of_stream, State0#?MODULE{mode = Remote1}}
             end;
         {become_local, Offset} ->
+            counters:add(counter(), ?C_REMOTE_CLOSE, 1),
             case init_local_reader(Offset, Config) of
                 {ok, State} ->
                     send_file(Socket, State, Callback);
@@ -317,6 +396,7 @@ chunk_iterator(
                     },
                     chunk_iterator(State, Credit, undefined);
                 {become_local, Offset} ->
+                    counters:add(counter(), ?C_REMOTE_CLOSE, 1),
                     case init_local_reader(Offset, Config) of
                         {ok, State} ->
                             chunk_iterator(State, Credit, undefined);
@@ -327,6 +407,7 @@ chunk_iterator(
                     {end_of_stream, State0#?MODULE{mode = Remote1}}
             end;
         {become_local, Offset} ->
+            counters:add(counter(), ?C_REMOTE_CLOSE, 1),
             case init_local_reader(Offset, Config) of
                 {ok, State} ->
                     chunk_iterator(State, Credit, undefined);
@@ -492,6 +573,7 @@ select_amount_to_send(_ChunkSelector, #{
 init_local_reader(OffsetSpec, Config) ->
     case osiris_log:init_offset_reader(OffsetSpec, Config) of
         {ok, Local} ->
+            counters:add(counter(), ?C_LOCAL_INIT, 1),
             {ok, #?MODULE{config = Config, mode = Local}};
         {error, _} = Err ->
             Err
@@ -515,6 +597,7 @@ init_remote_reader(
     },
     case rabbitmq_stream_s3_remote_reader_sup:add_child(Conf) of
         {ok, Pid} ->
+            counters:add(counter(), ?C_REMOTE_INIT, 1),
             Reader = #?MODULE{
                 config = Config,
                 mode = #remote{

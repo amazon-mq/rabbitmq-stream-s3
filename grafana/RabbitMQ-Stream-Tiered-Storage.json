@@ -1047,7 +1047,11 @@
       "id": 32,
       "options": {
         "legend": {
-          "calcs": ["mean", "max", "last"],
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -1109,7 +1113,11 @@
       "id": 33,
       "options": {
         "legend": {
-          "calcs": ["mean", "max", "last"],
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -1135,6 +1143,489 @@
         "w": 24,
         "x": 0,
         "y": 53
+      },
+      "id": 105,
+      "title": "Log Reader",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 0,
+        "y": 54
+      },
+      "id": 106,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "last"
+          ]
+        },
+        "textMode": "auto",
+        "noValue": "0"
+      },
+      "targets": [
+        {
+          "expr": "scalar(sum(rabbitmq_stream_s3_remote_init * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"}) or vector(0)) - scalar(sum(rabbitmq_stream_s3_remote_close * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"}) or vector(0))",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "title": "Active remote readers",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 12,
+        "y": 54
+      },
+      "id": 107,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "last"
+          ]
+        },
+        "textMode": "auto",
+        "noValue": "0"
+      },
+      "targets": [
+        {
+          "expr": "scalar(sum(rabbitmq_stream_s3_local_init * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"}) or vector(0)) - scalar(sum(rabbitmq_stream_s3_local_close * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"}) or vector(0))",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "title": "Active local readers",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "gradientMode": "opacity",
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "min": 0,
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 58
+      },
+      "id": 108,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_remote_init[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "{{rabbitmq_node}} remote",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_local_init[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "{{rabbitmq_node}} local",
+          "refId": "B"
+        }
+      ],
+      "title": "Reader init / s",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "gradientMode": "opacity",
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "min": 0,
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 58
+      },
+      "id": 109,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_remote_close[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "{{rabbitmq_node}} remote",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_local_close[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "{{rabbitmq_node}} local",
+          "refId": "B"
+        }
+      ],
+      "title": "Reader close / s",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "gradientMode": "opacity",
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "min": 0,
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 67
+      },
+      "id": 110,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_resolve_local[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "{{rabbitmq_node}} local",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by(rabbitmq_node) ((rate(rabbitmq_stream_s3_resolve_remote_first[60s]) + rate(rabbitmq_stream_s3_resolve_remote_next[60s]) + rate(rabbitmq_stream_s3_resolve_remote_last[60s]) + rate(rabbitmq_stream_s3_resolve_remote_offset[60s]) + rate(rabbitmq_stream_s3_resolve_remote_timestamp[60s])) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "{{rabbitmq_node}} remote",
+          "refId": "B"
+        }
+      ],
+      "title": "Offset resolution by tier / s",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "gradientMode": "opacity",
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "min": 0,
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 67
+      },
+      "id": 111,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_resolve_remote_first[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "{{rabbitmq_node}} first",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_resolve_remote_next[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "{{rabbitmq_node}} next",
+          "refId": "B"
+        },
+        {
+          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_resolve_remote_last[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "{{rabbitmq_node}} last",
+          "refId": "C"
+        },
+        {
+          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_resolve_remote_offset[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "{{rabbitmq_node}} offset",
+          "refId": "D"
+        },
+        {
+          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_resolve_remote_timestamp[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "{{rabbitmq_node}} timestamp",
+          "refId": "E"
+        }
+      ],
+      "title": "Remote resolution by offset spec / s",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "gradientMode": "opacity",
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "min": 0,
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 76
+      },
+      "id": 112,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_resolve_duration_ms[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"}) / sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_resolve[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "{{rabbitmq_node}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Avg offset resolution time",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 85
       },
       "id": 104,
       "title": "Remote Reader",
@@ -1182,7 +1673,7 @@
         "h": 4,
         "w": 12,
         "x": 0,
-        "y": 54
+        "y": 86
       },
       "id": 40,
       "options": {
@@ -1235,7 +1726,7 @@
         "h": 4,
         "w": 12,
         "x": 12,
-        "y": 54
+        "y": 86
       },
       "id": 41,
       "options": {
@@ -1296,12 +1787,16 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 58
+        "y": 90
       },
       "id": 44,
       "options": {
         "legend": {
-          "calcs": ["mean", "max", "last"],
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -1358,12 +1853,16 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 58
+        "y": 90
       },
       "id": 42,
       "options": {
         "legend": {
-          "calcs": ["mean", "max", "last"],
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -1420,12 +1919,16 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 67
+        "y": 99
       },
       "id": 43,
       "options": {
         "legend": {
-          "calcs": ["mean", "max", "last"],
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
