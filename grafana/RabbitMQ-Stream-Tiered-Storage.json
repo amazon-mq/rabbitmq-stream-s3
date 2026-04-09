@@ -28,7 +28,27 @@
   "description": "Tiered storage metrics for the rabbitmq_stream_s3 plugin",
   "editable": true,
   "graphTooltip": 1,
-  "links": [],
+  "links": [
+    {
+      "icon": "dashboard",
+      "tags": [
+        "rabbitmq-stream"
+      ],
+      "targetBlank": true,
+      "title": "RabbitMQ-Stream",
+      "tooltip": "Stream protocol message rates and errors",
+      "type": "dashboards"
+    },
+    {
+      "icon": "doc",
+      "tags": [],
+      "targetBlank": true,
+      "title": "rabbitmq-stream-s3 on GitHub",
+      "tooltip": "",
+      "type": "link",
+      "url": "https://github.com/amazon-mq/rabbitmq-stream-s3"
+    }
+  ],
   "panels": [
     {
       "collapsed": false,
