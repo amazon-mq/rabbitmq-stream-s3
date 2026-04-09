@@ -99,7 +99,7 @@
         "graphMode": "none",
         "reduceOptions": {
           "calcs": [
-            "last"
+            "lastNotNull"
           ]
         },
         "textMode": "auto"
@@ -155,7 +155,7 @@
         "graphMode": "none",
         "reduceOptions": {
           "calcs": [
-            "last"
+            "lastNotNull"
           ]
         },
         "textMode": "auto"
@@ -211,7 +211,7 @@
         "graphMode": "none",
         "reduceOptions": {
           "calcs": [
-            "last"
+            "lastNotNull"
           ]
         },
         "textMode": "auto"
@@ -263,7 +263,7 @@
         "graphMode": "none",
         "reduceOptions": {
           "calcs": [
-            "last"
+            "lastNotNull"
           ]
         },
         "textMode": "auto"
@@ -315,7 +315,7 @@
         "graphMode": "none",
         "reduceOptions": {
           "calcs": [
-            "last"
+            "lastNotNull"
           ]
         },
         "textMode": "auto"
@@ -367,7 +367,7 @@
         "graphMode": "none",
         "reduceOptions": {
           "calcs": [
-            "last"
+            "lastNotNull"
           ]
         },
         "textMode": "auto"
@@ -1218,7 +1218,7 @@
         "graphMode": "none",
         "reduceOptions": {
           "calcs": [
-            "last"
+            "lastNotNull"
           ]
         },
         "textMode": "auto",
@@ -1271,7 +1271,7 @@
         "graphMode": "none",
         "reduceOptions": {
           "calcs": [
-            "last"
+            "lastNotNull"
           ]
         },
         "textMode": "auto",
@@ -1714,7 +1714,7 @@
         "graphMode": "none",
         "reduceOptions": {
           "calcs": [
-            "last"
+            "lastNotNull"
           ]
         },
         "textMode": "auto",
@@ -1767,7 +1767,7 @@
         "graphMode": "none",
         "reduceOptions": {
           "calcs": [
-            "last"
+            "lastNotNull"
           ]
         },
         "textMode": "auto"
