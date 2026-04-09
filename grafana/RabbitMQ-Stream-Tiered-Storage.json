@@ -322,7 +322,7 @@
       },
       "targets": [
         {
-          "expr": "sum by(rabbitmq_cluster) (irate(rabbitmq_stream_s3_total_requests[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_cluster) (irate(rabbitmq_stream_s3_total_requests[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "",
           "refId": "A"
         }
@@ -374,7 +374,7 @@
       },
       "targets": [
         {
-          "expr": "sum by(rabbitmq_cluster) (irate(rabbitmq_stream_s3_fragments_created[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_cluster) (irate(rabbitmq_stream_s3_fragments_created[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "",
           "refId": "A"
         }
@@ -614,7 +614,7 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.99, sum by(le, rabbitmq_node) (rate(rabbitmq_stream_s3_request_duration_seconds_bucket{kind=\"write\"}[1m]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"}))",
+          "expr": "histogram_quantile(0.99, sum by(le, rabbitmq_node) (rate(rabbitmq_stream_s3_request_duration_seconds_bucket{kind=\"write\"}[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"}))",
           "legendFormat": "{{rabbitmq_node}}",
           "refId": "A"
         }
@@ -842,7 +842,7 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.99, sum by(le, rabbitmq_node) (rate(rabbitmq_stream_s3_request_duration_seconds_bucket{kind=\"read\"}[1m]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"}))",
+          "expr": "histogram_quantile(0.99, sum by(le, rabbitmq_node) (rate(rabbitmq_stream_s3_request_duration_seconds_bucket{kind=\"read\"}[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"}))",
           "legendFormat": "{{rabbitmq_node}}",
           "refId": "A"
         }
@@ -1083,7 +1083,7 @@
       },
       "targets": [
         {
-          "expr": "sum by(rabbitmq_node) (irate(rabbitmq_stream_s3_fragments_created[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_node) (irate(rabbitmq_stream_s3_fragments_created[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "{{rabbitmq_node}}",
           "refId": "A"
         }
@@ -1312,7 +1312,7 @@
       },
       "targets": [
         {
-          "expr": "sum by(rabbitmq_node) (irate(rabbitmq_stream_s3_fragments_deleted[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_node) (irate(rabbitmq_stream_s3_fragments_deleted[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "{{rabbitmq_node}}",
           "refId": "A"
         }
@@ -1770,7 +1770,7 @@
       },
       "targets": [
         {
-          "expr": "sum by(rabbitmq_node) (irate(rabbitmq_stream_s3_task_failures[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_node) (irate(rabbitmq_stream_s3_task_failures[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "{{rabbitmq_node}}",
           "refId": "A"
         }
@@ -2011,7 +2011,7 @@
       },
       "targets": [
         {
-          "expr": "sum by(rabbitmq_node) (irate(rabbitmq_stream_s3_total_requests[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_node) (irate(rabbitmq_stream_s3_total_requests[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "{{rabbitmq_node}}",
           "refId": "A"
         }
@@ -2240,12 +2240,12 @@
       },
       "targets": [
         {
-          "expr": "sum by(rabbitmq_node) (irate(rabbitmq_stream_s3_response_500[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_node) (irate(rabbitmq_stream_s3_response_500[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "{{rabbitmq_node}} 500",
           "refId": "A"
         },
         {
-          "expr": "sum by(rabbitmq_node) (irate(rabbitmq_stream_s3_response_503[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_node) (irate(rabbitmq_stream_s3_response_503[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "{{rabbitmq_node}} 503",
           "refId": "B"
         }
@@ -2463,7 +2463,7 @@
       },
       "targets": [
         {
-          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_bytes_sent[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_bytes_sent[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "{{rabbitmq_node}}",
           "refId": "A"
         }
@@ -2681,7 +2681,7 @@
       },
       "targets": [
         {
-          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_bytes_received[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_bytes_received[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "{{rabbitmq_node}}",
           "refId": "A"
         }
@@ -3017,12 +3017,12 @@
       },
       "targets": [
         {
-          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_remote_init[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_remote_init[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "{{rabbitmq_node}} remote",
           "refId": "A"
         },
         {
-          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_local_init[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_local_init[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "{{rabbitmq_node}} local",
           "refId": "B"
         }
@@ -3240,12 +3240,12 @@
       },
       "targets": [
         {
-          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_remote_close[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_remote_close[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "{{rabbitmq_node}} remote",
           "refId": "A"
         },
         {
-          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_local_close[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_local_close[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "{{rabbitmq_node}} local",
           "refId": "B"
         }
@@ -3463,12 +3463,12 @@
       },
       "targets": [
         {
-          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_resolve_local[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_resolve_local[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "{{rabbitmq_node}} local",
           "refId": "A"
         },
         {
-          "expr": "sum by(rabbitmq_node) ((rate(rabbitmq_stream_s3_resolve_remote_first[60s]) + rate(rabbitmq_stream_s3_resolve_remote_next[60s]) + rate(rabbitmq_stream_s3_resolve_remote_last[60s]) + rate(rabbitmq_stream_s3_resolve_remote_offset[60s]) + rate(rabbitmq_stream_s3_resolve_remote_timestamp[60s])) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_node) ((rate(rabbitmq_stream_s3_resolve_remote_first[$__rate_interval]) + rate(rabbitmq_stream_s3_resolve_remote_next[$__rate_interval]) + rate(rabbitmq_stream_s3_resolve_remote_last[$__rate_interval]) + rate(rabbitmq_stream_s3_resolve_remote_offset[$__rate_interval]) + rate(rabbitmq_stream_s3_resolve_remote_timestamp[$__rate_interval])) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "{{rabbitmq_node}} remote",
           "refId": "B"
         }
@@ -3686,27 +3686,27 @@
       },
       "targets": [
         {
-          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_resolve_remote_first[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_resolve_remote_first[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "{{rabbitmq_node}} first",
           "refId": "A"
         },
         {
-          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_resolve_remote_next[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_resolve_remote_next[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "{{rabbitmq_node}} next",
           "refId": "B"
         },
         {
-          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_resolve_remote_last[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_resolve_remote_last[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "{{rabbitmq_node}} last",
           "refId": "C"
         },
         {
-          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_resolve_remote_offset[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_resolve_remote_offset[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "{{rabbitmq_node}} offset",
           "refId": "D"
         },
         {
-          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_resolve_remote_timestamp[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_resolve_remote_timestamp[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "{{rabbitmq_node}} timestamp",
           "refId": "E"
         }
@@ -3924,7 +3924,7 @@
       },
       "targets": [
         {
-          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_resolve_duration_ms[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"}) / sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_resolve[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_resolve_duration_ms[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"}) / sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_resolve[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "{{rabbitmq_node}}",
           "refId": "A"
         }
@@ -4002,7 +4002,7 @@
       },
       "targets": [
         {
-          "expr": "sum by(rabbitmq_cluster) (rate(rabbitmq_stream_s3_buffer_hit[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"}) / (sum by(rabbitmq_cluster) (rate(rabbitmq_stream_s3_buffer_hit[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"}) + sum by(rabbitmq_cluster) (rate(rabbitmq_stream_s3_buffer_miss[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})) * 100",
+          "expr": "sum by(rabbitmq_cluster) (rate(rabbitmq_stream_s3_buffer_hit[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"}) / (sum by(rabbitmq_cluster) (rate(rabbitmq_stream_s3_buffer_hit[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"}) + sum by(rabbitmq_cluster) (rate(rabbitmq_stream_s3_buffer_miss[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})) * 100",
           "legendFormat": "",
           "refId": "A"
         }
@@ -4272,7 +4272,7 @@
       },
       "targets": [
         {
-          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_read_duration_ms[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"}) / sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_read[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_read_duration_ms[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"}) / sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_read[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "{{rabbitmq_node}}",
           "refId": "A"
         }
@@ -4490,7 +4490,7 @@
       },
       "targets": [
         {
-          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_await_duration_ms[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"}) / sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_await[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_await_duration_ms[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"}) / sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_await[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "{{rabbitmq_node}}",
           "refId": "A"
         }
@@ -4708,7 +4708,7 @@
       },
       "targets": [
         {
-          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_fragment_transition[60s]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_fragment_transition[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "{{rabbitmq_node}}",
           "refId": "A"
         }
