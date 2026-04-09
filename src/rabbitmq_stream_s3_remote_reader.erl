@@ -644,10 +644,13 @@ try_read(#?MODULE{end_pos = EndPos} = State, Offset, Bytes) when Offset + Bytes 
             %% older data than the remote tier. (Possible if retention
             %% reclaims fragments but not the current segment.)
             erlang:error(unimplemented);
-        _ ->
-            %% TODO: This could happen if the chunk is larger than the read-ahead.
-            %% We need to request a larger read-ahead.
-            erlang:error(unimplemented)
+        #?MODULE{read_size = ReadSize0} ->
+            %% The chunk is larger than the read-ahead. Bump read_size to
+            %% cover the needed bytes so maybe_start_request issues a
+            %% sufficiently large request.
+            Needed = Offset + Bytes - EndPos,
+            ReadSize = max(ReadSize0, Needed),
+            {await, State#?MODULE{read_size = ReadSize}}
     end;
 try_read(
     #?MODULE{
