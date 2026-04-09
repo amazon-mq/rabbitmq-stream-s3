@@ -138,7 +138,8 @@ get(Key, Opts) when is_binary(Key) andalso is_map(Opts) ->
             {ok, Data};
         {ok, #{status := 404}} ->
             {error, not_found};
-        {ok, Other} ->
+        {ok, #{status := Status} = Other} ->
+            log_unexpected_status(?FUNCTION_NAME, Status, Key),
             {error, Other};
         {error, _} = Err ->
             Err
@@ -162,7 +163,8 @@ get_range(Key, Range, Opts) when is_binary(Key) andalso is_map(Opts) ->
             {ok, Data};
         {ok, #{status := 404}} ->
             {error, not_found};
-        {ok, Other} ->
+        {ok, #{status := Status} = Other} ->
+            log_unexpected_status(?FUNCTION_NAME, Status, Key),
             {error, Other};
         {error, _} = Err ->
             Err
@@ -181,7 +183,8 @@ put(Key, Data, Opts) when is_binary(Key) andalso is_map(Opts) ->
     case request(<<"PUT">>, key_to_path(Key), Headers, Data, Opts) of
         {ok, #{status := 200}} ->
             ok;
-        {ok, Other} ->
+        {ok, #{status := Status} = Other} ->
+            log_unexpected_status(?FUNCTION_NAME, Status, Key),
             {error, Other};
         {error, _} = Err ->
             Err
@@ -204,7 +207,8 @@ delete(Keys, Opts) when is_list(Keys) andalso is_map(Opts) ->
     case request(<<"POST">>, <<"/?delete=">>, Headers, Data, Opts) of
         {ok, #{status := 200}} ->
             ok;
-        {ok, Other} ->
+        {ok, #{status := Status} = Other} ->
+            log_unexpected_status(?FUNCTION_NAME, Status),
             {error, Other};
         {error, _} = Err ->
             Err
@@ -214,7 +218,8 @@ delete(Key, Opts) when is_binary(Key) andalso is_map(Opts) ->
     case request(<<"DELETE">>, key_to_path(Key), #{}, <<>>, Opts) of
         {ok, #{status := 204}} ->
             ok;
-        {ok, Other} ->
+        {ok, #{status := Status} = Other} ->
+            log_unexpected_status(?FUNCTION_NAME, Status, Key),
             {error, Other};
         {error, _} = Err ->
             Err
@@ -289,7 +294,8 @@ list(Prefix, ContinuationToken, Opts) ->
     case request(<<"GET">>, <<"/?", Params/binary>>, #{}, <<>>, Opts) of
         {ok, #{status := 200, body := Body}} ->
             {ok, decode_list_bucket_result(Body)};
-        {ok, Other} ->
+        {ok, #{status := Status} = Other} ->
+            log_unexpected_status(?FUNCTION_NAME, Status),
             {error, Other};
         {error, _} = Err ->
             Err
@@ -327,6 +333,12 @@ decode_list_bucket_result(Data) ->
         {[], 0, undefined},
         Result
     ).
+
+log_unexpected_status(Function, Status) ->
+    ?LOG_DEBUG("~ts unexpected HTTP status ~b", [Function, Status]).
+
+log_unexpected_status(Function, Status, Key) ->
+    ?LOG_DEBUG("~ts unexpected HTTP status ~b for key ~ts", [Function, Status, Key]).
 
 -spec request(http_method(), key(), req_headers(), iodata(), request_opts()) ->
     {ok, http_response()}
