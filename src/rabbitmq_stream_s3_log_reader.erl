@@ -198,12 +198,18 @@ committed_offset(#?MODULE{mode = #remote{shared = Shared}}) ->
 committed_offset(#?MODULE{mode = Local}) ->
     osiris_log:committed_offset(Local).
 
-close(#?MODULE{mode = #remote{pid = Pid}}) ->
-    ok = gen_server:cast(Pid, close);
+%% The remote reader monitors the log reader process and stops when it exits,
+%% so no explicit close is needed.
+close(#?MODULE{mode = #remote{}}) ->
+    ok;
 close(#?MODULE{mode = Local}) ->
     ok = osiris_log:close(Local).
 
-send_file(Socket, #?MODULE{mode = #remote{} = Remote0} = State0, Callback) ->
+send_file(
+    Socket,
+    #?MODULE{config = Config, mode = #remote{} = Remote0} = State0,
+    Callback
+) ->
     case read_header(Remote0) of
         {ok,
             #{
@@ -220,26 +226,39 @@ send_file(Socket, #?MODULE{mode = #remote{} = Remote0} = State0, Callback) ->
             } = Remote1} ->
             {ToSkip, ToSend} = select_amount_to_send(ChunkSelector, Header),
             DataPos = Position + ?CHUNK_HEADER_B + ToSkip,
-            PrefixData = Callback(Header, ToSend + byte_size(HeaderData)),
-            {ReadMsec, {ok, Data}} = timer:tc(
-                rabbitmq_stream_s3_remote_reader,
-                read,
-                [Pid, DataPos, ToSend, within_chunk],
-                millisecond
-            ),
-            validate_read_timing(ReadMsec, ToSend, DataPos),
-            case send(Transport, Socket, [PrefixData, HeaderData, Data]) of
-                ok ->
-                    Remote = Remote1#remote{
-                        next_offset = ChId + NumRecords,
-                        position = NextPosition
+            case read(Pid, DataPos, ToSend, within_chunk) of
+                {ok, Data} ->
+                    PrefixData = Callback(Header, ToSend + byte_size(HeaderData)),
+                    case send(Transport, Socket, [PrefixData, HeaderData, Data]) of
+                        ok ->
+                            Remote = Remote1#remote{
+                                next_offset = ChId + NumRecords,
+                                position = NextPosition
+                            },
+                            {ok, State0#?MODULE{mode = Remote}};
+                        {error, _} = Err ->
+                            Err
+                    end;
+                {next_fragment, Offset} ->
+                    State = State0#?MODULE{
+                        mode = Remote1#remote{
+                            next_offset = Offset,
+                            position = ?FRAGMENT_HEADER_B
+                        }
                     },
-                    {ok, State0#?MODULE{mode = Remote}};
-                {error, _} = Err ->
-                    Err
+                    send_file(Socket, State, Callback);
+                {become_local, Offset} ->
+                    case init_local_reader(Offset, Config) of
+                        {ok, State} ->
+                            send_file(Socket, State, Callback);
+                        {error, _} = Err ->
+                            Err
+                    end;
+                end_of_stream ->
+                    {end_of_stream, State0#?MODULE{mode = Remote1}}
             end;
-        {local, Remote} ->
-            case convert_remote_to_local(State0#?MODULE{mode = Remote}) of
+        {become_local, Offset} ->
+            case init_local_reader(Offset, Config) of
                 {ok, State} ->
                     send_file(Socket, State, Callback);
                 {error, _} = Err ->
@@ -260,7 +279,11 @@ send_file(Socket, #?MODULE{mode = Local0} = State0, Callback) ->
             Err
     end.
 
-chunk_iterator(#?MODULE{mode = #remote{} = Remote0} = State0, Credit, _PrevIter) ->
+chunk_iterator(
+    #?MODULE{config = Config, mode = #remote{} = Remote0} = State0,
+    Credit,
+    _PrevIter
+) ->
     case read_header(Remote0) of
         {ok,
             #{
@@ -273,25 +296,38 @@ chunk_iterator(#?MODULE{mode = #remote{} = Remote0} = State0, Credit, _PrevIter)
             } = Header,
             #remote{pid = Pid} = Remote1} ->
             DataPos = Position + ?CHUNK_HEADER_B + FilterSize,
-            {ReadMsec, {ok, Data}} = timer:tc(
-                rabbitmq_stream_s3_remote_reader,
-                read,
-                [Pid, DataPos, DataSize, within_chunk],
-                millisecond
-            ),
-            validate_read_timing(ReadMsec, DataPos),
-            Iter = #remote_iterator{
-                next_offset = ChId,
-                data = Data
-            },
-            Remote = Remote1#remote{
-                next_offset = ChId + NumRecords,
-                position = NextPosition
-            },
-            State = State0#?MODULE{mode = Remote},
-            {ok, Header, Iter, State};
-        {local, Remote} ->
-            case convert_remote_to_local(State0#?MODULE{mode = Remote}) of
+            case read(Pid, DataPos, DataSize, within_chunk) of
+                {ok, Data} ->
+                    Iter = #remote_iterator{
+                        next_offset = ChId,
+                        data = Data
+                    },
+                    Remote = Remote1#remote{
+                        next_offset = ChId + NumRecords,
+                        position = NextPosition
+                    },
+                    State = State0#?MODULE{mode = Remote},
+                    {ok, Header, Iter, State};
+                {next_fragment, Offset} ->
+                    State = State0#?MODULE{
+                        mode = Remote1#remote{
+                            next_offset = Offset,
+                            position = ?FRAGMENT_HEADER_B
+                        }
+                    },
+                    chunk_iterator(State, Credit, undefined);
+                {become_local, Offset} ->
+                    case init_local_reader(Offset, Config) of
+                        {ok, State} ->
+                            chunk_iterator(State, Credit, undefined);
+                        {error, _} = Err ->
+                            Err
+                    end;
+                end_of_stream ->
+                    {end_of_stream, State0#?MODULE{mode = Remote1}}
+            end;
+        {become_local, Offset} ->
+            case init_local_reader(Offset, Config) of
                 {ok, State} ->
                     chunk_iterator(State, Credit, undefined);
                 {error, _} = Err ->
@@ -343,9 +379,10 @@ send(ssl, Socket, Data) ->
 %%   a single read operation.
 %% * Check the chunk selector within this helper. osiris_log does this in the
 %%   callers, but we can always skip when the chunk selector doesn't match.
+%% TODO: revise this comment as more moves into the server.
 -spec read_header(#remote{}) ->
     {ok, osiris_log:header_map(), #remote{}}
-    | {local, #remote{}}
+    | {become_local, osiris:offset()}
     | {end_of_stream, #remote{}}.
 read_header(#remote{shared = Shared, next_offset = NextOffset} = Remote) ->
     CanReadNext =
@@ -360,11 +397,8 @@ read_header(#remote{shared = Shared, next_offset = NextOffset} = Remote) ->
 
 read_header1(
     #remote{
-        pid = Pid0,
-        stream = StreamId,
-        position = Position,
-        next_offset = NextChId,
-        shared = Shared
+        pid = Pid,
+        position = Position
     } = Remote0
 ) ->
     %% Over-read the chunk header so that the filter (if it exists) is always
@@ -372,45 +406,16 @@ read_header1(
     %% over-reading is faster.
     %% TODO: make sure that over-reading is handled gracefully: as much of the
     %% binary should be returned as possible.
-    {ReadMsec, ReadResult} = timer:tc(
-        rabbitmq_stream_s3_remote_reader,
-        read,
-        [Pid0, Position, ?CHUNK_HEADER_B + ?MAX_FILTER_SIZE, chunk_boundary],
-        millisecond
-    ),
-    validate_read_timing(ReadMsec),
-    case ReadResult of
+    case read(Pid, Position, ?CHUNK_HEADER_B + ?MAX_FILTER_SIZE, chunk_boundary) of
         {ok, Header} ->
             read_header2(Remote0, Header);
-        eof ->
-            FirstChId = osiris_log_shared:first_chunk_id(Shared),
-            LastChId = osiris_log_shared:last_chunk_id(Shared),
-            case NextChId of
-                FirstChId ->
-                    {local, Remote0};
-                _ when NextChId > LastChId ->
-                    {end_of_stream, Remote0};
-                _ ->
-                    %% TODO: what if retention takes away fragments? We need to
-                    %% jump ahead to the start of the log.
-                    Conf = #{
-                        reader => self(),
-                        stream => StreamId,
-                        location => remote_location_first(NextChId)
-                    },
-                    case rabbitmq_stream_s3_remote_reader_sup:add_child(Conf) of
-                        {ok, Pid} ->
-                            ok = gen_server:cast(Pid0, close),
-                            Remote = Remote0#remote{
-                                pid = Pid,
-                                fragment = NextChId,
-                                position = ?FRAGMENT_HEADER_B
-                            },
-                            read_header1(Remote);
-                        {error, _} ->
-                            {end_of_stream, Remote0}
-                    end
-            end
+        {next_fragment, Offset} ->
+            Remote = Remote0#remote{next_offset = Offset, position = ?FRAGMENT_HEADER_B},
+            read_header(Remote);
+        {become_local, Offset} ->
+            {become_local, Offset};
+        end_of_stream ->
+            {end_of_stream, Remote0}
     end.
 
 read_header2(
@@ -528,14 +533,6 @@ init_remote_reader(
         {error, _} = Err ->
             Err
     end.
-
-convert_remote_to_local(#?MODULE{
-    config = Config,
-    mode = #remote{pid = Pid, next_offset = NextOffset}
-}) ->
-    ?LOG_DEBUG("Converting to local reader at offset ~b", [NextOffset]),
-    ok = gen_server:cast(Pid, close),
-    init_local_reader(first, Config).
 
 -spec find_position(
     {offset, osiris:offset()} | {timestamp, osiris:timestamp()},
@@ -659,20 +656,26 @@ index_data(StreamId, FragmentOffset, StartPos) ->
     ),
     Data.
 
-validate_read_timing(ReadMsec) when ReadMsec > ?SLOW_READ_THRESHOLD_MS ->
-    ?LOG_WARNING("Slow remote tier read: ~bms", [ReadMsec]);
-validate_read_timing(_) ->
-    ok.
-
-validate_read_timing(ReadMsec, DataPos) when ReadMsec > ?SLOW_READ_THRESHOLD_MS ->
-    ?LOG_WARNING("Slow remote tier read: ~bms (offset ~b)", [ReadMsec, DataPos]);
-validate_read_timing(_, _) ->
-    ok.
-
-validate_read_timing(ReadMsec, ToSend, DataPos) when ReadMsec > ?SLOW_READ_THRESHOLD_MS ->
-    ?LOG_WARNING("Slow remote tier read: ~bms (~b bytes at offset ~b)", [ReadMsec, ToSend, DataPos]);
-validate_read_timing(_, _, _) ->
-    ok.
+-spec read(pid(), byte_offset(), pos_integer(), rabbitmq_stream_s3_remote_reader:hint()) ->
+    {ok, binary()}
+    | {next_fragment, osiris:offset()}
+    | {become_local, osiris:offset()}
+    | end_of_stream.
+read(RemoteReader, Offset, Bytes, Hint) ->
+    {Ms, Result} = timer:tc(
+        rabbitmq_stream_s3_remote_reader,
+        read,
+        [RemoteReader, Offset, Bytes, Hint],
+        millisecond
+    ),
+    case Ms > ?SLOW_READ_THRESHOLD_MS of
+        true ->
+            ?LOG_WARNING("Slow remote tier read: ~bms (~b bytes at offset ~b)", [Ms, Bytes, Offset]),
+            ok;
+        false ->
+            ok
+    end,
+    Result.
 
 remote_location_first(Offset) ->
     #remote_location{

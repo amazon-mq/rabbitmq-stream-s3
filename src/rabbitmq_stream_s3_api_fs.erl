@@ -16,9 +16,13 @@ associated file in that folder.
     init/0,
     get/2,
     get_range/3,
+    get_range_async/3,
     put/3,
     delete/2,
-    delete_prefix/2
+    delete_prefix/2,
+    match_async/2,
+    handle_async/3,
+    cancel_async/2
 ]).
 
 % Auxiliary function for testing
@@ -27,6 +31,9 @@ associated file in that folder.
     clear/0,
     set_data_dir/1
 ]).
+
+-type async_req() :: reference().
+-type async_state() :: undefined.
 
 -ifdef(TEST).
 -export([range_spec_to_location_number/2]).
@@ -93,6 +100,44 @@ get_range(Key, RangeSpec, Opts) ->
         end
     end).
 
+-doc """
+Gets a range of bytes "asynchronously".
+
+Since the FS backend is just for testing, this is not truly async. The caller
+process performs the read itself and then sends itself a message with the
+result.
+""".
+-spec get_range_async(
+    key(),
+    rabbitmq_stream_s3_api:range_spec(),
+    rabbitmq_stream_s3_api:request_opts()
+) ->
+    {ok, async_req(), async_state()} | {error, any()}.
+get_range_async(Key, RangeSpec, _Opts) ->
+    case key_to_path(Key) of
+        {error, path_not_set} = Err ->
+            Err;
+        FilePath ->
+            Reply =
+                case file:read_file_info(FilePath) of
+                    {ok, #file_info{size = FileSize}} ->
+                        {ok, Fd} = file:open(FilePath, [read, binary]),
+                        {Location, Number} = range_spec_to_location_number(FileSize, RangeSpec),
+                        Data =
+                            case file:pread(Fd, Location, Number) of
+                                {ok, D} -> D;
+                                eof -> <<>>
+                            end,
+                        ok = file:close(Fd),
+                        {data, Data, done};
+                    {error, enoent} ->
+                        {done, {error, not_found}}
+                end,
+            Req = erlang:make_ref(),
+            self() ! {'$async', Req, Reply},
+            {ok, Req, undefined}
+    end.
+
 -spec put(key(), iodata(), rabbitmq_stream_s3_api:request_opts()) ->
     ok | {error, any()}.
 put(Key, Data, Opts) ->
@@ -154,6 +199,24 @@ delete_prefix(Prefix, Opts) when is_binary(Prefix) andalso is_map(Opts) ->
                 end
         end
     end).
+
+-spec match_async(Msg :: term(), #{async_req() := async_state()}) ->
+    {ok, async_req()} | error.
+match_async({'$async', Req, _Msg}, Reqs) when is_map_key(Req, Reqs) ->
+    {ok, Req};
+match_async(_Msg, _Reqs) ->
+    error.
+
+-spec handle_async(Msg :: term(), async_req(), async_state()) ->
+    {continue, async_state()}
+    | {data, binary(), async_state() | done}
+    | {done, ok | {error, any()}}.
+handle_async({'$async', Req, Msg}, Req, undefined) ->
+    Msg.
+
+-spec cancel_async(async_req(), async_state()) -> ok.
+cancel_async(_Req, _State) ->
+    ok.
 
 -spec get_stream_data(StreamName) ->
     {ok, Manifest, [FragmentFile]} | {error, not_found | path_not_set}

@@ -19,12 +19,17 @@ file-system operations. Use that in non-unit tests.
     get/2,
     get_range/2,
     get_range/3,
+    get_range_async/2,
+    get_range_async/3,
     put/2,
     put/3,
     delete/1,
     delete/2,
     delete_prefix/1,
-    delete_prefix/2
+    delete_prefix/2,
+    match_async/2,
+    handle_async/3,
+    cancel_async/2
 ]).
 
 -export([backend/0]).
@@ -39,13 +44,22 @@ file-system operations. Use that in non-unit tests.
     crc32 => integer(),
     unsigned_payload => boolean()
 }.
+-type async_state() :: term().
+-type async_req() :: reference().
 
--export_type([range_spec/0, request_opts/0]).
+-export_type([
+    range_spec/0,
+    request_opts/0,
+    async_state/0,
+    async_req/0
+]).
 
 -callback init() -> ok.
 -callback get(key(), request_opts()) -> {ok, binary()} | {error, any()}.
 -callback get_range(key(), range_spec(), request_opts()) ->
     {ok, binary()} | {error, any()}.
+-callback get_range_async(key(), range_spec(), request_opts()) ->
+    {ok, async_req(), async_state()} | {error, any()}.
 -callback put(key(), iodata(), request_opts()) -> ok | {error, any()}.
 -doc """
 Delete the given key or all of the listed keys from the remote tier.
@@ -57,6 +71,14 @@ examples.
 """.
 -callback delete(key() | [key()], request_opts()) -> ok | {error, any()}.
 -callback delete_prefix(key(), request_opts()) -> {ok, map()} | {error, any()}.
+-callback match_async(Msg :: term(), #{async_req() := async_state()}) ->
+    {ok, async_req()}
+    | error.
+-callback handle_async(Msg :: term(), async_req(), async_state()) ->
+    {continue, async_state()}
+    | {data, binary(), async_state() | done}
+    | {done, ok | {error, any()}}.
+-callback cancel_async(async_req(), async_state()) -> ok.
 
 -define(C_GET, 1).
 -define(C_GET_RANGE, 2).
@@ -88,6 +110,7 @@ counter() ->
 init() ->
     Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?COUNTERS, #{module => ?MODULE}),
     persistent_term:put(?COUNTER_KEY, Cnt),
+    ok = rabbitmq_stream_s3_remote_reader:init_counters(),
     ok = rabbitmq_stream_s3_request_metrics:init(),
     (backend()):init().
 
@@ -122,6 +145,24 @@ get_range(Key, Range, Opts) when is_binary(Key) andalso is_map(Opts) ->
     end,
     Result.
 
+-doc #{equiv => get_range(Key, Range, #{})}.
+-spec get_range_async(key(), range_spec()) ->
+    {ok, async_req(), async_state()} | {error, any()}.
+get_range_async(Key, Range) when is_binary(Key) ->
+    get_range_async(Key, Range, #{}).
+
+-spec get_range_async(key(), range_spec(), request_opts()) ->
+    {ok, async_req(), async_state()} | {error, any()}.
+get_range_async(Key, Range, Opts) when is_binary(Key) andalso is_map(Opts) ->
+    counters:add(counter(), ?C_GET_RANGE, 1),
+    StartTs = erlang:monotonic_time(),
+    case (backend()):get_range_async(Key, Range, Opts) of
+        {ok, Req, BackendState} ->
+            {ok, Req, {StartTs, BackendState}};
+        {error, _} = Err ->
+            Err
+    end.
+
 -doc #{equiv => put(Key, Data, #{})}.
 -spec put(key(), iodata()) -> ok | {error, any()}.
 put(Key, Data) when is_binary(Key) ->
@@ -155,6 +196,41 @@ delete_prefix(Prefix) ->
 delete_prefix(Prefix, Opts) when is_binary(Prefix) andalso is_map(Opts) ->
     counters:add(counter(), ?C_LIST, 1),
     observe(write, fun() -> (backend()):delete_prefix(Prefix, Opts) end).
+
+-spec match_async(Msg :: term(), #{async_req() := async_state()}) ->
+    {ok, async_req()} | error.
+match_async(Msg, Reqs) ->
+    (backend()):match_async(Msg, Reqs).
+
+-spec handle_async(Msg :: term(), async_req(), AsyncState :: term()) ->
+    {continue, AsyncState :: term()}
+    | {data, binary(), async_state()}
+    | {done, ok | {error, any()}}.
+handle_async(Msg, Req, {StartTs, BackendState0}) ->
+    case (backend()):handle_async(Msg, Req, BackendState0) of
+        {continue, BackendState} ->
+            {continue, {StartTs, BackendState}};
+        {data, Data, done} ->
+            counters:add(counter(), ?C_BYTES_RECEIVED, byte_size(Data)),
+            ok = finish_async(StartTs),
+            {data, Data, done};
+        {data, Data, BackendState} ->
+            counters:add(counter(), ?C_BYTES_RECEIVED, byte_size(Data)),
+            {data, Data, {StartTs, BackendState}};
+        {done, _} = Done ->
+            ok = finish_async(StartTs),
+            Done
+    end.
+
+-spec cancel_async(async_req(), async_state()) -> ok.
+cancel_async(Req, {StartTs, BackendState}) ->
+    (backend()):cancel_async(Req, BackendState),
+    ok = finish_async(StartTs).
+
+finish_async(StartTs) ->
+    Ms = erlang:convert_time_unit(erlang:monotonic_time() - StartTs, native, millisecond),
+    rabbitmq_stream_s3_request_metrics:observe(read, Ms),
+    ok.
 
 observe(Kind, Fun) ->
     T0 = erlang:monotonic_time(),
