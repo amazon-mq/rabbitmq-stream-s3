@@ -305,11 +305,7 @@ handle_info(Msg, State) ->
     {noreply, State}.
 
 terminate(_Reason, #?MODULE{requests = Requests}) ->
-    _ = [
-        rabbitmq_stream_s3_api:cancel_async(RequestId, ReqState)
-     || RequestId := #request{state = ReqState} <- Requests
-    ],
-    counters:put(counter(), ?C_REQUESTS_IN_FLIGHT, 0),
+    cancel_requests(Requests),
     ok.
 
 format_status(#{state := #?MODULE{} = State} = Status0) ->
@@ -638,19 +634,39 @@ try_read(#?MODULE{end_pos = EndPos} = State, Offset, Bytes) when Offset + Bytes 
         #?MODULE{requests = Requests} when map_size(Requests) =/= 0 ->
             %% The current fragment's info is being requested. Wait for its arrival.
             {await, State};
-        #?MODULE{current_not_found = true} ->
-            %% TODO: fragment deletion. Skip ahead to the next fragment if the
-            %% stream still exists, or convert to a local reader if that has
-            %% older data than the remote tier. (Possible if retention
-            %% reclaims fragments but not the current segment.)
-            erlang:error(unimplemented);
+        #?MODULE{current_not_found = true, stream = StreamId, requests = Requests} ->
+            %% The current fragment was deleted by retention while being read.
+            %% Cancel all in-flight requests for the deleted fragment, then jump
+            %% to the oldest fragment still available in the remote tier.
+            cancel_requests(Requests),
+            {FirstOffset, _} = rabbitmq_stream_s3_server:get_range(StreamId),
+            Key = rabbitmq_stream_s3:fragment_key(StreamId, FirstOffset),
+            ?LOG_WARNING(
+                "Fragment ~20..0B was deleted by retention while being read. "
+                "Jumping to oldest available fragment ~20..0B",
+                [State#?MODULE.fragment, FirstOffset]
+            ),
+            NewState = State#?MODULE{
+                fragment = FirstOffset,
+                key = Key,
+                info = undefined,
+                buffer = <<>>,
+                start_pos = ?FRAGMENT_HEADER_B,
+                current_pos = ?FRAGMENT_HEADER_B,
+                end_pos = ?FRAGMENT_HEADER_B,
+                next = undefined,
+                requests = #{},
+                current_not_found = false
+            },
+            {next_fragment, NewState, FirstOffset};
         #?MODULE{read_size = ReadSize0} ->
             %% The chunk is larger than the read-ahead. Bump read_size to
-            %% cover the needed bytes so maybe_start_request issues a
-            %% sufficiently large request.
+            %% cover the needed bytes and call maybe_start_current_request
+            %% directly - bypassing the maybe_start_request guard that skips
+            %% current requests when the buffer already exceeds read_size.
             Needed = Offset + Bytes - EndPos,
             ReadSize = max(ReadSize0, Needed),
-            {await, State#?MODULE{read_size = ReadSize}}
+            {await, maybe_start_current_request(State#?MODULE{read_size = ReadSize})}
     end;
 try_read(
     #?MODULE{
@@ -703,6 +719,15 @@ goto_next_fragment(
         info = Info,
         next = undefined
     }.
+
+cancel_requests(Requests) ->
+    maps:foreach(
+        fun(RequestId, #request{state = ReqState}) ->
+            rabbitmq_stream_s3_api:cancel_async(RequestId, ReqState)
+        end,
+        Requests
+    ),
+    counters:put(counter(), ?C_REQUESTS_IN_FLIGHT, 0).
 
 format_state(#?MODULE{
     stream = StreamId,
