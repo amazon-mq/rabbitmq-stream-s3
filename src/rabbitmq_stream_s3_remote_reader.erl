@@ -30,6 +30,8 @@ multiplicative decrease ([AIMD]) algorithm.
 -define(HITS_TO_GROW, 8).
 %% Additive increase step size (1 MiB in bytes).
 -define(GROW_STEP, 1048576).
+-define(MIN_RETRY_DELAY_MS, 1_000).
+-define(MAX_RETRY_DELAY_MS, 30_000).
 
 -define(C_BUFFER_HIT, 1).
 -define(C_BUFFER_MISS, 2).
@@ -85,6 +87,9 @@ multiplicative decrease ([AIMD]) algorithm.
     read_size_max :: pos_integer(),
     %% Consecutive buffer hits since the last miss. Used for AIMD.
     hits_since_last_miss = 0 :: non_neg_integer(),
+    %% Current retry delay in milliseconds. Doubles on each retry, resets on
+    %% successful data arrival.
+    retry_delay = ?MIN_RETRY_DELAY_MS :: pos_integer(),
     reader_ref :: reference(),
 
     %% Current fragment state.
@@ -226,7 +231,7 @@ handle_cast(Message, State) ->
 
 handle_info({'DOWN', MRef, process, _Pid, _Reason}, #?MODULE{reader_ref = MRef} = State) ->
     {stop, normal, State};
-handle_info(Msg, #?MODULE{requests = Requests0} = State0) ->
+handle_info(Msg, #?MODULE{requests = Requests0, retry_delay = RetryDelay0} = State0) ->
     AsyncStates = #{Req => R#request.state || Req := R <- Requests0},
     case rabbitmq_stream_s3_api:match_async(Msg, AsyncStates) of
         {ok, RequestId} ->
@@ -244,7 +249,10 @@ handle_info(Msg, #?MODULE{requests = Requests0} = State0) ->
                             ReqState ->
                                 Requests0#{RequestId := Req0#request{state = ReqState}}
                         end,
-                    State1 = State0#?MODULE{requests = Requests},
+                    State1 = State0#?MODULE{
+                        requests = Requests,
+                        retry_delay = ?MIN_RETRY_DELAY_MS
+                    },
                     State2 = add_data(Data, Req0, State1),
                     State3 = maybe_start_request(State2),
                     maybe_reply_pending(State3);
@@ -262,16 +270,24 @@ handle_info(Msg, #?MODULE{requests = Requests0} = State0) ->
                     State1 = State0#?MODULE{requests = Requests},
                     case {Reason, Req0#request.fragment =:= State1#?MODULE.fragment} of
                         {not_found, true} ->
-                            maybe_reply_pending(State1#?MODULE{current_not_found = true});
+                            maybe_reply_pending(State1#?MODULE{
+                                current_not_found = true,
+                                retry_delay = ?MIN_RETRY_DELAY_MS
+                            });
                         {not_found, false} ->
-                            maybe_reply_pending(State1#?MODULE{next = not_found});
+                            maybe_reply_pending(State1#?MODULE{
+                                next = not_found,
+                                retry_delay = ?MIN_RETRY_DELAY_MS
+                            });
                         {slow_down, _} ->
-                            %% TODO: backoff delay
-                            State2 = maybe_start_request(State1),
+                            erlang:send_after(RetryDelay0, self(), retry_requests),
+                            RetryDelay = min(RetryDelay0 * 2, ?MAX_RETRY_DELAY_MS),
+                            State2 = State1#?MODULE{retry_delay = RetryDelay},
                             maybe_reply_pending(State2);
                         {internal_error, _} ->
-                            %% TODO: backoff delay
-                            State2 = maybe_start_request(State1),
+                            erlang:send_after(RetryDelay0, self(), retry_requests),
+                            RetryDelay = min(RetryDelay0 * 2, ?MAX_RETRY_DELAY_MS),
+                            State2 = State1#?MODULE{retry_delay = RetryDelay},
                             maybe_reply_pending(State2);
                         _ ->
                             {stop, {shutdown, Reason}, State1}
@@ -281,6 +297,9 @@ handle_info(Msg, #?MODULE{requests = Requests0} = State0) ->
             ?LOG_DEBUG(?MODULE_STRING " received unexpected message: ~W", [Msg, 10]),
             {noreply, State0}
     end;
+handle_info(retry_requests, State0) ->
+    State = maybe_start_request(State0),
+    maybe_reply_pending(State);
 handle_info(Msg, State) ->
     ?LOG_DEBUG(?MODULE_STRING " received unexpected message: ~W", [Msg, 10]),
     {noreply, State}.
