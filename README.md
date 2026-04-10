@@ -63,8 +63,8 @@ The minimum required configuration is:
 stream.log_reader = rabbitmq_stream_s3_log_reader
 stream.log_manifest = rabbitmq_stream_s3_log_manifest
 
-s3.bucket = my-rabbitmq-streams-bucket
-s3.region = us-east-1
+stream_s3.bucket = my-rabbitmq-streams-bucket
+stream_s3.region = us-east-1
 ```
 
 ## Security
