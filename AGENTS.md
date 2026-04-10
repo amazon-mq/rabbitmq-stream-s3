@@ -31,15 +31,20 @@ Read the relevant doc before modifying any module.
 | `rabbitmq_stream_s3.erl` | Utility functions: key construction, index file helpers |
 | `rabbitmq_stream_s3_api.erl` | Storage backend behaviour (callbacks for get, put, delete) |
 | `rabbitmq_stream_s3_api_aws.erl` | AWS S3 backend implementation (production) |
+| `rabbitmq_stream_s3_api_aws_pool.erl` | Connection pool for S3 HTTP connections; separate pools for reads and writes avoid reader starvation |
 | `rabbitmq_stream_s3_api_fs.erl` | Filesystem backend implementation (tests) |
 | `rabbitmq_stream_s3_app.erl` | OTP application module |
 | `rabbitmq_stream_s3_array.erl` | Binary array operations (at, slice, partition_point, etc.) |
 | `rabbitmq_stream_s3_db.erl` | Khepri interactions: stream ID storage, triggers, keep-while conditions |
 | `rabbitmq_stream_s3_log_manifest.erl` | `osiris_log_manifest` behaviour: local tier interface, fragment recovery on boot |
 | `rabbitmq_stream_s3_log_reader.erl` | `osiris_log_reader` behaviour: reads from local or remote tier |
+| `rabbitmq_stream_s3_machine.erl` | Manifest state machine: fragment tracking, retention, groups |
+| `rabbitmq_stream_s3_membership_reconciliation.erl` | `gen_server` implementing Continuous Membership Reconciliation (CMR) for streams |
+| `rabbitmq_stream_s3_membership_reconciliation_events.erl` | `gen_event` handler that notifies the CMR server when membership should be evaluated |
+| `rabbitmq_stream_s3_prometheus_collector.erl` | Prometheus metrics collector; implements the `prometheus_collector` behaviour |
 | `rabbitmq_stream_s3_remote_reader.erl` | `gen_server` that pre-fetches and buffers data from the remote tier for a single consumer |
 | `rabbitmq_stream_s3_remote_reader_sup.erl` | Supervisor for remote reader `gen_server` processes |
-| `rabbitmq_stream_s3_machine.erl` | Manifest state machine: fragment tracking, retention, groups |
+| `rabbitmq_stream_s3_request_metrics.erl` | Tracks S3 request duration as a histogram (set of per-bucket counters) |
 | `rabbitmq_stream_s3_server.erl` | `gen_server` coordinating uploads, deletions, manifest updates |
 | `rabbitmq_stream_s3_sup.erl` | Top-level supervisor |
 
@@ -60,6 +65,8 @@ constants (`?INDEX_RECORD_SIZE_B`, `?CHUNK_HEADER_B`, `?MAX_FRAGMENT_SIZE_B`).
 
 | Suite | What it tests |
 |-------|---------------|
+| `config_schema_SUITE.erl` | Configuration schema snippets from `docs/configuration.md` |
+| `membership_reconciliation_SUITE.erl` | Continuous Membership Reconciliation behaviour |
 | `unit_SUITE.erl` | Property-based tests for `_array`, `find_fragment`, `find_index_position` |
 | `s3_streams_SUITE.erl` | Integration tests: publish, read from remote tier by offset and timestamp |
 | `rabbitmq_stream_s3_machine_SUITE.erl` | State machine transitions |
@@ -125,5 +132,11 @@ The backend is configured via application environment, not `rabbitmq.conf`.
   `init_local_reader` which returns `{ok, Reader}`
 - The `rabbitmq_stream_s3_server` public API (`get_manifest/1`, `get_range/1`)
   uses the stream ID, not the user-visible queue name
+- `maybe_start_request/1` in `rabbitmq_stream_s3_remote_reader` has a guard
+  `when EndPos - CurrentPos > ReadSize` that skips `maybe_start_current_request`
+  and calls only `maybe_start_next_request`. After the initial fetch this guard
+  is always true, so calling `maybe_start_request` when the buffer is exhausted
+  leaves the reader in `await` indefinitely. Call `maybe_start_current_request`
+  directly in that case
 - Index records are 29 bytes (`?INDEX_RECORD_SIZE_B`):
   `<<ChunkId:64, Timestamp:64, Epoch:64, FilePos:32, ChunkType:8>>`
