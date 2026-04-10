@@ -60,11 +60,11 @@ See [docs/configuration.md](docs/configuration.md) for all configuration options
 The minimum required configuration is:
 
 ```
-streams.log_reader = rabbitmq_stream_s3_log_reader
-streams.log_manifest = rabbitmq_stream_s3_log_manifest
+stream.log_reader = rabbitmq_stream_s3_log_reader
+stream.log_manifest = rabbitmq_stream_s3_log_manifest
 
-s3.bucket = my-rabbitmq-streams-bucket
-s3.region = us-east-1
+stream_s3.bucket = my-rabbitmq-streams-bucket
+stream_s3.region = us-east-1
 ```
 
 ## Security
