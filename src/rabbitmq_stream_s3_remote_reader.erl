@@ -639,26 +639,30 @@ try_read(#?MODULE{end_pos = EndPos} = State, Offset, Bytes) when Offset + Bytes 
             %% Cancel all in-flight requests for the deleted fragment, then jump
             %% to the oldest fragment still available in the remote tier.
             cancel_requests(Requests),
-            {FirstOffset, _} = rabbitmq_stream_s3_server:get_range(StreamId),
-            Key = rabbitmq_stream_s3:fragment_key(StreamId, FirstOffset),
-            ?LOG_WARNING(
-                "Fragment ~20..0B was deleted by retention while being read. "
-                "Jumping to oldest available fragment ~20..0B",
-                [State#?MODULE.fragment, FirstOffset]
-            ),
-            NewState = State#?MODULE{
-                fragment = FirstOffset,
-                key = Key,
-                info = undefined,
-                buffer = <<>>,
-                start_pos = ?FRAGMENT_HEADER_B,
-                current_pos = ?FRAGMENT_HEADER_B,
-                end_pos = ?FRAGMENT_HEADER_B,
-                next = undefined,
-                requests = #{},
-                current_not_found = false
-            },
-            {next_fragment, NewState, FirstOffset};
+            case rabbitmq_stream_s3_server:get_range(StreamId) of
+                empty ->
+                    {end_of_stream, State#?MODULE{requests = #{}}};
+                {FirstOffset, _} ->
+                    Key = rabbitmq_stream_s3:fragment_key(StreamId, FirstOffset),
+                    ?LOG_WARNING(
+                        "Fragment ~20..0B was deleted by retention while being read. "
+                        "Jumping to oldest available fragment ~20..0B",
+                        [State#?MODULE.fragment, FirstOffset]
+                    ),
+                    NewState = State#?MODULE{
+                        fragment = FirstOffset,
+                        key = Key,
+                        info = undefined,
+                        buffer = <<>>,
+                        start_pos = ?FRAGMENT_HEADER_B,
+                        current_pos = ?FRAGMENT_HEADER_B,
+                        end_pos = ?FRAGMENT_HEADER_B,
+                        next = undefined,
+                        requests = #{},
+                        current_not_found = false
+                    },
+                    {next_fragment, NewState, FirstOffset}
+            end;
         #?MODULE{read_size = ReadSize0} ->
             %% The chunk is larger than the read-ahead. Bump read_size to
             %% cover the needed bytes and call maybe_start_current_request
