@@ -5,8 +5,8 @@
 Add the following to `rabbitmq.conf` to route stream reads and writes through the plugin:
 
 ```ini
-streams.log_reader = rabbitmq_stream_s3_log_reader
-streams.log_manifest = rabbitmq_stream_s3_log_manifest
+stream.log_reader = rabbitmq_stream_s3_log_reader
+stream.log_manifest = rabbitmq_stream_s3_log_manifest
 ```
 
 ## S3 settings
