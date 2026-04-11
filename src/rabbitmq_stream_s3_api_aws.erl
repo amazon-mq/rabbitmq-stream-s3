@@ -30,7 +30,7 @@ A wrapper around the AWS S3 HTTP API.
 -export([get_credentials/0, get_credentials/2]).
 
 %% For the pool. Not to be called by anyone else.
--export([open/0]).
+-export([hostname/0]).
 
 -define(ALGORITHM, "AWS4-HMAC-SHA256").
 -define(ISOFORMAT_BASIC, "~4.10.0b~2.10.0b~2.10.0bT~2.10.0b~2.10.0b~2.10.0bZ").
@@ -141,19 +141,6 @@ reload_config() ->
             ok
     end,
     ok.
-
--doc """
-Opens a connection to S3 in the configured region.
-""".
--spec open() -> {ok, pid()} | {error, any()}.
-open() ->
-    %% NOTE: unfortunately, `inet:hostname()` is a string not a binary.
-    Host = binary_to_list(hostname()),
-    %% NOTE: AWS S3 only supports HTTP/1.1 but other providers like Google Cloud
-    %% support HTTP/2 (from what I heard). TODO: Evaluate HTTP/2 on other
-    %% providers. Maybe just pin to HTTP/1.1.
-    Opts = #{transport => tls, protocols => [http2, http]},
-    gun:open(Host, 443, Opts).
 
 -doc "Gets the body of an object at key `Key`".
 -spec get(key(), request_opts()) -> {ok, binary()} | {error, any()}.

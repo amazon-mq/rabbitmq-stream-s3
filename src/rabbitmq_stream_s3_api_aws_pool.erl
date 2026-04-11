@@ -313,7 +313,7 @@ grow(
 grow(0, State) ->
     State;
 grow(N, #?MODULE{monitors = Monitors0} = State0) ->
-    case rabbitmq_stream_s3_api_aws:open() of
+    case open() of
         {ok, Conn} ->
             State = State0#?MODULE{monitors = Monitors0#{Conn => erlang:monitor(process, Conn)}},
             grow(N - 1, State);
@@ -322,6 +322,30 @@ grow(N, #?MODULE{monitors = Monitors0} = State0) ->
             erlang:send_after(1_000, self(), grow),
             State0
     end.
+
+-doc """
+Opens a connection to S3 in the configured region.
+""".
+-spec open() -> {ok, pid()} | {error, any()}.
+open() ->
+    %% NOTE: unfortunately, `inet:hostname()` is a string not a binary.
+    Host = binary_to_list(rabbitmq_stream_s3_api_aws:hostname()),
+    Opts = #{
+        transport => tls,
+        %% AWS S3 only supports HTTP/1.1.
+        protocols => [http],
+        tls_opts => [
+            {hibernate_after, 5000},
+            %% Connections are mostly data pipes for large refc binaries.
+            %% Full sweeps are nearly free since the process's heap doesn't
+            %% contain much, and the immediate cleanup of dead refc binary
+            %% references lets the binary allocator free promptly rather than
+            %% holding until the nth minor GC triggers a full sweep.
+            {receiver_spawn_opts, [{fullsweep_after, 0}]},
+            {sender_spawn_opts, [{fullsweep_after, 0}]}
+        ]
+    },
+    gun:open(Host, 443, Opts).
 
 checkout(
     #?MODULE{
