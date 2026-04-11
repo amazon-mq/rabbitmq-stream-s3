@@ -18,6 +18,9 @@ the reader pool avoids reader starvation.
 
 -behaviour(gen_server).
 
+%% Reap proactively before S3 closes an idle connection from under us.
+-define(IDLE_TIMEOUT_MS, 10_000).
+
 -record(pending, {
     from :: gen_server:from(),
     checkout :: checkout(),
@@ -42,7 +45,9 @@ the reader pool avoids reader starvation.
     %% Same as above but reversed.
     checkouts_rev = #{} :: #{MRef :: reference() => conn()},
     %% A queue of requests to check out a connection.
-    pending = queue:new() :: queue:queue(#pending{})
+    pending = queue:new() :: queue:queue(#pending{}),
+    %% Idle timers for available connections.
+    idle_timers = #{} :: #{conn() => reference()}
 }).
 
 %% Gun connection pid.
@@ -141,7 +146,7 @@ handle_call(
                 checkouts = Checkouts0#{Conn => MRef},
                 checkouts_rev = CheckoutsRev0#{MRef => Conn}
             },
-            {reply, Conn, State};
+            {reply, Conn, cancel_idle_timer(Conn, State)};
         [] ->
             P = #pending{from = From, checkout = Checkout, mref = MRef},
             State1 = State0#?MODULE{pending = queue:in(P, Pending0)},
@@ -154,7 +159,6 @@ handle_call(Request, From, State) ->
 handle_cast(
     {checkin, Conn},
     #?MODULE{
-        available = Available0,
         checkouts = Checkouts0,
         checkouts_rev = CheckoutsRev0,
         monitors = Monitors
@@ -169,9 +173,9 @@ handle_cast(
             },
             case Monitors of
                 #{Conn := _} ->
-                    %% Connection is still alive and should be able to be reused.
-                    State2 = State1#?MODULE{available = [Conn | Available0]},
-                    {noreply, checkout(State2)};
+                    %% Connection is still alive as far as we know, and should
+                    %% be reused.
+                    {noreply, make_available(Conn, State1)};
                 _ ->
                     {noreply, State1}
             end;
@@ -200,15 +204,11 @@ handle_info(grow, State0) ->
     {noreply, grow(State0)};
 handle_info(
     {gun_up, Conn, _Protocol},
-    #?MODULE{
-        available = Available0,
-        monitors = Monitors
-    } = State0
+    #?MODULE{monitors = Monitors} = State0
 ) ->
     %% `gun_up` messages cannot arrive from connections not opened by this pool.
     ?assert(is_map_key(Conn, Monitors)),
-    State1 = State0#?MODULE{available = [Conn | Available0]},
-    {noreply, checkout(State1)};
+    {noreply, make_available(Conn, State0)};
 handle_info({gun_down, _Conn, _Protocol, _Reason, _KilledStreams}, #?MODULE{} = State) ->
     %% With retry=>0, gun sends this message before stopping the connection
     %% process. We'll do the necessary cleanup in the 'DOWN' handler instead.
@@ -216,7 +216,6 @@ handle_info({gun_down, _Conn, _Protocol, _Reason, _KilledStreams}, #?MODULE{} = 
 handle_info(
     {'DOWN', MRef, process, Pid, _Reason},
     #?MODULE{
-        available = Available0,
         checkouts = Checkouts0,
         checkouts_rev = CheckoutsRev0,
         monitors = Monitors0,
@@ -236,11 +235,10 @@ handle_info(
                     %% A caller process is down which has a conn checked out.
                     %% Return the conn.
                     State1 = State0#?MODULE{
-                        available = [Conn | Available0],
                         checkouts = maps:remove(Conn, Checkouts0),
                         checkouts_rev = maps:remove(MRef, CheckoutsRev0)
                     },
-                    {noreply, checkout(State1)};
+                    {noreply, make_available(Conn, State1)};
                 _ ->
                     %% A pending caller process is down. Remove it from the
                     %% pending queue.
@@ -250,6 +248,25 @@ handle_info(
                     State = State0#?MODULE{pending = Pending},
                     {noreply, State}
             end
+    end;
+handle_info({idle_timeout, Conn}, #?MODULE{idle_timers = Timers, monitors = Monitors} = State0) ->
+    case Timers of
+        #{Conn := _} ->
+            %% Timer is still active (wasn't cancelled by a checkout), so the
+            %% connection has been idle too long. Close it.
+            State1 = State0#?MODULE{idle_timers = maps:remove(Conn, Timers)},
+            State2 = cancel(Conn, State1),
+            case Monitors of
+                #{Conn := ConnMRef} ->
+                    erlang:demonitor(ConnMRef, [flush]),
+                    gun:close(Conn),
+                    {noreply, State2#?MODULE{monitors = maps:remove(Conn, Monitors)}};
+                _ ->
+                    {noreply, State2}
+            end;
+        _ ->
+            %% Timer was already cancelled (stale message). Ignore.
+            {noreply, State0}
     end;
 handle_info(Message, State) ->
     ?LOG_DEBUG(
@@ -312,7 +329,6 @@ open() ->
         %% AWS S3 only supports HTTP/1.1.
         protocols => [http],
         tls_opts => [
-            {hibernate_after, 5000},
             %% Connections are mostly data pipes for large refc binaries.
             %% Full sweeps are nearly free since the process's heap doesn't
             %% contain much, and the immediate cleanup of dead refc binary
@@ -340,12 +356,12 @@ checkout(
     case {queue:out(Pending0), Available0} of
         {{{value, #pending{from = From, mref = MRef}}, Pending}, [Conn | Available]} ->
             gen_server:reply(From, Conn),
-            State1 = State0#?MODULE{
+            State1 = cancel_idle_timer(Conn, State0#?MODULE{
                 pending = Pending,
                 available = Available,
                 checkouts = Checkouts0#{Conn => MRef},
                 checkouts_rev = CheckoutsRev0#{MRef => Conn}
-            },
+            }),
             checkout(State1);
         _ ->
             State0
@@ -369,13 +385,27 @@ cancel(
         _ ->
             case lists:member(Conn, Available0) of
                 true ->
-                    State0#?MODULE{available = lists:delete(Conn, Available0)};
+                    State1 = State0#?MODULE{available = lists:delete(Conn, Available0)},
+                    cancel_idle_timer(Conn, State1);
                 false ->
-                    %% The conn could be spawned but never sent a
-                    %% gun_up, so it might not be checked out or
-                    %% available.
                     State0
             end
+    end.
+
+make_available(Conn, #?MODULE{available = Available, idle_timers = Timers} = State) ->
+    TRef = erlang:send_after(?IDLE_TIMEOUT_MS, self(), {idle_timeout, Conn}),
+    checkout(State#?MODULE{
+        available = [Conn | Available],
+        idle_timers = Timers#{Conn => TRef}
+    }).
+
+cancel_idle_timer(Conn, #?MODULE{idle_timers = Timers0} = State) ->
+    case Timers0 of
+        #{Conn := TRef} ->
+            ok = erlang:cancel_timer(TRef, [{async, true}, {info, false}]),
+            State#?MODULE{idle_timers = maps:remove(Conn, Timers0)};
+        _ ->
+            State
     end.
 
 format_state(#?MODULE{
