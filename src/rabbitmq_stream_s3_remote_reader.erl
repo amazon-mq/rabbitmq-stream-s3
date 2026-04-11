@@ -41,6 +41,7 @@ multiplicative decrease ([AIMD]) algorithm.
 -define(C_AWAIT, 6).
 -define(C_READ_DURATION_MS, 7).
 -define(C_READ, 8).
+-define(C_TOTAL_REQUESTS, 9).
 -define(COUNTERS, [
     {buffer_hit, ?C_BUFFER_HIT, counter, "Number of reads served from the buffer"},
     {buffer_miss, ?C_BUFFER_MISS, counter, "Number of reads that had to await async data"},
@@ -51,7 +52,8 @@ multiplicative decrease ([AIMD]) algorithm.
         "Total milliseconds spent awaiting async data"},
     {await, ?C_AWAIT, counter, "Number of awaits"},
     {read_duration_ms, ?C_READ_DURATION_MS, counter, "Total milliseconds spent in read calls"},
-    {read, ?C_READ, counter, "Number of read/4,5 calls"}
+    {read, ?C_READ, counter, "Number of read/4,5 calls"},
+    {remote_reader_total_requests, ?C_TOTAL_REQUESTS, counter, "Number of S3 requests initiated"}
 ]).
 
 %% API
@@ -352,6 +354,7 @@ maybe_start_current_request(
             {ok, RequestId, AsyncState} = rabbitmq_stream_s3_api:get_range_async(CurrentKey, Range),
             Request = #request{fragment = Fragment, range = Range, state = AsyncState},
             counters:add(counter(), ?C_REQUESTS_IN_FLIGHT, 1),
+            counters:add(counter(), ?C_TOTAL_REQUESTS, 1),
             State0#?MODULE{requests = Requests0#{RequestId => Request}}
     end;
 maybe_start_current_request(
@@ -374,6 +377,7 @@ maybe_start_current_request(
             {ok, RequestId, AsyncState} = rabbitmq_stream_s3_api:get_range_async(CurrentKey, Range),
             Request = #request{fragment = Fragment, range = Range, state = AsyncState},
             counters:add(counter(), ?C_REQUESTS_IN_FLIGHT, 1),
+            counters:add(counter(), ?C_TOTAL_REQUESTS, 1),
             State0#?MODULE{requests = Requests0#{RequestId => Request}}
     end;
 maybe_start_current_request(State) ->
@@ -398,6 +402,7 @@ maybe_start_next_request(
             {ok, RequestId, AsyncState} = rabbitmq_stream_s3_api:get_range_async(Key, Range),
             Request = #request{fragment = NextOffset, range = Range, state = AsyncState},
             counters:add(counter(), ?C_REQUESTS_IN_FLIGHT, 1),
+            counters:add(counter(), ?C_TOTAL_REQUESTS, 1),
             State0#?MODULE{requests = Requests0#{RequestId => Request}}
     end;
 maybe_start_next_request(State) ->
