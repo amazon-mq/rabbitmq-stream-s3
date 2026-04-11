@@ -4519,7 +4519,7 @@
             "lineWidth": 1,
             "pointSize": 5,
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "none"
             },
@@ -4708,7 +4708,7 @@
       },
       "targets": [
         {
-          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_fragment_transition[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_fragment_transition[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"}) > 0",
           "legendFormat": "{{rabbitmq_node}}",
           "refId": "A"
         }
