@@ -523,6 +523,20 @@ request(Method, Path, Headers0, Body, Opts) when
     end.
 
 request0(Method, Path, Headers, Body, Opts) ->
+    request0(Method, Path, Headers, Body, Opts, 2).
+
+request0(Method, Path, Headers, Body, Opts, 0) ->
+    request1(Method, Path, Headers, Body, Opts);
+request0(Method, Path, Headers, Body, Opts, Retries) ->
+    case request1(Method, Path, Headers, Body, Opts) of
+        {error, {down, normal}} ->
+            %% Retry if we get a connection that closes upon request.
+            request0(Method, Path, Headers, Body, Opts, Retries - 1);
+        Other ->
+            Other
+    end.
+
+request1(Method, Path, Headers, Body, Opts) ->
     Pool =
         case Method of
             <<"PUT">> -> ?UPLOAD_POOL;

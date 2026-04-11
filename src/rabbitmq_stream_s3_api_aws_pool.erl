@@ -27,13 +27,11 @@ the reader pool avoids reader starvation.
 -record(?MODULE, {
     min_size :: non_neg_integer(),
     max_size :: pos_integer(),
-    %% A queue of connections which are available to be checked out of the
-    %% pool. IDEA: consider LIFO ordering instead. More recently used connections
-    %% might be 'hotter'.
-    available = queue:new() :: queue:queue(conn()),
-    %% Number of conns in the `available` queue. This value is cached here
-    %% since `queue:len/1` takes linear time.
-    num_available = 0 :: non_neg_integer(),
+    %% A stack of connections which are available to be checked out of the
+    %% pool. This is a stack rather than a queue so that the most recently used
+    %% connection (which is most 'hot' and least likely to be closed because of
+    %% idleness) is prioritized for a checkout.
+    available = [] :: [conn()],
     %% Monitors on all connections whether they are available, checked out,
     %% or down.
     monitors = #{} :: #{conn() => MRef :: reference()},
@@ -133,22 +131,20 @@ handle_call(
     #?MODULE{
         pending = Pending0,
         available = Available0,
-        num_available = NumAvailable0,
         checkouts = Checkouts0,
         checkouts_rev = CheckoutsRev0
     } = State0
 ) ->
     MRef = erlang:monitor(process, Pid),
-    case queue:out(Available0) of
-        {{value, Conn}, Available} ->
+    case Available0 of
+        [Conn | Available] ->
             State = State0#?MODULE{
                 available = Available,
-                num_available = NumAvailable0 - 1,
                 checkouts = Checkouts0#{Conn => MRef},
                 checkouts_rev = CheckoutsRev0#{MRef => Conn}
             },
             {reply, Conn, State};
-        {empty, _Available0} ->
+        [] ->
             P = #pending{from = From, checkout = Checkout, mref = MRef},
             State1 = State0#?MODULE{pending = queue:in(P, Pending0)},
             {noreply, grow(State1)}
@@ -161,7 +157,6 @@ handle_cast(
     {checkin, Conn},
     #?MODULE{
         available = Available0,
-        num_available = NumAvailable0,
         checkouts = Checkouts0,
         checkouts_rev = CheckoutsRev0,
         down = Down
@@ -179,10 +174,7 @@ handle_cast(
                     %% Connection is reconnecting. Don't return to available.
                     {noreply, State1};
                 _ ->
-                    State2 = State1#?MODULE{
-                        available = queue:in(Conn, Available0),
-                        num_available = NumAvailable0 + 1
-                    },
+                    State2 = State1#?MODULE{available = [Conn | Available0]},
                     {noreply, checkout(State2)}
             end;
         _ ->
@@ -212,7 +204,6 @@ handle_info(
     {gun_up, Conn, _Protocol},
     #?MODULE{
         available = Available0,
-        num_available = NumAvailable0,
         monitors = Monitors,
         down = Down0
     } = State0
@@ -220,8 +211,7 @@ handle_info(
     %% `gun_up` messages cannot arrive from connections not opened by this pool.
     ?assert(is_map_key(Conn, Monitors)),
     State1 = State0#?MODULE{
-        available = queue:in(Conn, Available0),
-        num_available = NumAvailable0 + 1,
+        available = [Conn | Available0],
         down = maps:remove(Conn, Down0)
     },
     {noreply, checkout(State1)};
@@ -234,7 +224,6 @@ handle_info(
     {'DOWN', MRef, process, Pid, _Reason},
     #?MODULE{
         available = Available0,
-        num_available = NumAvailable0,
         checkouts = Checkouts0,
         checkouts_rev = CheckoutsRev0,
         monitors = Monitors0,
@@ -258,8 +247,7 @@ handle_info(
                     %% A caller process is down which has a conn checked out.
                     %% Return the conn.
                     State1 = State0#?MODULE{
-                        available = queue:in(Conn, Available0),
-                        num_available = NumAvailable0 + 1,
+                        available = [Conn | Available0],
                         checkouts = maps:remove(Conn, Checkouts0),
                         checkouts_rev = maps:remove(MRef, CheckoutsRev0)
                     },
@@ -297,14 +285,14 @@ grow(
     #?MODULE{
         min_size = MinSize,
         max_size = MaxSize,
-        num_available = NumAvailable,
+        available = Available,
         checkouts = Checkouts,
         pending = Pending,
         monitors = Monitors0
     } = State0
 ) ->
     Count = map_size(Monitors0),
-    InFlight = Count - NumAvailable - map_size(Checkouts),
+    InFlight = Count - length(Available) - map_size(Checkouts),
     Demand = queue:len(Pending) - InFlight,
     Target = max(MinSize - Count, max(Demand, 0)),
     N = min(Target, MaxSize - Count),
@@ -351,18 +339,16 @@ checkout(
     #?MODULE{
         pending = Pending0,
         available = Available0,
-        num_available = NumAvailable0,
         checkouts = Checkouts0,
         checkouts_rev = CheckoutsRev0
     } = State0
 ) ->
-    case {queue:out(Pending0), queue:out(Available0)} of
-        {{{value, #pending{from = From, mref = MRef}}, Pending}, {{value, Conn}, Available}} ->
+    case {queue:out(Pending0), Available0} of
+        {{{value, #pending{from = From, mref = MRef}}, Pending}, [Conn | Available]} ->
             gen_server:reply(From, Conn),
             State1 = State0#?MODULE{
                 pending = Pending,
                 available = Available,
-                num_available = NumAvailable0 - 1,
                 checkouts = Checkouts0#{Conn => MRef},
                 checkouts_rev = CheckoutsRev0#{MRef => Conn}
             },
@@ -375,7 +361,6 @@ cancel(
     Conn,
     #?MODULE{
         available = Available0,
-        num_available = NumAvailable0,
         checkouts = Checkouts0,
         checkouts_rev = CheckoutsRev0
     } = State0
@@ -388,12 +373,9 @@ cancel(
                 checkouts_rev = maps:remove(CallerMRef, CheckoutsRev0)
             };
         _ ->
-            case queue:member(Conn, Available0) of
+            case lists:member(Conn, Available0) of
                 true ->
-                    State0#?MODULE{
-                        available = queue:delete(Conn, Available0),
-                        num_available = NumAvailable0 - 1
-                    };
+                    State0#?MODULE{available = lists:delete(Conn, Available0)};
                 false ->
                     %% The conn could be spawned but never sent a
                     %% gun_up, so it might not be checked out or
@@ -405,7 +387,7 @@ cancel(
 format_state(#?MODULE{
     min_size = MinSize,
     max_size = MaxSize,
-    num_available = NumAvailable,
+    available = Available,
     monitors = Monitors,
     checkouts = Checkouts,
     pending = Pending
@@ -413,7 +395,7 @@ format_state(#?MODULE{
     #{
         min_size => MinSize,
         max_size => MaxSize,
-        available => NumAvailable,
+        available => length(Available),
         monitors => map_size(Monitors),
         checkouts => map_size(Checkouts),
         pending => queue:len(Pending)
