@@ -42,9 +42,7 @@ the reader pool avoids reader starvation.
     %% Same as above but reversed.
     checkouts_rev = #{} :: #{MRef :: reference() => conn()},
     %% A queue of requests to check out a connection.
-    pending = queue:new() :: queue:queue(#pending{}),
-    %% Connections that received gun_down but not yet gun_up.
-    down = #{} :: #{conn() => true}
+    pending = queue:new() :: queue:queue(#pending{})
 }).
 
 %% Gun connection pid.
@@ -159,7 +157,7 @@ handle_cast(
         available = Available0,
         checkouts = Checkouts0,
         checkouts_rev = CheckoutsRev0,
-        down = Down
+        monitors = Monitors
     } = State0
 ) ->
     case Checkouts0 of
@@ -169,13 +167,13 @@ handle_cast(
                 checkouts = maps:remove(Conn, Checkouts0),
                 checkouts_rev = maps:remove(MRef, CheckoutsRev0)
             },
-            case Down of
+            case Monitors of
                 #{Conn := _} ->
-                    %% Connection is reconnecting. Don't return to available.
-                    {noreply, State1};
-                _ ->
+                    %% Connection is still alive and should be able to be reused.
                     State2 = State1#?MODULE{available = [Conn | Available0]},
-                    {noreply, checkout(State2)}
+                    {noreply, checkout(State2)};
+                _ ->
+                    {noreply, State1}
             end;
         _ ->
             {noreply, State0}
@@ -204,22 +202,17 @@ handle_info(
     {gun_up, Conn, _Protocol},
     #?MODULE{
         available = Available0,
-        monitors = Monitors,
-        down = Down0
+        monitors = Monitors
     } = State0
 ) ->
     %% `gun_up` messages cannot arrive from connections not opened by this pool.
     ?assert(is_map_key(Conn, Monitors)),
-    State1 = State0#?MODULE{
-        available = [Conn | Available0],
-        down = maps:remove(Conn, Down0)
-    },
+    State1 = State0#?MODULE{available = [Conn | Available0]},
     {noreply, checkout(State1)};
-handle_info({gun_down, Conn, _Protocol, _Reason, _KilledStreams}, #?MODULE{down = Down0} = State0) ->
-    %% The connection is down. Gun automatically attempts re-connection so
-    %% remove it from available or checkouts until it comes back up.
-    State1 = State0#?MODULE{down = Down0#{Conn => true}},
-    {noreply, cancel(Conn, State1)};
+handle_info({gun_down, _Conn, _Protocol, _Reason, _KilledStreams}, #?MODULE{} = State) ->
+    %% With retry=>0, gun sends this message before stopping the connection
+    %% process. We'll do the necessary cleanup in the 'DOWN' handler instead.
+    {noreply, State};
 handle_info(
     {'DOWN', MRef, process, Pid, _Reason},
     #?MODULE{
@@ -227,18 +220,14 @@ handle_info(
         checkouts = Checkouts0,
         checkouts_rev = CheckoutsRev0,
         monitors = Monitors0,
-        pending = Pending0,
-        down = Down0
+        pending = Pending0
     } = State0
 ) ->
     case Monitors0 of
         #{Pid := MRef} ->
-            %% A connection is down. Forget it and grow a new one.
+            %% A connection is down. Forget it and maybe grow a new one.
             Conn = Pid,
-            State1 = State0#?MODULE{
-                monitors = maps:remove(Conn, Monitors0),
-                down = maps:remove(Conn, Down0)
-            },
+            State1 = State0#?MODULE{monitors = maps:remove(Conn, Monitors0)},
             State2 = cancel(Pid, State1),
             {noreply, grow(State2)};
         _ ->
@@ -331,7 +320,12 @@ open() ->
             %% holding until the nth minor GC triggers a full sweep.
             {receiver_spawn_opts, [{fullsweep_after, 0}]},
             {sender_spawn_opts, [{fullsweep_after, 0}]}
-        ]
+        ],
+        %% Let connections which were closed from idleness (or errors) close
+        %% and be reopened lazily. With TLSv1.3 it only costs one round trip.
+        %% This pool optimizes for best resource use rather than consistently
+        %% low latency. (A fully idle broker should have a min-sized pool.)
+        retry => 0
     },
     gun:open(Host, 443, Opts).
 
