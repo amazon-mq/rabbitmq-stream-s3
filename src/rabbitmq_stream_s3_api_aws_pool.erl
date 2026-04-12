@@ -210,8 +210,9 @@ handle_info(
     ?assert(is_map_key(Conn, Monitors)),
     {noreply, make_available(Conn, State0)};
 handle_info({gun_down, _Conn, _Protocol, _Reason, _KilledStreams}, #?MODULE{} = State) ->
-    %% With retry=>0, gun sends this message before stopping the connection
-    %% process. We'll do the necessary cleanup in the 'DOWN' handler instead.
+    %% With retry=>0, gun stops the connection process immediately after sending
+    %% this message (with reason 'normal' for a clean close, or
+    %% '{shutdown, Reason}' otherwise). The 'DOWN' handler does all cleanup.
     {noreply, State};
 handle_info(
     {'DOWN', MRef, process, Pid, _Reason},
