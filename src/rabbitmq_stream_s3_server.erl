@@ -338,23 +338,30 @@ handle_info(
             erlang:send_after(DelayMs, self(), #retry_task{task = TaskRef}),
             DelayedTasks = DelayedTasks0#{TaskRef => Task},
             %% TODO: move all application:get_env calls to rabbitmq_stream_s3_config.
-            Depth =
-                case application:get_env(rabbitmq_stream_s3, verbose_logging, false) of
-                    true -> unlimited;
-                    false -> 5
-                end,
-            %% ~0P prints a term to a given depth, consuming the depth as the
-            %% next argument; `unlimited` removes the depth limit.
-            %% See https://www.erlang.org/doc/apps/stdlib/io.html#fwrite/3
-            ?LOG_INFO("Task ~0P (~p) down (~b other outstanding), retrying in ~bms. Reason: ~0P", [
-                Task0,
-                Depth,
-                Pid,
-                map_size(Tasks),
-                DelayMs,
-                Reason,
-                Depth
-            ]),
+            case application:get_env(rabbitmq_stream_s3, verbose_logging, false) of
+                true ->
+                    ?LOG_INFO(
+                        "Task ~p (~p) down (~b other outstanding), retrying in ~bms. Reason: ~p", [
+                            Task0,
+                            Pid,
+                            map_size(Tasks),
+                            DelayMs,
+                            Reason
+                        ]
+                    );
+                false ->
+                    ?LOG_INFO(
+                        "Task ~P (~p) down (~b other outstanding), retrying in ~bms. Reason: ~P", [
+                            Task0,
+                            5,
+                            Pid,
+                            map_size(Tasks),
+                            DelayMs,
+                            Reason,
+                            5
+                        ]
+                    )
+            end,
             State = State0#?MODULE{
                 tasks = Tasks,
                 delayed_tasks = DelayedTasks
