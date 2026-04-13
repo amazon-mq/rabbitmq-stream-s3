@@ -18,6 +18,9 @@ associated file in that folder.
     get_range/3,
     get_range_async/3,
     put/3,
+    stream_put/3,
+    stream_data/2,
+    stream_finish/2,
     delete/2,
     delete_prefix/2,
     match_async/2,
@@ -33,7 +36,7 @@ associated file in that folder.
 ]).
 
 -type async_req() :: reference().
--type async_state() :: undefined.
+-type async_state() :: term().
 
 -ifdef(TEST).
 -export([range_spec_to_location_number/2]).
@@ -217,6 +220,31 @@ handle_async({'$async', Req, Msg}, Req, undefined) ->
 -spec cancel_async(async_req(), async_state()) -> ok.
 cancel_async(_Req, _State) ->
     ok.
+
+-spec stream_put(key(), pos_integer(), rabbitmq_stream_s3_api:request_opts()) ->
+    {ok, async_state()} | {error, any()}.
+stream_put(Key, _ContentLength, _Opts) ->
+    case key_to_path(Key) of
+        {error, _} = Err ->
+            Err;
+        FilePath ->
+            ok = filelib:ensure_path(filename:dirname(FilePath)),
+            {ok, Fd} = file:open(FilePath, [write, raw, binary]),
+            {ok, {Fd, 0}}
+    end.
+
+-spec stream_data(async_state(), iodata()) -> async_state().
+stream_data({Fd, Crc0}, Data) ->
+    ok = file:write(Fd, Data),
+    {Fd, erlang:crc32(Crc0, Data)}.
+
+-spec stream_finish(async_state(), non_neg_integer()) -> ok | {error, any()}.
+stream_finish({Fd, Crc}, Crc32) ->
+    ok = file:close(Fd),
+    case Crc of
+        Crc32 -> ok;
+        _ -> {error, {checksum_mismatch, #{expected => Crc32, actual => Crc}}}
+    end.
 
 -spec get_stream_data(StreamName) ->
     {ok, Manifest, [FragmentFile]} | {error, not_found | path_not_set}

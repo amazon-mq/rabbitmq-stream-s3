@@ -4,6 +4,7 @@
 -module(rabbitmq_stream_s3_server).
 
 -include_lib("kernel/include/logger.hrl").
+-include_lib("stdlib/include/assert.hrl").
 -include_lib("rabbit_common/include/rabbit.hrl").
 
 -include("include/rabbitmq_stream_s3.hrl").
@@ -15,6 +16,7 @@
 %% Public set of {stream_id(), {#group_ref{}, rabbitmq_stream_s3:entries()}}
 %% used to avoid unnecessarily re-downloading the first group in a stream.
 -define(FIRST_GROUPS, rabbitmq_stream_s3_server_first_groups).
+-define(MiB, 1048576).
 
 -behaviour(gen_server).
 
@@ -527,104 +529,8 @@ execute_task(Effect, ManifestServer) ->
         counters:sub(Cnt, ?C_ACTIVE_TASKS, 1)
     end.
 
-execute_task(#upload_fragment{
-    stream = StreamId,
-    dir = Dir,
-    fragment =
-        #fragment{
-            segment_offset = SegmentOffset,
-            segment_pos = SegmentPos,
-            first_offset = FragmentOffset,
-            first_timestamp = FirstTs,
-            last_timestamp = LastTs,
-            next_offset = NextOffset,
-            checksum = SegmentDataCrc,
-            num_chunks = {IdxStart, IdxLen},
-            seq_no = SeqNo,
-            size = Size,
-            roll_reason = RollReason
-        } = Fragment
-}) ->
-    Timeout = application:get_env(rabbitmq_stream_s3, segment_upload_timeout, 45_000),
-    FragmentFilename = rabbitmq_stream_s3:offset_filename(FragmentOffset, <<"fragment">>),
-    SegmentFilename = rabbitmq_stream_s3:offset_filename(SegmentOffset, <<"segment">>),
-    IndexFilename = rabbitmq_stream_s3:offset_filename(SegmentOffset, <<"index">>),
-    Key = rabbitmq_stream_s3:fragment_key(StreamId, FragmentOffset),
-    ?LOG_DEBUG(
-        "Starting upload of ~ts (~b of ~ts, next offset ~b of ~ts): ~w", [
-            FragmentFilename, SeqNo, SegmentFilename, NextOffset, StreamId, Fragment
-        ]
-    ),
-
-    {UploadMSec, {UploadSize, FragmentInfo0}} = timer:tc(
-        fun() ->
-            {ok, SegFd} = file:open(filename:join(Dir, SegmentFilename), [read, raw, binary]),
-            {ok, IdxFd} = file:open(filename:join(Dir, IndexFilename), [read, raw, binary]),
-
-            {ok, SegData} = file:pread(SegFd, SegmentPos, Size),
-            {ok, IdxData0} = file:pread(
-                IdxFd,
-                ?IDX_HEADER_B + (IdxStart * ?INDEX_RECORD_SIZE_B),
-                IdxLen * ?INDEX_RECORD_SIZE_B
-            ),
-            %% Convert from osiris index style to fragment index. We can
-            %% drop epoch since it's not necessary after commit. TODO: right?
-            %% TODO: this is pretty messy. Use the INDEX_RECORD macro.
-            IdxData = <<
-                <<
-                    IdxChId:64/unsigned,
-                    IdxTs:64/signed,
-                    (SegmentFilePos - SegmentPos + ?FRAGMENT_HEADER_B):32/unsigned
-                >>
-             || <<
-                    IdxChId:64/unsigned,
-                    IdxTs:64/signed,
-                    _Epoch:64/unsigned,
-                    SegmentFilePos:32/unsigned,
-                    _ChType:8/unsigned
-                >> <= IdxData0
-            >>,
-            Header = ?FRAGMENT_HEADER(
-                FragmentOffset,
-                NextOffset,
-                FirstTs,
-                LastTs,
-                SeqNo,
-                SegmentOffset,
-                SegmentPos,
-                (?FRAGMENT_HEADER_B + Size),
-                <<>>
-            ),
-            Data = [Header, SegData, ?IDX_HEADER, IdxData],
-            Crc =
-                case SegmentDataCrc of
-                    undefined ->
-                        %% TODO: If there is no CRC32 cached then we need
-                        %% to validate chunks data during the upload and
-                        %% rebuild the index from the segment data.
-                        erlang:crc32(Data);
-                    _ ->
-                        Crc0 = erlang:crc32_combine(erlang:crc32(Header), SegmentDataCrc, Size),
-                        erlang:crc32(Crc0, [?IDX_HEADER, IdxData])
-                end,
-            %% TODO: should be able to upload this in chunks. Gun should
-            %% support that.
-            ReqOpts = #{unsigned_payload => true, crc32 => Crc, timeout => Timeout},
-            case rabbitmq_stream_s3_api:put(Key, Data, ReqOpts) of
-                ok ->
-                    ok;
-                {error, _} = Err ->
-                    exit(Err)
-            end,
-            {iolist_size(Data), fragment_header_to_info(Header)}
-        end,
-        millisecond
-    ),
-    ?LOG_DEBUG("Uploaded ~ts of ~ts in ~b msec (~b bytes)", [
-        FragmentFilename, SegmentFilename, UploadMSec, UploadSize
-    ]),
-    counters:add(counter(), ?C_FRAGMENTS_CREATED, 1),
-    FragmentInfo = FragmentInfo0#fragment_info{roll_reason = RollReason},
+execute_task(#upload_fragment{stream = StreamId, dir = Dir, fragment = Fragment}) ->
+    FragmentInfo = upload_fragment(StreamId, Dir, Fragment),
     #fragment_uploaded{stream = StreamId, info = FragmentInfo};
 execute_task(#upload_group{
     stream = StreamId,
@@ -937,6 +843,157 @@ execute_task(#evaluate_retention{
             ok
     end,
     #retention_executed{stream = StreamId, edit = Edit}.
+
+upload_fragment(
+    StreamId,
+    Dir,
+    #fragment{
+        segment_offset = SegmentOffset,
+        first_offset = FragmentOffset,
+        next_offset = NextOffset,
+        seq_no = SeqNo,
+        size = Size,
+        roll_reason = RollReason
+    } = Fragment
+) ->
+    ?LOG_DEBUG(
+        "Starting upload of ~20..0B.fragment (~b of ~20..0B.segment, next offset ~b of ~ts, size ~b)",
+        [
+            FragmentOffset, SeqNo, SegmentOffset, NextOffset, StreamId, Size
+        ]
+    ),
+    {UploadMSec, {UploadSize, FragmentInfo0}} = timer:tc(
+        fun() -> upload_fragment0(StreamId, Dir, Fragment) end,
+        millisecond
+    ),
+    ?LOG_DEBUG("Uploaded ~20..0B (seg ~20..0B) in ~b msec (~b bytes)", [
+        FragmentOffset, SegmentOffset, UploadMSec, UploadSize
+    ]),
+    counters:add(counter(), ?C_FRAGMENTS_CREATED, 1),
+    FragmentInfo0#fragment_info{roll_reason = RollReason}.
+
+upload_fragment0(
+    StreamId,
+    Dir,
+    #fragment{
+        segment_offset = SegmentOffset,
+        segment_pos = SegmentPos,
+        first_offset = FragmentOffset,
+        first_timestamp = FirstTs,
+        last_timestamp = LastTs,
+        next_offset = NextOffset,
+        checksum = SegmentDataCrc,
+        num_chunks = {IdxStart, IdxLen},
+        seq_no = SeqNo,
+        size = Size
+    }
+) ->
+    Timeout = application:get_env(rabbitmq_stream_s3, segment_upload_timeout, 45_000),
+    SegmentFilename = rabbitmq_stream_s3:offset_filename(SegmentOffset, <<"segment">>),
+    IndexFilename = rabbitmq_stream_s3:offset_filename(SegmentOffset, <<"index">>),
+
+    Key = rabbitmq_stream_s3:fragment_key(StreamId, FragmentOffset),
+
+    ContentLength = ?FRAGMENT_HEADER_B + Size + ?IDX_HEADER_B + (IdxLen * ?INDEX_RECORD_B),
+    {ok, Stream0} = rabbitmq_stream_s3_api:stream_put(Key, ContentLength, #{timeout => Timeout}),
+    Header = ?FRAGMENT_HEADER(
+        FragmentOffset,
+        NextOffset,
+        FirstTs,
+        LastTs,
+        SeqNo,
+        SegmentOffset,
+        SegmentPos,
+        (?FRAGMENT_HEADER_B + Size),
+        <<>>
+    ),
+    Stream1 = rabbitmq_stream_s3_api:stream_data(Stream0, Header),
+    Crc0 = erlang:crc32(Header),
+
+    {ok, SegFd} = file:open(filename:join(Dir, SegmentFilename), [read, raw, binary]),
+    {Stream2, Crc1} =
+        try
+            stream_segment_data(Stream1, SegFd, Crc0, SegmentPos, Size)
+        after
+            file:close(SegFd)
+        end,
+    case SegmentDataCrc of
+        undefined ->
+            ok;
+        _ ->
+            ?assertEqual(Crc1, erlang:crc32_combine(Crc0, SegmentDataCrc, Size))
+    end,
+
+    %% TODO: do we even need the index header anymore? It doesn't have
+    %% structural significance now that we know the index start in the remote
+    %% reader.
+    Stream3 = rabbitmq_stream_s3_api:stream_data(Stream2, ?IDX_HEADER),
+    Crc2 = erlang:crc32(Crc1, ?IDX_HEADER),
+    {ok, IdxFd} = file:open(filename:join(Dir, IndexFilename), [read, raw, binary]),
+    {Stream4, Crc} =
+        try
+            stream_index_data(
+                Stream3,
+                IdxFd,
+                Crc2,
+                ?IDX_HEADER_B + (IdxStart * ?INDEX_RECORD_SIZE_B),
+                IdxLen,
+                SegmentPos
+            )
+        after
+            file:close(IdxFd)
+        end,
+
+    case rabbitmq_stream_s3_api:stream_finish(Stream4, Crc) of
+        ok ->
+            ok;
+        {error, _} = Err ->
+            exit(Err)
+    end,
+    {ContentLength, fragment_header_to_info(Header)}.
+
+stream_segment_data(Stream, _Fd, Crc, _Pos, 0) ->
+    {Stream, Crc};
+stream_segment_data(Stream0, Fd, Crc0, Pos, Size) ->
+    Bytes = min(Size, ?MiB),
+    {ok, Data} = file:pread(Fd, Pos, Bytes),
+    Crc = erlang:crc32(Crc0, Data),
+    Stream = rabbitmq_stream_s3_api:stream_data(Stream0, Data),
+    stream_segment_data(Stream, Fd, Crc, Pos + Bytes, Size - Bytes).
+
+stream_index_data(Stream, Fd, Crc0, StartPos, IdxLen, SegmentPos) ->
+    stream_index_data(Stream, Fd, Crc0, StartPos, IdxLen, SegmentPos, 0).
+
+stream_index_data(Stream, _Fd, Crc, _Pos, Total, _SegmentPos, Total) ->
+    {Stream, Crc};
+stream_index_data(Stream0, Fd, Crc0, Pos, Total, SegmentPos, Done) ->
+    ChunkRecords = min(Total - Done, ?MiB div ?INDEX_RECORD_SIZE_B),
+    {ok, RawData} = file:pread(Fd, Pos, ChunkRecords * ?INDEX_RECORD_SIZE_B),
+    Transformed = <<
+        <<
+            IdxChId:64/unsigned,
+            IdxTs:64/signed,
+            (SegFilePos - SegmentPos + ?FRAGMENT_HEADER_B):32/unsigned
+        >>
+     || <<
+            IdxChId:64/unsigned,
+            IdxTs:64/signed,
+            _Epoch:64/unsigned,
+            SegFilePos:32/unsigned,
+            _ChType:8/unsigned
+        >> <= RawData
+    >>,
+    Crc = erlang:crc32(Crc0, Transformed),
+    Stream = rabbitmq_stream_s3_api:stream_data(Stream0, Transformed),
+    stream_index_data(
+        Stream,
+        Fd,
+        Crc,
+        Pos + ChunkRecords * ?INDEX_RECORD_SIZE_B,
+        Total,
+        SegmentPos,
+        Done + ChunkRecords
+    ).
 
 resolve_manifest_tail(
     StreamId,

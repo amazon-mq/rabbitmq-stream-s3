@@ -10,6 +10,8 @@ A wrapper around the AWS S3 HTTP API.
 -include_lib("stdlib/include/assert.hrl").
 -include_lib("xmerl/include/xmerl.hrl").
 
+-define(MiB, 1048576).
+
 %% API:
 -export([
     init/0,
@@ -18,6 +20,9 @@ A wrapper around the AWS S3 HTTP API.
     get_range/3,
     get_range_async/3,
     put/3,
+    stream_put/3,
+    stream_data/2,
+    stream_finish/2,
     delete/2,
     delete_prefix/2,
     list/3,
@@ -91,6 +96,7 @@ Called "HTTP Verb" in S3 docs. "GET", "PUT", "HEAD", "POST", "DELETE", etc..
     pages := non_neg_integer()
 }.
 -type async_state() :: #{
+    pool := ?GENERAL_POOL | ?UPLOAD_POOL,
     conn := pid(),
     stream_ref := gun:stream_ref(),
     %% PERF: The remote tier sends relatively small binaries when reading with
@@ -103,7 +109,8 @@ Called "HTTP Verb" in S3 docs. "GET", "PUT", "HEAD", "POST", "DELETE", etc..
     %% to this list and reverse and concatenate the binaries into one large
     %% binary when a fairly large amount of data has been collected.
     data => [binary()],
-    pending_bytes => non_neg_integer()
+    pending_bytes => non_neg_integer(),
+    timeout => timeout()
 }.
 %% Re-use the gun stream ref since it's already a reference.
 -type async_req() :: gun:stream_ref().
@@ -207,6 +214,110 @@ put(Key, Data, Opts) when is_binary(Key) andalso is_map(Opts) ->
         {error, _} = Err ->
             Err
     end.
+
+-spec stream_put(key(), pos_integer(), request_opts()) -> {ok, async_state()} | {error, any()}.
+stream_put(Key, ContentLength, Opts0) when is_binary(Key) andalso is_map(Opts0) ->
+    Method = <<"PUT">>,
+    Path = key_to_path(Key),
+    EncodedLength = aws_chunked_encoded_length(ContentLength),
+    Headers0 = #{
+        <<"content-length">> => integer_to_binary(EncodedLength),
+        <<"content-encoding">> => <<"aws-chunked">>,
+        <<"x-amz-decoded-content-length">> => integer_to_binary(ContentLength),
+        <<"x-amz-trailer">> => <<"x-amz-checksum-crc32">>
+    },
+    case get_credentials() of
+        {ok, AccessKey, SecretKey, SecurityToken} ->
+            Headers = sign_headers(
+                Headers0,
+                AccessKey,
+                SecretKey,
+                SecurityToken,
+                Method,
+                Path,
+                no_body,
+                Opts0#{stream_payload => true}
+            ),
+            Cnt = counter(),
+            counters:add(Cnt, ?C_ACTIVE_REQUESTS, 1),
+            counters:add(Cnt, ?C_TOTAL_REQUESTS, 1),
+            Pool = ?UPLOAD_POOL,
+            Conn = rabbitmq_stream_s3_api_aws_pool:checkout(Pool, 10_000),
+            StreamRef = gun:headers(Conn, Method, Path, Headers),
+            State = #{
+                pool => Pool,
+                conn => Conn,
+                stream_ref => StreamRef,
+                data => [],
+                pending_bytes => 0,
+                timeout => maps:get(timeout, Opts0, 60_000)
+            },
+            {ok, State};
+        {error, _} = Err ->
+            Err
+    end.
+
+-spec stream_data(async_state(), iodata()) -> async_state().
+stream_data(#{data := PendingData0, pending_bytes := PendingBytes0} = State0, Data) ->
+    PendingData = [PendingData0, Data],
+    PendingBytes = PendingBytes0 + iolist_size(Data),
+    State = State0#{data := PendingData, pending_bytes := PendingBytes},
+    flush_chunks(State).
+
+flush_chunks(
+    #{
+        conn := Conn,
+        stream_ref := StreamRef,
+        data := PendingData,
+        pending_bytes := PendingBytes
+    } = State0
+) when PendingBytes >= ?MiB ->
+    Flat = iolist_to_binary(PendingData),
+    <<Chunk:?MiB/binary, Rest/binary>> = Flat,
+    send_chunk(Conn, StreamRef, Chunk),
+    flush_chunks(State0#{data := [Rest], pending_bytes := byte_size(Rest)});
+flush_chunks(State) ->
+    State.
+
+-spec stream_finish(async_state(), non_neg_integer()) -> ok | {error, any()}.
+stream_finish(
+    #{
+        conn := Conn,
+        stream_ref := StreamRef,
+        data := PendingData,
+        pending_bytes := PendingBytes,
+        timeout := Timeout
+    } = State,
+    Crc32
+) ->
+    %% Flush remaining buffer as the last data chunk (may be smaller than ?MiB).
+    case PendingBytes of
+        0 -> ok;
+        _ -> send_chunk(Conn, StreamRef, iolist_to_binary(PendingData))
+    end,
+    Checksum = base64:encode(<<Crc32:32/unsigned>>),
+    %% Final aws-chunked terminator + trailer + CRLF, sent as the last body chunk.
+    ok = gun:data(
+        Conn,
+        StreamRef,
+        fin,
+        <<"0\r\nx-amz-checksum-crc32:", Checksum/binary, "\r\n\r\n">>
+    ),
+    try await_response(Conn, StreamRef, Timeout) of
+        {ok, #{status := 200}} ->
+            ok;
+        {ok, #{status := Status} = Other} ->
+            log_unexpected_status(?FUNCTION_NAME, Status),
+            {error, Other};
+        {error, _} = Err ->
+            Err
+    after
+        finish_async(State)
+    end.
+
+send_chunk(Conn, StreamRef, Chunk) when is_binary(Chunk) ->
+    Size = byte_size(Chunk),
+    gun:data(Conn, StreamRef, nofin, [integer_to_binary(Size, 16), <<"\r\n">>, Chunk, <<"\r\n">>]).
 
 -doc "Deletes the given key or list of keys".
 -spec delete(key() | [key()], request_opts()) ->
@@ -484,9 +595,9 @@ cancel_async(StreamRef, #{conn := Conn, stream_ref := StreamRef} = State) ->
     gun:cancel(Conn, StreamRef),
     ok = finish_async(State).
 
-finish_async(#{conn := Conn}) ->
+finish_async(#{conn := Conn, pool := Pool}) ->
     counters:sub(counter(), ?C_ACTIVE_REQUESTS, 1),
-    ok = rabbitmq_stream_s3_api_aws_pool:checkin(?GENERAL_POOL, Conn).
+    ok = rabbitmq_stream_s3_api_aws_pool:checkin(Pool, Conn).
 
 -spec request(http_method(), key(), req_headers(), iodata(), request_opts()) ->
     {ok, http_response()}
@@ -546,28 +657,32 @@ request1(Method, Path, Headers, Body, Opts) ->
     T1 = start_timeout_window(Timeout),
     rabbitmq_stream_s3_api_aws_pool:with(Pool, Timeout, fun(Conn) ->
         StreamRef = gun:request(Conn, Method, Path, Headers, Body),
-        case gun:await(Conn, StreamRef, end_timeout_window(Timeout, T1)) of
-            {response, fin, Status, RespHeaders} ->
-                Response = #{status => Status, headers => RespHeaders},
-                postprocess_response(Response),
-                {ok, Response};
-            {response, nofin, Status, RespHeaders} ->
-                case gun:await_body(Conn, StreamRef, end_timeout_window(Timeout, T1)) of
-                    {ok, RespBody} ->
-                        Response = #{
-                            status => Status,
-                            headers => RespHeaders,
-                            body => RespBody
-                        },
-                        postprocess_response(Response),
-                        {ok, Response};
-                    {error, _} = Err ->
-                        Err
-                end;
-            {error, _} = Err ->
-                Err
-        end
+        await_response(Conn, StreamRef, end_timeout_window(Timeout, T1))
     end).
+
+await_response(Conn, StreamRef, Timeout) ->
+    T1 = start_timeout_window(Timeout),
+    case gun:await(Conn, StreamRef, Timeout) of
+        {response, fin, Status, RespHeaders} ->
+            Response = #{status => Status, headers => RespHeaders},
+            postprocess_response(Response),
+            {ok, Response};
+        {response, nofin, Status, RespHeaders} ->
+            case gun:await_body(Conn, StreamRef, end_timeout_window(Timeout, T1)) of
+                {ok, RespBody} ->
+                    Response = #{
+                        status => Status,
+                        headers => RespHeaders,
+                        body => RespBody
+                    },
+                    postprocess_response(Response),
+                    {ok, Response};
+                {error, _} = Err ->
+                    Err
+            end;
+        {error, _} = Err ->
+            Err
+    end.
 
 postprocess_response(#{status := 503}) ->
     counters:add(counter(), ?C_RESPONSE_503, 1);
@@ -592,11 +707,12 @@ request_async(Method, Path, Headers0, Body, Opts) ->
             Cnt = counter(),
             counters:add(Cnt, ?C_ACTIVE_REQUESTS, 1),
             counters:add(Cnt, ?C_TOTAL_REQUESTS, 1),
-            Conn = rabbitmq_stream_s3_api_aws_pool:checkout(?GENERAL_POOL, 10_000),
+            Pool = ?GENERAL_POOL,
+            Conn = rabbitmq_stream_s3_api_aws_pool:checkout(Pool, 10_000),
             %% NOTE: no need to wrap this in try/catch and checkin the conn
             %% since gun:request/5 cannot exit/error/throw.
             StreamRef = gun:request(Conn, Method, Path, Headers, Body),
-            {ok, StreamRef, #{conn => Conn, stream_ref => StreamRef}};
+            {ok, StreamRef, #{pool => Pool, conn => Conn, stream_ref => StreamRef}};
         {error, _} = Err ->
             Err
     end.
@@ -1013,22 +1129,31 @@ sign_headers(
         case Opts of
             #{unsigned_payload := true} ->
                 <<"UNSIGNED-PAYLOAD">>;
+            #{stream_payload := true} ->
+                <<"STREAMING-UNSIGNED-PAYLOAD-TRAILER">>;
             _ ->
                 hex(sha256hash(Body))
         end,
     DefaultHeaders0 = #{
-        %% TODO: support chunked transfer.
-        <<"content-length">> => integer_to_binary(iolist_size(Body)),
         <<"host">> => Host,
         <<"x-amz-date">> => RequestTimestamp,
         <<"x-amz-content-sha256">> => PayloadHash
     },
+    DefaultHeaders1 =
+        case Opts of
+            #{stream_payload := true} ->
+                %% content-length (encoded size) is provided in Headers0 and will be
+                %% merged in below. Do not add it here from iolist_size(Body).
+                DefaultHeaders0;
+            _ ->
+                DefaultHeaders0#{<<"content-length">> => integer_to_binary(iolist_size(Body))}
+        end,
     DefaultHeaders =
         case SecurityToken of
             undefined ->
-                DefaultHeaders0;
+                DefaultHeaders1;
             _ ->
-                DefaultHeaders0#{<<"x-amz-security-token">> => SecurityToken}
+                DefaultHeaders1#{<<"x-amz-security-token">> => SecurityToken}
         end,
     Headers1 = maps:merge(DefaultHeaders, Headers0),
     URIMap = uri_string:parse(Path),
@@ -1134,6 +1259,7 @@ hmac_sha256(Key, Message) ->
 %%   be added...
 %% We also include `range` and `date` since the AWS documentation does too.
 is_canonical_header(<<"host">>) -> true;
+is_canonical_header(<<"content-encoding">>) -> true;
 is_canonical_header(<<"Content-MD5">>) -> true;
 is_canonical_header(<<"x-amz-", _/binary>>) -> true;
 is_canonical_header(<<"range">>) -> true;
@@ -1184,11 +1310,63 @@ delete_many_body(Keys) when is_list(Keys) ->
 key_to_path(Key) ->
     <<$/, (uri_string:quote(Key, "/"))/binary>>.
 
+%% Computes the aws-chunked framing overhead for a single chunk of DataSize bytes.
+%% Each chunk is framed as: <hex-size>\r\n<data>\r\n
+-spec aws_chunked_chunk_length(non_neg_integer()) -> non_neg_integer().
+aws_chunked_chunk_length(DataSize) ->
+    hex_digits(DataSize) + 2 + DataSize + 2.
+
+-spec hex_digits(non_neg_integer()) -> pos_integer().
+hex_digits(0) -> 1;
+hex_digits(N) -> hex_digits(N, 0).
+
+hex_digits(0, Acc) -> Acc;
+hex_digits(N, Acc) -> hex_digits(N bsr 4, Acc + 1).
+
+-doc """
+Computes the total encoded content-length for an aws-chunked body with a CRC32 trailer,
+given the decoded content length. All chunks except the last are exactly `?MiB` bytes.
+
+The final terminator + trailer is:
+
+    0\\r\\nx-amz-checksum-crc32:<8-char-base64>\\r\\n\\r\\n
+""".
+-spec aws_chunked_encoded_length(non_neg_integer()) -> non_neg_integer().
+aws_chunked_encoded_length(ContentLength) ->
+    FullChunks = ContentLength div ?MiB,
+    Remainder = ContentLength rem ?MiB,
+    %% "0\r\n" (3) + "x-amz-checksum-crc32:" (21) + base64(4 bytes)=8 + "\r\n" (2) + "\r\n" (2)
+    TrailerLength = 3 + 21 + 8 + 2 + 2,
+    FullChunks * aws_chunked_chunk_length(?MiB) +
+        case Remainder of
+            0 -> 0;
+            _ -> aws_chunked_chunk_length(Remainder)
+        end +
+        TrailerLength.
+
 counter() ->
     persistent_term:get(?COUNTER_KEY).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
+
+hex_digits_test() ->
+    ?assertEqual(1, hex_digits(0)),
+    ?assertEqual(1, hex_digits(1)),
+    ?assertEqual(1, hex_digits(15)),
+    ?assertEqual(2, hex_digits(16)),
+    ?assertEqual(2, hex_digits(255)),
+    ?assertEqual(3, hex_digits(256)),
+    %% 1 MiB = 0x100000 = 6 hex digits
+    ?assertEqual(6, hex_digits(1048576)),
+    ok.
+
+aws_chunked_chunk_length_test() ->
+    %% "3a\r\n<58 bytes>\r\n" = 2+2+58+2 = 64
+    ?assertEqual(64, aws_chunked_chunk_length(58)),
+    %% "100000\r\n<1048576 bytes>\r\n" = 6+2+1048576+2 = 1048586
+    ?assertEqual(1048586, aws_chunked_chunk_length(1048576)),
+    ok.
 
 parse_iso8601_test() ->
     ?assertEqual(
