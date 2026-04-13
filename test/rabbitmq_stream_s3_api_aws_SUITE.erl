@@ -159,6 +159,21 @@ kick_the_tires(_Config) ->
         ok = rabbitmq_stream_s3_api_aws:put(K2, <<"Object 2">>, #{}),
         ok = rabbitmq_stream_s3_api_aws:put(K3, <<"Object 3">>, #{}),
 
+        %% Streaming upload: send data in two chunks and verify the result.
+        StreamKey = <<(atom_to_binary(?FUNCTION_NAME))/binary, "-stream-", (nonce())/binary>>,
+        Chunk1 = <<"Hello, ">>,
+        Chunk2 = <<"streaming S3!">>,
+        StreamData = <<Chunk1/binary, Chunk2/binary>>,
+        Crc = erlang:crc32([Chunk1, Chunk2]),
+        {ok, Stream0} = rabbitmq_stream_s3_api_aws:stream_put(
+            StreamKey, byte_size(StreamData), #{}
+        ),
+        Stream1 = rabbitmq_stream_s3_api_aws:stream_data(Stream0, Chunk1),
+        Stream2 = rabbitmq_stream_s3_api_aws:stream_data(Stream1, Chunk2),
+        ok = rabbitmq_stream_s3_api_aws:stream_finish(Stream2, Crc),
+        {ok, StreamData} = rabbitmq_stream_s3_api_aws:get(StreamKey, #{}),
+        ok = rabbitmq_stream_s3_api_aws:delete(StreamKey, #{}),
+
         ok = rabbitmq_stream_s3_api_aws:delete(K1, #{}),
         {error, not_found} = rabbitmq_stream_s3_api_aws:get(K1, #{}),
 

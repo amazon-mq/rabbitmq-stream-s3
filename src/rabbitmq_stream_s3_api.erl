@@ -23,6 +23,9 @@ file-system operations. Use that in non-unit tests.
     get_range_async/3,
     put/2,
     put/3,
+    stream_put/3,
+    stream_data/2,
+    stream_finish/2,
     delete/1,
     delete/2,
     delete_prefix/1,
@@ -61,6 +64,10 @@ file-system operations. Use that in non-unit tests.
 -callback get_range_async(key(), range_spec(), request_opts()) ->
     {ok, async_req(), async_state()} | {error, any()}.
 -callback put(key(), iodata(), request_opts()) -> ok | {error, any()}.
+-callback stream_put(key(), pos_integer(), request_opts()) ->
+    {ok, async_state()} | {error, any()}.
+-callback stream_data(async_state(), iodata()) -> async_state().
+-callback stream_finish(async_state(), non_neg_integer()) -> ok | {error, any()}.
 -doc """
 Delete the given key or all of the listed keys from the remote tier.
 
@@ -174,6 +181,31 @@ put(Key, Data, Opts) when is_binary(Key) andalso is_map(Opts) ->
     counters:add(counter(), ?C_PUT, 1),
     counters:add(counter(), ?C_BYTES_SENT, iolist_size(Data)),
     observe(write, fun() -> (backend()):put(Key, Data, Opts) end).
+
+-spec stream_put(key(), pos_integer(), request_opts()) -> {ok, async_state()} | {error, any()}.
+stream_put(Key, ContentLength, Opts) when
+    is_binary(Key) andalso is_integer(ContentLength) andalso is_map(Opts)
+->
+    counters:add(counter(), ?C_PUT, 1),
+    StartTs = erlang:monotonic_time(),
+    case (backend()):stream_put(Key, ContentLength, Opts) of
+        {ok, BackendState} ->
+            {ok, {StartTs, BackendState}};
+        {error, _} = Err ->
+            Err
+    end.
+
+-spec stream_data(async_state(), iodata()) -> async_state().
+stream_data({StartTs, BackendState}, Data) ->
+    counters:add(counter(), ?C_BYTES_SENT, iolist_size(Data)),
+    {StartTs, (backend()):stream_data(BackendState, Data)}.
+
+-spec stream_finish(async_state(), non_neg_integer()) -> ok | {error, any()}.
+stream_finish({StartTs, BackendState}, Crc32) ->
+    Result = (backend()):stream_finish(BackendState, Crc32),
+    Ms = erlang:convert_time_unit(erlang:monotonic_time() - StartTs, native, millisecond),
+    rabbitmq_stream_s3_request_metrics:observe(write, Ms),
+    Result.
 
 -doc #{equiv => delete(Keys, #{})}.
 -spec delete(key() | [key()]) -> ok | {error, any()}.
