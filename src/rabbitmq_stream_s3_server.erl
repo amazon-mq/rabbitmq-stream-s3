@@ -105,6 +105,9 @@
 -define(C_STREAMS_DELETED, 15).
 -define(C_LOCAL_TIER_RETENTION_EVALUATIONS, 16).
 -define(C_REMOTE_TIER_RETENTION_EVALUATIONS, 17).
+-define(C_REMOTE_BYTES, 18).
+-define(C_REMOTE_MESSAGES, 19).
+-define(C_REMOTE_OLDEST_TIMESTAMP, 20).
 -define(COUNTERS, [
     {active_tasks, ?C_ACTIVE_TASKS, gauge, "Current number of tasks"},
     {total_tasks, ?C_TOTAL_TASKS, counter, "Total number of tasks spawned"},
@@ -136,7 +139,11 @@
     {local_tier_retention_evaluations, ?C_LOCAL_TIER_RETENTION_EVALUATIONS, counter,
         "Number of times retention has been evaluated against the local tier"},
     {remote_tier_retention_evaluations, ?C_REMOTE_TIER_RETENTION_EVALUATIONS, counter,
-        "Number of times retention has been evaluated against the remote tier"}
+        "Number of times retention has been evaluated against the remote tier"},
+    {remote_bytes, ?C_REMOTE_BYTES, gauge, "Total bytes stored in the remote tier"},
+    {remote_messages, ?C_REMOTE_MESSAGES, gauge, "Total messages stored in the remote tier"},
+    {remote_oldest_timestamp, ?C_REMOTE_OLDEST_TIMESTAMP, gauge,
+        "Timestamp (ms) of the oldest message stored in the remote tier, or 0 if empty"}
 ]).
 -define(COUNTER_KEY, {?MODULE, counters}).
 
@@ -423,7 +430,17 @@ format_state(#?MODULE{machine = Machine, tasks = Tasks, delayed_tasks = DelayedT
 -spec evolve_event(event(), #?MODULE{}) -> #?MODULE{}.
 evolve_event(Event, #?MODULE{machine = MacState0} = State0) ->
     {MacState, Effects} = rabbitmq_stream_s3_machine:apply(metadata(), Event, MacState0),
-    lists:foldl(fun apply_effect/2, State0#?MODULE{machine = MacState}, Effects).
+    State = lists:foldl(fun apply_effect/2, State0#?MODULE{machine = MacState}, Effects),
+    #{
+        bytes := Bytes,
+        messages := Messages,
+        oldest_timestamp := OldestTs
+    } = rabbitmq_stream_s3_machine:metrics(MacState),
+    Cnt = counter(),
+    counters:put(Cnt, ?C_REMOTE_BYTES, Bytes),
+    counters:put(Cnt, ?C_REMOTE_MESSAGES, Messages),
+    counters:put(Cnt, ?C_REMOTE_OLDEST_TIMESTAMP, OldestTs),
+    State.
 
 -spec apply_effect(effect(), #?MODULE{}) -> #?MODULE{}.
 apply_effect(#reply{to = To, response = Response}, State) ->

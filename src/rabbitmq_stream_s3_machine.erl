@@ -113,7 +113,14 @@ for the log manifest server to execute.
 
 -export_type([metadata/0, state/0]).
 
--export([new/0, new/1, get_manifest/2, apply/3, format/1]).
+-export([
+    new/0,
+    new/1,
+    get_manifest/2,
+    apply/3,
+    format/1,
+    metrics/1
+]).
 
 -export([execute_retention/4]).
 
@@ -1571,6 +1578,41 @@ resolve_replica_seq(undefined, Stream) ->
     maps:get(seq, Stream);
 resolve_replica_seq(Seq, _Stream) ->
     Seq.
+
+-spec metrics(state()) ->
+    #{
+        bytes := non_neg_integer(),
+        messages := non_neg_integer(),
+        oldest_timestamp := non_neg_integer()
+    }.
+metrics(#?MODULE{streams = Streams}) ->
+    {B, M, OT} = maps:fold(
+        fun
+            (
+                _,
+                #{
+                    kind := writer,
+                    manifest := #manifest{
+                        total_size = S,
+                        first_offset = F,
+                        next_offset = N,
+                        first_timestamp = T
+                    }
+                },
+                {B, M, OT}
+            ) ->
+                {B + S, M + max(0, N - F), min_ts(OT, T)};
+            (_, _, Acc) ->
+                Acc
+        end,
+        {0, 0, 0},
+        Streams
+    ),
+    #{bytes => B, messages => M, oldest_timestamp => OT}.
+
+min_ts(0, T) -> T;
+min_ts(T, 0) -> T;
+min_ts(A, B) -> min(A, B).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
