@@ -704,15 +704,19 @@ request_async(Method, Path, Headers0, Body, Opts) ->
                 Body,
                 Opts
             ),
-            Cnt = counter(),
-            counters:add(Cnt, ?C_ACTIVE_REQUESTS, 1),
-            counters:add(Cnt, ?C_TOTAL_REQUESTS, 1),
             Pool = ?GENERAL_POOL,
-            Conn = rabbitmq_stream_s3_api_aws_pool:checkout(Pool, 10_000),
-            %% NOTE: no need to wrap this in try/catch and checkin the conn
-            %% since gun:request/5 cannot exit/error/throw.
-            StreamRef = gun:request(Conn, Method, Path, Headers, Body),
-            {ok, StreamRef, #{pool => Pool, conn => Conn, stream_ref => StreamRef}};
+            case rabbitmq_stream_s3_api_aws_pool:try_checkout(Pool) of
+                {ok, Conn} ->
+                    Cnt = counter(),
+                    counters:add(Cnt, ?C_ACTIVE_REQUESTS, 1),
+                    counters:add(Cnt, ?C_TOTAL_REQUESTS, 1),
+                    %% NOTE: no need to wrap this in try/catch and checkin the conn
+                    %% since gun:request/5 cannot exit/error/throw.
+                    StreamRef = gun:request(Conn, Method, Path, Headers, Body),
+                    {ok, StreamRef, #{pool => Pool, conn => Conn, stream_ref => StreamRef}};
+                busy ->
+                    {error, pool_busy}
+            end;
         {error, _} = Err ->
             Err
     end.

@@ -221,6 +221,16 @@ handle_call(#read{} = Read, From, State0) ->
                 }
             },
             {noreply, State};
+        {retry, State1} ->
+            erlang:send_after(?MIN_RETRY_DELAY_MS, self(), retry_requests),
+            State = State1#?MODULE{
+                pending_read = #pending_read{
+                    read = Read,
+                    from = From,
+                    since = erlang:monotonic_time()
+                }
+            },
+            {noreply, State};
         Reply ->
             Reply
     end;
@@ -233,6 +243,9 @@ handle_cast(Message, State) ->
 
 handle_info({'DOWN', MRef, process, _Pid, _Reason}, #?MODULE{reader_ref = MRef} = State) ->
     {stop, normal, State};
+handle_info(retry_requests, State0) ->
+    State = maybe_start_request(State0),
+    maybe_reply_pending(State);
 handle_info(Msg, #?MODULE{requests = Requests0, retry_delay = RetryDelay0} = State0) ->
     AsyncStates = #{Req => R#request.state || Req := R <- Requests0},
     case rabbitmq_stream_s3_api:match_async(Msg, AsyncStates) of
@@ -302,9 +315,6 @@ handle_info(Msg, #?MODULE{requests = Requests0, retry_delay = RetryDelay0} = Sta
             ?LOG_DEBUG(?MODULE_STRING " received unexpected message: ~W", [Msg, 10]),
             {noreply, State0}
     end;
-handle_info(retry_requests, State0) ->
-    State = maybe_start_request(State0),
-    maybe_reply_pending(State);
 handle_info(Msg, State) ->
     ?LOG_DEBUG(?MODULE_STRING " received unexpected message: ~W", [Msg, 10]),
     {noreply, State}.
@@ -351,11 +361,7 @@ maybe_start_current_request(
             State0;
         false ->
             Range = {0, ReadSize + ?FRAGMENT_HEADER_B},
-            {ok, RequestId, AsyncState} = rabbitmq_stream_s3_api:get_range_async(CurrentKey, Range),
-            Request = #request{fragment = Fragment, range = Range, state = AsyncState},
-            counters:add(counter(), ?C_REQUESTS_IN_FLIGHT, 1),
-            counters:add(counter(), ?C_TOTAL_REQUESTS, 1),
-            State0#?MODULE{requests = Requests0#{RequestId => Request}}
+            start_request(CurrentKey, Range, Fragment, State0)
     end;
 maybe_start_current_request(
     #?MODULE{
@@ -374,11 +380,7 @@ maybe_start_current_request(
             State0;
         false ->
             Range = {EndPos, min(EndPos + ReadSize, IdxStartPos - 1)},
-            {ok, RequestId, AsyncState} = rabbitmq_stream_s3_api:get_range_async(CurrentKey, Range),
-            Request = #request{fragment = Fragment, range = Range, state = AsyncState},
-            counters:add(counter(), ?C_REQUESTS_IN_FLIGHT, 1),
-            counters:add(counter(), ?C_TOTAL_REQUESTS, 1),
-            State0#?MODULE{requests = Requests0#{RequestId => Request}}
+            start_request(CurrentKey, Range, Fragment, State0)
     end;
 maybe_start_current_request(State) ->
     State.
@@ -399,11 +401,7 @@ maybe_start_next_request(
         false ->
             Key = rabbitmq_stream_s3:fragment_key(StreamId, NextOffset),
             Range = {0, ReadSize + ?FRAGMENT_HEADER_B},
-            {ok, RequestId, AsyncState} = rabbitmq_stream_s3_api:get_range_async(Key, Range),
-            Request = #request{fragment = NextOffset, range = Range, state = AsyncState},
-            counters:add(counter(), ?C_REQUESTS_IN_FLIGHT, 1),
-            counters:add(counter(), ?C_TOTAL_REQUESTS, 1),
-            State0#?MODULE{requests = Requests0#{RequestId => Request}}
+            start_request(Key, Range, NextOffset, State0)
     end;
 maybe_start_next_request(State) ->
     State.
@@ -414,6 +412,17 @@ has_request_for(Fragment, Requests) ->
         false,
         Requests
     ).
+
+start_request(Key, Range, Fragment, #?MODULE{requests = Requests0} = State0) ->
+    case rabbitmq_stream_s3_api:get_range_async(Key, Range) of
+        {ok, RequestId, AsyncState} ->
+            Request = #request{fragment = Fragment, range = Range, state = AsyncState},
+            counters:add(counter(), ?C_REQUESTS_IN_FLIGHT, 1),
+            counters:add(counter(), ?C_TOTAL_REQUESTS, 1),
+            State0#?MODULE{requests = Requests0#{RequestId => Request}};
+        {error, pool_busy} ->
+            State0
+    end.
 
 add_data(Data, #request{fragment = Fragment}, #?MODULE{fragment = Fragment} = State) ->
     add_data_current(Data, State);
@@ -495,6 +504,11 @@ maybe_reply_pending(
             gen_server:reply(From, Reply),
             State = State1#?MODULE{pending_read = undefined},
             {stop, Reason, State};
+        {retry, State} ->
+            %% No in-flight requests - the pool was busy when maybe_start_request
+            %% was called. Schedule a retry so the read does not stall forever.
+            erlang:send_after(?MIN_RETRY_DELAY_MS, self(), retry_requests),
+            {noreply, State};
         {noreply, _} = NoReply ->
             NoReply
     end.
@@ -524,7 +538,12 @@ maybe_reply(#read{offset = Offset, bytes = Bytes, hint = Hint}, #?MODULE{} = Sta
             counters:add(counter(), ?C_BUFFER_MISS, 1),
             State2 = adjust_read_size(miss, State1),
             State = maybe_start_request(State2),
-            {noreply, State}
+            case State of
+                #?MODULE{requests = Requests} when map_size(Requests) =:= 0 ->
+                    {retry, State};
+                _ ->
+                    {noreply, State}
+            end
     end.
 
 %% AIMD read-ahead adjustment.

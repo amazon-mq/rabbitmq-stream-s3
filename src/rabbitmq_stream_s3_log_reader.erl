@@ -658,7 +658,7 @@ maybe_become_remote(Offset, #?MODULE{config = Config, mode = Local}) ->
     {offset, osiris:offset()} | {timestamp, osiris:timestamp()},
     rabbitmq_stream_s3:entries(),
     stream_id()
-) -> {ok, #remote_location{}}.
+) -> {ok, #remote_location{}} | {error, any()}.
 find_position(Spec, Entries, StreamId) ->
     GetGroupFun = rabbitmq_stream_s3_server:get_group_fun(StreamId, resolve_offset_spec),
     Fragment = find_fragment(Entries, Spec, GetGroupFun),
@@ -713,21 +713,22 @@ find_fragment(Entries, Spec, GetGroup) ->
     {offset, osiris:offset()} | {timestamp, osiris:timestamp()},
     osiris:offset(),
     stream_id()
-) -> {ok, #remote_location{}}.
+) -> {ok, #remote_location{}} | {error, any()}.
 find_position0(Spec, Fragment, StreamId) ->
-    {ok, Info} = rabbitmq_stream_s3_server:get_fragment_info(
-        StreamId,
-        Fragment
-    ),
-    #fragment_info{index_start_pos = IdxStartPos} = Info,
-    IndexData = index_data(StreamId, Fragment, IdxStartPos),
-    {ChunkId, _, Pos} = find_index_position(IndexData, Spec),
-    {ok, #remote_location{
-        chunk_id = ChunkId,
-        position = Pos,
-        fragment = Fragment,
-        fragment_info = Info
-    }}.
+    case rabbitmq_stream_s3_server:get_fragment_info(StreamId, Fragment) of
+        {ok, Info} ->
+            #fragment_info{index_start_pos = IdxStartPos} = Info,
+            IndexData = index_data(StreamId, Fragment, IdxStartPos),
+            {ChunkId, _, Pos} = find_index_position(IndexData, Spec),
+            {ok, #remote_location{
+                chunk_id = ChunkId,
+                position = Pos,
+                fragment = Fragment,
+                fragment_info = Info
+            }};
+        {error, _} = Err ->
+            Err
+    end.
 
 find_index_position(IndexData, Spec) ->
     %% Osiris prefers different chunk boundaries for offset and timestamp
