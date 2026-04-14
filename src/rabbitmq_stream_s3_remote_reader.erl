@@ -279,16 +279,19 @@ handle_info(Msg, #?MODULE{requests = Requests0, retry_delay = RetryDelay0} = Sta
                                 next = not_found,
                                 retry_delay = ?MIN_RETRY_DELAY_MS
                             });
-                        {slow_down, _} ->
+                        {Transient, _} when
+                            Transient =:= slow_down;
+                            Transient =:= internal_error
+                        ->
                             erlang:send_after(RetryDelay0, self(), retry_requests),
                             RetryDelay = min(RetryDelay0 * 2, ?MAX_RETRY_DELAY_MS),
                             State2 = State1#?MODULE{retry_delay = RetryDelay},
                             maybe_reply_pending(State2);
-                        {internal_error, _} ->
-                            erlang:send_after(RetryDelay0, self(), retry_requests),
-                            RetryDelay = min(RetryDelay0 * 2, ?MAX_RETRY_DELAY_MS),
-                            State2 = State1#?MODULE{retry_delay = RetryDelay},
-                            maybe_reply_pending(State2);
+                        {Transient, _} when
+                            Transient =:= stream_error;
+                            Transient =:= connection_error
+                        ->
+                            maybe_reply_pending(State1);
                         _ ->
                             {stop, {shutdown, Reason}, State1}
                     end
