@@ -1583,7 +1583,7 @@ resolve_replica_seq(Seq, _Stream) ->
     #{
         bytes := non_neg_integer(),
         messages := non_neg_integer(),
-        oldest_timestamp := non_neg_integer()
+        oldest_timestamp := -1 | pos_integer()
     }.
 metrics(#?MODULE{streams = Streams}) ->
     {B, M, OT} = maps:fold(
@@ -1605,13 +1605,13 @@ metrics(#?MODULE{streams = Streams}) ->
             (_, _, Acc) ->
                 Acc
         end,
-        {0, 0, 0},
+        {0, 0, -1},
         Streams
     ),
     #{bytes => B, messages => M, oldest_timestamp => OT}.
 
-min_ts(0, T) -> T;
-min_ts(T, 0) -> T;
+min_ts(T, T2) when T =< 0 -> T2;
+min_ts(T, T2) when T2 =< 0 -> T;
 min_ts(A, B) -> min(A, B).
 
 -ifdef(TEST).
