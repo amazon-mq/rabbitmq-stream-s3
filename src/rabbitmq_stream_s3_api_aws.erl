@@ -732,32 +732,31 @@ request_async(Method, Path, Headers0, Body, Opts) ->
                 Opts
             ),
             Pool = ?GENERAL_POOL,
-            case rabbitmq_stream_s3_api_aws_pool:try_checkout(Pool) of
-                {ok, Conn} ->
-                    Cnt = counter(),
-                    counters:add(Cnt, ?C_ACTIVE_REQUESTS, 1),
-                    counters:add(Cnt, ?C_TOTAL_REQUESTS, 1),
-                    %% NOTE: no need to wrap this in try/catch and checkin the conn
-                    %% since gun:request/5 cannot exit/error/throw.
-                    StreamRef = gun:request(Conn, Method, Path, Headers, Body),
-                    State = #{pool => Pool, conn => Conn, stream_ref => StreamRef},
-                    StateWithTimer =
-                        case maps:get(timeout, Opts, undefined) of
-                            undefined ->
-                                State;
-                            Timeout ->
-                                TimerRef = erlang:send_after(
-                                    Timeout, self(), {request_timeout, StreamRef}
-                                ),
-                                State#{timer_ref => TimerRef}
-                        end,
-                    {ok, StreamRef, StateWithTimer};
-                busy ->
-                    {error, pool_busy}
-            end;
+            start_async_request(Pool, Method, Path, Headers, Body, Opts);
         {error, _} = Err ->
             Err
     end.
+
+start_async_request(Pool, Method, Path, Headers, Body, Opts) ->
+    case rabbitmq_stream_s3_api_aws_pool:try_checkout(Pool) of
+        {ok, Conn} ->
+            Cnt = counter(),
+            counters:add(Cnt, ?C_ACTIVE_REQUESTS, 1),
+            counters:add(Cnt, ?C_TOTAL_REQUESTS, 1),
+            %% NOTE: no need to wrap this in try/catch and checkin the conn
+            %% since gun:request/5 cannot exit/error/throw.
+            StreamRef = gun:request(Conn, Method, Path, Headers, Body),
+            State = #{pool => Pool, conn => Conn, stream_ref => StreamRef},
+            {ok, StreamRef, maybe_set_timer(Opts, StreamRef, State)};
+        busy ->
+            {error, pool_busy}
+    end.
+
+maybe_set_timer(#{timeout := Timeout}, StreamRef, State) ->
+    TimerRef = erlang:send_after(Timeout, self(), {request_timeout, StreamRef}),
+    State#{timer_ref => TimerRef};
+maybe_set_timer(_Opts, _StreamRef, State) ->
+    State.
 
 -spec hostname() -> binary().
 hostname() ->
