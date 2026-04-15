@@ -238,9 +238,14 @@ handle_info(
     {gun_up, Conn, _Protocol},
     #?MODULE{monitors = Monitors} = State0
 ) ->
-    %% `gun_up` messages cannot arrive from connections not opened by this pool.
-    ?assert(is_map_key(Conn, Monitors)),
-    {noreply, make_available(Conn, State0)};
+    case is_map_key(Conn, Monitors) of
+        true ->
+            {noreply, make_available(Conn, State0)};
+        false ->
+            %% Stale gun_up from a connection opened by a previous pool instance.
+            gun:close(Conn),
+            {noreply, State0}
+    end;
 handle_info({gun_down, _Conn, _Protocol, _Reason, _KilledStreams}, #?MODULE{} = State) ->
     %% With retry=>0, gun stops the connection process immediately after sending
     %% this message (with reason 'normal' for a clean close, or
