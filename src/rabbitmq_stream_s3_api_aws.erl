@@ -110,7 +110,10 @@ Called "HTTP Verb" in S3 docs. "GET", "PUT", "HEAD", "POST", "DELETE", etc..
     %% binary when a fairly large amount of data has been collected.
     data => [binary()],
     pending_bytes => non_neg_integer(),
-    timeout => timeout()
+    timeout => timeout(),
+    %% Timer reference for request timeout. Set when a `timeout` is given in
+    %% request opts. Cancelled and flushed in `finish_async/1`.
+    timer_ref => reference()
 }.
 %% Re-use the gun stream ref since it's already a reference.
 -type async_req() :: gun:stream_ref().
@@ -486,6 +489,7 @@ match_async(Msg, Reqs) ->
             {gun_error, _, StreamRef, _} -> StreamRef;
             {gun_response, _, StreamRef, _, _, _} -> StreamRef;
             {gun_data, _, StreamRef, _, _} -> StreamRef;
+            {request_timeout, StreamRef} -> StreamRef;
             _ -> undefined
         end,
     case Reqs of
@@ -588,14 +592,33 @@ handle_async(
 ) ->
     finish_async(State),
     PendingData = iolist_to_binary(lists:reverse(Data0, [Data])),
-    {data, PendingData, done}.
+    {data, PendingData, done};
+handle_async(
+    {request_timeout, StreamRef},
+    StreamRef,
+    #{conn := Conn, stream_ref := StreamRef} = State
+) ->
+    ?LOG_WARNING("S3 request timed out on ~tw/~tw", [Conn, StreamRef]),
+    gun:cancel(Conn, StreamRef),
+    finish_async(State),
+    {done, {error, timeout}}.
 
 -spec cancel_async(async_req(), async_state()) -> ok.
 cancel_async(StreamRef, #{conn := Conn, stream_ref := StreamRef} = State) ->
     gun:cancel(Conn, StreamRef),
     ok = finish_async(State).
 
-finish_async(#{conn := Conn, pool := Pool}) ->
+finish_async(#{conn := Conn, pool := Pool} = State) ->
+    case State of
+        #{timer_ref := TimerRef} ->
+            erlang:cancel_timer(TimerRef),
+            receive
+                {request_timeout, _} -> ok
+            after 0 -> ok
+            end;
+        _ ->
+            ok
+    end,
     counters:sub(counter(), ?C_ACTIVE_REQUESTS, 1),
     ok = rabbitmq_stream_s3_api_aws_pool:checkin(Pool, Conn).
 
@@ -713,7 +736,18 @@ request_async(Method, Path, Headers0, Body, Opts) ->
                     %% NOTE: no need to wrap this in try/catch and checkin the conn
                     %% since gun:request/5 cannot exit/error/throw.
                     StreamRef = gun:request(Conn, Method, Path, Headers, Body),
-                    {ok, StreamRef, #{pool => Pool, conn => Conn, stream_ref => StreamRef}};
+                    State = #{pool => Pool, conn => Conn, stream_ref => StreamRef},
+                    StateWithTimer =
+                        case maps:get(timeout, Opts, undefined) of
+                            undefined ->
+                                State;
+                            Timeout ->
+                                TimerRef = erlang:send_after(
+                                    Timeout, self(), {request_timeout, StreamRef}
+                                ),
+                                State#{timer_ref => TimerRef}
+                        end,
+                    {ok, StreamRef, StateWithTimer};
                 busy ->
                     {error, pool_busy}
             end;

@@ -83,8 +83,7 @@ multiplicative decrease ([AIMD]) algorithm.
     %% In the future we could make parallel requests within the same fragment,
     %% so we may need to track the byte range. This is unused currently.
     range :: {byte_offset(), byte_offset()},
-    state :: rabbitmq_stream_s3_api:async_state(),
-    started_at :: integer()
+    state :: rabbitmq_stream_s3_api:async_state()
 }).
 
 -record(?MODULE, {
@@ -251,9 +250,6 @@ handle_info({'DOWN', MRef, process, _Pid, _Reason}, #?MODULE{reader_ref = MRef} 
 handle_info(retry_requests, State0) ->
     State = maybe_start_request(State0),
     maybe_reply_pending(State);
-handle_info(check_request_timeouts, State0) ->
-    State = cancel_timed_out_requests(State0),
-    maybe_reply_pending(State);
 handle_info(Msg, #?MODULE{requests = Requests0, retry_delay = RetryDelay0} = State0) ->
     AsyncStates = #{Req => R#request.state || Req := R <- Requests0},
     case rabbitmq_stream_s3_api:match_async(Msg, AsyncStates) of
@@ -312,7 +308,8 @@ handle_info(Msg, #?MODULE{requests = Requests0, retry_delay = RetryDelay0} = Sta
                             maybe_reply_pending(State2);
                         {Transient, _} when
                             Transient =:= stream_error;
-                            Transient =:= connection_error
+                            Transient =:= connection_error;
+                            Transient =:= timeout
                         ->
                             maybe_reply_pending(State1);
                         _ ->
@@ -422,17 +419,15 @@ has_request_for(Fragment, Requests) ->
     ).
 
 start_request(Key, Range, Fragment, #?MODULE{requests = Requests0} = State0) ->
-    case rabbitmq_stream_s3_api:get_range_async(Key, Range) of
+    case rabbitmq_stream_s3_api:get_range_async(Key, Range, #{timeout => ?REQUEST_TIMEOUT_MS}) of
         {ok, RequestId, AsyncState} ->
             Request = #request{
                 fragment = Fragment,
                 range = Range,
-                state = AsyncState,
-                started_at = erlang:monotonic_time()
+                state = AsyncState
             },
             counters:add(counter(), ?C_REQUESTS_IN_FLIGHT, 1),
             counters:add(counter(), ?C_TOTAL_REQUESTS, 1),
-            erlang:send_after(?REQUEST_TIMEOUT_MS, self(), check_request_timeouts),
             State0#?MODULE{requests = Requests0#{RequestId => Request}};
         {error, pool_busy} ->
             State0
@@ -773,35 +768,6 @@ cancel_requests(Requests) ->
         Requests
     ),
     counters:put(counter(), ?C_REQUESTS_IN_FLIGHT, 0).
-
-%% Cancel any in-flight requests that have exceeded ?REQUEST_TIMEOUT_MS.
-%% Returns the updated state with timed-out requests removed and re-issued.
-cancel_timed_out_requests(#?MODULE{requests = Requests0} = State0) ->
-    Now = erlang:monotonic_time(),
-    TimeoutNative = erlang:convert_time_unit(?REQUEST_TIMEOUT_MS, millisecond, native),
-    {TimedOut, Remaining} = maps:partition(
-        fun(_, #request{started_at = StartedAt}) ->
-            Now - StartedAt > TimeoutNative
-        end,
-        Requests0
-    ),
-    case map_size(TimedOut) of
-        0 ->
-            State0;
-        N ->
-            ?LOG_WARNING(
-                "Cancelling ~b timed-out S3 request(s) for stream '~ts' after ~bms",
-                [N, State0#?MODULE.stream, ?REQUEST_TIMEOUT_MS]
-            ),
-            maps:foreach(
-                fun(RequestId, #request{state = ReqState}) ->
-                    rabbitmq_stream_s3_api:cancel_async(RequestId, ReqState),
-                    counters:sub(counter(), ?C_REQUESTS_IN_FLIGHT, 1)
-                end,
-                TimedOut
-            ),
-            maybe_start_request(State0#?MODULE{requests = Remaining})
-    end.
 
 format_state(#?MODULE{
     stream = StreamId,
