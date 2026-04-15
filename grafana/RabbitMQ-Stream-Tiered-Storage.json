@@ -383,12 +383,266 @@
       "type": "stat"
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              }
+            ]
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 5
+      },
+      "id": 113,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "sum(rabbitmq_stream_s3_remote_bytes * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "title": "Remote tier size",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 5
+      },
+      "id": 114,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "sum(rabbitmq_stream_s3_remote_messages * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "title": "Remote tier messages",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              }
+            ]
+          },
+          "unit": "dateTimeAsLocal",
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "N/A",
+                  "index": 0
+                }
+              }
+            },
+            {
+              "type": "range",
+              "options": {
+                "from": -1000000000000000.0,
+                "to": 0,
+                "result": {
+                  "text": "N/A",
+                  "index": 1
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 5
+      },
+      "id": 115,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "min(rabbitmq_stream_s3_remote_oldest_timestamp * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "title": "Remote tier oldest message",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              }
+            ]
+          },
+          "unit": "dateTimeFromNow",
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "N/A",
+                  "index": 0
+                }
+              }
+            },
+            {
+              "type": "range",
+              "options": {
+                "from": -1000000000000000.0,
+                "to": 0,
+                "result": {
+                  "text": "N/A",
+                  "index": 1
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 5
+      },
+      "id": 116,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "min(rabbitmq_stream_s3_remote_oldest_timestamp * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "title": "Remote tier oldest message (age)",
+      "type": "stat"
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 5
+        "y": 10
       },
       "id": 101,
       "title": "S3 Request Duration",
@@ -592,7 +846,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 6
+        "y": 11
       },
       "id": 10,
       "options": {
@@ -820,7 +1074,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 6
+        "y": 11
       },
       "id": 11,
       "options": {
@@ -856,7 +1110,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 15
+        "y": 20
       },
       "id": 102,
       "title": "Upload & Retention",
@@ -1061,7 +1315,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 16
+        "y": 21
       },
       "id": 20,
       "options": {
@@ -1290,7 +1544,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 16
+        "y": 21
       },
       "id": 21,
       "options": {
@@ -1519,7 +1773,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 25
+        "y": 30
       },
       "id": 22,
       "options": {
@@ -1748,7 +2002,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 25
+        "y": 30
       },
       "id": 23,
       "options": {
@@ -1784,7 +2038,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 34
+        "y": 39
       },
       "id": 103,
       "title": "S3 API",
@@ -1989,7 +2243,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 35
+        "y": 40
       },
       "id": 30,
       "options": {
@@ -2218,7 +2472,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 35
+        "y": 40
       },
       "id": 31,
       "options": {
@@ -2442,7 +2696,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 44
+        "y": 49
       },
       "id": 32,
       "options": {
@@ -2660,7 +2914,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 44
+        "y": 49
       },
       "id": 33,
       "options": {
@@ -2695,7 +2949,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 53
+        "y": 58
       },
       "id": 105,
       "title": "Log Reader",
@@ -2730,7 +2984,7 @@
         "h": 4,
         "w": 12,
         "x": 0,
-        "y": 54
+        "y": 59
       },
       "id": 106,
       "options": {
@@ -2783,7 +3037,7 @@
         "h": 4,
         "w": 12,
         "x": 12,
-        "y": 54
+        "y": 59
       },
       "id": 107,
       "options": {
@@ -2996,7 +3250,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 58
+        "y": 63
       },
       "id": 108,
       "options": {
@@ -3219,7 +3473,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 58
+        "y": 63
       },
       "id": 109,
       "options": {
@@ -3442,7 +3696,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 67
+        "y": 72
       },
       "id": 110,
       "options": {
@@ -3665,7 +3919,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 67
+        "y": 72
       },
       "id": 111,
       "options": {
@@ -3903,7 +4157,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 76
+        "y": 81
       },
       "id": 112,
       "options": {
@@ -3938,7 +4192,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 85
+        "y": 90
       },
       "id": 104,
       "title": "Remote Reader",
@@ -3986,7 +4240,7 @@
         "h": 4,
         "w": 12,
         "x": 0,
-        "y": 86
+        "y": 91
       },
       "id": 40,
       "options": {
@@ -4039,7 +4293,7 @@
         "h": 4,
         "w": 12,
         "x": 12,
-        "y": 86
+        "y": 91
       },
       "id": 41,
       "options": {
@@ -4251,7 +4505,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 90
+        "y": 95
       },
       "id": 44,
       "options": {
@@ -4469,7 +4723,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 90
+        "y": 95
       },
       "id": 42,
       "options": {
@@ -4687,7 +4941,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 99
+        "y": 104
       },
       "id": 43,
       "options": {
@@ -4905,7 +5159,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 99
+        "y": 104
       },
       "id": 45,
       "options": {
