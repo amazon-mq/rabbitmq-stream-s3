@@ -56,11 +56,13 @@ A wrapper around the AWS S3 HTTP API.
 -define(C_TOTAL_REQUESTS, 2).
 -define(C_RESPONSE_500, 3).
 -define(C_RESPONSE_503, 4).
+-define(C_REQUEST_TIMEOUTS, 5).
 -define(COUNTERS, [
     {active_requests, ?C_ACTIVE_REQUESTS, gauge, "Current number of requests to S3"},
     {total_requests, ?C_TOTAL_REQUESTS, counter, "Total number of requests to S3"},
     {response_500, ?C_RESPONSE_500, counter, "Number of HTTP 500 responses"},
-    {response_503, ?C_RESPONSE_503, counter, "Number of HTTP 503 responses"}
+    {response_503, ?C_RESPONSE_503, counter, "Number of HTTP 503 responses"},
+    {request_timeouts, ?C_REQUEST_TIMEOUTS, counter, "Number of S3 requests that timed out"}
 ]).
 -define(COUNTER_KEY, {?MODULE, counter}).
 
@@ -599,6 +601,7 @@ handle_async(
     #{conn := Conn, stream_ref := StreamRef} = State
 ) ->
     ?LOG_WARNING("S3 request timed out on ~tw/~tw", [Conn, StreamRef]),
+    counters:add(counter(), ?C_REQUEST_TIMEOUTS, 1),
     gun:cancel(Conn, StreamRef),
     finish_async(State),
     {done, {error, timeout}}.
@@ -704,9 +707,15 @@ await_response(Conn, StreamRef, Timeout) ->
                     },
                     postprocess_response(Response),
                     {ok, Response};
+                {error, timeout} = Err ->
+                    counters:add(counter(), ?C_REQUEST_TIMEOUTS, 1),
+                    Err;
                 {error, _} = Err ->
                     Err
             end;
+        {error, timeout} = Err ->
+            counters:add(counter(), ?C_REQUEST_TIMEOUTS, 1),
+            Err;
         {error, _} = Err ->
             Err
     end.
