@@ -141,46 +141,22 @@ init(#{min_size := MinSize, max_size := MaxSize}) ->
 handle_call(
     {checkout, Checkout},
     {Pid, _} = From,
-    #?MODULE{
-        pending = Pending0,
-        available = Available0,
-        checkouts = Checkouts0,
-        checkouts_rev = CheckoutsRev0
-    } = State0
+    #?MODULE{pending = Pending0} = State0
 ) ->
-    MRef = erlang:monitor(process, Pid),
-    case Available0 of
-        [Conn | Available] ->
-            State = State0#?MODULE{
-                available = Available,
-                checkouts = Checkouts0#{Conn => MRef},
-                checkouts_rev = CheckoutsRev0#{MRef => Conn}
-            },
-            {reply, Conn, cancel_idle_timer(Conn, State)};
-        [] ->
+    case take_available(Pid, State0) of
+        {Conn, State} ->
+            {reply, Conn, State};
+        empty ->
+            MRef = erlang:monitor(process, Pid),
             P = #pending{from = From, checkout = Checkout, mref = MRef},
             State1 = State0#?MODULE{pending = queue:in(P, Pending0)},
             {noreply, grow(State1)}
     end;
-handle_call(
-    {try_checkout, _Checkout},
-    {Pid, _} = _From,
-    #?MODULE{
-        available = Available0,
-        checkouts = Checkouts0,
-        checkouts_rev = CheckoutsRev0
-    } = State0
-) ->
-    case Available0 of
-        [Conn | Available] ->
-            MRef = erlang:monitor(process, Pid),
-            State = State0#?MODULE{
-                available = Available,
-                checkouts = Checkouts0#{Conn => MRef},
-                checkouts_rev = CheckoutsRev0#{MRef => Conn}
-            },
-            {reply, {ok, Conn}, cancel_idle_timer(Conn, State)};
-        [] ->
+handle_call({try_checkout, _Checkout}, {Pid, _} = _From, State0) ->
+    case take_available(Pid, State0) of
+        {Conn, State} ->
+            {reply, {ok, Conn}, State};
+        empty ->
             {reply, busy, State0}
     end;
 handle_call(Request, From, State) ->
@@ -381,6 +357,27 @@ open() ->
         retry => 0
     },
     gun:open(Host, 443, Opts).
+
+take_available(
+    Pid,
+    #?MODULE{
+        available = Available0,
+        checkouts = Checkouts0,
+        checkouts_rev = CheckoutsRev0
+    } = State0
+) ->
+    case Available0 of
+        [Conn | Available] ->
+            MRef = erlang:monitor(process, Pid),
+            State = State0#?MODULE{
+                available = Available,
+                checkouts = Checkouts0#{Conn => MRef},
+                checkouts_rev = CheckoutsRev0#{MRef => Conn}
+            },
+            {Conn, cancel_idle_timer(Conn, State)};
+        [] ->
+            empty
+    end.
 
 checkout(
     #?MODULE{
