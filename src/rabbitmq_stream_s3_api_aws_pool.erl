@@ -66,6 +66,7 @@ the reader pool avoids reader starvation.
 %% API
 -export([
     checkout/2,
+    try_checkout/1,
     checkin/2,
     with/3
 ]).
@@ -103,6 +104,15 @@ checkout(Pool, Timeout) ->
 -spec checkin(pool(), conn()) -> ok.
 checkin(Pool, Conn) ->
     gen_server:cast(Pool, {checkin, Conn}).
+
+-doc """
+Non-blocking checkout. Returns `{ok, Conn}` if a connection is immediately
+available, or `busy` if the pool is exhausted. Unlike `checkout/2`, this
+never queues a pending request, so no `cancel_checkout` is needed on timeout.
+""".
+-spec try_checkout(pool()) -> {ok, conn()} | busy.
+try_checkout(Pool) ->
+    gen_server:call(Pool, {try_checkout, erlang:make_ref()}, 5000).
 
 -spec with(pool(), timeout(), fun((conn()) -> term())) -> term().
 with(Pool, Timeout, Fun) ->
@@ -151,6 +161,27 @@ handle_call(
             P = #pending{from = From, checkout = Checkout, mref = MRef},
             State1 = State0#?MODULE{pending = queue:in(P, Pending0)},
             {noreply, grow(State1)}
+    end;
+handle_call(
+    {try_checkout, _Checkout},
+    {Pid, _} = _From,
+    #?MODULE{
+        available = Available0,
+        checkouts = Checkouts0,
+        checkouts_rev = CheckoutsRev0
+    } = State0
+) ->
+    case Available0 of
+        [Conn | Available] ->
+            MRef = erlang:monitor(process, Pid),
+            State = State0#?MODULE{
+                available = Available,
+                checkouts = Checkouts0#{Conn => MRef},
+                checkouts_rev = CheckoutsRev0#{MRef => Conn}
+            },
+            {reply, {ok, Conn}, cancel_idle_timer(Conn, State)};
+        [] ->
+            {reply, busy, State0}
     end;
 handle_call(Request, From, State) ->
     ?LOG_INFO(?MODULE_STRING " received unexpected call from ~p: ~W", [From, Request, 10]),
@@ -206,9 +237,14 @@ handle_info(
     {gun_up, Conn, _Protocol},
     #?MODULE{monitors = Monitors} = State0
 ) ->
-    %% `gun_up` messages cannot arrive from connections not opened by this pool.
-    ?assert(is_map_key(Conn, Monitors)),
-    {noreply, make_available(Conn, State0)};
+    case is_map_key(Conn, Monitors) of
+        true ->
+            {noreply, make_available(Conn, State0)};
+        false ->
+            %% Stale gun_up from a connection opened by a previous pool instance.
+            gun:close(Conn),
+            {noreply, State0}
+    end;
 handle_info({gun_down, _Conn, _Protocol, _Reason, _KilledStreams}, #?MODULE{} = State) ->
     %% With retry=>0, gun stops the connection process immediately after sending
     %% this message (with reason 'normal' for a clean close, or

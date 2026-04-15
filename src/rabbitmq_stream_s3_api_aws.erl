@@ -56,11 +56,13 @@ A wrapper around the AWS S3 HTTP API.
 -define(C_TOTAL_REQUESTS, 2).
 -define(C_RESPONSE_500, 3).
 -define(C_RESPONSE_503, 4).
+-define(C_REQUEST_TIMEOUTS, 5).
 -define(COUNTERS, [
     {active_requests, ?C_ACTIVE_REQUESTS, gauge, "Current number of requests to S3"},
     {total_requests, ?C_TOTAL_REQUESTS, counter, "Total number of requests to S3"},
     {response_500, ?C_RESPONSE_500, counter, "Number of HTTP 500 responses"},
-    {response_503, ?C_RESPONSE_503, counter, "Number of HTTP 503 responses"}
+    {response_503, ?C_RESPONSE_503, counter, "Number of HTTP 503 responses"},
+    {request_timeouts, ?C_REQUEST_TIMEOUTS, counter, "Number of S3 requests that timed out"}
 ]).
 -define(COUNTER_KEY, {?MODULE, counter}).
 
@@ -110,7 +112,10 @@ Called "HTTP Verb" in S3 docs. "GET", "PUT", "HEAD", "POST", "DELETE", etc..
     %% binary when a fairly large amount of data has been collected.
     data => [binary()],
     pending_bytes => non_neg_integer(),
-    timeout => timeout()
+    timeout => timeout(),
+    %% Timer reference for request timeout. Set when a `timeout` is given in
+    %% request opts. Cancelled and flushed in `finish_async/1`.
+    timer_ref => reference()
 }.
 %% Re-use the gun stream ref since it's already a reference.
 -type async_req() :: gun:stream_ref().
@@ -486,6 +491,7 @@ match_async(Msg, Reqs) ->
             {gun_error, _, StreamRef, _} -> StreamRef;
             {gun_response, _, StreamRef, _, _, _} -> StreamRef;
             {gun_data, _, StreamRef, _, _} -> StreamRef;
+            {request_timeout, StreamRef} -> StreamRef;
             _ -> undefined
         end,
     case Reqs of
@@ -588,14 +594,38 @@ handle_async(
 ) ->
     finish_async(State),
     PendingData = iolist_to_binary(lists:reverse(Data0, [Data])),
-    {data, PendingData, done}.
+    {data, PendingData, done};
+handle_async(
+    {request_timeout, StreamRef},
+    StreamRef,
+    #{conn := Conn, stream_ref := StreamRef} = State
+) ->
+    ?LOG_WARNING("S3 request timed out on ~tw/~tw", [Conn, StreamRef]),
+    counters:add(counter(), ?C_REQUEST_TIMEOUTS, 1),
+    gun:cancel(Conn, StreamRef),
+    finish_async(State),
+    {done, {error, timeout}}.
 
 -spec cancel_async(async_req(), async_state()) -> ok.
 cancel_async(StreamRef, #{conn := Conn, stream_ref := StreamRef} = State) ->
     gun:cancel(Conn, StreamRef),
     ok = finish_async(State).
 
-finish_async(#{conn := Conn, pool := Pool}) ->
+finish_async(#{conn := Conn, pool := Pool} = State) ->
+    case State of
+        #{timer_ref := TimerRef, stream_ref := StreamRef} ->
+            case erlang:cancel_timer(TimerRef) of
+                false ->
+                    receive
+                        {request_timeout, StreamRef} -> ok
+                    after 0 -> ok
+                    end;
+                _ ->
+                    ok
+            end;
+        _ ->
+            ok
+    end,
     counters:sub(counter(), ?C_ACTIVE_REQUESTS, 1),
     ok = rabbitmq_stream_s3_api_aws_pool:checkin(Pool, Conn).
 
@@ -677,9 +707,15 @@ await_response(Conn, StreamRef, Timeout) ->
                     },
                     postprocess_response(Response),
                     {ok, Response};
+                {error, timeout} = Err ->
+                    counters:add(counter(), ?C_REQUEST_TIMEOUTS, 1),
+                    Err;
                 {error, _} = Err ->
                     Err
             end;
+        {error, timeout} = Err ->
+            counters:add(counter(), ?C_REQUEST_TIMEOUTS, 1),
+            Err;
         {error, _} = Err ->
             Err
     end.
@@ -704,18 +740,32 @@ request_async(Method, Path, Headers0, Body, Opts) ->
                 Body,
                 Opts
             ),
-            Cnt = counter(),
-            counters:add(Cnt, ?C_ACTIVE_REQUESTS, 1),
-            counters:add(Cnt, ?C_TOTAL_REQUESTS, 1),
             Pool = ?GENERAL_POOL,
-            Conn = rabbitmq_stream_s3_api_aws_pool:checkout(Pool, 10_000),
-            %% NOTE: no need to wrap this in try/catch and checkin the conn
-            %% since gun:request/5 cannot exit/error/throw.
-            StreamRef = gun:request(Conn, Method, Path, Headers, Body),
-            {ok, StreamRef, #{pool => Pool, conn => Conn, stream_ref => StreamRef}};
+            start_async_request(Pool, Method, Path, Headers, Body, Opts);
         {error, _} = Err ->
             Err
     end.
+
+start_async_request(Pool, Method, Path, Headers, Body, Opts) ->
+    case rabbitmq_stream_s3_api_aws_pool:try_checkout(Pool) of
+        {ok, Conn} ->
+            Cnt = counter(),
+            counters:add(Cnt, ?C_ACTIVE_REQUESTS, 1),
+            counters:add(Cnt, ?C_TOTAL_REQUESTS, 1),
+            %% NOTE: no need to wrap this in try/catch and checkin the conn
+            %% since gun:request/5 cannot exit/error/throw.
+            StreamRef = gun:request(Conn, Method, Path, Headers, Body),
+            State = #{pool => Pool, conn => Conn, stream_ref => StreamRef},
+            {ok, StreamRef, maybe_set_timer(Opts, StreamRef, State)};
+        busy ->
+            {error, pool_busy}
+    end.
+
+maybe_set_timer(#{timeout := Timeout}, StreamRef, State) ->
+    TimerRef = erlang:send_after(Timeout, self(), {request_timeout, StreamRef}),
+    State#{timer_ref => TimerRef};
+maybe_set_timer(_Opts, _StreamRef, State) ->
+    State.
 
 -spec hostname() -> binary().
 hostname() ->
