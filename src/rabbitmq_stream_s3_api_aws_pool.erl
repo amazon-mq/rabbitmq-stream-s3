@@ -171,9 +171,9 @@ handle_call(
         checkouts_rev = CheckoutsRev0
     } = State0
 ) ->
-    MRef = erlang:monitor(process, Pid),
     case Available0 of
         [Conn | Available] ->
+            MRef = erlang:monitor(process, Pid),
             State = State0#?MODULE{
                 available = Available,
                 checkouts = Checkouts0#{Conn => MRef},
@@ -181,7 +181,6 @@ handle_call(
             },
             {reply, {ok, Conn}, cancel_idle_timer(Conn, State)};
         [] ->
-            erlang:demonitor(MRef, [flush]),
             {reply, busy, State0}
     end;
 handle_call(Request, From, State) ->
