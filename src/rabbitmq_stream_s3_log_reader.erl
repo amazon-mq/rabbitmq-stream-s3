@@ -18,6 +18,13 @@ tier.
 
 -behaviour(osiris_log_reader).
 
+%% OTP 27 dialyzer infers narrower success types for osiris_log:send_file/3
+%% and osiris_log:chunk_iterator/3 than their specs declare, causing false
+%% positives for the {offset_not_found, ...} branches and maybe_become_remote/2.
+%% Remove these suppressions once OTP 28 is required.
+-dialyzer({no_match, [send_file/3, chunk_iterator/3]}).
+-dialyzer({no_unused, maybe_become_remote/2}).
+
 -define(READ_TIMEOUT, 10000).
 -define(SLOW_READ_THRESHOLD_MS, 10_000).
 
@@ -350,6 +357,19 @@ send_file(Socket, #?MODULE{mode = Local0} = State0, Callback) ->
     case osiris_log:send_file(Socket, Local0, Callback) of
         {ok, Local} ->
             {ok, State0#?MODULE{mode = Local}};
+        {offset_not_found, Local1} ->
+            Offset = osiris_log:next_offset(Local1),
+            case maybe_become_remote(Offset, State0#?MODULE{mode = Local1}) of
+                {ok, State} ->
+                    send_file(Socket, State, Callback);
+                false ->
+                    case osiris_log:open_next_segment(Local1) of
+                        {ok, Local} ->
+                            send_file(Socket, State0#?MODULE{mode = Local}, Callback);
+                        not_found ->
+                            {end_of_stream, State0#?MODULE{mode = Local1}}
+                    end
+            end;
         {end_of_stream, Local} ->
             {end_of_stream, State0#?MODULE{mode = Local}};
         {error, _} = Err ->
@@ -419,6 +439,19 @@ chunk_iterator(#?MODULE{mode = Local0} = State0, Credit, PrevIter) ->
     case osiris_log:chunk_iterator(Local0, Credit, PrevIter) of
         {ok, Header, Iter, Local} ->
             {ok, Header, Iter, State0#?MODULE{mode = Local}};
+        {offset_not_found, Local1} ->
+            Offset = osiris_log:next_offset(Local1),
+            case maybe_become_remote(Offset, State0#?MODULE{mode = Local1}) of
+                {ok, State} ->
+                    chunk_iterator(State, Credit, undefined);
+                false ->
+                    case osiris_log:open_next_segment(Local1) of
+                        {ok, Local} ->
+                            chunk_iterator(State0#?MODULE{mode = Local}, Credit, undefined);
+                        not_found ->
+                            {end_of_stream, State0#?MODULE{mode = Local1}}
+                    end
+            end;
         {end_of_stream, Local} ->
             {end_of_stream, State0#?MODULE{mode = Local}};
         {error, _} = Err ->
@@ -611,6 +644,21 @@ init_remote_reader(
             {ok, Reader};
         {error, _} = Err ->
             Err
+    end.
+
+maybe_become_remote(Offset, #?MODULE{config = Config, mode = Local}) ->
+    case resolve_remote_location(Offset, Config) of
+        {ok, Location} ->
+            case init_remote_reader(Location, Config) of
+                {ok, RemoteState} ->
+                    counters:add(counter(), ?C_LOCAL_CLOSE, 1),
+                    osiris_log:close(Local),
+                    {ok, RemoteState};
+                {error, _} ->
+                    false
+            end;
+        _ ->
+            false
     end.
 
 -spec find_position(
