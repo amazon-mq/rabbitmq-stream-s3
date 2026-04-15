@@ -611,7 +611,7 @@ cancel_async(StreamRef, #{conn := Conn, stream_ref := StreamRef} = State) ->
 finish_async(#{conn := Conn, pool := Pool} = State) ->
     case State of
         #{timer_ref := TimerRef} ->
-            erlang:cancel_timer(TimerRef),
+            _ = erlang:cancel_timer(TimerRef),
             receive
                 {request_timeout, _} -> ok
             after 0 -> ok
