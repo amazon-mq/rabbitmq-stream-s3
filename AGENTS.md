@@ -45,6 +45,8 @@ Read the relevant doc before modifying any module.
 | `rabbitmq_stream_s3_remote_reader.erl` | `gen_server` that pre-fetches and buffers data from the remote tier for a single consumer |
 | `rabbitmq_stream_s3_remote_reader_sup.erl` | Supervisor for remote reader `gen_server` processes |
 | `rabbitmq_stream_s3_request_metrics.erl` | Tracks S3 request duration as a histogram (set of per-bucket counters) |
+| `rabbitmq_stream_s3_read_size_metrics.erl` | Tracks remote tier read size distribution as a histogram |
+| `rabbitmq_stream_s3_histogram.erl` | Generic histogram used by `_api` (request duration) and `_remote_reader` (read size distribution) |
 | `rabbitmq_stream_s3_server.erl` | `gen_server` coordinating uploads, deletions, manifest updates |
 | `rabbitmq_stream_s3_sup.erl` | Top-level supervisor |
 

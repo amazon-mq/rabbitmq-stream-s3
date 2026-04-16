@@ -129,8 +129,11 @@ multiplicative decrease ([AIMD]) algorithm.
 -export_type([config/0, hint/0]).
 
 -define(COUNTER_KEY, {?MODULE, counter}).
+-define(READ_SIZE_BUCKETS, [
+    48, 128, 512, 2_048, 8_192, 32_768, 131_072, 524_288, 2_097_152, 8_388_608, infinity
+]).
 
--export([init_counters/0]).
+-export([init_counters/0, read_size_prometheus_format/0]).
 
 %% API
 -export([
@@ -156,6 +159,7 @@ multiplicative decrease ([AIMD]) algorithm.
 init_counters() ->
     Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?COUNTERS, #{module => ?MODULE}),
     persistent_term:put(?COUNTER_KEY, Cnt),
+    rabbitmq_stream_s3_histogram:new(?MODULE, ?READ_SIZE_BUCKETS),
     ok.
 
 -spec read(pid(), byte_offset(), pos_integer(), hint()) ->
@@ -531,6 +535,7 @@ maybe_reply(#read{offset = Offset, bytes = Bytes, hint = Hint}, #?MODULE{} = Sta
             %% with debugging.
             erlang:error(unreachable);
         {ok, State1, Data} ->
+            rabbitmq_stream_s3_histogram:observe(?MODULE, byte_size(Data)),
             counters:add(counter(), ?C_BUFFER_HIT, 1),
             State2 = adjust_read_size(hit, State1),
             State = maybe_start_request(State2),
@@ -845,3 +850,16 @@ format_fragment_info(#fragment_info{
 
 counter() ->
     persistent_term:get(?COUNTER_KEY).
+
+-spec read_size_prometheus_format() -> map().
+read_size_prometheus_format() ->
+    {Buckets, Count, Sum} = rabbitmq_stream_s3_histogram:prometheus_format(
+        ?MODULE, fun(X) -> X end, ?READ_SIZE_BUCKETS
+    ),
+    #{
+        read_size_bytes => #{
+            type => histogram,
+            help => <<"Distribution of remote tier read sizes in bytes">>,
+            values => [{[], Buckets, Count, Sum}]
+        }
+    }.

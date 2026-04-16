@@ -5731,7 +5731,7 @@
       },
       "gridPos": {
         "h": 9,
-        "w": 24,
+        "w": 12,
         "x": 0,
         "y": 139
       },
@@ -5761,6 +5761,74 @@
       ],
       "title": "Buffer hit rate",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "scaleDistribution": {
+              "type": "linear"
+            }
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 139
+      },
+      "id": 132,
+      "options": {
+        "calculate": false,
+        "color": {
+          "exponent": 0.5,
+          "fill": "dark-orange",
+          "mode": "scheme",
+          "reverse": false,
+          "scale": "exponential",
+          "scheme": "Oranges",
+          "steps": 64
+        },
+        "exemplars": {
+          "color": "rgba(255,0,255,0.7)"
+        },
+        "filterValues": {
+          "le": 1e-09
+        },
+        "legend": {
+          "show": true
+        },
+        "rowsFrame": {
+          "layout": "auto"
+        },
+        "tooltip": {
+          "mode": "single",
+          "showColorScale": false,
+          "yHistogram": false
+        },
+        "yAxis": {
+          "axisPlacement": "left",
+          "reverse": false,
+          "unit": "bytes"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by(le) (rate(rabbitmq_stream_s3_read_size_bytes_bucket[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "format": "heatmap",
+          "legendFormat": "{{le}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Read size distribution",
+      "type": "heatmap"
     },
     {
       "datasource": {

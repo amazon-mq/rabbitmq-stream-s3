@@ -32,7 +32,8 @@ file-system operations. Use that in non-unit tests.
     delete_prefix/2,
     match_async/2,
     handle_async/3,
-    cancel_async/2
+    cancel_async/2,
+    request_duration_prometheus_format/0
 ]).
 
 -export([backend/0]).
@@ -107,6 +108,8 @@ examples.
 ]).
 -define(COUNTER_KEY, {?MODULE, counter}).
 
+-define(REQUEST_DURATION_BUCKETS, [10, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, infinity]).
+
 backend() ->
     application:get_env(rabbitmq_stream_s3, ?MODULE, rabbitmq_stream_s3_api_aws).
 
@@ -119,7 +122,14 @@ init() ->
     persistent_term:put(?COUNTER_KEY, Cnt),
     ok = rabbitmq_stream_s3_remote_reader:init_counters(),
     ok = rabbitmq_stream_s3_log_reader:init_counters(),
-    ok = rabbitmq_stream_s3_request_metrics:init(),
+    lists:foreach(
+        fun(Kind) ->
+            rabbitmq_stream_s3_histogram:new(
+                {?MODULE, request_duration, Kind}, ?REQUEST_DURATION_BUCKETS
+            )
+        end,
+        [read, write]
+    ),
     (backend()):init().
 
 -doc #{equiv => get(Key, #{})}.
@@ -204,7 +214,7 @@ stream_data({StartTs, BackendState}, Data) ->
 stream_finish({StartTs, BackendState}, Crc32) ->
     Result = (backend()):stream_finish(BackendState, Crc32),
     Ms = erlang:convert_time_unit(erlang:monotonic_time() - StartTs, native, millisecond),
-    rabbitmq_stream_s3_request_metrics:observe(write, Ms),
+    rabbitmq_stream_s3_histogram:observe({?MODULE, request_duration, write}, Ms),
     Result.
 
 -doc #{equiv => delete(Keys, #{})}.
@@ -262,7 +272,7 @@ cancel_async(Req, {StartTs, BackendState}) ->
 
 finish_async(StartTs) ->
     Ms = erlang:convert_time_unit(erlang:monotonic_time() - StartTs, native, millisecond),
-    rabbitmq_stream_s3_request_metrics:observe(read, Ms),
+    rabbitmq_stream_s3_histogram:observe({?MODULE, request_duration, read}, Ms),
     ok.
 
 observe(Kind, Fun) ->
@@ -273,5 +283,26 @@ observe(Kind, Fun) ->
         DurationMs = erlang:convert_time_unit(
             erlang:monotonic_time() - T0, native, millisecond
         ),
-        rabbitmq_stream_s3_request_metrics:observe(Kind, DurationMs)
+        rabbitmq_stream_s3_histogram:observe({?MODULE, request_duration, Kind}, DurationMs)
     end.
+
+-spec request_duration_prometheus_format() -> map().
+request_duration_prometheus_format() ->
+    Values = [
+        begin
+            {Buckets, Count, Sum} = rabbitmq_stream_s3_histogram:prometheus_format(
+                {?MODULE, request_duration, Kind},
+                fun(Ms) -> Ms / 1000 end,
+                ?REQUEST_DURATION_BUCKETS
+            ),
+            {[{kind, Kind}], Buckets, Count, Sum}
+        end
+     || Kind <- [read, write]
+    ],
+    #{
+        request_duration_seconds => #{
+            type => histogram,
+            help => <<"Duration of S3 API requests in seconds">>,
+            values => Values
+        }
+    }.
