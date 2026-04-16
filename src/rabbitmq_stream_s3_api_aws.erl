@@ -748,7 +748,9 @@ request_async(Method, Path, Headers0, Body, Opts) ->
 
 start_async_request(Pool, Method, Path, Headers, Body, Opts) ->
     case rabbitmq_stream_s3_api_aws_pool:try_checkout(Pool) of
-        {ok, Conn} ->
+        busy ->
+            {error, pool_busy};
+        Conn ->
             Cnt = counter(),
             counters:add(Cnt, ?C_ACTIVE_REQUESTS, 1),
             counters:add(Cnt, ?C_TOTAL_REQUESTS, 1),
@@ -756,9 +758,7 @@ start_async_request(Pool, Method, Path, Headers, Body, Opts) ->
             %% since gun:request/5 cannot exit/error/throw.
             StreamRef = gun:request(Conn, Method, Path, Headers, Body),
             State = #{pool => Pool, conn => Conn, stream_ref => StreamRef},
-            {ok, StreamRef, maybe_set_timer(Opts, StreamRef, State)};
-        busy ->
-            {error, pool_busy}
+            {ok, StreamRef, maybe_set_timer(Opts, StreamRef, State)}
     end.
 
 maybe_set_timer(#{timeout := Timeout}, StreamRef, State) ->

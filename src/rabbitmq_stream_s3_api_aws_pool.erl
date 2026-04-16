@@ -107,12 +107,19 @@ checkin(Pool, Conn) ->
 
 -doc """
 Non-blocking checkout. Returns `{ok, Conn}` if a connection is immediately
-available, or `busy` if the pool is exhausted. Unlike `checkout/2`, this
-never queues a pending request, so no `cancel_checkout` is needed on timeout.
+available, or `busy` if the pool is at capacity. If the pool has room to grow,
+queues the caller and waits for a new connection (like `checkout/2`).
 """.
--spec try_checkout(pool()) -> {ok, conn()} | busy.
+-spec try_checkout(pool()) -> conn() | busy.
 try_checkout(Pool) ->
-    gen_server:call(Pool, {try_checkout, erlang:make_ref()}, 5000).
+    Checkout = erlang:make_ref(),
+    try
+        gen_server:call(Pool, {try_checkout, Checkout}, 5000)
+    catch
+        C:E:Stack ->
+            gen_server:cast(Pool, {cancel_checkout, Checkout}),
+            erlang:raise(C, E, Stack)
+    end.
 
 -spec with(pool(), timeout(), fun((conn()) -> term())) -> term().
 with(Pool, Timeout, Fun) ->
@@ -152,10 +159,20 @@ handle_call(
             State1 = State0#?MODULE{pending = queue:in(P, Pending0)},
             {noreply, grow(State1)}
     end;
-handle_call({try_checkout, _Checkout}, {Pid, _} = _From, State0) ->
+handle_call(
+    {try_checkout, Checkout},
+    {Pid, _} = From,
+    #?MODULE{max_size = MaxSize, monitors = Monitors, pending = Pending0} = State0
+) ->
     case take_available(Pid, State0) of
         {Conn, State} ->
-            {reply, {ok, Conn}, State};
+            {reply, Conn, State};
+        empty when map_size(Monitors) < MaxSize ->
+            %% Pool has room to grow — queue the caller and grow.
+            MRef = erlang:monitor(process, Pid),
+            P = #pending{from = From, checkout = Checkout, mref = MRef},
+            State1 = State0#?MODULE{pending = queue:in(P, Pending0)},
+            {noreply, grow(State1)};
         empty ->
             {reply, busy, State0}
     end;
