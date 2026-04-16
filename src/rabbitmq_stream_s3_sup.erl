@@ -13,25 +13,29 @@ start_link() ->
 init([]) ->
     SupFlags = #{strategy => one_for_one, intensity => 3, period => 5},
     %% TODO: configure pool sizes.
+    UploadPoolId = rabbitmq_stream_s3_upload_pool,
     UploadPoolSup = #{
-        id => rabbitmq_stream_s3_upload_pool,
+        id => UploadPoolId,
         type => worker,
         start =>
             {rabbitmq_stream_s3_api_aws_pool, start_link, [
-                rabbitmq_stream_s3_upload_pool,
+                UploadPoolId,
                 #{
+                    name => UploadPoolId,
                     min_size => application:get_env(rabbitmq_stream_s3, upload_pool_min_size, 0),
                     max_size => application:get_env(rabbitmq_stream_s3, upload_pool_max_size, 20)
                 }
             ]}
     },
+    GeneralPoolId = rabbitmq_stream_s3_general_pool,
     GeneralPoolSup = #{
-        id => rabbitmq_stream_s3_general_pool,
+        id => GeneralPoolId,
         type => worker,
         start =>
             {rabbitmq_stream_s3_api_aws_pool, start_link, [
-                rabbitmq_stream_s3_general_pool,
+                GeneralPoolId,
                 #{
+                    name => GeneralPoolId,
                     min_size => application:get_env(rabbitmq_stream_s3, general_pool_min_size, 0),
                     max_size => application:get_env(rabbitmq_stream_s3, general_pool_max_size, 50)
                 }

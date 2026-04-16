@@ -21,6 +21,19 @@ the reader pool avoids reader starvation.
 %% Reap proactively before S3 closes an idle connection from under us.
 -define(IDLE_TIMEOUT_MS, 10_000).
 
+-define(C_CHECKOUTS, 1).
+-define(C_CHECKINS, 2).
+-define(C_CHECKOUT_QUEUED, 3).
+-define(C_CHECKOUT_CANCELLED, 4).
+-define(COUNTERS, [
+    {checkouts, ?C_CHECKOUTS, counter, "Total successful pool checkouts"},
+    {checkins, ?C_CHECKINS, counter, "Total pool checkins"},
+    {checkout_queued, ?C_CHECKOUT_QUEUED, counter,
+        "Number of checkout requests that had to wait for a connection"},
+    {checkout_cancelled, ?C_CHECKOUT_CANCELLED, counter,
+        "Number of checkout requests that were cancelled (caller timeout or exit)"}
+]).
+
 -record(pending, {
     from :: gen_server:from(),
     checkout :: checkout(),
@@ -47,7 +60,8 @@ the reader pool avoids reader starvation.
     %% A queue of requests to check out a connection.
     pending = queue:new() :: queue:queue(#pending{}),
     %% Idle timers for available connections.
-    idle_timers = #{} :: #{conn() => reference()}
+    idle_timers = #{} :: #{conn() => reference()},
+    counter :: counters:counters_ref()
 }).
 
 %% Gun connection pid.
@@ -136,11 +150,15 @@ with(Pool, Timeout, Fun) ->
 start_link(Name, Config) ->
     gen_server:start_link({local, Name}, ?MODULE, Config, []).
 
-init(#{min_size := MinSize, max_size := MaxSize}) ->
+init(#{min_size := MinSize, max_size := MaxSize, name := Name}) ->
     case rabbitmq_stream_s3_api:backend() of
         rabbitmq_stream_s3_api_aws ->
+            Cnt = seshat:new(rabbitmq_stream_s3, Name, ?COUNTERS, #{
+                module => ?MODULE,
+                pool => Name
+            }),
             self() ! grow,
-            {ok, #?MODULE{min_size = MinSize, max_size = MaxSize}};
+            {ok, #?MODULE{min_size = MinSize, max_size = MaxSize, counter = Cnt}};
         _ ->
             ignore
     end.
@@ -148,12 +166,14 @@ init(#{min_size := MinSize, max_size := MaxSize}) ->
 handle_call(
     {checkout, Checkout},
     {Pid, _} = From,
-    #?MODULE{pending = Pending0} = State0
+    #?MODULE{pending = Pending0, counter = Cnt} = State0
 ) ->
     case take_available(Pid, State0) of
         {Conn, State} ->
+            counters:add(Cnt, ?C_CHECKOUTS, 1),
             {reply, Conn, State};
         empty ->
+            counters:add(Cnt, ?C_CHECKOUT_QUEUED, 1),
             MRef = erlang:monitor(process, Pid),
             P = #pending{from = From, checkout = Checkout, mref = MRef},
             State1 = State0#?MODULE{pending = queue:in(P, Pending0)},
@@ -162,12 +182,19 @@ handle_call(
 handle_call(
     {try_checkout, Checkout},
     {Pid, _} = From,
-    #?MODULE{max_size = MaxSize, monitors = Monitors, pending = Pending0} = State0
+    #?MODULE{
+        max_size = MaxSize,
+        monitors = Monitors,
+        pending = Pending0,
+        counter = Cnt
+    } = State0
 ) ->
     case take_available(Pid, State0) of
         {Conn, State} ->
+            counters:add(Cnt, ?C_CHECKOUTS, 1),
             {reply, Conn, State};
         empty when map_size(Monitors) < MaxSize ->
+            counters:add(Cnt, ?C_CHECKOUT_QUEUED, 1),
             %% Pool has room to grow — queue the caller and grow.
             MRef = erlang:monitor(process, Pid),
             P = #pending{from = From, checkout = Checkout, mref = MRef},
@@ -185,11 +212,13 @@ handle_cast(
     #?MODULE{
         checkouts = Checkouts0,
         checkouts_rev = CheckoutsRev0,
-        monitors = Monitors
+        monitors = Monitors,
+        counter = Cnt
     } = State0
 ) ->
     case Checkouts0 of
         #{Conn := MRef} ->
+            counters:add(Cnt, ?C_CHECKINS, 1),
             erlang:demonitor(MRef, [flush]),
             State1 = State0#?MODULE{
                 checkouts = maps:remove(Conn, Checkouts0),
@@ -206,11 +235,12 @@ handle_cast(
         _ ->
             {noreply, State0}
     end;
-handle_cast({cancel_checkout, Checkout}, #?MODULE{pending = Pending0} = State0) ->
+handle_cast({cancel_checkout, Checkout}, #?MODULE{pending = Pending0, counter = Cnt} = State0) ->
     Pending = queue:delete_with(
         fun(#pending{checkout = C, mref = MRef}) ->
             case C =:= Checkout of
                 true ->
+                    counters:add(Cnt, ?C_CHECKOUT_CANCELLED, 1),
                     erlang:demonitor(MRef, [flush]),
                     true;
                 false ->
@@ -401,11 +431,13 @@ checkout(
         pending = Pending0,
         available = Available0,
         checkouts = Checkouts0,
-        checkouts_rev = CheckoutsRev0
+        checkouts_rev = CheckoutsRev0,
+        counter = Cnt
     } = State0
 ) ->
     case {queue:out(Pending0), Available0} of
         {{{value, #pending{from = From, mref = MRef}}, Pending}, [Conn | Available]} ->
+            counters:add(Cnt, ?C_CHECKOUTS, 1),
             gen_server:reply(From, Conn),
             State1 = cancel_idle_timer(Conn, State0#?MODULE{
                 pending = Pending,
