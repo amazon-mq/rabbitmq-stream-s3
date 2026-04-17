@@ -294,7 +294,7 @@ set_data_dir(DataDir) ->
 
 -spec data_dir() -> binary() | undefined.
 data_dir() ->
-    application:get_env(rabbitmq_stream_s3, api_fs_data_dir, undefined).
+    rabbitmq_stream_s3_config:api_fs_data_dir().
 
 -spec key_to_path(rabbitmq_stream_s3_api:key()) -> binary() | {error, path_not_set}.
 key_to_path(Key) ->

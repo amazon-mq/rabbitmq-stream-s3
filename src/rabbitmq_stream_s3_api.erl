@@ -111,7 +111,7 @@ examples.
 -define(REQUEST_DURATION_BUCKETS, [10, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, infinity]).
 
 backend() ->
-    application:get_env(rabbitmq_stream_s3, ?MODULE, rabbitmq_stream_s3_api_aws).
+    rabbitmq_stream_s3_config:api_backend().
 
 counter() ->
     persistent_term:get(?COUNTER_KEY).

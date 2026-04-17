@@ -129,27 +129,27 @@ init() ->
 
 -spec reload_config() -> ok.
 reload_config() ->
-    AccessKey0 = application:get_env(rabbitmq_stream_s3, aws_access_key),
-    SecretKey0 = application:get_env(rabbitmq_stream_s3, aws_secret_key),
+    AccessKey0 = rabbitmq_stream_s3_config:aws_access_key(),
+    SecretKey0 = rabbitmq_stream_s3_config:aws_secret_key(),
     case {AccessKey0, SecretKey0} of
         {undefined, undefined} ->
             ok;
-        {{ok, AccessKey}, {ok, SecretKey}} ->
+        {AccessKey, SecretKey} when is_binary(AccessKey) andalso is_binary(SecretKey) ->
             _ = ets:insert(?TABLE, {
                 credentials,
                 AccessKey,
                 SecretKey,
-                application:get_env(rabbitmq_stream_s3, aws_security_token, undefined),
+                rabbitmq_stream_s3_config:aws_security_token(),
                 undefined
             }),
             ok
         %% TODO: helpful error message when only one of these keys is set...
     end,
-    case application:get_env(rabbitmq_stream_s3, aws_region) of
-        {ok, Region} ->
-            persistent_term:put(?REGION_KEY, Region),
-            ok;
+    case rabbitmq_stream_s3_config:aws_region() of
         undefined ->
+            ok;
+        Region ->
+            persistent_term:put(?REGION_KEY, Region),
             ok
     end,
     ok.
@@ -777,7 +777,7 @@ hostname(Region) ->
 
 -spec region() -> binary().
 region() ->
-    Attempts = application:get_env(rabbitmq_stream_s3, get_region_attempts, 10),
+    Attempts = rabbitmq_stream_s3_config:get_region_attempts(),
     region(Attempts).
 
 region(Retries) ->
@@ -835,7 +835,7 @@ tld(Region) ->
             <<"us-isof-south-1">> => <<"csp.hci.ic.gov">>,
             <<"eusc-de-east-1">> => <<"amazonaws.eu">>
         },
-        application:get_env(rabbitmq_stream_s3, region_endpoints, #{})
+        rabbitmq_stream_s3_config:aws_region_endpoints()
     ),
     maps:get(Region, Mapping, <<"amazonaws.com">>).
 
@@ -853,7 +853,7 @@ fetch_credentials(false) ->
         ?MODULE_STRING
         ": no AWS credentials available, requesting from EC2 instance metadata"
     ),
-    Attempts = application:get_env(rabbitmq_stream_s3, get_credentials_attempts, 10),
+    Attempts = rabbitmq_stream_s3_config:get_credentials_attempts(),
     {Msec, Result} = timer:tc(?MODULE, get_credentials, [Attempts, imds], millisecond),
     log_credentials_result(Result, Msec, "EC2 instance metadata service"),
     Result;
@@ -862,7 +862,7 @@ fetch_credentials(URI) ->
         ?MODULE_STRING
         ": no AWS credentials available, requesting from container credentials endpoint"
     ),
-    Attempts = application:get_env(rabbitmq_stream_s3, get_credentials_attempts, 10),
+    Attempts = rabbitmq_stream_s3_config:get_credentials_attempts(),
     {Msec, Result} = timer:tc(?MODULE, get_credentials, [Attempts, {container, URI}], millisecond),
     log_credentials_result(Result, Msec, "container credentials endpoint"),
     Result.
@@ -1133,7 +1133,7 @@ with_instance_metadata_conn(Fun) when is_function(Fun, 1) ->
     end.
 
 sign_headers(Headers, AccessKey, SecretKey, SecurityToken, Method, Path, Body, Opts) ->
-    {ok, Bucket} = application:get_env(rabbitmq_stream_s3, bucket),
+    Bucket = rabbitmq_stream_s3_config:bucket(),
     Region = region(),
     Host = <<Bucket/binary, $., (hostname(Region))/binary>>,
     sign_headers(

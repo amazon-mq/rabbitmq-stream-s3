@@ -339,15 +339,14 @@ handle_info(
             Task = Task0#task{failures = Failures},
             %% With default settings, retry after 100, 400, 900, 1600, 2500, 3600,
             %% 4900, 5000, 5000, 5000, ... ms
-            Max = application:get_env(rabbitmq_stream_s3, task_retry_delay_max_ms, 5_000),
-            Constant = application:get_env(rabbitmq_stream_s3, task_retry_delay_constant, 10),
-            Exponent = application:get_env(rabbitmq_stream_s3, task_retry_delay_exponent, 2),
+            Max = rabbitmq_stream_s3_config:task_retry_delay_max_ms(),
+            Constant = rabbitmq_stream_s3_config:task_retry_delay_constant(),
+            Exponent = rabbitmq_stream_s3_config:task_retry_delay_exponent(),
             DelayMs = min(trunc(math:pow(Constant * Failures, Exponent)), Max),
             TaskRef = erlang:make_ref(),
             erlang:send_after(DelayMs, self(), #retry_task{task = TaskRef}),
             DelayedTasks = DelayedTasks0#{TaskRef => Task},
-            %% TODO: move all application:get_env calls to rabbitmq_stream_s3_config.
-            case application:get_env(rabbitmq_stream_s3, verbose_logging, false) of
+            case rabbitmq_stream_s3_config:verbose_logging() of
                 true ->
                     ?LOG_INFO(
                         "Task ~p (~p) down (~b other outstanding), retrying in ~bms. Reason: ~p", [
@@ -905,7 +904,7 @@ upload_fragment0(
         size = Size
     }
 ) ->
-    Timeout = application:get_env(rabbitmq_stream_s3, segment_upload_timeout, 45_000),
+    Timeout = rabbitmq_stream_s3_config:segment_upload_timeout(),
     SegmentFilename = rabbitmq_stream_s3:offset_filename(SegmentOffset, <<"segment">>),
     IndexFilename = rabbitmq_stream_s3:offset_filename(SegmentOffset, <<"index">>),
 
@@ -1099,7 +1098,7 @@ fragment_header_to_info(Data) ->
     Info.
 
 set_tick_timer() ->
-    Timeout = application:get_env(rabbitmq_stream_s3, tick_timeout_milliseconds, 5000),
+    Timeout = rabbitmq_stream_s3_config:tick_timeout_milliseconds(),
     _ = erlang:send_after(Timeout, self(), tick_timeout),
     ok.
 

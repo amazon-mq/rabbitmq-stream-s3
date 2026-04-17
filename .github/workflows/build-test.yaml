@@ -48,7 +48,7 @@ jobs:
       - name: make
         run: make -C ${{ github.workspace }}/rabbitmq-server/deps/rabbitmq_stream_s3
       - name: tests
-        run: make -C ${{ github.workspace }}/rabbitmq-server/deps/rabbitmq_stream_s3 tests
+        run: make -C ${{ github.workspace }}/rabbitmq-server/deps/rabbitmq_stream_s3 EUNIT_OPTS=verbose tests
       - name: maybe upload CT logs
         if: failure()
         uses: actions/upload-artifact@v4

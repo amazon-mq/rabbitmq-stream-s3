@@ -184,15 +184,9 @@ Create a default, empty machine state.
 -spec new() -> state().
 new() ->
     new(#{
-        rebalance_factor => application:get_env(
-            rabbitmq_stream_s3, manifest_rebalance_factor, 1024
-        ),
-        debounce_modifications => application:get_env(
-            rabbitmq_stream_s3, manifest_debounce_modifications, 10
-        ),
-        debounce_milliseconds => application:get_env(
-            rabbitmq_stream_s3, manifest_debounce_milliseconds, 5000
-        )
+        rebalance_factor => rabbitmq_stream_s3_config:manifest_rebalance_factor(),
+        debounce_modifications => rabbitmq_stream_s3_config:manifest_debounce_modifications(),
+        debounce_milliseconds => rabbitmq_stream_s3_config:manifest_debounce_milliseconds()
     }).
 
 -spec new(cfg()) -> state().
