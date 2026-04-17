@@ -40,7 +40,11 @@ prometheus_format(Key, SumTransform, Buckets) ->
     {Cumulative, Count} = lists:mapfoldl(
         fun({Pos, UB}, Acc) ->
             N = Acc + counters:get(Counters, Pos),
-            TransformedUB = case UB of infinity -> infinity; _ -> SumTransform(UB) end,
+            TransformedUB =
+                case UB of
+                    infinity -> infinity;
+                    _ -> SumTransform(UB)
+                end,
             {{TransformedUB, N}, N}
         end,
         0,
