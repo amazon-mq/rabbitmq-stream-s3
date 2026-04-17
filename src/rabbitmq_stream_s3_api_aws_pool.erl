@@ -73,6 +73,7 @@ the reader pool avoids reader starvation.
 -type checkout() :: reference().
 
 -type config() :: #{
+    name := pool(),
     min_size := non_neg_integer(),
     max_size := pos_integer()
 }.

@@ -137,11 +137,11 @@ end_per_testcase(_Testcase, Config) ->
 kick_the_tires(_Config) ->
     {ok, _} = rabbitmq_stream_s3_api_aws_pool:start_link(
         rabbitmq_stream_s3_upload_pool,
-        #{min_size => 1, max_size => 3}
+        #{name => rabbitmq_stream_s3_upload_pool, min_size => 1, max_size => 3}
     ),
     {ok, _} = rabbitmq_stream_s3_api_aws_pool:start_link(
         rabbitmq_stream_s3_general_pool,
-        #{min_size => 1, max_size => 3}
+        #{name => rabbitmq_stream_s3_general_pool, min_size => 1, max_size => 3}
     ),
     Keys =
         [K1, K2, K3] = [

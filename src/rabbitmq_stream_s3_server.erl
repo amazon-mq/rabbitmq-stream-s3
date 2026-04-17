@@ -24,7 +24,7 @@
     {rabbitmq_stream_s3_server, [
         {description, "tiered storage S3 coordinator"},
         {mfa, {?MODULE, start, []}},
-        {requires, rabbitmq_stream_s3},
+        {requires, rabbitmq_stream_s3_http_pools},
         {enables, core_initialized}
     ]}
 ).
