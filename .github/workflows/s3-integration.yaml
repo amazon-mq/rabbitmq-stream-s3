@@ -38,13 +38,13 @@ jobs:
             elixir-version: 1.18
     steps:
       - id: restore-rabbitmq-server-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/rabbitmq-server
           key: rmq-${{ matrix.rmq-version }}-otp-${{ matrix.otp-version }}-elixir-${{ matrix.elixir-version }}
       - id: maybe-fail-rabbitmq-server-miss
         if: steps.restore-rabbitmq-server-cache.outputs.cache-hit != 'true'
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             core.setFailed('could not restore cached rabbitmq-server build');
@@ -52,11 +52,11 @@ jobs:
         with:
           otp-version: ${{ matrix.otp-version }}
           elixir-version: ${{ matrix.elixir-version }}
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           path: rabbitmq-server/deps/rabbitmq_stream_s3
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v6.0.0
+        uses: aws-actions/configure-aws-credentials@v6.1.0
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_REGION }}
@@ -69,7 +69,7 @@ jobs:
           AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
       - name: Upload test logs
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: CommonTest logs
           if-no-files-found: ignore
