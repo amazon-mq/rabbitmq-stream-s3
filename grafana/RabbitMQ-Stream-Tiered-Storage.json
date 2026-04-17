@@ -553,7 +553,7 @@
       },
       "targets": [
         {
-          "expr": "min(rabbitmq_stream_s3_remote_oldest_timestamp * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "min((rabbitmq_stream_s3_remote_oldest_timestamp > 0) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "",
           "refId": "A"
         }
@@ -628,7 +628,7 @@
       },
       "targets": [
         {
-          "expr": "min(rabbitmq_stream_s3_remote_oldest_timestamp * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "min((rabbitmq_stream_s3_remote_oldest_timestamp > 0) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "",
           "refId": "A"
         }
