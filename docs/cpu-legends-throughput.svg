@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="160" height="56">
+  <style>
+    text { fill: #000000; }
+    @media (prefers-color-scheme: dark) {
+      text { fill: #ffffff; }
+    }
+  </style>
+  <rect x="0" y="8"  width="20" height="4" fill="#1f77b4"/>
+  <text x="26" y="16" font-size="12" font-family="sans-serif">15 MiB/s</text>
+  <rect x="0" y="24" width="20" height="4" fill="#ff7f0e"/>
+  <text x="26" y="32" font-size="12" font-family="sans-serif">30 MiB/s</text>
+  <rect x="0" y="40" width="20" height="4" fill="#2ca02c"/>
+  <text x="26" y="48" font-size="12" font-family="sans-serif">60 MiB/s</text>
+</svg>
