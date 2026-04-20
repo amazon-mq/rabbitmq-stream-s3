@@ -28,7 +28,7 @@ jobs:
           git clone --branch ${{ matrix.rmq-version }} https://github.com/amazon-mq/upstream-to-rabbitmq-server.git ${{ github.workspace }}/rabbitmq-server
       - id: build-rabbitmq-server
         run: make -C ${{ github.workspace }}/rabbitmq-server
-      - uses: actions/cache/save@v4
+      - uses: actions/cache/save@v5
         # Always overwrite an existing cache entry:
         if: always()
         with:

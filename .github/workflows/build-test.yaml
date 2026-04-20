@@ -24,13 +24,13 @@ jobs:
             elixir-version: 1.18
     steps:
       - id: restore-rabbitmq-server-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/rabbitmq-server
           key: rmq-${{ matrix.rmq-version }}-otp-${{ matrix.otp-version }}-elixir-${{ matrix.elixir-version }}
       - id: maybe-fail-rabbitmq-server-miss
         if: steps.restore-rabbitmq-server-cache.outputs.cache-hit != 'true'
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             core.setFailed('could not restore cached rabbitmq-server build');
@@ -38,10 +38,10 @@ jobs:
         with:
           otp-version: ${{ matrix.otp-version }}
           elixir-version: ${{ matrix.elixir-version }}
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           path: rabbitmq-server/deps/rabbitmq_stream_s3
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/rabbitmq-server/deps/rabbitmq_stream_s3/.rabbitmq_stream_s3.plt
           key: plt-${{ matrix.rmq-version }}-otp-${{ matrix.otp-version }}-elixir-${{ matrix.elixir-version }}
@@ -51,7 +51,7 @@ jobs:
         run: make -C ${{ github.workspace }}/rabbitmq-server/deps/rabbitmq_stream_s3 tests
       - name: maybe upload CT logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ct-logs-${{ matrix.rmq-version }}-otp-${{ matrix.otp-version }}
           path: ${{ github.workspace }}/rabbitmq-server/logs/
