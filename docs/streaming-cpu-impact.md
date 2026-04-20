@@ -4,7 +4,7 @@ This doc is an investigation into CPU usage of streaming workloads. Streaming wo
 
 ## Test Setup
 
-Single-node broker, `m7g.2xlarge` instances, single publisher, no consumers, no retention policy. Three throughput levels tested.
+Single-node broker, `m7g.2xlarge` instances, single producer, no consumers, no retention policy. Three throughput levels tested.
 
 We use two `m7g.2xlarge` instances, `bob` and `alice`. In this test `bob` runs RabbitMQ on main from the HEAD at time of writing, `267dec665112844d457464c30a35eb36d353eb88`, using Erlang/OTP 27.3.4.2. `alice` has passwordless SSH access to `bob`. `bob` has the plugins `rabbitmq_stream` and `rabbitmq_prometheus` enabled and a user provisioned for `alice` with username `alice` and password `password`. `bob` needs `pidstat` installed from the `sysstat` package. `alice` has a script `bench.sh` to run the test.
 
@@ -297,9 +297,9 @@ xychart-beta
 
 At fixed byte throughput, message size determines which cost regime dominates. The system has two additive cost components: a per-chunk fixed cost and a per-byte variable cost.
 
-**Chunk rate ceiling**: the writer creates at most 15,300-15,500 chunks/s regardless of throughput level. This ceiling is the maximum frequency at which the `osiris_writer` process can complete a batch. The ceiling is throughput-independent.
+**Chunk rate ceiling**: with a single producer, the writer creates at most 15,300-15,500 chunks/s regardless of throughput level. This ceiling is the maximum frequency at which one producer can send messages to the writer. The ceiling is throughput-independent, but can be increased by adding more producers (see [Multiple producers](#multiple-producers) below).
 
-**Crossover point**: the crossover between ceiling-bound and chunk-rate-proportional operation occurs at: `crossover_size = throughput / ceiling_rate`. At 15 MiB/s: 1 KiB. At 30 MiB/s: 2 KiB. At 60 MiB/s: 4 KiB. Below the crossover, the publisher is faster than the writer can create chunks. The writer batches multiple messages per chunk and operates at the ceiling. CPU is flat at 135-145% regardless of message rate. Above the crossover, chunk rate equals message rate and CPU scales proportionally downward.
+**Crossover point**: the crossover between ceiling-bound and chunk-rate-proportional operation occurs at: `crossover_size = throughput / ceiling_rate`. At 15 MiB/s: 1 KiB. At 30 MiB/s: 2 KiB. At 60 MiB/s: 4 KiB. Below the crossover, the producer is faster than the writer can create chunks. The writer batches multiple messages per chunk and operates at the ceiling. CPU is flat at 135-145% regardless of message rate. Above the crossover, chunk rate equals message rate and CPU scales proportionally downward.
 
 **CPU per chunk**: in the ceiling region, CPU%/chunk is ~0.009 across all throughput levels, a fixed cost per chunk. Above the crossover, CPU%/chunk rises with message size as per-byte costs (CRC32, page cache write) accumulate. At 1 MiB, CPU%/chunk is ~0.133, 15 times higher than the fixed cost, reflecting the dominance of per-byte work at large message sizes.
 
@@ -380,3 +380,87 @@ If we comment out the writing of index files, we can see that CPU cost drops sig
 | 1 MiB   |          3.8  |           3.9 |     -2.6% |                  30 |                  30 |
 
 This is not realistic as the index file needs to be written at some point in order to make lookup efficient. But the writer could wait a number of chunks or on a timer before writing index records to reduce overhead. Even longer term, the writer could coalesce the requests with `io_uring(7)` so that both writes are done in one syscall.
+
+## Multiple producers
+
+We can send the same number of messages from multiple producers
+
+| producers | msg/s  | chunks/s | msgs/chunk | avg chunk B | total CPU% | confirm p99 µs |
+|----------:|-------:|---------:|-----------:|------------:|-----------:|---------------:|
+|         1 | 30,315 |   15,402 |        2.0 |       2,150 |      141.6 |            346 |
+|         2 | 29,879 |   19,059 |        1.6 |       1,721 |      209.6 |            475 |
+|         4 | 29,929 |   19,491 |        1.5 |       1,684 |      220.7 |            473 |
+|         8 | 30,013 |   19,679 |        1.5 |       1,668 |      220.3 |            441 |
+
+```mermaid
+xychart-beta
+   title "Chunk Rate vs Publisher Count at 1 KiB, 30 MiB/s"
+   x-axis ["1", "2", "4", "8"]
+   y-axis "chunks/s" 0 --> 22000
+   line [15402, 19059, 19491, 19679]
+```
+
+```mermaid
+xychart-beta
+   title "Total CPU % vs Publisher Count at 1 KiB, 30 MiB/s"
+   x-axis ["1", "2", "4", "8"]
+   y-axis "CPU %" 0 --> 250
+   line [141.6, 209.6, 220.7, 220.3]
+```
+
+At two producers, the stream writer process becomes the bottleneck. The time it takes to complete a single chunk then limits the ceiling to just under 20,000 chunks/s. After this point, increasing producer count does not change chunk size much.
+
+## Client-side batching
+
+Clients can send batches of messages to RabbitMQ and optionally compress the batch before sending. This is a feature in the stream client libraries. Producers can delay for a configurable time to build batches and then send all data effectively as one or more combined messages. This is conceptually like sending fewer larger messages, so sending the same number of messages in client-side batches decreases chunk rate and CPU usage. This is an effective way to decrease CPU usage for workloads with smaller messages, but it increases latency.
+
+| batch size | delay | chunks/s | total CPU% | confirm p99 µs |
+|-----------:|------:|---------:|-----------:|---------------:|
+|          1 |  1 ms |   14,473 |      128.4 |            399 |
+|          1 | 10 ms |   15,304 |      134.4 |            408 |
+|          1 |100 ms |   13,651 |      127.8 |            391 |
+|          4 |  1 ms |    2,492 |       28.9 |            835 |
+|          4 | 10 ms |    1,985 |       25.5 |            851 |
+|          4 |100 ms |    1,958 |       25.1 |            854 |
+|         16 |  1 ms |      929 |       13.8 |          1,491 |
+|         16 | 10 ms |      199 |        6.0 |          8,897 |
+|         16 |100 ms |      131 |        5.3 |          8,897 |
+|         64 |  1 ms |      926 |       13.6 |          1,491 |
+|         64 | 10 ms |      103 |        4.6 |         10,977 |
+|         64 |100 ms |       26 |        4.7 |        105,294 |
+
+```mermaid
+%%{init: {'themeVariables': {'xyChart': {'plotColorPalette': '#1f77b4,#ff7f0e,#2ca02c'}}}}%%
+xychart-beta
+   title "Total CPU % vs Sub-entry Size (1 KiB, 30 MiB/s)"
+   x-axis ["1", "4", "16", "64"]
+   y-axis "CPU %" 0 --> 160
+   line [128.4, 28.9, 13.8, 13.6]
+   line [134.4, 25.5, 6.0, 4.6]
+   line [127.8, 25.1, 5.3, 4.7]
+```
+
+```mermaid
+%%{init: {'themeVariables': {'xyChart': {'plotColorPalette': '#1f77b4,#ff7f0e,#2ca02c'}}}}%%
+xychart-beta
+   title "Confirm p99 Latency (µs) vs Sub-entry Size (1 KiB, 30 MiB/s)"
+   x-axis ["1", "4", "16", "64"]
+   y-axis "µs" 0 --> 110000
+   line [399, 835, 1491, 1491]
+   line [408, 851, 8897, 10977]
+   line [391, 854, 8897, 105294]
+```
+
+<div align="center">
+    <i>Blue: 1ms delay &nbsp; Orange: 10ms delay &nbsp; Green: 100ms delay</i>
+</div>
+
+For this total throughput (30 MiB/s) and message size (1 KiB), this data makes a Pareto frontier with a few solutions which cater towards different use-cases.
+
+| operating point        | CPU%  | confirm p99 | use case
+|------------------------|------:|------------:|----------
+| baseline (no batching) | ~140% | ~350 µs     | latency-critical
+| batch-size 4, 1ms      | ~29%  | ~835 µs     | balanced
+| batch-size 16, 1ms     | ~14%  | ~1,491 µs   | throughput-oriented, <2ms tolerance
+| batch-size 16, 10ms    | ~6%   | ~9 ms       | bulk ingest, <10ms tolerance
+| batch-size 64, 10ms    | ~5%   | ~11 ms      | bulk ingest, <15ms tolerance
