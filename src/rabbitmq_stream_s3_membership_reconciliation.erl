@@ -32,11 +32,7 @@
 %%----------------------------------------------------------------------------
 
 is_enabled() ->
-    application:get_env(
-        rabbitmq_stream_s3,
-        membership_reconciliation_enabled,
-        false
-    ).
+    rabbitmq_stream_s3_config:membership_reconciliation_enabled().
 
 schedule() ->
     gen_server:cast(?SERVER, {schedule, manual}).
@@ -111,29 +107,13 @@ code_change(_OldVsn, State, _Extra) ->
 %%----------------------------------------------------------------------------
 
 interval() ->
-    application:get_env(
-        rabbitmq_stream_s3,
-        membership_reconciliation_interval,
-        60_000 * 60
-    ).
+    rabbitmq_stream_s3_config:membership_reconciliation_interval().
 trigger_interval() ->
-    application:get_env(
-        rabbitmq_stream_s3,
-        membership_reconciliation_trigger_interval,
-        10_000
-    ).
+    rabbitmq_stream_s3_config:membership_reconciliation_trigger_interval().
 target_group_size() ->
-    application:get_env(
-        rabbitmq_stream_s3,
-        membership_reconciliation_target_group_size,
-        undefined
-    ).
+    rabbitmq_stream_s3_config:membership_reconciliation_target_group_size().
 auto_remove() ->
-    application:get_env(
-        rabbitmq_stream_s3,
-        membership_reconciliation_auto_remove,
-        false
-    ).
+    rabbitmq_stream_s3_config:membership_reconciliation_auto_remove().
 
 evaluate_membership(_Qs, [], _Running, _TargetSize, _AutoRemove, Changes) ->
     %% If there was an error attempting to list members, skip this round of evaluation.

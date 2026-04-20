@@ -25,8 +25,8 @@ start_pools() ->
         UploadPoolId,
         #{
             name => UploadPoolId,
-            min_size => application:get_env(rabbitmq_stream_s3, upload_pool_min_size, 0),
-            max_size => application:get_env(rabbitmq_stream_s3, upload_pool_max_size, 20)
+            min_size => rabbitmq_stream_s3_config:upload_pool_min_size(),
+            max_size => rabbitmq_stream_s3_config:upload_pool_max_size()
         }
     ]),
     GeneralPoolId = rabbitmq_stream_s3_general_pool,
@@ -34,8 +34,8 @@ start_pools() ->
         GeneralPoolId,
         #{
             name => GeneralPoolId,
-            min_size => application:get_env(rabbitmq_stream_s3, general_pool_min_size, 0),
-            max_size => application:get_env(rabbitmq_stream_s3, general_pool_max_size, 50)
+            min_size => rabbitmq_stream_s3_config:general_pool_min_size(),
+            max_size => rabbitmq_stream_s3_config:general_pool_max_size()
         }
     ]).
 
