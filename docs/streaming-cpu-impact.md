@@ -2,7 +2,9 @@
 
 This doc is an investigation into CPU usage of streaming workloads. Streaming workloads stress network resources nearly more than anything else, and far more than messaging workloads. At relatively low message sizes, though, streaming can use up significant CPU resources.
 
-## Test Setup
+## Producing workloads
+
+### Test Setup
 
 Single-node broker, `m7g.2xlarge` instances, single producer, no consumers, no retention policy. Three throughput levels tested.
 
@@ -178,9 +180,9 @@ And we modify `stream-perf-test` to measure confirm latency in nanoseconds and r
 
 The test takes around 40 minutes to run.
 
-## Results
+### Results
 
-### 15 MiB/s
+#### 15 MiB/s
 
 | Size    |   msg/s | chunks/s | msgs/chunk | avg chunk B | total CPU% | CPU%/chunk | confirm p99 µs |
 |---------|--------:|---------:|-----------:|------------:|-----------:|-----------:|---------------:|
@@ -197,7 +199,7 @@ The test takes around 40 minutes to run.
 | 256 KiB |      58 |       60 |        1.0 |     262,204 |        2.7 |     0.0450 |          1,506 |
 | 1 MiB   |      15 |       15 |        1.0 |   1,048,636 |        2.0 |     0.1333 |          2,761 |
 
-### 30 MiB/s
+#### 30 MiB/s
 
 | Size    |   msg/s | chunks/s | msgs/chunk | avg chunk B | total CPU% | CPU%/chunk | confirm p99 µs |
 |---------|--------:|---------:|-----------:|------------:|-----------:|-----------:|---------------:|
@@ -214,7 +216,7 @@ The test takes around 40 minutes to run.
 | 256 KiB |     116 |      120 |        1.0 |     262,204 |        5.0 |     0.0417 |          1,190 |
 | 1 MiB   |      29 |       30 |        1.0 |   1,048,636 |        4.0 |     0.1333 |          2,396 |
 
-### 60 MiB/s
+#### 60 MiB/s
 
 | Size    |   msg/s | chunks/s | msgs/chunk | avg chunk B | total CPU% | CPU%/chunk | confirm p99 µs |
 |---------|--------:|---------:|-----------:|------------:|-----------:|-----------:|---------------:|
@@ -231,7 +233,7 @@ The test takes around 40 minutes to run.
 | 256 KiB |     233 |      240 |        1.0 |     262,204 |        9.2 |     0.0383 |            750 |
 | 1 MiB   |      58 |       60 |        1.0 |   1,048,636 |        8.0 |     0.1333 |          2,626 |
 
-## Charts
+### Charts
 
 ```mermaid
 %%{init: {'themeVariables': {'xyChart': {'plotColorPalette': '#1f77b4,#ff7f0e,#2ca02c'}}}}%%
@@ -293,7 +295,7 @@ xychart-beta
   <img src="cpu-legends-throughput.svg" />
 </div>
 
-## Interpretation
+### Interpretation
 
 At fixed byte throughput, message size determines which cost regime dominates. The system has two additive cost components: a per-chunk fixed cost and a per-byte variable cost.
 
@@ -317,7 +319,7 @@ Since the Erlang VM uses cooperative scheduling, a system under more load might 
 > [!NOTE]
 > These tests did not use zlib compiled with hardware CRC32.
 
-### Flame graphs
+#### Flame graphs
 
 The blog post [Improving RabbitMQ Performance with Flame Graphs](https://www.rabbitmq.com/blog/2022/05/31/flame-graphs) shows the methodology for collecting `perf` data and generating the flagmegraph using the Perl scripts from [CPU Flame Graphs](https://www.brendangregg.com/FlameGraphs/cpuflamegraphs.html). Also see Erlang/OTP's [documentation](https://www.erlang.org/doc/apps/erts/beamasm.html#flame-graph) about flame graphs. Here are the flamegraphs from 30 second samples from the 1 KiB, 64 KiB and 256 KiB sections of the script at 30 MiB/sec ingress, running `bob` with `+JPperf true`:
 
@@ -360,7 +362,7 @@ Observations:
 * Publish confirms (`port_command`) drop from around 17% to 4% as chunk rate falls.
 * `gen_statem` overhead grows as a fraction as the broker becomes more idle.
 
-### CPU improvement: index files
+#### CPU improvement: index files
 
 If we comment out the writing of index files, we can see that CPU cost drops significantly. Comparing the 30 MiB/sec section of the script:
 
@@ -381,7 +383,7 @@ If we comment out the writing of index files, we can see that CPU cost drops sig
 
 This is not realistic as the index file needs to be written at some point in order to make lookup efficient. But the writer could wait a number of chunks or on a timer before writing index records to reduce overhead. Even longer term, the writer could coalesce the requests with `io_uring(7)` so that both writes are done in one syscall.
 
-## Multiple producers
+### Multiple producers
 
 We can send the same number of messages from multiple producers
 
@@ -410,7 +412,7 @@ xychart-beta
 
 At two producers, the stream writer process becomes the bottleneck. The time it takes to complete a single chunk then limits the ceiling to just under 20,000 chunks/s. After this point, increasing producer count does not change chunk size much.
 
-## Client-side batching
+### Client-side batching
 
 Clients can send batches of messages to RabbitMQ and optionally compress the batch before sending. This is a feature in the stream client libraries. Producers can delay for a configurable time to build batches and then send all data effectively as one or more combined messages. This is conceptually like sending fewer larger messages, so sending the same number of messages in client-side batches decreases chunk rate and CPU usage. This is an effective way to decrease CPU usage for workloads with smaller messages, but it increases latency.
 
@@ -464,3 +466,192 @@ For this total throughput (30 MiB/s) and message size (1 KiB), this data makes a
 | batch-size 16, 1ms     | ~14%  | ~1,491 µs   | throughput-oriented, <2ms tolerance
 | batch-size 16, 10ms    | ~6%   | ~9 ms       | bulk ingest, <10ms tolerance
 | batch-size 64, 10ms    | ~5%   | ~11 ms      | bulk ingest, <15ms tolerance
+
+## Consuming
+
+### Test setup
+
+We use the same setup as the producing workloads section, but modify the script to test consumers.
+
+<details><summary><code>bench.sh</code> script...</summary>
+
+```bash
+#!/usr/bin/env bash
+set -uo pipefail
+
+# Usage: ./bench_consumers.sh <broker-host>
+# Tests consumer resource usage at fixed publish throughput.
+# Sweeps message size and consumer count.
+
+HOST="${1:?usage: $0 <broker-host>}"
+URI="rabbitmq-stream://alice:password@${HOST}:5552"
+DURATION=60
+WARMUP=30
+CHUNK_SAMPLE_WINDOW=$((DURATION - WARMUP - 5))
+STREAM_PERF_TEST="java -jar $HOME/stream-perf-test.jar"
+RESULTS="results_consumers.tsv"
+THROUGHPUT=30
+BYTES_PER_SEC=$((THROUGHPUT * 1024 * 1024))
+
+# Message sizes to test
+SIZES="1024 65536"
+
+# Consumer counts to test
+CONSUMER_COUNTS="0 1 3"
+
+printf "size_bytes\tsize_label\tconsumers\tmsg_per_sec\tMiB_per_sec\tcpu_usr\tcpu_sys\tchunk_rate\tavg_chunk_bytes\tconfirm_p99_us\n" \
+    > "$RESULTS"
+
+size_label() {
+    case "$1" in
+        1024)  echo "1 KiB" ;;
+        65536) echo "64 KiB" ;;
+    esac
+}
+
+scrape_chunks_and_bytes() {
+    curl -s "http://${HOST}:15692/metrics" | awk '
+        /^rabbitmq_stream_chunks_published_total / { chunks = $2 }
+        /^rabbitmq_stream_chunk_bytes_published_total / { bytes = $2 }
+        END { print chunks+0, bytes+0 }
+    '
+}
+
+for SIZE in $SIZES; do
+    RATE=$((BYTES_PER_SEC / SIZE))
+    LABEL=$(size_label "$SIZE")
+
+    for CONSUMERS in $CONSUMER_COUNTS; do
+        STREAM="perf-bench-consumers-${SIZE}-${CONSUMERS}"
+
+        echo "=== ${LABEL} @ ${RATE} msg/s  consumers=${CONSUMERS} ==="
+
+        ssh "bob" "pidstat -p \$(pgrep -x beam.smp) -u 1 ${DURATION}" \
+            > /tmp/pidstat_cons_${SIZE}_${CONSUMERS}.txt 2>&1 &
+        PIDSTAT_PID=$!
+
+        { sleep "$WARMUP"
+          read C_BEFORE B_BEFORE < <(scrape_chunks_and_bytes)
+          sleep "$CHUNK_SAMPLE_WINDOW"
+          read C_AFTER B_AFTER < <(scrape_chunks_and_bytes)
+          echo "${C_BEFORE:-0} ${C_AFTER:-0} ${B_BEFORE:-0} ${B_AFTER:-0}" \
+              > /tmp/chunks_cons_${SIZE}_${CONSUMERS}.txt
+        } &
+        CHUNKS_PID=$!
+
+        $STREAM_PERF_TEST \
+            --streams          "$STREAM" \
+            --uris             "$URI" \
+            --producers        1 \
+            --consumers        "$CONSUMERS" \
+            --size             "$SIZE" \
+            --rate             "$RATE" \
+            --max-length-bytes 0 \
+            --requested-max-frame-size 2097152 \
+            --confirm-latency \
+            --offset           first \
+            --time             "$DURATION" \
+            --delete-streams \
+            > /tmp/perftest_cons_${SIZE}_${CONSUMERS}.txt
+
+        wait "$PIDSTAT_PID" || true
+        wait "$CHUNKS_PID" || true
+
+        read C_BEFORE C_AFTER B_BEFORE B_AFTER < /tmp/chunks_cons_${SIZE}_${CONSUMERS}.txt
+        CHUNK_RATE=$(awk "BEGIN { printf \"%.1f\", (${C_AFTER:-0} - ${C_BEFORE:-0}) / ${CHUNK_SAMPLE_WINDOW} }")
+        AVG_CHUNK_BYTES=$(awk "BEGIN {
+            dc = ${C_AFTER:-0} - ${C_BEFORE:-0}
+            db = ${B_AFTER:-0} - ${B_BEFORE:-0}
+            if (dc > 0) printf \"%.0f\", db / dc
+            else print \"0\"
+        }")
+
+        MSG_SEC=$(awk -v w="$WARMUP" \
+            'NR > w { match($0, /published ([0-9]+) msg/, a); sum += a[1]; n++ }
+             END { printf "%.0f", (n > 0 ? sum / n : 0) }' \
+            /tmp/perftest_cons_${SIZE}_${CONSUMERS}.txt)
+        MSG_SEC=${MSG_SEC:-0}
+
+        MIB_SEC=$(awk "BEGIN { printf \"%.2f\", ${MSG_SEC} * ${SIZE} / 1048576 }")
+
+        CPU_USR=$(awk -v w="$WARMUP" \
+            '/beam/ { n++; if (n > w) { sum += $4; c++ } }
+             END { printf "%.1f", (c > 0 ? sum / c : 0) }' \
+            /tmp/pidstat_cons_${SIZE}_${CONSUMERS}.txt)
+        CPU_USR=${CPU_USR:-0}
+
+        CPU_SYS=$(awk -v w="$WARMUP" \
+            '/beam/ { n++; if (n > w) { sum += $5; c++ } }
+             END { printf "%.1f", (c > 0 ? sum / c : 0) }' \
+            /tmp/pidstat_cons_${SIZE}_${CONSUMERS}.txt)
+        CPU_SYS=${CPU_SYS:-0}
+
+        CONFIRM_P99=$(grep -oP 'confirm latency median/75th/95th/99th \K[0-9/]+' \
+            /tmp/perftest_cons_${SIZE}_${CONSUMERS}.txt | tail -n +$((WARMUP+1)) | \
+            awk -F/ '{sum+=$4; n++} END{printf "%.0f", (n>0 ? sum/n : 0)}')
+        CONFIRM_P99=${CONFIRM_P99:-0}
+
+        echo "  -> ${MSG_SEC} msg/s  ${MIB_SEC} MiB/s  usr=${CPU_USR}%  sys=${CPU_SYS}%  chunks/s=${CHUNK_RATE}  avg_chunk=${AVG_CHUNK_BYTES}B  confirm_p99=${CONFIRM_P99}µs"
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+            "$SIZE" "$LABEL" "$CONSUMERS" "$MSG_SEC" "$MIB_SEC" \
+            "$CPU_USR" "$CPU_SYS" "$CHUNK_RATE" "$AVG_CHUNK_BYTES" "$CONFIRM_P99" \
+            >> "$RESULTS"
+
+        sleep 5
+    done
+done
+
+echo ""
+echo "Results written to ${RESULTS}"
+cat "$RESULTS"
+```
+
+</details>
+
+Also, this test setup is using TCP connections for consumers, not TLS. This is an important distinction since consumers connected via TCP are sent chunk bodies via `sendfile(2)`. For TLS connections, chunk data is read into user-space and then sent on the socket.
+
+### Results
+
+1 KiB messages:
+
+| consumers | total CPU% | CPU increment per consumer | chunks/s |
+|----------:|-----------:|---------------------------:|---------:|
+|         0 |      143.2 |                            |   15,487 |
+|         1 |      202.8 |                      +59.6 |   15,116 |
+|         3 |      261.3 |                      +39.3 |   14,234 |
+
+3 KiB messages:
+
+| consumers | total CPU% | CPU increment per consumer | chunks/s |
+|----------:|-----------:|---------------------------:|---------:|
+|         0 |        9.1 |                            |      480 |
+|         1 |       14.3 |                       +5.2 |      480 |
+|         3 |       21.9 |                       +4.3 |      480 |
+
+```mermaid
+%%{init: {'themeVariables': {'xyChart': {'plotColorPalette': '#1f77b4,#ff7f0e'}}}}%%
+xychart-beta
+   title "Total CPU % vs Consumer Count at 30 MiB/s"
+   x-axis ["0", "1", "3"]
+   y-axis "CPU %" 0 --> 280
+   line [143.2, 202.8, 261.3]
+   line [9.1, 14.3, 21.9]
+```
+
+<div align="center">
+  <img src="cpu-legends-consumers.svg" />
+</div>
+
+### Interpretation
+
+Consumers show the same relationship to chunk rate that producers do: a lower chunk rate means that both producing and consuming leave the CPU mostly idle. The same optimization levers help both: batch on the client side or send fewer, larger messages.
+
+### Flame graph
+
+<details><summary>Flame graph at 1 KiB, 3 consumers...</summary>
+
+![flame graph](./cpu-1k-3consumers.svg)
+
+</details>
+
+The main new cost introduced is `$erlang:port_control/3` and the other `sendfile(2)`-related calls in that stack. The other costs like `$prim_file:write/2` diminish as a fraction of the total since the total CPU usage increased.
