@@ -113,6 +113,12 @@ multiplicative decrease ([AIMD]) algorithm.
     %% All in-flight requests, keyed by async_req().
     requests = #{} :: #{rabbitmq_stream_s3_api:async_req() => #request{}},
 
+    %% Refs of requests cancelled via cancel_requests/1. Gun may still deliver
+    %% already-buffered frames for these refs after the cancel; tracking them
+    %% here lets match_async/3 drop those messages silently without flooding
+    %% the mailbox through the `error` branch.
+    cancelled_requests = #{} :: #{rabbitmq_stream_s3_api:async_req() => ok},
+
     %% Pending read from the log reader process.
     pending_read :: #pending_read{} | undefined,
     current_not_found = false :: boolean()
@@ -254,12 +260,21 @@ handle_info({'DOWN', MRef, process, _Pid, _Reason}, #?MODULE{reader_ref = MRef} 
 handle_info(retry_requests, State0) ->
     State = maybe_start_request(State0),
     maybe_reply_pending(State);
-handle_info(Msg, #?MODULE{requests = Requests0, retry_delay = RetryDelay0} = State0) ->
+handle_info(
+    Msg,
+    #?MODULE{
+        requests = Requests0,
+        cancelled_requests = CancelledRequests0,
+        retry_delay = RetryDelay0
+    } = State0
+) ->
     AsyncStates = #{Req => R#request.state || Req := R <- Requests0},
-    case rabbitmq_stream_s3_api:match_async(Msg, AsyncStates) of
+    case rabbitmq_stream_s3_api:match_async(Msg, AsyncStates, CancelledRequests0) of
         {ok, RequestId} ->
             #request{state = ReqState0} = Req0 = maps:get(RequestId, Requests0),
             case rabbitmq_stream_s3_api:handle_async(Msg, RequestId, ReqState0) of
+                ignore ->
+                    {noreply, State0};
                 {continue, ReqState} ->
                     Requests = Requests0#{RequestId := Req0#request{state = ReqState}},
                     {noreply, State0#?MODULE{requests = Requests}};
@@ -291,35 +306,27 @@ handle_info(Msg, #?MODULE{requests = Requests0, retry_delay = RetryDelay0} = Sta
                     counters:sub(counter(), ?C_REQUESTS_IN_FLIGHT, 1),
                     Requests = maps:remove(RequestId, Requests0),
                     State1 = State0#?MODULE{requests = Requests},
-                    case {Reason, Req0#request.fragment =:= State1#?MODULE.fragment} of
-                        {not_found, true} ->
-                            maybe_reply_pending(State1#?MODULE{
-                                current_not_found = true,
-                                retry_delay = ?MIN_RETRY_DELAY_MS
-                            });
-                        {not_found, false} ->
-                            maybe_reply_pending(State1#?MODULE{
-                                next = not_found,
-                                retry_delay = ?MIN_RETRY_DELAY_MS
-                            });
-                        {Transient, _} when
-                            Transient =:= slow_down;
-                            Transient =:= internal_error
-                        ->
-                            erlang:send_after(RetryDelay0, self(), retry_requests),
-                            RetryDelay = min(RetryDelay0 * 2, ?MAX_RETRY_DELAY_MS),
-                            State2 = State1#?MODULE{retry_delay = RetryDelay},
-                            maybe_reply_pending(State2);
-                        {Transient, _} when
-                            Transient =:= stream_error;
-                            Transient =:= connection_error;
-                            Transient =:= timeout
-                        ->
-                            maybe_reply_pending(State1);
-                        _ ->
-                            {stop, {shutdown, Reason}, State1}
-                    end
+                    handle_request_error(Reason, Req0, RetryDelay0, State1);
+                {done_cancel, {error, Reason}} ->
+                    counters:sub(counter(), ?C_REQUESTS_IN_FLIGHT, 1),
+                    Requests = maps:remove(RequestId, Requests0),
+                    CancelledRequests = CancelledRequests0#{RequestId => ok},
+                    State1 = State0#?MODULE{
+                        requests = Requests,
+                        cancelled_requests = CancelledRequests
+                    },
+                    handle_request_error(Reason, Req0, RetryDelay0, State1)
             end;
+        {cancelled, Ref, Final} ->
+            %% Stale message for a request that called gun:cancel (e.g.
+            %% after a timeout). Drop silently and remove the ref once
+            %% its terminal frame arrives.
+            CancelledRequests =
+                case Final of
+                    final -> maps:remove(Ref, CancelledRequests0);
+                    more -> CancelledRequests0
+                end,
+            {noreply, State0#?MODULE{cancelled_requests = CancelledRequests}};
         error ->
             ?LOG_DEBUG(?MODULE_STRING " received unexpected message: ~W", [Msg, 10]),
             {noreply, State0}
@@ -327,6 +334,36 @@ handle_info(Msg, #?MODULE{requests = Requests0, retry_delay = RetryDelay0} = Sta
 handle_info(Msg, State) ->
     ?LOG_DEBUG(?MODULE_STRING " received unexpected message: ~W", [Msg, 10]),
     {noreply, State}.
+
+handle_request_error(Reason, Req0, RetryDelay0, State) ->
+    case {Reason, Req0#request.fragment =:= State#?MODULE.fragment} of
+        {not_found, true} ->
+            maybe_reply_pending(State#?MODULE{
+                current_not_found = true,
+                retry_delay = ?MIN_RETRY_DELAY_MS
+            });
+        {not_found, false} ->
+            maybe_reply_pending(State#?MODULE{
+                next = not_found,
+                retry_delay = ?MIN_RETRY_DELAY_MS
+            });
+        {Transient, _} when
+            Transient =:= slow_down;
+            Transient =:= internal_error
+        ->
+            erlang:send_after(RetryDelay0, self(), retry_requests),
+            RetryDelay = min(RetryDelay0 * 2, ?MAX_RETRY_DELAY_MS),
+            State1 = State#?MODULE{retry_delay = RetryDelay},
+            maybe_reply_pending(State1);
+        {Transient, _} when
+            Transient =:= stream_error;
+            Transient =:= connection_error;
+            Transient =:= timeout
+        ->
+            maybe_reply_pending(State);
+        _ ->
+            {stop, {shutdown, Reason}, State}
+    end.
 
 terminate(_Reason, #?MODULE{requests = Requests}) ->
     cancel_requests(Requests),
@@ -675,14 +712,13 @@ try_read(#?MODULE{end_pos = EndPos} = State, Offset, Bytes) when Offset + Bytes 
         #?MODULE{requests = Requests} when map_size(Requests) =/= 0 ->
             %% The current fragment's info is being requested. Wait for its arrival.
             {await, State};
-        #?MODULE{current_not_found = true, stream = StreamId, requests = Requests} ->
+        #?MODULE{current_not_found = true, stream = StreamId} ->
             %% The current fragment was deleted by retention while being read.
-            %% Cancel all in-flight requests for the deleted fragment, then jump
-            %% to the oldest fragment still available in the remote tier.
-            cancel_requests(Requests),
+            %% Requests is empty here (the first case branch catches non-empty).
+            %% Jump to the oldest fragment still available in the remote tier.
             case rabbitmq_stream_s3_server:get_range(StreamId) of
                 empty ->
-                    {end_of_stream, State#?MODULE{requests = #{}}};
+                    {end_of_stream, State};
                 {FirstOffset, _} ->
                     Key = rabbitmq_stream_s3:fragment_key(StreamId, FirstOffset),
                     ?LOG_WARNING(
@@ -699,7 +735,6 @@ try_read(#?MODULE{end_pos = EndPos} = State, Offset, Bytes) when Offset + Bytes 
                         current_pos = ?FRAGMENT_HEADER_B,
                         end_pos = ?FRAGMENT_HEADER_B,
                         next = undefined,
-                        requests = #{},
                         current_not_found = false
                     },
                     {next_fragment, NewState, FirstOffset}
