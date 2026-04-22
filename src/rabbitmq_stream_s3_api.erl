@@ -30,7 +30,7 @@ file-system operations. Use that in non-unit tests.
     delete/2,
     delete_prefix/1,
     delete_prefix/2,
-    match_async/2,
+    match_async/3,
     handle_async/3,
     cancel_async/2,
     request_duration_prometheus_format/0
@@ -79,13 +79,20 @@ examples.
 """.
 -callback delete(key() | [key()], request_opts()) -> ok | {error, any()}.
 -callback delete_prefix(key(), request_opts()) -> {ok, map()} | {error, any()}.
--callback match_async(Msg :: term(), #{async_req() := async_state()}) ->
+-callback match_async(
+    Msg :: term(),
+    Reqs :: #{async_req() := async_state()},
+    CancelledReqs :: #{async_req() => _}
+) ->
     {ok, async_req()}
+    | {cancelled, async_req(), final | more}
     | error.
 -callback handle_async(Msg :: term(), async_req(), async_state()) ->
     {continue, async_state()}
     | {data, binary(), async_state() | done}
-    | {done, ok | {error, any()}}.
+    | {done, ok | {error, any()}}
+    | {done_cancel, {error, any()}}
+    | ignore.
 -callback cancel_async(async_req(), async_state()) -> ok.
 
 -define(C_GET, 1).
@@ -240,15 +247,21 @@ delete_prefix(Prefix, Opts) when is_binary(Prefix) andalso is_map(Opts) ->
     counters:add(counter(), ?C_LIST, 1),
     observe(write, fun() -> (backend()):delete_prefix(Prefix, Opts) end).
 
--spec match_async(Msg :: term(), #{async_req() := async_state()}) ->
-    {ok, async_req()} | error.
-match_async(Msg, Reqs) ->
-    (backend()):match_async(Msg, Reqs).
+-spec match_async(
+    Msg :: term(),
+    Reqs :: #{async_req() := async_state()},
+    CancelledReqs :: #{async_req() => _}
+) ->
+    {ok, async_req()} | {cancelled, async_req(), final | more} | error.
+match_async(Msg, Reqs, CancelledReqs) ->
+    (backend()):match_async(Msg, Reqs, CancelledReqs).
 
 -spec handle_async(Msg :: term(), async_req(), AsyncState :: term()) ->
     {continue, AsyncState :: term()}
     | {data, binary(), async_state()}
-    | {done, ok | {error, any()}}.
+    | {done, ok | {error, any()}}
+    | {done_cancel, {error, any()}}
+    | ignore.
 handle_async(Msg, Req, {StartTs, BackendState0}) ->
     case (backend()):handle_async(Msg, Req, BackendState0) of
         {continue, BackendState} ->
@@ -262,7 +275,12 @@ handle_async(Msg, Req, {StartTs, BackendState0}) ->
             {data, Data, {StartTs, BackendState}};
         {done, _} = Done ->
             ok = finish_async(StartTs),
-            Done
+            Done;
+        {done_cancel, _} = DoneCancel ->
+            ok = finish_async(StartTs),
+            DoneCancel;
+        ignore ->
+            ignore
     end.
 
 -spec cancel_async(async_req(), async_state()) -> ok.

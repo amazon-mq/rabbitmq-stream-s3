@@ -26,7 +26,7 @@ A wrapper around the AWS S3 HTTP API.
     delete/2,
     delete_prefix/2,
     list/3,
-    match_async/2,
+    match_async/3,
     handle_async/3,
     cancel_async/2
 ]).
@@ -474,9 +474,16 @@ log_unexpected_status(Function, Status) ->
 log_unexpected_status(Function, Status, Key) ->
     ?LOG_DEBUG("~ts unexpected HTTP status ~b for key ~ts", [Function, Status, Key]).
 
--spec match_async(Msg :: term(), #{async_req() := async_state()}) ->
-    {ok, async_req()} | error.
-match_async({gun_error, Conn, _Reason}, Reqs) ->
+-spec match_async(
+    Msg :: term(),
+    Reqs :: #{async_req() := async_state()},
+    CancelledReqs :: #{async_req() => _}
+) ->
+    {ok, async_req()} | {cancelled, async_req(), final | more} | error.
+match_async({gun_error, Conn, _Reason}, Reqs, _CancelledReqs) ->
+    %% Connection-level error: match any active request on this connection.
+    %% We intentionally ignore cancelled requests - a dying connection only
+    %% needs to notify live requests.
     maps:fold(
         fun
             (Req, #{conn := C}, error) when C =:= Conn -> {ok, Req};
@@ -485,18 +492,25 @@ match_async({gun_error, Conn, _Reason}, Reqs) ->
         error,
         Reqs
     );
-match_async(Msg, Reqs) ->
-    Req =
+match_async(Msg, Reqs, CancelledReqs) ->
+    {Req, Final} =
         case Msg of
-            {gun_error, _, StreamRef, _} -> StreamRef;
-            {gun_response, _, StreamRef, _, _, _} -> StreamRef;
-            {gun_data, _, StreamRef, _, _} -> StreamRef;
-            {request_timeout, StreamRef} -> StreamRef;
-            _ -> undefined
+            {gun_error, _, StreamRef, _} -> {StreamRef, final};
+            {gun_response, _, StreamRef, fin, _, _} -> {StreamRef, final};
+            {gun_response, _, StreamRef, nofin, _, _} -> {StreamRef, more};
+            {gun_data, _, StreamRef, fin, _} -> {StreamRef, final};
+            {gun_data, _, StreamRef, nofin, _} -> {StreamRef, more};
+            {request_timeout, StreamRef} -> {StreamRef, final};
+            _ -> {undefined, final}
         end,
     case Reqs of
-        #{Req := _} -> {ok, Req};
-        _ -> error
+        #{Req := _} ->
+            {ok, Req};
+        _ ->
+            case CancelledReqs of
+                #{Req := _} -> {cancelled, Req, Final};
+                _ -> error
+            end
     end.
 
 -spec handle_async(Msg :: term(), async_req(), async_state()) ->
@@ -552,19 +566,35 @@ handle_async(
         206 ->
             State = State0#{data => [], pending_bytes => 0},
             {continue, State};
-        404 ->
-            finish_async(State0),
-            {done, {error, not_found}};
-        500 ->
-            finish_async(State0),
-            {done, {error, internal_error}};
-        503 ->
-            finish_async(State0),
-            {done, {error, slow_down}};
         _ ->
-            finish_async(State0),
-            {done, {error, #{status => Status, headers => Headers}}}
+            %% Non-success response with a body. Cancel the request timer
+            %% and drain the body before reporting the error so that the
+            %% remaining gun_data frames do not orphan in the caller's
+            %% mailbox.
+            Reason =
+                case Status of
+                    404 -> not_found;
+                    500 -> internal_error;
+                    503 -> slow_down;
+                    _ -> #{status => Status, headers => Headers}
+                end,
+            State = cancel_request_timer(State0),
+            {continue, State#{draining => Reason}}
     end;
+handle_async(
+    {gun_data, Conn, StreamRef, nofin, _Data},
+    StreamRef,
+    #{conn := Conn, stream_ref := StreamRef, draining := _}
+) ->
+    %% Discard body data from a non-success response being drained.
+    ignore;
+handle_async(
+    {gun_data, Conn, StreamRef, fin, _Data},
+    StreamRef,
+    #{conn := Conn, stream_ref := StreamRef, draining := Reason} = State
+) ->
+    finish_async(State),
+    {done, {error, Reason}};
 handle_async(
     {gun_data, Conn, StreamRef, nofin, Data},
     StreamRef,
@@ -604,12 +634,32 @@ handle_async(
     counters:add(counter(), ?C_REQUEST_TIMEOUTS, 1),
     gun:cancel(Conn, StreamRef),
     finish_async(State),
-    {done, {error, timeout}}.
+    {done_cancel, {error, timeout}}.
 
 -spec cancel_async(async_req(), async_state()) -> ok.
 cancel_async(StreamRef, #{conn := Conn, stream_ref := StreamRef} = State) ->
     gun:cancel(Conn, StreamRef),
     ok = finish_async(State).
+
+%% Cancel the request timer without checking in the connection or
+%% decrementing the active-request counter. Used when the response
+%% body still needs to be drained before the request is complete.
+cancel_request_timer(State) ->
+    case State of
+        #{timer_ref := TimerRef, stream_ref := StreamRef} ->
+            case erlang:cancel_timer(TimerRef) of
+                false ->
+                    receive
+                        {request_timeout, StreamRef} -> ok
+                    after 0 -> ok
+                    end;
+                _ ->
+                    ok
+            end,
+            maps:remove(timer_ref, State);
+        _ ->
+            State
+    end.
 
 finish_async(#{conn := Conn, pool := Pool} = State) ->
     case State of
@@ -1558,6 +1608,94 @@ sign_test() ->
         Authorization3
     ),
 
+    ok.
+
+match_async_active_request_test() ->
+    Ref = make_ref(),
+    Conn = self(),
+    Reqs = #{Ref => #{conn => Conn, stream_ref => Ref}},
+    ?assertEqual(
+        {ok, Ref},
+        match_async({gun_data, Conn, Ref, nofin, <<"data">>}, Reqs, #{})
+    ),
+    ?assertEqual(
+        {ok, Ref},
+        match_async({gun_response, Conn, Ref, nofin, 200, []}, Reqs, #{})
+    ),
+    ?assertEqual(
+        {ok, Ref},
+        match_async({gun_error, Conn, Ref, some_reason}, Reqs, #{})
+    ),
+    ?assertEqual(
+        {ok, Ref},
+        match_async({request_timeout, Ref}, Reqs, #{})
+    ),
+    ok.
+
+match_async_cancelled_request_test() ->
+    Ref = make_ref(),
+    Conn = self(),
+    CancelledReqs = #{Ref => ok},
+    %% Terminal frames: fin data, fin response, stream-level gun_error,
+    %% request_timeout.
+    ?assertEqual(
+        {cancelled, Ref, final},
+        match_async({gun_data, Conn, Ref, fin, <<"stale">>}, #{}, CancelledReqs)
+    ),
+    ?assertEqual(
+        {cancelled, Ref, final},
+        match_async({gun_response, Conn, Ref, fin, 200, []}, #{}, CancelledReqs)
+    ),
+    ?assertEqual(
+        {cancelled, Ref, final},
+        match_async({gun_error, Conn, Ref, some_reason}, #{}, CancelledReqs)
+    ),
+    ?assertEqual(
+        {cancelled, Ref, final},
+        match_async({request_timeout, Ref}, #{}, CancelledReqs)
+    ),
+    %% Non-terminal frames: nofin data, nofin response.
+    ?assertEqual(
+        {cancelled, Ref, more},
+        match_async({gun_data, Conn, Ref, nofin, <<"stale">>}, #{}, CancelledReqs)
+    ),
+    ?assertEqual(
+        {cancelled, Ref, more},
+        match_async({gun_response, Conn, Ref, nofin, 200, []}, #{}, CancelledReqs)
+    ),
+    ok.
+
+match_async_unknown_request_test() ->
+    Ref = make_ref(),
+    Conn = self(),
+    ?assertEqual(
+        error,
+        match_async({gun_data, Conn, Ref, nofin, <<"x">>}, #{}, #{})
+    ),
+    ?assertEqual(
+        error,
+        match_async(some_other_message, #{}, #{})
+    ),
+    ok.
+
+match_async_connection_error_ignores_cancelled_test() ->
+    %% A connection-level gun_error (3-tuple) should match an active request
+    %% on that connection, not a cancelled one - even if the only request on
+    %% the connection is cancelled, we return `error` (the connection dying
+    %% has no active request to notify).
+    Conn = self(),
+    Ref = make_ref(),
+    ?assertEqual(
+        error,
+        match_async({gun_error, Conn, some_reason}, #{}, #{Ref => ok})
+    ),
+    %% With an active request on the connection, match_async returns it.
+    ActiveRef = make_ref(),
+    Reqs = #{ActiveRef => #{conn => Conn, stream_ref => ActiveRef}},
+    ?assertEqual(
+        {ok, ActiveRef},
+        match_async({gun_error, Conn, some_reason}, Reqs, #{Ref => ok})
+    ),
     ok.
 
 -endif.

@@ -23,7 +23,7 @@ associated file in that folder.
     stream_finish/2,
     delete/2,
     delete_prefix/2,
-    match_async/2,
+    match_async/3,
     handle_async/3,
     cancel_async/2
 ]).
@@ -203,11 +203,17 @@ delete_prefix(Prefix, Opts) when is_binary(Prefix) andalso is_map(Opts) ->
         end
     end).
 
--spec match_async(Msg :: term(), #{async_req() := async_state()}) ->
-    {ok, async_req()} | error.
-match_async({'$async', Req, _Msg}, Reqs) when is_map_key(Req, Reqs) ->
+-spec match_async(
+    Msg :: term(),
+    Reqs :: #{async_req() := async_state()},
+    CancelledReqs :: #{async_req() => _}
+) ->
+    {ok, async_req()} | {cancelled, async_req(), final | more} | error.
+match_async({'$async', Req, _Msg}, Reqs, _CancelledReqs) when is_map_key(Req, Reqs) ->
     {ok, Req};
-match_async(_Msg, _Reqs) ->
+match_async({'$async', Req, _Msg}, _Reqs, CancelledReqs) when is_map_key(Req, CancelledReqs) ->
+    {cancelled, Req, final};
+match_async(_Msg, _Reqs, _CancelledReqs) ->
     error.
 
 -spec handle_async(Msg :: term(), async_req(), async_state()) ->
@@ -330,3 +336,16 @@ range_spec_to_location_number(FileSize, {StartByte, EndByte}) ->
             _ -> EndByte - StartByte + 1
         end,
     {StartByte, Number}.
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+match_async_test() ->
+    Ref = make_ref(),
+    ?assertEqual({ok, Ref}, match_async({'$async', Ref, data}, #{Ref => state}, #{})),
+    ?assertEqual({cancelled, Ref, final}, match_async({'$async', Ref, data}, #{}, #{Ref => ok})),
+    ?assertEqual(error, match_async({'$async', Ref, data}, #{}, #{})),
+    ?assertEqual(error, match_async(other_message, #{}, #{})),
+    ok.
+
+-endif.
