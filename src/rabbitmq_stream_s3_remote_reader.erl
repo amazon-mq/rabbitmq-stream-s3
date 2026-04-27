@@ -681,9 +681,40 @@ try_read(
     ),
     case RemoteRange of
         {RemoteStartOffset, _EndOffset} when RemoteStartOffset >= NextFragment ->
-            %% re-set the state at this offset. Also take the min between this
-            %% and the first local offset.
-            erlang:error(unimplemented);
+            %% Retention has evicted the next fragment and advanced past it.
+            %% Jump to the oldest fragment still available. Cancel any
+            %% in-flight requests and track their refs as cancelled so that
+            %% late frames are dropped silently.
+            #?MODULE{
+                fragment = CurrentFragment,
+                requests = Requests,
+                cancelled_requests = Cancelled0
+            } = State0,
+            cancel_requests(Requests),
+            Cancelled = maps:merge(
+                Cancelled0,
+                #{Req => ok || Req := _ <- Requests}
+            ),
+            Key = rabbitmq_stream_s3:fragment_key(StreamId, RemoteStartOffset),
+            ?LOG_WARNING(
+                "Fragment ~20..0B finished but next fragment ~20..0B was evicted. "
+                "Jumping to oldest available fragment ~20..0B",
+                [CurrentFragment, NextFragment, RemoteStartOffset]
+            ),
+            State = State0#?MODULE{
+                fragment = RemoteStartOffset,
+                key = Key,
+                info = undefined,
+                buffer = <<>>,
+                start_pos = ?FRAGMENT_HEADER_B,
+                current_pos = ?FRAGMENT_HEADER_B,
+                end_pos = ?FRAGMENT_HEADER_B,
+                next = undefined,
+                current_not_found = false,
+                requests = #{},
+                cancelled_requests = Cancelled
+            },
+            {next_fragment, State, RemoteStartOffset};
         {_StartOffset, EndOffset} when EndOffset < NextFragment ->
             State = goto_next_fragment(State0),
             {become_local, State};

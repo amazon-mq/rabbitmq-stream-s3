@@ -17,8 +17,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
-          otp-version: 27
-          rebar3-version: 3.22
+          otp-version: '27'
+          rebar3-version: '3.27'
       - run: |
           git clone --branch v1.7.0 https://github.com/WhatsApp/erlfmt.git ${{ github.workspace }}/erlfmt
           cd ${{ github.workspace }}/erlfmt && rebar3 as release escriptize
