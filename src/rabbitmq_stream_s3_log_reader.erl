@@ -172,7 +172,7 @@ resolve_remote_location(Spec, _Config) when Spec =:= last orelse Spec =:= next -
     {local, Spec};
 resolve_remote_location(first, #{name := StreamId, shared := Shared}) ->
     LocalFirstOffset = osiris_log_shared:first_chunk_id(Shared),
-    case rabbitmq_stream_s3_server:get_manifest(StreamId) of
+    case (rabbitmq_stream_s3_server:backend()):get_manifest(StreamId) of
         #manifest{first_offset = RemoteFirstOffset} when RemoteFirstOffset < LocalFirstOffset ->
             ?LOG_DEBUG(
                 "Attaching remote reader at first offset ~b for spec 'first'",
@@ -203,7 +203,7 @@ resolve_remote_location(Offset, #{name := StreamId, shared := Shared}) when
                     Offset, StreamId, FirstChunkId
                 ]
             ),
-            case rabbitmq_stream_s3_server:get_manifest(StreamId) of
+            case (rabbitmq_stream_s3_server:backend()):get_manifest(StreamId) of
                 undefined ->
                     {local, next};
                 #manifest{first_offset = FirstOffset} when Offset < FirstOffset ->
@@ -220,7 +220,7 @@ resolve_remote_location({timestamp, Ts} = Spec, #{name := StreamId}) ->
     ]),
     %% We can't cheaply query the first timestamp from `osiris_log_shared`.
     %% Instead try the remote tier first.
-    case rabbitmq_stream_s3_server:get_manifest(StreamId) of
+    case (rabbitmq_stream_s3_server:backend()):get_manifest(StreamId) of
         #manifest{first_offset = FirstOffset, first_timestamp = FirstTs} when Ts < FirstTs ->
             {ok, remote_location_first(FirstOffset)};
         #manifest{entries = Entries} ->
@@ -249,14 +249,14 @@ total_range(#{name := StreamId, shared := Shared}) ->
             empty;
         LocalFirst ->
             LocalLast = osiris_log_shared:committed_offset(Shared),
-            case rabbitmq_stream_s3_server:get_range(StreamId) of
+            case (rabbitmq_stream_s3_server:backend()):get_range(StreamId) of
                 {RemoteFirst, RemoteLast} when RemoteFirst =/= -1 ->
                     {min(LocalFirst, RemoteFirst), max(LocalLast, RemoteLast)};
                 _ ->
                     %% The stream might be starting up and not have a range
                     %% yet. Request the manifest so we can check the values
                     %% ourselves.
-                    case rabbitmq_stream_s3_server:get_manifest(StreamId) of
+                    case (rabbitmq_stream_s3_server:backend()):get_manifest(StreamId) of
                         #manifest{first_offset = RemoteFirst, next_offset = RemoteNext} ->
                             {min(LocalFirst, RemoteFirst), max(LocalLast, RemoteNext - 1)};
                         undefined ->
