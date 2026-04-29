@@ -343,7 +343,7 @@ manifest_replication(Config) ->
     Uploaded0 = [#fragment_uploaded{stream = StreamId, info = I} || I <- Infos],
     Uploaded = lists:reverse(Uploaded0),
     {Writer5, Effects6} = handle_events(?META(), Uploaded, Writer4),
-    {ok, Edit0} = ?MAC:apply_infos(Infos, Manifest),
+    {ok, Edit0} = rabbitmq_stream_s3_manifest:apply_infos(Infos, Manifest),
     ManifestEdited = #manifest_edited{
         stream = StreamId,
         edits = [Edit0],
@@ -412,7 +412,7 @@ retention(Config) ->
     ),
     ?assertMatch([#set_range{first_offset = 0, next_offset = 120}], REffects1),
 
-    Edit0 = ?MAC:new_edit(Manifest),
+    Edit0 = rabbitmq_stream_s3_manifest:new_edit(Manifest),
     Edit1 = Edit0#edit{
         first_offset = 40,
         first_timestamp = Ts - 100 + 20,
@@ -501,7 +501,7 @@ retention(Config) ->
     FragmentUploaded = #fragment_uploaded{stream = StreamId, info = Info},
     Manifest1 = ?MAC:get_manifest(StreamId, Writer7),
     {Writer8, Effects8} = ?MAC:apply(?META(), FragmentUploaded, Writer7),
-    {ok, UploadEdit} = ?MAC:apply_infos([Info], Manifest1),
+    {ok, UploadEdit} = rabbitmq_stream_s3_manifest:apply_infos([Info], Manifest1),
     ManifestEdited3 = #manifest_edited{
         stream = StreamId,
         edits = [UploadEdit],
@@ -523,7 +523,7 @@ retention(Config) ->
     {Writer9, Effects9} = ?MAC:apply(?META(), ManifestUploaded3, Writer8),
     ?assertMatch([], Effects9),
 
-    {Replica4, REffects4} = ?MAC:apply(?META(), ManifestEdited3, Replica3),
+    {_Replica4, REffects4} = ?MAC:apply(?META(), ManifestEdited3, Replica3),
     ?assertMatch(
         [
             #set_range{first_offset = 60, next_offset = 140},
@@ -533,8 +533,8 @@ retention(Config) ->
     ),
 
     %% Retention runs on tick and deletes the oldest fragment.
-    {Writer10, Effects10} = ?MAC:apply(?META(), #tick{}, Writer9),
-    RetentionEdit = (?MAC:new_edit(
+    {_Writer10, Effects10} = ?MAC:apply(?META(), #tick{}, Writer9),
+    RetentionEdit = (rabbitmq_stream_s3_manifest:new_edit(
         ?MAC:get_manifest(StreamId, Writer9)
     ))#edit{
         first_offset = 80,
@@ -874,7 +874,7 @@ rebalance_group(Config) ->
     RetentionUpdated = #retention_updated{stream = StreamId, retention = [{max_bytes, 100}]},
     {Writer6, WEffects6} = ?MAC:apply(?META(), RetentionUpdated, Writer5),
     ?assertMatch([#evaluate_retention{}], WEffects6),
-    Edit0 = ?MAC:new_edit(?MAC:get_manifest(StreamId, Writer6)),
+    Edit0 = rabbitmq_stream_s3_manifest:new_edit(?MAC:get_manifest(StreamId, Writer6)),
     Edit = Edit0#edit{
         %% Retention would delete everything except F6.
         first_offset = F6#fragment.first_offset,
