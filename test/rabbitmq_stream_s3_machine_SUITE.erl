@@ -480,10 +480,7 @@ retention(Config) ->
     ?assertMatch([#set_range{first_offset = 60, next_offset = 120}], REffects3),
 
     %% Publish another fragment which will exceed the max-bytes setting.
-    %% That fragment should be added to the manifest and the oldest fragment
-    %% currently in the manifest (offset 80) should be deleted by retention.
-    %% Both the new fragment and fragment deletion should be reflected in the
-    %% same upload of the manifest object.
+    %% Retention is not evaluated on fragment upload - it runs on tick.
     Fragment = (fragment(120, 139))#fragment{roll_reason = segment_roll},
     {Writer7, Effects7} = handle_events(
         ?META(),
@@ -505,7 +502,41 @@ retention(Config) ->
     Manifest1 = ?MAC:get_manifest(StreamId, Writer7),
     {Writer8, Effects8} = ?MAC:apply(?META(), FragmentUploaded, Writer7),
     {ok, UploadEdit} = ?MAC:apply_infos([Info], Manifest1),
-    RetentionEdit = UploadEdit#edit{
+    ManifestEdited3 = #manifest_edited{
+        stream = StreamId,
+        edits = [UploadEdit],
+        seq = 4,
+        trigger_retention = true
+    },
+    ?assertMatch(
+        [
+            #set_range{first_offset = 60, next_offset = 140},
+            #trigger_retention{},
+            #send{to = {_, ReplicaNode}, message = ManifestEdited3},
+            #upload_manifest{
+                manifest = #manifest{first_offset = 60, next_offset = 140, total_size = 600}
+            }
+        ],
+        Effects8
+    ),
+    ManifestUploaded3 = #manifest_uploaded{stream = StreamId, entry = #{revision => 3}},
+    {Writer9, Effects9} = ?MAC:apply(?META(), ManifestUploaded3, Writer8),
+    ?assertMatch([], Effects9),
+
+    {Replica4, REffects4} = ?MAC:apply(?META(), ManifestEdited3, Replica3),
+    ?assertMatch(
+        [
+            #set_range{first_offset = 60, next_offset = 140},
+            #trigger_retention{}
+        ],
+        REffects4
+    ),
+
+    %% Retention runs on tick and deletes the oldest fragment.
+    {Writer10, Effects10} = ?MAC:apply(?META(), #tick{}, Writer9),
+    RetentionEdit = (?MAC:new_edit(
+        ?MAC:get_manifest(StreamId, Writer9)
+    ))#edit{
         first_offset = 80,
         first_timestamp = Ts - 100 + 60,
         first_last_timestamp = Ts - 100 + 80,
@@ -515,35 +546,22 @@ retention(Config) ->
         pos = 0,
         len = ?ENTRY_B
     },
-    ManifestEdited3 = #manifest_edited{
+    ManifestEdited4 = #manifest_edited{
         stream = StreamId,
-        edits = [UploadEdit, RetentionEdit],
-        seq = 4,
-        trigger_retention = true
+        edits = [RetentionEdit],
+        seq = 5,
+        trigger_retention = false
     },
     ?assertMatch(
         [
             #set_range{first_offset = 80, next_offset = 140},
-            #trigger_retention{},
-            #send{to = {_, ReplicaNode}, message = ManifestEdited3},
+            #send{to = {_, ReplicaNode}, message = ManifestEdited4},
             #delete_objects{objects = [60]},
             #upload_manifest{
                 manifest = #manifest{first_offset = 80, next_offset = 140, total_size = 400}
             }
         ],
-        Effects8
-    ),
-    ManifestUploaded3 = #manifest_uploaded{stream = StreamId, entry = #{revision => 3}},
-    {_Writer9, Effects9} = ?MAC:apply(?META(), ManifestUploaded3, Writer8),
-    ?assertMatch([], Effects9),
-
-    {_Replica4, REffects4} = ?MAC:apply(?META(), ManifestEdited3, Replica3),
-    ?assertMatch(
-        [
-            #set_range{first_offset = 80, next_offset = 140},
-            #trigger_retention{}
-        ],
-        REffects4
+        Effects10
     ),
     ok.
 
@@ -688,19 +706,34 @@ manifest_upload_conflict(Config) ->
     {NewWriter4, NewEffects4} = ?MAC:apply(?META(), F4Uploaded, NewWriter3),
     ?assertMatch(
         [
-            #set_range{first_offset = 40, next_offset = 80},
+            #set_range{first_offset = 0, next_offset = 80},
             #trigger_retention{},
-            #delete_objects{objects = [0, 20]},
             #upload_manifest{
-                manifest = #manifest{first_offset = 40, next_offset = 80, total_size = 400}
+                manifest = #manifest{first_offset = 0, next_offset = 80, total_size = 800}
             }
         ],
         NewEffects4
     ),
     %% Say that the new writer successfully uploads a new manifest revision.
     Manifest2Uploaded = #manifest_uploaded{stream = StreamId, entry = #{revision => 1, epoch => 2}},
-    {_NewWriter5, NewEffects5} = ?MAC:apply(?META(), Manifest2Uploaded, NewWriter4),
+    {NewWriter5, NewEffects5} = ?MAC:apply(?META(), Manifest2Uploaded, NewWriter4),
     ?assertMatch([], NewEffects5),
+
+    %% Retention runs on tick and deletes F1 and F2.
+    {NewWriter6, NewEffects6} = ?MAC:apply(?META(), #tick{}, NewWriter5),
+    ?assertMatch(
+        [
+            #set_range{first_offset = 40, next_offset = 80},
+            #delete_objects{objects = [0, 20]},
+            #upload_manifest{
+                manifest = #manifest{first_offset = 40, next_offset = 80, total_size = 400}
+            }
+        ],
+        NewEffects6
+    ),
+    Manifest3Uploaded = #manifest_uploaded{stream = StreamId, entry = #{revision => 2, epoch => 2}},
+    {_NewWriter7, NewEffects7} = ?MAC:apply(?META(), Manifest3Uploaded, NewWriter6),
+    ?assertMatch([], NewEffects7),
 
     %% OLD (deposed) writer, part 2.
     %% Say that it evaluates retention on tick. Its change to the manifest will
@@ -719,7 +752,7 @@ manifest_upload_conflict(Config) ->
     ),
     ManifestUploadRejected = #manifest_upload_rejected{
         stream = StreamId,
-        conflict = #{revision => 1, epoch => 2}
+        conflict = #{revision => 2, epoch => 2}
     },
     {_OldWriter5, OldEffects5} = ?MAC:apply(?META(), ManifestUploadRejected, OldWriter4),
     %% Stand down the old writer gracefully.
