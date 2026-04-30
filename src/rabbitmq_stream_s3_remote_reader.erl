@@ -17,6 +17,7 @@ multiplicative decrease ([AIMD]) algorithm.
 -include_lib("stdlib/include/assert.hrl").
 -include_lib("rabbit_common/include/rabbit.hrl").
 -include("include/rabbitmq_stream_s3.hrl").
+-include("include/logging.hrl").
 
 -behaviour(gen_server).
 
@@ -204,6 +205,7 @@ init(#{
         fragment_info = Info
     }
 }) ->
+    logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
     Key = rabbitmq_stream_s3:fragment_key(StreamId, Fragment),
     State0 = #?MODULE{
         stream = StreamId,
