@@ -632,8 +632,13 @@ handle_async(
 ) ->
     ?LOG_WARNING("S3 request timed out on ~tw/~tw", [Conn, StreamRef]),
     counters:add(counter(), ?C_REQUEST_TIMEOUTS, 1),
-    gun:cancel(Conn, StreamRef),
-    finish_async(State),
+    %% gun cannot cancel an HTTP/1.1 stream on the wire - it only stops
+    %% forwarding events to the owner. The cancelled stream continues to
+    %% occupy the connection, blocking subsequent requests until its full
+    %% response is received. Close the whole connection instead; the pool
+    %% observes the 'DOWN' and opens a fresh replacement.
+    gun:close(Conn),
+    finish_async_close(State),
     {done_cancel, {error, timeout}}.
 
 -spec cancel_async(async_req(), async_state()) -> ok.
@@ -678,6 +683,27 @@ finish_async(#{conn := Conn, pool := Pool} = State) ->
     end,
     counters:sub(counter(), ?C_ACTIVE_REQUESTS, 1),
     ok = rabbitmq_stream_s3_api_aws_pool:checkin(Pool, Conn).
+
+%% Finish an async request when the connection is being closed (e.g. on
+%% timeout). Same bookkeeping as `finish_async` but omits the pool checkin -
+%% the pool's 'DOWN' handler removes the conn and grows a replacement.
+finish_async_close(State) ->
+    case State of
+        #{timer_ref := TimerRef, stream_ref := StreamRef} ->
+            case erlang:cancel_timer(TimerRef) of
+                false ->
+                    receive
+                        {request_timeout, StreamRef} -> ok
+                    after 0 -> ok
+                    end;
+                _ ->
+                    ok
+            end;
+        _ ->
+            ok
+    end,
+    counters:sub(counter(), ?C_ACTIVE_REQUESTS, 1),
+    ok.
 
 -spec request(http_method(), key(), req_headers(), iodata(), request_opts()) ->
     {ok, http_response()}
