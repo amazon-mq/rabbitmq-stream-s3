@@ -57,3 +57,5 @@ jobs:
           path: ${{ github.workspace }}/rabbitmq-server/logs/
       - name: dialyze
         run: make -C ${{ github.workspace }}/rabbitmq-server/deps/rabbitmq_stream_s3 dialyze
+      - name: xref
+        run: make -C ${{ github.workspace }}/rabbitmq-server/deps/rabbitmq_stream_s3 xref
