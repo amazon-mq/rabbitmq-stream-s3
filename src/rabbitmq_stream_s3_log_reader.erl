@@ -521,8 +521,6 @@ read_header1(
     %% Over-read the chunk header so that the filter (if it exists) is always
     %% included in the binary. Reading from the remote tier takes time, so
     %% over-reading is faster.
-    %% TODO: make sure that over-reading is handled gracefully: as much of the
-    %% binary should be returned as possible.
     case read(Pid, Position, ?CHUNK_HEADER_B + ?MAX_FILTER_SIZE, chunk_boundary) of
         {ok, Header} ->
             read_header2(Remote0, Header);

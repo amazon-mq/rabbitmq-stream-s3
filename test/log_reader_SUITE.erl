@@ -32,7 +32,8 @@ all() ->
 groups() ->
     [
         {parallel, [parallel], [
-            read_from_first_with_remote_tier
+            read_from_first_with_remote_tier,
+            read_last_chunk_at_index_boundary
         ]}
     ].
 
@@ -128,6 +129,29 @@ read_from_first_with_remote_tier(Config) ->
     %% After local retention, only the active segment (offset 10) remains.
     Manifest = execute_local_retention(Manifest, Config),
     ?assertEqual([10], local_segments(Config)),
+
+    ReaderCfg = reader_config(Config),
+    {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg),
+    ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),
+
+    Records = read_all(Reader0),
+    ?assertEqual(Messages, Records).
+
+-doc """
+The log reader might attempt to read into the index section of a fragment
+since it over-reads the chunk header to get the full bloom filter. The remote
+reader must cap the read at the index boundary.
+""".
+read_last_chunk_at_index_boundary(Config) ->
+    %% Small messages produce small chunks, making it likely that the last
+    %% chunk header in a fragment falls within ?MAX_FILTER_SIZE bytes of the
+    %% index boundary.
+    Messages = messages(20, 1),
+
+    ok = seed_local_tier(Messages, Config),
+    Manifest = upload_to_remote_tier(#manifest{}, Config),
+    publish_manifest(Manifest, Config),
+    Manifest = execute_local_retention(Manifest, Config),
 
     ReaderCfg = reader_config(Config),
     {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg),

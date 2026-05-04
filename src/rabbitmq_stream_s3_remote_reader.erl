@@ -742,6 +742,13 @@ try_read(#?MODULE{end_pos = EndPos} = State, Offset, Bytes) when Offset + Bytes 
     %% Wait until the current request is complete and then respond with the
     %% newly added data.
     case State of
+        #?MODULE{
+            info = #fragment_info{index_start_pos = IdxStartPos}
+        } when EndPos >= IdxStartPos andalso Offset + ?CHUNK_HEADER_B =< EndPos ->
+            %% The log-reader over-reads the chunk header to try to get the
+            %% full filter. That might be larger than the chunk though. If so,
+            %% we need to cap the read at the index boundary.
+            try_read(State, Offset, EndPos - Offset);
         #?MODULE{requests = Requests} when map_size(Requests) =/= 0 ->
             %% The current fragment's info is being requested. Wait for its arrival.
             {await, State};
