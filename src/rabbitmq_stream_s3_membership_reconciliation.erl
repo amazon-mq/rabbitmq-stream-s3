@@ -6,6 +6,7 @@
 -behaviour(gen_server).
 
 -include_lib("kernel/include/logger.hrl").
+-include("include/logging.hrl").
 
 -record(?MODULE, {timer :: reference()}).
 
@@ -60,6 +61,7 @@ start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
 init([]) ->
+    logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
     case is_enabled() of
         true ->
             ?LOG_INFO(?MODULE_STRING " is enabled. Scheduling membership evaluation."),

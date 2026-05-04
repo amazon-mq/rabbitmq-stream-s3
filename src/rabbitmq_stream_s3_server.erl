@@ -8,6 +8,7 @@
 -include_lib("rabbit_common/include/rabbit.hrl").
 
 -include("include/rabbitmq_stream_s3.hrl").
+-include("include/logging.hrl").
 
 -define(SERVER, ?MODULE).
 %% Protected set of {stream_id(), FirstOffset, NextOffset} used to quickly
@@ -222,6 +223,7 @@ start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
 init([]) ->
+    logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
     %% Table keyed by stream ID. This is used for local retention: segments
     %% with all offsets less than or equal to the last tiered offset can be
     %% deleted by retention since they are stored in the remote tier.

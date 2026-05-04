@@ -15,6 +15,7 @@ the reader pool avoids reader starvation.
 
 -include_lib("kernel/include/logger.hrl").
 -include_lib("stdlib/include/assert.hrl").
+-include("include/logging.hrl").
 
 -behaviour(gen_server).
 
@@ -152,6 +153,7 @@ start_link(Name, Config) ->
     gen_server:start_link({local, Name}, ?MODULE, Config, []).
 
 init(#{min_size := MinSize, max_size := MaxSize, name := Name}) ->
+    logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
     case rabbitmq_stream_s3_api:backend() of
         rabbitmq_stream_s3_api_aws ->
             Cnt = seshat:new(rabbitmq_stream_s3, Name, ?COUNTERS, #{
