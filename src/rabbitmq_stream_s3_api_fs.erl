@@ -9,6 +9,7 @@ Each connection has an associated folder and each key for the connection has an
 associated file in that folder.
 """.
 
+-include_lib("stdlib/include/assert.hrl").
 -include_lib("kernel/include/logger.hrl").
 -include_lib("kernel/include/file.hrl").
 
@@ -58,16 +59,12 @@ get(Key, Opts) ->
     Timeout = maps:get(timeout, Opts, 5000),
     with_timeout(Timeout, fun() ->
         ?LOG_INFO("Trying to find file ~p in : ~p", [Key, data_dir()]),
-        case key_to_path(Key) of
-            {error, path_not_set} = E ->
-                E;
-            FilePath ->
-                case file:read_file(binary_to_list(FilePath)) of
-                    {ok, _} = Result ->
-                        Result;
-                    {error, enoent} ->
-                        {error, not_found}
-                end
+        FilePath = key_to_path(Key),
+        case file:read_file(FilePath) of
+            {ok, _} = Result ->
+                Result;
+            {error, enoent} ->
+                {error, not_found}
         end
     end).
 
@@ -80,27 +77,22 @@ get(Key, Opts) ->
 get_range(Key, RangeSpec, Opts) ->
     Timeout = maps:get(timeout, Opts, 5000),
     with_timeout(Timeout, fun() ->
-        case key_to_path(Key) of
-            {error, path_not_set} = E ->
-                E;
-            FilePath ->
-                FilePathBin = binary_to_list(FilePath),
-                case file:read_file_info(FilePathBin) of
-                    {ok, #file_info{size = FileSize}} ->
-                        {ok, Fd} = file:open(FilePathBin, [read, binary]),
-                        {Location, Number} = range_spec_to_location_number(FileSize, RangeSpec),
-                        Result =
-                            case file:pread(Fd, Location, Number) of
-                                {ok, Data} ->
-                                    {ok, Data};
-                                eof ->
-                                    {ok, <<>>}
-                            end,
-                        ok = file:close(Fd),
-                        Result;
-                    {error, enoent} ->
-                        {error, not_found}
-                end
+        FilePath = key_to_path(Key),
+        case file:read_file_info(FilePath) of
+            {ok, #file_info{size = FileSize}} ->
+                {ok, Fd} = file:open(FilePath, [read, binary]),
+                {Location, Number} = range_spec_to_location_number(FileSize, RangeSpec),
+                Result =
+                    case file:pread(Fd, Location, Number) of
+                        {ok, Data} ->
+                            {ok, Data};
+                        eof ->
+                            {ok, <<>>}
+                    end,
+                ok = file:close(Fd),
+                Result;
+            {error, enoent} ->
+                {error, not_found}
         end
     end).
 
@@ -118,29 +110,25 @@ result.
 ) ->
     {ok, async_req(), async_state()} | {error, any()}.
 get_range_async(Key, RangeSpec, _Opts) ->
-    case key_to_path(Key) of
-        {error, path_not_set} = Err ->
-            Err;
-        FilePath ->
-            Reply =
-                case file:read_file_info(FilePath) of
-                    {ok, #file_info{size = FileSize}} ->
-                        {ok, Fd} = file:open(FilePath, [read, binary]),
-                        {Location, Number} = range_spec_to_location_number(FileSize, RangeSpec),
-                        Data =
-                            case file:pread(Fd, Location, Number) of
-                                {ok, D} -> D;
-                                eof -> <<>>
-                            end,
-                        ok = file:close(Fd),
-                        {data, Data, done};
-                    {error, enoent} ->
-                        {done, {error, not_found}}
-                end,
-            Req = erlang:make_ref(),
-            self() ! {'$async', Req, Reply},
-            {ok, Req, undefined}
-    end.
+    FilePath = key_to_path(Key),
+    Reply =
+        case file:read_file_info(FilePath) of
+            {ok, #file_info{size = FileSize}} ->
+                {ok, Fd} = file:open(FilePath, [read, binary]),
+                {Location, Number} = range_spec_to_location_number(FileSize, RangeSpec),
+                Data =
+                    case file:pread(Fd, Location, Number) of
+                        {ok, D} -> D;
+                        eof -> <<>>
+                    end,
+                ok = file:close(Fd),
+                {data, Data, done};
+            {error, enoent} ->
+                {done, {error, not_found}}
+        end,
+    Req = erlang:make_ref(),
+    self() ! {'$async', Req, Reply},
+    {ok, Req, undefined}.
 
 -spec put(key(), iodata(), rabbitmq_stream_s3_api:request_opts()) ->
     ok | {error, any()}.
@@ -148,15 +136,11 @@ put(Key, Data, Opts) ->
     Timeout = maps:get(timeout, Opts, 5000),
     with_timeout(Timeout, fun() ->
         ?LOG_INFO("Writing file ~p in : ~p", [Key, data_dir()]),
-        case key_to_path(Key) of
-            {error, path_not_set} = E ->
-                E;
-            FilePath ->
-                ok = filelib:ensure_path(filename:dirname(FilePath)),
-                Result = file:write_file(FilePath, Data),
-                ?LOG_INFO("Write result: ~p", [Result]),
-                Result
-        end
+        FilePath = key_to_path(Key),
+        ok = filelib:ensure_path(filename:dirname(FilePath)),
+        Result = file:write_file(FilePath, Data),
+        ?LOG_INFO("Write result: ~p", [Result]),
+        Result
     end).
 
 -spec delete(key() | [key()], rabbitmq_stream_s3_api:request_opts()) ->
@@ -168,14 +152,9 @@ delete(Keys, Opts) when is_list(Keys) andalso is_map(Opts) ->
     with_timeout(Timeout, fun() ->
         Result = lists:filtermap(
             fun(K) ->
-                case key_to_path(K) of
-                    {error, path_not_set} = E ->
-                        {true, {K, E}};
-                    FilePath ->
-                        case file:delete(FilePath) of
-                            ok -> false;
-                            Error -> {true, {K, Error}}
-                        end
+                case file:delete(key_to_path(K)) of
+                    ok -> false;
+                    Error -> {true, {K, Error}}
                 end
             end,
             Keys
@@ -191,16 +170,12 @@ delete(Keys, Opts) when is_list(Keys) andalso is_map(Opts) ->
 delete_prefix(Prefix, Opts) when is_binary(Prefix) andalso is_map(Opts) ->
     Timeout = maps:get(timeout, Opts, 5000),
     with_timeout(Timeout, fun() ->
-        case key_to_path(Prefix) of
-            {error, path_not_set} = Err ->
-                Err;
-            Path ->
-                case file:del_dir_r(Path) of
-                    ok ->
-                        {ok, #{}};
-                    {error, _} = Err ->
-                        Err
-                end
+        Path = key_to_path(Prefix),
+        case file:del_dir_r(Path) of
+            ok ->
+                {ok, #{}};
+            {error, _} = Err ->
+                Err
         end
     end).
 
@@ -231,14 +206,10 @@ cancel_async(_Req, _State) ->
 -spec stream_put(key(), pos_integer(), rabbitmq_stream_s3_api:request_opts()) ->
     {ok, async_state()} | {error, any()}.
 stream_put(Key, _ContentLength, _Opts) ->
-    case key_to_path(Key) of
-        {error, _} = Err ->
-            Err;
-        FilePath ->
-            ok = filelib:ensure_path(filename:dirname(FilePath)),
-            {ok, Fd} = file:open(FilePath, [write, raw, binary]),
-            {ok, {Fd, 0}}
-    end.
+    FilePath = key_to_path(Key),
+    ok = filelib:ensure_path(filename:dirname(FilePath)),
+    {ok, Fd} = file:open(FilePath, [write, raw, binary]),
+    {ok, {Fd, 0}}.
 
 -spec stream_data(async_state(), iodata()) -> async_state().
 stream_data({Fd, Crc0}, Data) ->
@@ -254,40 +225,35 @@ stream_finish({Fd, Crc}, Crc32) ->
     end.
 
 -spec get_stream_data(StreamName) ->
-    {ok, Manifest, [FragmentFile]} | {error, not_found | path_not_set}
+    {ok, Manifest, [FragmentFile]} | {error, not_found}
 when
     StreamName :: binary(),
     Manifest :: file:filename() | undefined,
     FragmentFile :: file:filename().
 get_stream_data(StreamName0) ->
-    case data_dir() of
-        undefined ->
-            {error, path_not_set};
-        DataDir ->
-            StreamNameWildcard = binary_to_list(<<"*", StreamName0/binary, "*">>),
-            case filelib:wildcard(string:join([DataDir, "**", StreamNameWildcard], "/")) of
-                [] ->
-                    {error, not_found};
-                [StreamDir | _] ->
-                    Manifest =
-                        case filelib:wildcard(string:join([StreamDir, "**", "*manifest"], "/")) of
-                            [] -> undefined;
-                            [ManifestFile | _] -> ManifestFile
-                        end,
-                    Fragments = filelib:wildcard(
-                        string:join(
-                            [
-                                DataDir,
-                                "**",
-                                StreamNameWildcard,
-                                "**",
-                                "*.fragment"
-                            ],
-                            "/"
-                        )
-                    ),
-                    {ok, Manifest, Fragments}
-            end
+    DataDir = data_dir(),
+    StreamNameWildcard = binary_to_list(<<"*", StreamName0/binary, "*">>),
+    case filelib:wildcard(filename:join([DataDir, "**", StreamNameWildcard])) of
+        [] ->
+            {error, not_found};
+        [StreamDir | _] ->
+            Manifest =
+                case filelib:wildcard(filename:join([StreamDir, "**", "*manifest"])) of
+                    [] -> undefined;
+                    [ManifestFile | _] -> ManifestFile
+                end,
+            Fragments = filelib:wildcard(
+                filename:join(
+                    [
+                        DataDir,
+                        "**",
+                        StreamNameWildcard,
+                        "**",
+                        "*.fragment"
+                    ]
+                )
+            ),
+            {ok, Manifest, Fragments}
     end.
 
 -doc "Returns the sorted first offsets of fragment files stored for the given stream.".
@@ -308,16 +274,15 @@ clear() ->
 set_data_dir(DataDir) ->
     application:set_env(rabbitmq_stream_s3, api_fs_data_dir, DataDir).
 
--spec data_dir() -> file:filename_all() | undefined.
+-spec data_dir() -> file:filename_all().
 data_dir() ->
-    rabbitmq_stream_s3_config:api_fs_data_dir().
+    Dir = rabbitmq_stream_s3_config:api_fs_data_dir(),
+    ?assertNotEqual(undefined, Dir),
+    Dir.
 
--spec key_to_path(rabbitmq_stream_s3_api:key()) -> binary() | {error, path_not_set}.
+-spec key_to_path(rabbitmq_stream_s3_api:key()) -> binary().
 key_to_path(Key) ->
-    case data_dir() of
-        undefined -> {error, path_not_set};
-        DataDir -> filename:join(DataDir, Key)
-    end.
+    filename:join(data_dir(), Key).
 
 with_timeout(Timeout, Fun) ->
     Self = self(),
