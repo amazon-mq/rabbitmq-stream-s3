@@ -31,6 +31,7 @@ associated file in that folder.
 % Auxiliary function for testing
 -export([
     get_stream_data/1,
+    list_fragments/1,
     clear/0,
     set_data_dir/1
 ]).
@@ -256,9 +257,8 @@ stream_finish({Fd, Crc}, Crc32) ->
     {ok, Manifest, [FragmentFile]} | {error, not_found | path_not_set}
 when
     StreamName :: binary(),
-    Manifest :: Path | undefined,
-    FragmentFile :: Path,
-    Path :: binary().
+    Manifest :: file:filename() | undefined,
+    FragmentFile :: file:filename().
 get_stream_data(StreamName0) ->
     case data_dir() of
         undefined ->
@@ -290,6 +290,16 @@ get_stream_data(StreamName0) ->
             end
     end.
 
+-doc "Returns the sorted first offsets of fragment files stored for the given stream.".
+-spec list_fragments(StreamName :: binary()) -> [osiris:offset()].
+list_fragments(StreamName) ->
+    case get_stream_data(StreamName) of
+        {ok, _Manifest, Fragments} ->
+            lists:sort([binary_to_integer(filename:basename(F, <<".fragment">>)) || F <- Fragments]);
+        _ ->
+            []
+    end.
+
 -spec clear() -> ok | {error, any()}.
 clear() ->
     file:del_dir_r(data_dir()).
@@ -298,7 +308,7 @@ clear() ->
 set_data_dir(DataDir) ->
     application:set_env(rabbitmq_stream_s3, api_fs_data_dir, DataDir).
 
--spec data_dir() -> binary() | undefined.
+-spec data_dir() -> file:filename_all() | undefined.
 data_dir() ->
     rabbitmq_stream_s3_config:api_fs_data_dir().
 

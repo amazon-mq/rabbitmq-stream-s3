@@ -65,7 +65,8 @@
     init_writer/3,
     fragment_available/2,
     retention_updated/2,
-    delete_stream/1
+    delete_stream/1,
+    init_counters/0
 ]).
 
 %% Useful for other modules
@@ -75,6 +76,7 @@
     split_fragment_info/1,
     get_group_fun/2,
     get_group/3,
+    local_retention_fun/1,
     backend/0
 ]).
 
@@ -168,13 +170,18 @@
 %% recover replicas before this server is started and writer_manifest/1 will
 %% fail a few times and look messy in the logs.
 start() ->
-    Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?COUNTERS, #{module => ?MODULE}),
-    persistent_term:put(?COUNTER_KEY, Cnt),
+    ok = init_counters(),
 
     ok = rabbitmq_stream_s3_api:init(),
     ok = rabbitmq_stream_s3_db:setup(),
     _ = ets:new(?FIRST_GROUPS, [named_table, public]),
     rabbit_sup:start_child(?MODULE).
+
+-spec init_counters() -> ok.
+init_counters() ->
+    Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?COUNTERS, #{module => ?MODULE}),
+    persistent_term:put(?COUNTER_KEY, Cnt),
+    ok.
 
 -spec backend() -> module().
 backend() ->

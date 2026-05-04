@@ -103,6 +103,9 @@ tier.
     iterator_next/1
 ]).
 
+%% Debugging, testing.
+-export([mode/1]).
+
 -ifdef(TEST).
 -export([find_fragment/3, find_index_position/2]).
 -endif.
@@ -477,6 +480,10 @@ iterator_next(Local) ->
 
 %%---------------------------------------------------------------------------
 %% Helpers
+
+-spec mode(#?MODULE{}) -> local | remote.
+mode(#?MODULE{mode = #remote{}}) -> remote;
+mode(#?MODULE{}) -> local.
 
 send(tcp, Socket, Data) ->
     gen_tcp:send(Socket, Data);

@@ -36,6 +36,7 @@ and the server handles background uploads.
 ]).
 
 -export([
+    recover_fragments/1,
     recover_fragments/2,
     find_fragments_in_range/3
 ]).
