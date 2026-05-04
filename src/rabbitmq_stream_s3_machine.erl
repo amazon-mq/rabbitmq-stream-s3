@@ -281,20 +281,17 @@ apply(
                         fun(#fragment_info{roll_reason = Reason}) -> Reason =:= segment_roll end,
                         Finished
                     ),
-                    {Writer2, Edits, Effects0} = evaluate_writer(
-                        Cfg,
-                        Meta,
-                        StreamId,
-                        Writer1,
-                        [Edit],
-                        []
-                    ),
+                    %% Retention is evaluated on tick and on retention_updated,
+                    %% not on every fragment upload. This reduces S3 request
+                    %% cost by batching deletions.
+                    {Writer2, Effects0} = evaluate_rebalance(Cfg, StreamId, Writer1, []),
+                    {Writer3, Effects1} = evaluate_upload(Cfg, Meta, StreamId, Writer2, Effects0),
                     {Writer, Effects} = notify_edits(
-                        Edits,
+                        [Edit],
                         TriggerRetention,
                         StreamId,
-                        Writer2,
-                        Effects0
+                        Writer3,
+                        Effects1
                     ),
                     State = State0#?MODULE{streams = Streams0#{StreamId := Writer}},
                     {State, Effects}
@@ -986,14 +983,6 @@ upload_available_fragments(
     ),
     Writer = Writer0#{available_fragments := Available},
     {Writer, Effects}.
-
--spec evaluate_writer(cfg(), metadata(), stream_id(), writer(), [#edit{}], [effect()]) ->
-    {writer(), [#edit{}], [effect()]}.
-evaluate_writer(Cfg, Meta, StreamId, Writer0, Edits0, Effects0) ->
-    {Writer1, Edits, Effects1} = evaluate_retention(Meta, StreamId, Writer0, Edits0, Effects0),
-    {Writer2, Effects2} = evaluate_rebalance(Cfg, StreamId, Writer1, Effects1),
-    {Writer, Effects} = evaluate_upload(Cfg, Meta, StreamId, Writer2, Effects2),
-    {Writer, Edits, Effects}.
 
 -doc """
 Determine whether a stream's retention rules should delete fragments from the
