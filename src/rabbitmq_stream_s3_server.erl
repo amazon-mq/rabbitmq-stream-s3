@@ -65,7 +65,8 @@
     init_writer/3,
     fragment_available/2,
     retention_updated/2,
-    delete_stream/1
+    delete_stream/1,
+    init_counters/0
 ]).
 
 %% Useful for other modules
@@ -74,7 +75,9 @@
     get_fragment_info/2,
     split_fragment_info/1,
     get_group_fun/2,
-    get_group/3
+    get_group/3,
+    local_retention_fun/1,
+    backend/0
 ]).
 
 %% gen_server
@@ -154,6 +157,12 @@
 %% Need to be exported for `erlang:apply/3`.
 -export([start/0, format_osiris_event/1, execute_task/1, execute_task/2]).
 
+%% Behaviour for modules that can serve manifest queries to the log reader.
+%% The real implementation is this module (via gen_server). Tests can use
+%% `rabbitmq_stream_s3_server_ets` which is backed by an ETS table.
+-callback get_manifest(stream_id()) -> #manifest{} | undefined.
+-callback get_range(stream_id()) -> rabbitmq_stream_s3:range().
+
 %%----------------------------------------------------------------------------
 
 %% This server needs to be started by a boot step so that it is online before
@@ -161,13 +170,22 @@
 %% recover replicas before this server is started and writer_manifest/1 will
 %% fail a few times and look messy in the logs.
 start() ->
-    Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?COUNTERS, #{module => ?MODULE}),
-    persistent_term:put(?COUNTER_KEY, Cnt),
+    ok = init_counters(),
 
     ok = rabbitmq_stream_s3_api:init(),
     ok = rabbitmq_stream_s3_db:setup(),
     _ = ets:new(?FIRST_GROUPS, [named_table, public]),
     rabbit_sup:start_child(?MODULE).
+
+-spec init_counters() -> ok.
+init_counters() ->
+    Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?COUNTERS, #{module => ?MODULE}),
+    persistent_term:put(?COUNTER_KEY, Cnt),
+    ok.
+
+-spec backend() -> module().
+backend() ->
+    rabbitmq_stream_s3_config:manifest_server_backend().
 
 -spec get_manifest(stream_id()) -> #manifest{} | undefined.
 get_manifest(StreamId) ->
@@ -1164,11 +1182,10 @@ metadata() ->
 -spec local_retention_fun(stream_id()) -> osiris:retention_fun().
 local_retention_fun(StreamId) ->
     fun(IdxFiles) ->
-        try ets:lookup_element(?RANGE_TABLE, StreamId, 3) of
-            NextTieredOffset ->
-                eval_local_retention(IdxFiles, NextTieredOffset)
-        catch
-            error:badarg ->
+        case (backend()):get_range(StreamId) of
+            {_First, NextTieredOffset} ->
+                eval_local_retention(IdxFiles, NextTieredOffset + 1);
+            empty ->
                 {[], IdxFiles}
         end
     end.

@@ -670,7 +670,7 @@ try_read(
 ) when Offset >= IdxStartPos ->
     %% The request for the next fragment gave a 404. The fragment doesn't exist
     %% or hasn't been uploaded yet.
-    RemoteRange = rabbitmq_stream_s3_server:get_range(StreamId),
+    RemoteRange = (rabbitmq_stream_s3_server:backend()):get_range(StreamId),
     ?LOG_DEBUG(
         "Next fragment (~20..0B) was not found (requested ~b + ~b, idx start ~b). Remote range for this stream is ~w",
         [
@@ -742,6 +742,13 @@ try_read(#?MODULE{end_pos = EndPos} = State, Offset, Bytes) when Offset + Bytes 
     %% Wait until the current request is complete and then respond with the
     %% newly added data.
     case State of
+        #?MODULE{
+            info = #fragment_info{index_start_pos = IdxStartPos}
+        } when EndPos >= IdxStartPos andalso Offset + ?CHUNK_HEADER_B =< EndPos ->
+            %% The log-reader over-reads the chunk header to try to get the
+            %% full filter. That might be larger than the chunk though. If so,
+            %% we need to cap the read at the index boundary.
+            try_read(State, Offset, EndPos - Offset);
         #?MODULE{requests = Requests} when map_size(Requests) =/= 0 ->
             %% The current fragment's info is being requested. Wait for its arrival.
             {await, State};
@@ -749,7 +756,7 @@ try_read(#?MODULE{end_pos = EndPos} = State, Offset, Bytes) when Offset + Bytes 
             %% The current fragment was deleted by retention while being read.
             %% Requests is empty here (the first case branch catches non-empty).
             %% Jump to the oldest fragment still available in the remote tier.
-            case rabbitmq_stream_s3_server:get_range(StreamId) of
+            case (rabbitmq_stream_s3_server:backend()):get_range(StreamId) of
                 empty ->
                     {end_of_stream, State};
                 {FirstOffset, _} ->

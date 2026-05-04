@@ -124,9 +124,6 @@ for the log manifest server to execute.
 
 -export([execute_retention/4]).
 
-%% Used by tests:
--export([apply_infos/2, new_edit/1]).
-
 -spec writer(#writer_spawned{}) -> writer().
 writer(#writer_spawned{
     pid = Pid,
@@ -267,8 +264,8 @@ apply(
                     State = State0#?MODULE{streams = Streams0#{StreamId := Writer}},
                     {State, []};
                 [_ | _] ->
-                    {ok, Edit} = apply_infos(Finished, Manifest0),
-                    Manifest = apply_edit(Edit, Manifest0),
+                    {ok, Edit} = rabbitmq_stream_s3_manifest:apply_infos(Finished, Manifest0),
+                    Manifest = rabbitmq_stream_s3_manifest:apply_edit(Edit, Manifest0),
                     %% assertion: the finished fragments were applied up to the
                     %% next-tiered-offset we expected from split_uploaded_infos/2.
                     #manifest{next_offset = NextOffset} = Manifest,
@@ -427,12 +424,7 @@ apply(
     end;
 apply(
     _Meta,
-    #group_uploaded{
-        stream = StreamId,
-        entry = Entry,
-        pos = Pos,
-        len = Len
-    },
+    #group_uploaded{stream = StreamId} = Event,
     #?MODULE{streams = Streams0} = State0
 ) ->
     case Streams0 of
@@ -443,8 +435,8 @@ apply(
             %% Because uploads only append to the tail of the entries array,
             %% `Pos` and `Len` point to the same section of entries regardless
             %% of changes to the manifest since the group upload started.
-            Edit = (new_edit(Manifest0))#edit{entries = Entry, pos = Pos, len = Len},
-            Manifest = apply_edit(Edit, Manifest0),
+            Edit = rabbitmq_stream_s3_manifest:rebalance_edit(Event, Manifest0),
+            Manifest = rabbitmq_stream_s3_manifest:apply_edit(Edit, Manifest0),
             Writer1 = Writer0#{manifest := Manifest},
             {Writer2, Effects0} = upload(StreamId, Writer1, []),
             {Writer, Effects} = notify_edits([Edit], false, StreamId, Writer2, Effects0),
@@ -660,7 +652,7 @@ apply(
 ) ->
     case Streams0 of
         #{StreamId := #{kind := writer, manifest := #manifest{} = Manifest0} = Writer0} ->
-            Manifest = apply_edit(Edit, Manifest0),
+            Manifest = rabbitmq_stream_s3_manifest:apply_edit(Edit, Manifest0),
             Writer1 = Writer0#{manifest := Manifest},
             {Writer2, Effects0} = upload(StreamId, Writer1, []),
             {Writer, Effects} = notify_edits([Edit], false, StreamId, Writer2, Effects0),
@@ -726,136 +718,10 @@ split_uploaded_infos(
 split_uploaded_infos(NextTieredOffset, PendingUploaded, Acc) ->
     {NextTieredOffset, PendingUploaded, lists:reverse(Acc)}.
 
--spec new_edit(#manifest{}) -> #edit{}.
-new_edit(#manifest{
-    first_offset = FirstOffset,
-    first_timestamp = FirstTs,
-    first_last_timestamp = FirstLastTs,
-    next_offset = NextOffset
-}) ->
-    #edit{
-        first_offset = FirstOffset,
-        first_timestamp = FirstTs,
-        first_last_timestamp = FirstLastTs,
-        next_offset = NextOffset
-    }.
-
--doc """
-Create an edit that adds successfully uploaded fragments to their manifest
-entries array.
-
-`Infos` is expected to be sorted by offset ascending.
-""".
--spec apply_infos([#fragment_info{}], #manifest{}) ->
-    {ok, #edit{} | undefined} | {error, #fragment_info{}}.
-apply_infos(Infos, #manifest{entries = Entries} = Manifest) ->
-    Edit0 = (new_edit(Manifest))#edit{pos = byte_size(Entries)},
-    apply_infos0(Infos, Edit0).
-
-apply_infos0([], Edit) ->
-    {ok, Edit};
-apply_infos0(
-    [
-        #fragment_info{
-            first_offset = Offset,
-            next_offset = NextOffset,
-            first_timestamp = FirstTs,
-            last_timestamp = LastTs,
-            seq_no = SeqNo,
-            size = Size
-        }
-        | Rest
-    ],
-    #edit{
-        next_offset = Offset,
-        size = Size0,
-        entries = Entries0
-    } = Edit0
-) ->
-    Edit1 =
-        case Offset of
-            0 ->
-                %% For the very first fragment, also set the offset and timestamps.
-                Edit0#edit{
-                    first_offset = Offset,
-                    first_timestamp = FirstTs,
-                    first_last_timestamp = LastTs
-                };
-            _ ->
-                Edit0
-        end,
-    IsSeqZero =
-        case SeqNo of
-            0 -> 1;
-            _ -> 0
-        end,
-    Edit = Edit1#edit{
-        next_offset = NextOffset,
-        size = Size0 + Size,
-        entries = <<Entries0/binary, ?FRAGMENT(Offset, FirstTs, LastTs, IsSeqZero, Size)/binary>>
-    },
-    apply_infos0(Rest, Edit);
-apply_infos0([Info | _], #edit{}) ->
-    {error, Info}.
-
--spec apply_edits([#edit{}], #manifest{}) -> #manifest{}.
+-spec apply_edits([rabbitmq_stream_s3_manifest:edit()], rabbitmq_stream_s3_manifest:t()) ->
+    rabbitmq_stream_s3_manifest:t().
 apply_edits(Edits, Manifest) ->
-    lists:foldl(fun apply_edit/2, Manifest, Edits).
-
--spec apply_edit(#edit{}, #manifest{}) -> #manifest{}.
-apply_edit(
-    #edit{
-        first_offset = FirstOffset,
-        first_timestamp = FirstTs,
-        first_last_timestamp = FirstLastTs,
-        next_offset = EditNextOffset,
-        size = Size,
-        entries = EditEntries,
-        pos = Pos,
-        len = Len
-    },
-    #manifest{
-        next_offset = ManifestNextOffset,
-        total_size = TotalSize0,
-        entries = Entries0
-    } = Manifest0
-) ->
-    Entries =
-        if
-            %% Pure insertion (append)
-            Pos =:= byte_size(Entries0) andalso Len =:= 0 ->
-                <<Entries0/binary, EditEntries/binary>>;
-            %% No-op (empty)
-            Len =:= 0 andalso EditEntries =:= <<>> ->
-                Entries0;
-            %% Pure deletion (truncate)
-            EditEntries =:= <<>> ->
-                %% We only truncate from the beginning. No hole punching.
-                ?assertEqual(0, Pos),
-                binary:part(Entries0, Len, byte_size(Entries0) - Len);
-            %% Replacement (for rebalancing)
-            true ->
-                <<
-                    (binary:part(Entries0, 0, Pos))/binary,
-                    EditEntries/binary,
-                    (binary:part(Entries0, Pos + Len, byte_size(Entries0) - Pos - Len))/binary
-                >>
-        end,
-    NextOffset =
-        case EditNextOffset of
-            undefined ->
-                ManifestNextOffset;
-            _ when is_integer(EditNextOffset) ->
-                EditNextOffset
-        end,
-    Manifest0#manifest{
-        first_offset = FirstOffset,
-        first_timestamp = FirstTs,
-        first_last_timestamp = FirstLastTs,
-        next_offset = NextOffset,
-        total_size = TotalSize0 + Size,
-        entries = Entries
-    }.
+    lists:foldl(fun rabbitmq_stream_s3_manifest:apply_edit/2, Manifest, Edits).
 
 -spec notify_edits([#edit{}], SuggestRetention :: boolean(), stream_id(), writer(), [effect()]) ->
     {writer(), [effect()]}.
@@ -1037,7 +903,7 @@ evaluate_retention(
                             ),
                             {Writer0, Edits0, Effects0};
                         {Edit, Offsets} ->
-                            Manifest = apply_edit(Edit, Manifest0),
+                            Manifest = rabbitmq_stream_s3_manifest:apply_edit(Edit, Manifest0),
                             Writer1 = Writer0#{manifest := Manifest},
                             {Writer, Effects1} = upload(StreamId, Writer1, Effects0),
                             DeleteFragments = #delete_objects{stream = StreamId, objects = Offsets},
@@ -1075,7 +941,7 @@ execute_retention(
     RetentionSpec,
     GetGroupFun
 ) ->
-    Edit0 = new_edit(Manifest),
+    Edit0 = rabbitmq_stream_s3_manifest:new_edit(Manifest),
     %% Retention does not affect the tail of the entries array. Clear
     %% the next_offset to avoid clobbering edits made to the manifest
     %% tail during asynchronous retention evaluation.
@@ -1681,15 +1547,15 @@ apply_infos_test() ->
         ],
     ?assertMatch(
         {ok, #edit{first_timestamp = Ts, next_offset = 60}},
-        apply_infos(Infos, #manifest{})
+        rabbitmq_stream_s3_manifest:apply_infos(Infos, #manifest{})
     ),
     ?assertEqual(
         {error, I2},
-        apply_infos([I2, I3], #manifest{})
+        rabbitmq_stream_s3_manifest:apply_infos([I2, I3], #manifest{})
     ),
     ?assertEqual(
         {error, I3},
-        apply_infos([I1, I3], #manifest{})
+        rabbitmq_stream_s3_manifest:apply_infos([I1, I3], #manifest{})
     ),
     ok.
 
@@ -1897,7 +1763,7 @@ recursive_retention_test() ->
         %% G0
         #group_ref{offset = 0, kind = ?MANIFEST_KIND_GROUP}
     ]} = ExecuteRetention(#{max_bytes => 5 * FragmentSize}),
-    Manifest1 = apply_edit(Edit1, Manifest),
+    Manifest1 = rabbitmq_stream_s3_manifest:apply_edit(Edit1, Manifest),
     ?assertEqual(5 * FragmentSize, Manifest1#manifest.total_size),
     {#edit{first_offset = 80, size = -400, len = ?ENTRY_B} = Edit3, [
         %% G0. Returned because looking it up was successful.
@@ -1911,7 +1777,7 @@ recursive_retention_test() ->
         %% KG0
         #group_ref{offset = 0, kind = ?MANIFEST_KIND_KILO_GROUP}
     ]} = execute_retention(Manifest1, Ts, #{max_bytes => 3 * FragmentSize}, GetGroupFun),
-    Manifest2 = apply_edit(Edit3, Manifest1),
+    Manifest2 = rabbitmq_stream_s3_manifest:apply_edit(Edit3, Manifest1),
     ?assertEqual(3 * FragmentSize, Manifest2#manifest.total_size),
 
     ok.
