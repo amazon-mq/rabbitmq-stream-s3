@@ -2,26 +2,21 @@
 
 [![CI](https://github.com/amazon-mq/rabbitmq-stream-s3/actions/workflows/build-test.yaml/badge.svg)](https://github.com/amazon-mq/rabbitmq-stream-s3/actions/workflows/build-test.yaml)
 
-RabbitMQ Streams stores data in an append-only log on local disk, managed by the [osiris](https://github.com/rabbitmq/osiris) library. Each stream is a sequence of segments; old segments are deleted by retention policies. Once a segment is deleted locally, any consumer that hasn't read it yet loses access to that data permanently.
+Tiered storage plugin for RabbitMQ streams. Uploads committed stream data to Amazon S3 in the background. Consumers read from local disk when data is available and fall back to S3 for older data.
 
-`rabbitmq_stream_s3` adds a **remote tier** by hooking into osiris via two plugin behaviours:
+Streams retain data in S3 indefinitely (or according to a remote retention policy) at low cost, while local disk only holds recent data. Consumers see a single continuous stream regardless of where the data lives.
 
-- **`osiris_log_manifest`** (write path) — receives events for every chunk written and every segment roll. It tracks fragment metadata in memory and notifies the upload server when a fragment is ready. Uploads happen asynchronously in the background and do not block writes. The server ensures a fragment is fully uploaded before the corresponding local segment is eligible for deletion.
-- **`osiris_log_reader`** (read path) — when a consumer requests an offset or timestamp that no longer exists locally, instead of failing, the broker resolves the manifest to find the right S3 object and byte position, then streams the data directly from S3 to the consumer using HTTP range requests.
+For a detailed description of the design, start with [docs/README.md](docs/README.md).
 
-Streams can retain data indefinitely in S3 at low cost, while local disk only holds recent data. Consumers see a single continuous stream regardless of whether the data is local or remote.
+## Project Maturity
 
-For a detailed description of the design, see [docs/README.md](docs/README.md).
+rabbitmq-stream-s3 is not stable, with frequent changes in design and functionality.
 
 ## Important: `rabbitmq_prometheus` dependency
 
 This plugin depends on `rabbitmq_prometheus`. Enabling `rabbitmq_stream_s3`
 **implicitly enables** `rabbitmq_prometheus`, which opens the Prometheus
 metrics endpoint on port 15692.
-
-## Project Maturity
-
-rabbitmq-stream-s3 is not stable, with frequent changes in design and functionality.
 
 ## Prerequisites
 
@@ -55,7 +50,7 @@ For more information on building and developing RabbitMQ plugins, see [plugin-de
 
 ## Configure
 
-See [docs/configuration.md](docs/configuration.md) for all configuration options.
+See [docs/operations.md](docs/operations.md) for all configuration options.
 
 The minimum required configuration is:
 
@@ -63,6 +58,13 @@ The minimum required configuration is:
 stream_s3.bucket = my-rabbitmq-streams-bucket
 stream_s3.region = us-east-1
 ```
+
+## Documentation
+
+- [docs/README.md](docs/README.md): overview and reading guide
+- [docs/user-guide.md](docs/user-guide.md): behavior (no implementation details)
+- [docs/concepts.md](docs/concepts.md): streaming primitives and how the plugin extends them
+- [docs/manifest.md](docs/manifest.md): manifest tree structure and concurrency control
 
 ## Security
 

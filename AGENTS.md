@@ -1,144 +1,82 @@
 # Instructions for AI Agents
 
-This file covers the `rabbitmq_stream_s3` plugin specifically. For general
-RabbitMQ conventions (comments, git, building, testing), see the parent
-repository's `AGENTS.md` at the root of [`rabbitmq/rabbitmq-server`](https://github.com/rabbitmq/rabbitmq-server).
+This file covers the `rabbitmq_stream_s3` plugin specifically. For general RabbitMQ conventions (comments, git, building, testing), see the parent repository's `AGENTS.md` at the root of [`rabbitmq/rabbitmq-server`](https://github.com/rabbitmq/rabbitmq-server).
 
-## Overview
+## Before you start
 
-`rabbitmq_stream_s3` provides tiered storage for RabbitMQ streams using Amazon
-S3 as the remote tier. It uploads committed stream data as fragment objects and
-maintains a manifest per stream. Consumers read from local data when available
-and fall back to the remote tier for older data.
+Read the relevant documentation before modifying any module:
 
-The plugin is hosted at [`amazon-mq/rabbitmq-stream-s3`](https://github.com/amazon-mq/rabbitmq-stream-s3).
-
-## Documentation
-
-- `docs/README.md` — design overview, glossary, data representation, operations
-- `docs/manifest.md` — manifest structure, concurrency control, operations
-- `docs/configuration.md` — all configuration keys with examples
-- `docs/TODO.md` — known issues and planned work
-
-Read the relevant doc before modifying any module.
-
-## Repository Structure
-
-### Source (`src/`)
-
-| Module | Role |
-|--------|------|
-| `rabbitmq_stream_s3.erl` | Utility functions: key construction, index file helpers |
-| `rabbitmq_stream_s3_api.erl` | Storage backend behaviour (callbacks for get, put, delete) |
-| `rabbitmq_stream_s3_api_aws.erl` | AWS S3 backend implementation (production) |
-| `rabbitmq_stream_s3_api_aws_pool.erl` | Connection pool for S3 HTTP connections; separate pools for reads and writes avoid reader starvation |
-| `rabbitmq_stream_s3_api_fs.erl` | Filesystem backend implementation (tests) |
-| `rabbitmq_stream_s3_app.erl` | OTP application module |
-| `rabbitmq_stream_s3_array.erl` | Binary array operations (at, slice, partition_point, etc.) |
-| `rabbitmq_stream_s3_db.erl` | Khepri interactions: stream ID storage, triggers, keep-while conditions |
-| `rabbitmq_stream_s3_log_manifest.erl` | `osiris_log_manifest` behaviour: local tier interface, fragment recovery on boot |
-| `rabbitmq_stream_s3_log_reader.erl` | `osiris_log_reader` behaviour: reads from local or remote tier |
-| `rabbitmq_stream_s3_machine.erl` | Manifest state machine: fragment tracking, retention, groups |
-| `rabbitmq_stream_s3_membership_reconciliation.erl` | `gen_server` implementing Continuous Membership Reconciliation (CMR) for streams |
-| `rabbitmq_stream_s3_membership_reconciliation_events.erl` | `gen_event` handler that notifies the CMR server when membership should be evaluated |
-| `rabbitmq_stream_s3_prometheus_collector.erl` | Prometheus metrics collector; implements the `prometheus_collector` behaviour |
-| `rabbitmq_stream_s3_remote_reader.erl` | `gen_server` that pre-fetches and buffers data from the remote tier for a single consumer |
-| `rabbitmq_stream_s3_remote_reader_sup.erl` | Supervisor for remote reader `gen_server` processes |
-| `rabbitmq_stream_s3_request_metrics.erl` | Tracks S3 request duration as a histogram (set of per-bucket counters) |
-| `rabbitmq_stream_s3_read_size_metrics.erl` | Tracks remote tier read size distribution as a histogram |
-| `rabbitmq_stream_s3_histogram.erl` | Generic histogram used by `_api` (request duration) and `_remote_reader` (read size distribution) |
-| `rabbitmq_stream_s3_server.erl` | `gen_server` coordinating uploads, deletions, manifest updates |
-| `rabbitmq_stream_s3_sup.erl` | Top-level supervisor |
-
-### Key relationships
-
-- `rabbitmq_stream_s3_log_manifest` implements `osiris_log_manifest` — called by `osiris_writer` during segment rollover and chunk writes
-- `rabbitmq_stream_s3_log_reader` implements `osiris_log_reader` — called by `rabbit_stream_reader` when a consumer subscribes
-- `rabbitmq_stream_s3_server` is the central coordinator; `_log_manifest` notifies it of available fragments, it kicks off upload tasks
-- `rabbitmq_stream_s3_machine` is a pure state machine (no side effects) that `_server` uses to track manifest state
-- `rabbitmq_stream_s3_api` is the storage abstraction; `_api_aws` is the real backend, `_api_fs` is used in tests
-
-### Include (`include/`)
-
-`rabbitmq_stream_s3.hrl` — record definitions (`#fragment{}`, `#manifest{}`),
-constants (`?INDEX_RECORD_SIZE_B`, `?CHUNK_HEADER_B`, `?MAX_FRAGMENT_SIZE_B`).
-
-### Tests (`test/`)
-
-| Suite | What it tests |
-|-------|---------------|
-| `config_schema_SUITE.erl` | Configuration schema snippets from `docs/configuration.md` |
-| `membership_reconciliation_SUITE.erl` | Continuous Membership Reconciliation behaviour |
-| `unit_SUITE.erl` | Property-based tests for `_array`, `find_fragment`, `find_index_position` |
-| `s3_streams_SUITE.erl` | Integration tests: publish, read from remote tier by offset and timestamp |
-| `rabbitmq_stream_s3_machine_SUITE.erl` | State machine transitions |
-| `rabbitmq_stream_s3_api_aws_SUITE.erl` | AWS API client (requires credentials) |
+- `docs/README.md` — overview and reading guide
+- `docs/DEVELOPMENT.md` — building, testing, formatting
+- `docs/concepts.md` — streaming primitives and how the plugin extends them
+- `docs/architecture.md` — how the pieces fit together
+- `docs/conventions.md` — patterns and conventions for writing code here
 
 ## Building and Testing
 
+See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for build commands, test invocation, CT log navigation, and formatting.
+
+## Writing Tests
+
+**Your goal is not to make tests pass.** Your goal is to write correct code that the tests validate. If a test fails, that is information. If a test hangs, that is information. Do not chase green. Follow the priorities below.
+
+### Priorities (in order)
+
+0. **Tests are evidence, not checkboxes.** Running a test suite is an investigative act. You are collecting evidence about whether the code is correct. You are not confirming a result. If you catch yourself re-running to "check if it passes," you are chasing green. Stop. Run once, preserve the output, read it.
+
+1. **Investigate the root cause.** A root cause is the bedrock explanation. It fully explains the failure, irrefutably, and leaves no room to dive deeper. A timeout is not a root cause. A `badmatch` is not a root cause. "Function X is called with argument Y but expects Z because of W" is a root cause. Keep asking "why" until you reach a fact that makes the failure inevitable and obvious. Read source code. Read logs. If you cannot determine the root cause from available evidence, stop and ask.
+
+2. **Improve the test framework.** Make the failure obvious from the error message so future investigators don't need to dig. Better diagnostics on timeout. Better assertion messages. Better helpers.
+
+3. **Fix the code.** Only after you understand the root cause and its design implications. If the fix requires a design decision (e.g. when to fire an offset listener, what happens on recovery), stop and consult.
+
+### Rules
+
+- Never change test semantics to make a test green.
+- Never change production semantics (e.g. `>=` to `>`) as a reaction to a test failure without understanding why.
+- Never add error handling to production code to make a test pass.
+- Never speculate about causes without evidence. If you don't have logs or a stack trace, get them first.
+- Never run commands without timeouts. A hanging test is a symptom; killing it and retrying is not investigation.
+
+### When to stop and ask
+
+If you encounter any of the following, stop and present what you know:
+
+- A failure whose root cause involves process lifecycle, message ordering, or barrier semantics that you cannot fully trace.
+- A fix that would require changing how processes interact (hooks, listeners, registration).
+- A design question about when state becomes visible, when side effects should fire, or what guarantees a barrier provides.
+- Two failed attempts at the same problem. Step back, explain what you tried and what you observed, and ask for direction.
+
+### Running tests
+
+- Always use `timeout` when running make targets: `timeout 30 make ct-...`
+- If a test hangs, that is a bug. Do not retry. Investigate.
+- Always use `make test-build`, never `erlc` directly.
+- Tee output to a file so you can grep without re-running:
+
 ```bash
-# Build (including test dependencies)
-gmake test-build
-
-# Run all Common Test suites
-gmake ct
-
-# Run a specific suite
-gmake ct-s3_streams
-
-# Run a specific test case
-gmake t=TEST_GROUP:TEST_CASE ct-s3_streams
+timeout 120 make ct-replica_reader 2>&1 | tee /tmp/ct-out.txt
+grep -E 'pass|fail|Error' /tmp/ct-out.txt
 ```
 
-Integration tests in `s3_streams_SUITE` use the filesystem backend (`_api_fs`)
-and do not require AWS credentials or an S3 bucket.
+- See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for make targets, CT log navigation, and formatting.
 
-## Key Concepts
+### Deterministic test construction
 
-### Fragment recovery on boot
+See [docs/conventions.md](docs/conventions.md) for the test infrastructure (seed_log, build_manifest, barriers) and patterns for writing deterministic tests.
 
-When a writer starts, `rabbitmq_stream_s3_log_manifest:init_manifest/2` scans
-the most recent local index file to recover fragment boundaries. The function
-`recover_fragments/7` walks the index array and splits it at
-`?MAX_FRAGMENT_SIZE_B` boundaries. If the index array is empty (stream created
-but no data flushed), the guard clause returns a default empty fragment.
+## Writing documentation
 
-### Stream ID
+- Simple and direct sentences.
+- No em dashes.
+- No hard wrapping. Each paragraph is a single line.
+- Derive style from the existing documentation in `docs/`.
 
-Streams are identified internally by a binary like
-`<<"__stream-name_1234567890">>`. This is the `name` field in the queue's type
-state, not the user-visible queue name. Use `amqqueue:get_type_state/1` to
-retrieve it.
+## Making knowledge durable
 
-### Manifest updates
+Knowledge learned during implementation must be placed where it will survive:
 
-Fragment uploads are tracked by `rabbitmq_stream_s3_server`. When a contiguous
-run of fragments has been uploaded, the server applies them to the in-memory
-manifest via `rabbitmq_stream_s3_machine` and uploads the new manifest to S3.
-Manifest uploads are debounced to avoid high-frequency updates.
-
-### Storage backend abstraction
-
-The `rabbitmq_stream_s3_api` behaviour allows swapping the storage backend.
-Production uses `_api_aws` (real S3). Tests use `_api_fs` (local filesystem).
-The backend is configured via application environment, not `rabbitmq.conf`.
-
-## Common Pitfalls
-
-- `rabbitmq_stream_s3_array:at/3` crashes with `badarg` on an empty binary.
-  Always guard against empty arrays or use `try_at/3` which returns `undefined`
-- `recover_fragments/7` is called recursively with a shrinking `IdxArray` via
-  `slice/3`. The empty-array guard clause must be the first function head
-- `resolve_remote_location/2` in `_log_reader` must return `{local, Spec}` for
-  tail offset specs (`next`, `last`), not delegate directly to
-  `init_local_reader` which returns `{ok, Reader}`
-- The `rabbitmq_stream_s3_server` public API (`get_manifest/1`, `get_range/1`)
-  uses the stream ID, not the user-visible queue name
-- `maybe_start_request/1` in `rabbitmq_stream_s3_remote_reader` has a guard
-  `when EndPos - CurrentPos > ReadSize` that skips `maybe_start_current_request`
-  and calls only `maybe_start_next_request`. After the initial fetch this guard
-  is always true, so calling `maybe_start_request` when the buffer is exhausted
-  leaves the reader in `await` indefinitely. Call `maybe_start_current_request`
-  directly in that case
-- Index records are 29 bytes (`?INDEX_RECORD_SIZE_B`):
-  `<<ChunkId:64, Timestamp:64, Epoch:64, FilePos:32, ChunkType:8>>`
+- Implementation constraints and "why" explanations belong as comments in the code, next to the relevant line.
+- Architecture and design decisions belong in `docs/`.
+- Testing patterns and conventions belong in `docs/conventions.md`.
+- If you learn something surprising (a framework quirk, a type mismatch, a non-obvious ordering requirement), capture the learning in a comment.
