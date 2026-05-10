@@ -17,3 +17,8 @@
 
 rabbitmq_stream_s3.d
 .rabbitmq_stream_s3.plt
+
+# TLC model checker output
+tla/states/
+tla/*.dot
+tla/MC_TTrace_*
