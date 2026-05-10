@@ -27,6 +27,12 @@ VARIABLES
           coord_election,       \* the election phase of each epoch
           coord_election_ler,   \* the LER of each fenced replica, per epoch
 
+          \* Remote tier (shared state)
+          remote_log,               \* set of records uploaded to the remote tier
+          remote_epoch,             \* epoch of the last successful remote manifest update (optimistic lock)
+          remote_first_offset,      \* first offset in the remote tier (advances on remote retention or truncation)
+          replica_reader_pos,         \* per replica, the next offset the replica reader will upload
+
           \* meta data required by the spec
           confirmed,            \* the confirmation status of each written value
           confirmed_replicas,   \* the set of replicas that had the value at confirmation time
@@ -37,10 +43,12 @@ VARIABLES
 AllVars == << rep_state, rep_epoch, rep_leader, rep_log, rep_ler, rep_max_ler_of_rep, rep_listener,
               rep_committed_offset, rep_first_offset,
               coord_state, coord_epoch, coord_leader, coord_election, coord_election_ler,
+              remote_log, remote_epoch, remote_first_offset, replica_reader_pos,
               confirmed, confirmed_replicas, start_stop_ctr, requests, responses_processed >>
 RepVars == << rep_state, rep_epoch, rep_leader, rep_log, rep_ler, rep_max_ler_of_rep, rep_listener,
               rep_committed_offset, rep_first_offset >>
 CoordVars == << coord_state, coord_epoch, coord_leader, coord_election, coord_election_ler >>
+RemoteVars == << remote_log, remote_epoch, remote_first_offset, replica_reader_pos >>
 
 Record == [offset: Nat, epoch: Nat, value: V]
 NoRecord == [offset |-> 0, epoch |-> 0]
@@ -68,6 +76,10 @@ Init ==
     /\ coord_leader = InitialLeader
     /\ coord_election = [e \in {} |-> 0] @@ (1 :> "leader_elected")
     /\ coord_election_ler = [e \in {} |-> 0] @@ (1 :> [r \in R |-> NoMetaRecord])
+    /\ remote_log = {}
+    /\ remote_epoch = 0
+    /\ remote_first_offset = 0
+    /\ replica_reader_pos = [r \in R |-> 0]
     /\ confirmed = [w \in {} |-> 0]
     /\ confirmed_replicas = [w \in {} |-> 0]
     /\ start_stop_ctr = 0
@@ -188,8 +200,8 @@ ReplicaStarts ==
         /\ CoordinatorResetsReplica(r)
         /\ start_stop_ctr' = start_stop_ctr + 1
         /\ UNCHANGED << rep_log, rep_ler, rep_first_offset, coord_epoch, coord_leader,
-                        coord_election, coord_election_ler, confirmed, requests,
-                        confirmed_replicas, responses_processed >>
+                        coord_election, coord_election_ler, confirmed, confirmed_replicas, requests,
+                        responses_processed , RemoteVars >>
 
 \* An online replica stops
 \* The coordinator is immediately notified. The stopped replica could be the leader.
@@ -211,7 +223,7 @@ ReplicaStops ==
     /\ start_stop_ctr' = start_stop_ctr + 1
     /\ UNCHANGED << rep_epoch, rep_leader, rep_log, rep_ler, rep_max_ler_of_rep, rep_listener,
                     rep_committed_offset, rep_first_offset, coord_epoch, coord_election_ler,
-                    confirmed, requests, confirmed_replicas, responses_processed >>
+                    confirmed, confirmed_replicas, requests, responses_processed , RemoteVars >>
 
 \* A network partition causes the coordinator to lose visibility of a replica
 \* The replica could be the current leader
@@ -231,7 +243,7 @@ CoordinatorLosesVisibilityOfReplica ==
            \/ /\ r # coord_leader
               /\ coord_leader' = coord_leader
         /\ start_stop_ctr' = start_stop_ctr + 1
-    /\ UNCHANGED << RepVars, coord_epoch, coord_election_ler, confirmed, confirmed_replicas, requests, responses_processed >>
+    /\ UNCHANGED << RepVars, coord_epoch, coord_election_ler, confirmed, confirmed_replicas, requests, responses_processed, RemoteVars >>
 
 \* The network partition between the coordinator and the replica is resolved
 \* The coordinator tells the replica to reset itself
@@ -243,7 +255,7 @@ CoordinatorRestoresVisibilityOfReplica ==
         /\ start_stop_ctr' = start_stop_ctr + 1
     /\ UNCHANGED << rep_log, rep_ler, rep_first_offset, rep_max_ler_of_rep, rep_listener,
                     coord_leader, coord_epoch, coord_election, coord_election_ler,
-                    confirmed, requests, confirmed_replicas, responses_processed >>
+                    confirmed, confirmed_replicas, requests, responses_processed , RemoteVars >>
 
 \* ------------------------------------------
 \* LEADER ELECTION
@@ -268,7 +280,7 @@ CoordinatorTriggersElection ==
            /\ coord_election_ler' = coord_election_ler @@
                                         (new_epoch :> [r \in R |-> PendingFencingRequest])
            /\ UNCHANGED << RepVars, coord_state, coord_leader, confirmed, confirmed_replicas,
-                           start_stop_ctr, requests, confirmed_replicas, responses_processed >>
+                           start_stop_ctr, requests, responses_processed , RemoteVars >>
 
 \* The first phase of leader election is to fence a quorum of replicas
 \* A fenced replica will stop any replication with a stale leader
@@ -285,7 +297,7 @@ CoordinatorSendsFencingRequest ==
                         epoch  |-> coord_epoch,
                         dest   |-> r])
     /\ UNCHANGED << RepVars, coord_state, coord_epoch, coord_leader, coord_election,
-                    confirmed, start_stop_ctr, confirmed_replicas, responses_processed >>
+                    confirmed, confirmed_replicas, start_stop_ctr, responses_processed , RemoteVars >>
 
 \* A replica processes a fencing requess, fences itself and responds with its LER
 \* If the replica has started and not yet truncated its log it can still fence, even
@@ -308,7 +320,7 @@ ReplicaHandlesFencingRequest ==
                                ler    |-> rep_ler[request.dest]])
         /\ UNCHANGED << rep_leader, rep_log, rep_ler,
                         rep_first_offset, CoordVars,
-                        confirmed, start_stop_ctr, confirmed_replicas, responses_processed >>
+                        confirmed, confirmed_replicas, start_stop_ctr, responses_processed , RemoteVars >>
 
 ReceivedLerResponseEnsemble ==
     { r \in DOMAIN coord_election_ler[coord_epoch] : coord_election_ler[coord_epoch][r].offset >= 0 }
@@ -336,7 +348,7 @@ CoordinatorHandlesFencingResponse ==
                  coord_election' = coord_election
             /\ ResponseProcessed(response)
             /\ UNCHANGED << RepVars, coord_epoch, coord_leader, confirmed, confirmed_replicas,
-                            start_stop_ctr, confirmed_replicas, requests >>
+                            start_stop_ctr, requests , RemoteVars >>
 
 \* The coordinator selects the replica with the highest LER and sends it
 \* a become leader request
@@ -355,7 +367,7 @@ CoordinatorSendsBecomeLeaderRequest ==
                                    epoch |-> coord_epoch,
                                    dest  |-> new_leader])
     /\ UNCHANGED << RepVars, coord_state, coord_epoch, coord_leader, coord_election_ler,
-                    confirmed, start_stop_ctr, confirmed_replicas, responses_processed >>
+                    confirmed, confirmed_replicas, start_stop_ctr, responses_processed , RemoteVars >>
 
 \* A replica processes a become leader request and responds with a confirmation reply
 ReplicaHandlesBecomeLeaderRequest ==
@@ -372,8 +384,8 @@ ReplicaHandlesBecomeLeaderRequest ==
                                epoch  |-> request.epoch,
                                source |-> request.dest])
         /\ UNCHANGED << rep_log, rep_ler, rep_epoch, rep_max_ler_of_rep, rep_listener,
-                        rep_committed_offset, rep_first_offset, CoordVars, confirmed,
-                        start_stop_ctr, confirmed_replicas, responses_processed >>
+                        rep_committed_offset, rep_first_offset, CoordVars, confirmed, confirmed_replicas,
+                        start_stop_ctr, responses_processed , RemoteVars >>
 
 \* The coordinator process the become leader response and moves to the next
 \* election phase: leader_elected where followers are notified
@@ -392,7 +404,7 @@ CoordinatorHandlesBecomeLeaderResponse ==
             /\ coord_leader' = response.source
             /\ coord_election' = [coord_election EXCEPT ![coord_epoch] = "leader_elected"]
             /\ ResponseProcessed(response)
-            /\ UNCHANGED << RepVars, coord_epoch, coord_election_ler, confirmed, confirmed_replicas, start_stop_ctr, requests >>
+            /\ UNCHANGED << RepVars, coord_epoch, coord_election_ler, confirmed, confirmed_replicas, start_stop_ctr, requests, RemoteVars >>
 
 \* The coordinator sends a become follower request to a replica
 \* that is not the new leader
@@ -406,7 +418,7 @@ CoordinatorSendsBecomeFollowerRequest ==
                         epoch     |-> coord_epoch,
                         leader    |-> coord_leader,
                         dest      |-> r])
-    /\ UNCHANGED << RepVars, CoordVars, confirmed, confirmed_replicas, start_stop_ctr, responses_processed >>
+    /\ UNCHANGED << RepVars, CoordVars, confirmed, confirmed_replicas, start_stop_ctr, responses_processed, RemoteVars >>
 
 \* A replica processes a become follower request and
 \* - if it has an empty log it immediately becomes a follower
@@ -424,8 +436,8 @@ ReplicaHandlesBecomeFollowerRequest ==
               /\ rep_state' = [rep_state EXCEPT ![request.dest] = "pending_truncate"]
         /\ rep_leader' = [rep_leader EXCEPT ![request.dest] = request.leader]
         /\ UNCHANGED << rep_log, rep_ler, rep_epoch, rep_max_ler_of_rep, rep_listener,
-                        rep_committed_offset, rep_first_offset, CoordVars, confirmed,
-                        start_stop_ctr, requests, confirmed_replicas, responses_processed >>
+                        rep_committed_offset, rep_first_offset, CoordVars, confirmed, confirmed_replicas,
+                        start_stop_ctr, requests, responses_processed , RemoteVars >>
 
 \* -----------------------------------------
 \* LOG TRUNCATION AFTER ELECTION or START
@@ -502,7 +514,7 @@ ReplicaSendsLastOffsetAtEpochRequest ==
                            target_epoch  |-> last_epoch,
                            dest          |-> rep_leader[r],
                            source        |-> r])
-        /\ UNCHANGED << RepVars, CoordVars, confirmed, confirmed_replicas, start_stop_ctr, responses_processed >>
+        /\ UNCHANGED << RepVars, CoordVars, confirmed, confirmed_replicas, start_stop_ctr, responses_processed, RemoteVars >>
 
 \* The leader replica processes the ler_at_epoch_request and responds with
 \* the highest record it has in its log, at that particular epoch or lower.
@@ -523,7 +535,7 @@ LeaderReplicaHandlesLastOffsetAtEpochRequest ==
                                   target_epoch  |-> request.target_epoch,
                                   dest          |-> request.source,
                                   source        |-> request.dest])
-        /\ UNCHANGED << RepVars, CoordVars, confirmed, confirmed_replicas, start_stop_ctr, responses_processed >>
+        /\ UNCHANGED << RepVars, CoordVars, confirmed, confirmed_replicas, start_stop_ctr, responses_processed, RemoteVars >>
 
 
 \* A replica in the pending_truncate state receives a response with the highest
@@ -545,8 +557,8 @@ ReplicaHandlesLastOffsetAtEpochResponse ==
             /\ rep_state' = [rep_state EXCEPT ![response.dest] = "follower"]
             /\ ResponseProcessed(response)
             /\ UNCHANGED << rep_leader, rep_epoch, rep_max_ler_of_rep, rep_listener,
-                            rep_committed_offset, rep_first_offset, CoordVars, confirmed,
-                            start_stop_ctr, confirmed_replicas, requests >>
+                            rep_committed_offset, rep_first_offset, CoordVars, confirmed, confirmed_replicas,
+                            start_stop_ctr, requests , RemoteVars >>
 
 \* ------------------------------------------
 \* WRITES and REPLICATION
@@ -574,7 +586,7 @@ Write ==
                 /\ confirmed_replicas' = confirmed_replicas @@ (v :> {})
         /\ UNCHANGED << rep_state, rep_epoch, rep_leader, rep_listener,
                         rep_committed_offset, rep_first_offset, CoordVars, start_stop_ctr,
-                        requests, confirmed_replicas, responses_processed >>
+                        requests, responses_processed , RemoteVars >>
 
 \* A follower sends a start_listener_request to the replica it believes to be the leader
 \* It includes its current LER
@@ -588,7 +600,7 @@ ReplicaRequestsDataListener ==
                         ler    |-> rep_ler[r],
                         dest   |-> rep_leader[r],
                         source |-> r])
-        /\ UNCHANGED << RepVars, CoordVars, confirmed, confirmed_replicas, start_stop_ctr, responses_processed >>
+        /\ UNCHANGED << RepVars, CoordVars, confirmed, confirmed_replicas, start_stop_ctr, responses_processed, RemoteVars >>
 
 \* The leader registers a data listener, with the current position of the follower
 ReplicaLeaderRegistersDataListener ==
@@ -606,8 +618,8 @@ ReplicaLeaderRegistersDataListener ==
                                 [@ EXCEPT ![request.source] = TRUE]]
         /\ SendReply(request, [type |-> "start_listener_response"])
         /\ UNCHANGED << rep_state, rep_epoch, rep_leader, rep_log, rep_ler,
-                        rep_committed_offset, rep_first_offset, CoordVars, confirmed,
-                        start_stop_ctr, confirmed_replicas, responses_processed >>
+                        rep_committed_offset, rep_first_offset, CoordVars, confirmed, confirmed_replicas,
+                        start_stop_ctr, responses_processed , RemoteVars >>
 
 \* Get the next lowest record above the current replica position
 NextRecord(leader, last_record) ==
@@ -631,7 +643,7 @@ ReplicaLeaderSendsData ==
                                  record    |-> next,
                                  dest      |-> follower,
                                  source    |-> leader])
-            /\ UNCHANGED << RepVars, CoordVars, confirmed, confirmed_replicas, start_stop_ctr, responses_processed >>
+            /\ UNCHANGED << RepVars, CoordVars, confirmed, confirmed_replicas, start_stop_ctr, responses_processed, RemoteVars >>
 
 \* A replica sends an acknowledgement of records from the leader replica
 ReplicaAcksData ==
@@ -656,8 +668,8 @@ ReplicaAcksData ==
                                        dest          |-> request.source,
                                        source        |-> request.dest])
         /\ UNCHANGED << rep_state, rep_epoch, rep_leader, rep_max_ler_of_rep, rep_listener,
-                        rep_committed_offset, rep_first_offset, CoordVars, confirmed,
-                        start_stop_ctr, confirmed_replicas, responses_processed >>
+                        rep_committed_offset, rep_first_offset, CoordVars, confirmed, confirmed_replicas,
+                        start_stop_ctr, responses_processed , RemoteVars >>
 
 \* The leader replica processes an ack and updates the position of that replica
 LeaderReplicaUpdatesReplicaPosition ==
@@ -674,8 +686,8 @@ LeaderReplicaUpdatesReplicaPosition ==
                                         [@ EXCEPT ![response.source] = response.record]]
             /\ ResponseProcessed(response)
             /\ UNCHANGED << rep_state, rep_epoch, rep_leader, rep_log, rep_ler, rep_listener,
-                            rep_committed_offset, rep_first_offset, CoordVars, confirmed,
-                            start_stop_ctr, confirmed_replicas, requests >>
+                            rep_committed_offset, rep_first_offset, CoordVars, confirmed, confirmed_replicas,
+                            start_stop_ctr, requests , RemoteVars >>
 
 \* A leader replica will confirm a write if a quorum of replicas have confirmed
 \* they have it (by including their LER in their fetch requests)
@@ -688,7 +700,7 @@ ConfirmWrite ==
             /\ confirmed' = [confirmed EXCEPT ![record.value] = record.offset]
             /\ confirmed_replicas' = confirmed_replicas @@
                 (record.value :> { rr \in R : rep_max_ler_of_rep[r][rr].offset >= record.offset })
-        /\ UNCHANGED << RepVars, CoordVars, start_stop_ctr, requests, confirmed_replicas, responses_processed >>
+        /\ UNCHANGED << RepVars, CoordVars, start_stop_ctr, requests, responses_processed, RemoteVars >>
 
 \* The leader computes its committed offset from quorum acknowledgements
 \* and updates its own view. This happens implicitly as acks arrive.
@@ -700,7 +712,7 @@ LeaderAdvancesCommittedOffset ==
               /\ rep_committed_offset' = [rep_committed_offset EXCEPT ![r] = new_committed]
         /\ UNCHANGED << rep_state, rep_epoch, rep_leader, rep_log, rep_ler,
                         rep_max_ler_of_rep, rep_listener, rep_first_offset,
-                        CoordVars, confirmed, start_stop_ctr, requests, confirmed_replicas, responses_processed >>
+                        CoordVars, confirmed, confirmed_replicas, start_stop_ctr, requests, responses_processed , RemoteVars >>
 
 \* The leader propagates its committed offset to a follower via the
 \* replication channel.
@@ -715,7 +727,7 @@ LeaderSendsCommittedOffset ==
                             committed_offset |-> rep_committed_offset[leader],
                             dest             |-> follower,
                             source           |-> leader])
-        /\ UNCHANGED << RepVars, CoordVars, confirmed, confirmed_replicas, start_stop_ctr, responses_processed >>
+        /\ UNCHANGED << RepVars, CoordVars, confirmed, confirmed_replicas, start_stop_ctr, responses_processed, RemoteVars >>
 
 \* A follower receives the committed offset from the leader
 ReplicaHandlesCommittedOffset ==
@@ -731,7 +743,7 @@ ReplicaHandlesCommittedOffset ==
         /\ SendReply(request, [type |-> "committed_offset_response"])
         /\ UNCHANGED << rep_state, rep_epoch, rep_leader, rep_log, rep_ler,
                         rep_max_ler_of_rep, rep_listener, rep_first_offset,
-                        CoordVars, confirmed, start_stop_ctr, confirmed_replicas, responses_processed >>
+                        CoordVars, confirmed, confirmed_replicas, start_stop_ctr, responses_processed , RemoteVars >>
 
 \* ------------------------------------------
 \* RETENTION
@@ -739,24 +751,23 @@ ReplicaHandlesCommittedOffset ==
 
 \* A replica deletes a prefix of its log. This models local retention
 \* (max-bytes, max-age). Any replica can retain independently.
-\* NOTE: this means confirmed writes can be lost if the leader retains
-\* data and then an election causes the replicas that had it to truncate
-\* or reset. This is a known property of osiris (performance over durability).
 RetentionDeletesPrefix ==
     \E r \in R :
         /\ rep_state[r] \in {"leader", "follower"}
         /\ rep_log[r] # {}
         /\ \E record \in rep_log[r] :
-            \* Must leave at least one record
+            \* Must leave at least one record (the log is never fully empty
+            \* while the replica is online — there's always a "current segment")
             /\ \E remaining \in rep_log[r] : remaining.offset > record.offset
             \* Actions: delete all records at or below this offset
             /\ rep_log' = [rep_log EXCEPT ![r] =
                             { rec \in @ : rec.offset > record.offset }]
             /\ rep_first_offset' = [rep_first_offset EXCEPT ![r] = record.offset + 1]
+            \* LER is unchanged — it tracks the highest written, not the lowest available
             /\ UNCHANGED << rep_state, rep_epoch, rep_leader, rep_ler,
                             rep_max_ler_of_rep, rep_listener, rep_committed_offset,
-                            CoordVars, confirmed, start_stop_ctr, requests,
-                            confirmed_replicas, responses_processed >>
+                            CoordVars, confirmed, confirmed_replicas, start_stop_ctr, requests,
+                            responses_processed , RemoteVars >>
 
 \* A replica that falls behind retention on the leader must resync.
 \* When the leader tries to send data but the follower needs an offset
@@ -773,7 +784,8 @@ ReplicaFallsBehindRetention ==
             /\ rep_listener[leader][follower] = TRUE
             /\ rep_first_offset[leader] > 0
             /\ rep_ler[follower].offset < rep_first_offset[leader]
-            \* The leader must be coord-visible to communicate with followers
+            \* The leader must be the coord-acknowledged leader to communicate
+            \* with followers (a partitioned leader can't reach them)
             /\ coord_state[leader] # "offline"
             \* Actions: follower resets
             /\ rep_log' = [rep_log EXCEPT ![follower] = {}]
@@ -785,8 +797,72 @@ ReplicaFallsBehindRetention ==
             /\ rep_max_ler_of_rep' = [rep_max_ler_of_rep EXCEPT ![leader] =
                                     [@ EXCEPT ![follower] = NoMetaRecord]]
             /\ UNCHANGED << rep_state, rep_epoch, rep_leader,
-                            CoordVars, confirmed, start_stop_ctr, requests,
-                            confirmed_replicas, responses_processed >>
+                            CoordVars, confirmed, confirmed_replicas, start_stop_ctr, requests,
+                            responses_processed , RemoteVars >>
+
+\* ------------------------------------------
+\* REMOTE REPLICA READER (TIERED STORAGE)
+\* ------------------------------------------
+
+\* An replica reader on a replica that believes it is leader uploads the next
+\* committed record to the remote tier. The upload succeeds (is applied to remote_log) only
+\* if the replica's epoch >= remote_epoch (optimistic lock). This models the
+\* Khepri precondition. A deposed leader with a stale epoch will fail.
+ReplicaReaderUploads ==
+    \E r \in R :
+        /\ rep_state[r] = "leader"
+        /\ \E record \in rep_log[r] :
+            /\ record.offset = replica_reader_pos[r]
+            /\ record.offset <= rep_committed_offset[r]
+            \* Optimistic lock: epoch must be >= remote_epoch
+            /\ rep_epoch[r] >= remote_epoch
+            \* Actions
+            /\ remote_log' = remote_log \union { record }
+            /\ remote_epoch' = rep_epoch[r]
+            /\ replica_reader_pos' = [replica_reader_pos EXCEPT ![r] = record.offset + 1]
+            /\ UNCHANGED << RepVars, CoordVars, remote_first_offset,
+                            confirmed, confirmed_replicas, start_stop_ctr, requests, responses_processed >>
+
+\* The replica reader on a leader finds that retention has deleted data it hasn't
+\* uploaded yet. It jumps forward to the leader's first_offset, accepting
+\* a gap in the remote tier.
+ReplicaReaderJumpsForward ==
+    \E r \in R :
+        /\ rep_state[r] = "leader"
+        /\ rep_first_offset[r] > replica_reader_pos[r]
+        /\ replica_reader_pos' = [replica_reader_pos EXCEPT ![r] = rep_first_offset[r]]
+        /\ UNCHANGED << RepVars, CoordVars, remote_log, remote_epoch, remote_first_offset,
+                        confirmed, confirmed_replicas, start_stop_ctr, requests, responses_processed >>
+
+\* A new leader's replica reader detects that the remote tier is ahead of local (epoch change
+\* after power loss). It truncates the remote tier: removes all records at or above the
+\* local first offset for the new epoch. This models "local always wins".
+\* Precondition: the replica is the coordinator-acknowledged leader (to avoid
+\* a deposed leader truncating), and the remote tier has records above what the leader has.
+ReplicaReaderTruncatesRemote ==
+    \E r \in R :
+        /\ rep_state[r] = "leader"
+        /\ r = coord_leader
+        /\ rep_epoch[r] > remote_epoch
+        /\ \E record \in remote_log : record.offset >= replica_reader_pos[r]
+        \* Actions: remove records at or above replica_reader_pos from the remote tier
+        /\ remote_log' = { record \in remote_log : record.offset < replica_reader_pos[r] }
+        /\ remote_epoch' = rep_epoch[r]
+        /\ remote_first_offset' = IF remote_log' = {} THEN 0
+                              ELSE remote_first_offset
+        /\ UNCHANGED << RepVars, CoordVars, replica_reader_pos,
+                        confirmed, confirmed_replicas, start_stop_ctr, requests, responses_processed >>
+
+\* Remote retention deletes old records from the remote tier.
+RemoteRetentionDeletesPrefix ==
+    /\ remote_log # {}
+    /\ \E record \in remote_log :
+        \* Must leave at least one record
+        /\ \E remaining \in remote_log : remaining.offset > record.offset
+        /\ remote_log' = { rec \in remote_log : rec.offset > record.offset }
+        /\ remote_first_offset' = record.offset + 1
+        /\ UNCHANGED << RepVars, CoordVars, remote_epoch, replica_reader_pos,
+                        confirmed, confirmed_replicas, start_stop_ctr, requests, responses_processed >>
 
 
 Next ==
@@ -822,6 +898,11 @@ Next ==
     \* Retention
     \/ RetentionDeletesPrefix
     \/ ReplicaFallsBehindRetention
+    \* Remote replica reader (tiered storage)
+    \/ ReplicaReaderUploads
+    \/ ReplicaReaderJumpsForward
+    \/ ReplicaReaderTruncatesRemote
+    \/ RemoteRetentionDeletesPrefix
 
 \*-------------------------------------------------
 \*INVARIANTS
@@ -844,6 +925,10 @@ TypeOK ==
     /\ rep_listener \in [R -> [R -> BOOLEAN]]
     /\ rep_committed_offset \in [R -> Nat]
     /\ rep_first_offset \in [R -> Nat]
+    /\ remote_log \in SUBSET Record
+    /\ remote_epoch \in Nat
+    /\ remote_first_offset \in Nat
+    /\ replica_reader_pos \in [R -> Nat]
     /\ coord_state \in [R -> RepState]
     /\ coord_epoch \in Nat
     /\ coord_leader \in ReplicaOrNone
@@ -854,11 +939,16 @@ TypeOK ==
 \* the leader's log. A record conflicts if the leader has a DIFFERENT record
 \* at the same offset. Records the leader doesn't have (due to retention
 \* gaps) are not conflicts — they're stale but harmless.
+\* NOTE: with aggressive retention, a follower may retain records the leader
+\* never had (received from a previous leader that retained them before the
+\* new leader replicated them). This is a known limitation.
 NoDivergence ==
     \/ coord_leader = 0
     \/ /\ coord_leader # 0
        /\ \A r \in R :
             IF rep_state[r] = "follower" /\ rep_epoch[r] = rep_epoch[coord_leader] THEN
+                \* No record in the follower conflicts with a different record
+                \* at the same offset in the leader
                 \A record \in rep_log[r] :
                     \/ record \in rep_log[coord_leader]
                     \/ record.offset < rep_first_offset[coord_leader]
@@ -876,9 +966,10 @@ FollowerEqualOrLowerEpoch ==
             \/ /\ rep_state[r] = "follower"
                /\ rep_epoch[r] <= rep_epoch[coord_leader]
 
-\* A confirmed write must exist on at least one replica's log, UNLESS
-\* every replica that had it at confirmation time has since retained past it.
-\* This catches bugs where data disappears without retention being the cause.
+\* A confirmed write is never completely lost. It must exist somewhere:
+\* A confirmed write must exist on at least one replica's log or in the remote tier,
+\* UNLESS every replica that had it at confirmation time has since retained
+\* past it. This catches bugs where data disappears without retention.
 \* confirmed[v] = -1 means unconfirmed; confirmed[v] >= 0 means confirmed at that offset.
 NoLossOfConfirmedWrite ==
     IF coord_leader # 0 /\ Cardinality(DOMAIN confirmed) > 0 THEN
@@ -886,6 +977,7 @@ NoLossOfConfirmedWrite ==
             IF confirmed[v] = -1 THEN TRUE
             ELSE
                 \/ \E r \in R : \E record \in rep_log[r] : record.value = v
+                \/ \E record \in remote_log : record.value = v
                 \/ \A r \in confirmed_replicas[v] :
                     confirmed[v] < rep_first_offset[r]
     ELSE
@@ -910,6 +1002,20 @@ FollowerCommittedOffsetBounded ==
             \/ rep_state[r] # "follower"
             \/ rep_epoch[r] # rep_epoch[coord_leader]
             \/ rep_committed_offset[r] <= rep_committed_offset[coord_leader]
+
+\* The remote tier never contains a record that contradicts the current leader's timeline,
+\* AFTER the new leader's replica reader has had a chance to clean up (remote_epoch >= coord_epoch).
+\* During the transient window between election and cleanup (remote_epoch < coord_epoch),
+\* the remote tier may contain stale data from the old timeline.
+RemoteNoDivergedData ==
+    \/ coord_leader = 0
+    \/ remote_epoch < coord_epoch  \* cleanup pending, stale data acceptable
+    \/ /\ coord_leader # 0
+       /\ remote_epoch >= coord_epoch
+       /\ \A record \in remote_log :
+            \/ record \in rep_log[coord_leader]
+            \/ record.offset < rep_first_offset[coord_leader]
+            \/ record.offset < remote_first_offset
 
 TestInv ==
     \* Add debugging expressions here to trigger error trace
