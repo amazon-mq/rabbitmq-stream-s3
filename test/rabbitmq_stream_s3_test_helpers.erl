@@ -6,7 +6,9 @@
 Shared test helpers for rabbitmq_stream_s3 CT suites.
 """.
 
--include("include/rabbitmq_stream_s3.hrl").
+-include_lib("common_test/include/ct.hrl").
+-include_lib("stdlib/include/assert.hrl").
+-include_lib("rabbitmq_stream_s3/include/rabbitmq_stream_s3.hrl").
 
 -compile([export_all, nowarn_export_all]).
 
@@ -82,7 +84,216 @@ build_manifest(Specs) ->
     {Manifest, GetGroupFun}.
 
 %% ------------------------------------------------------------------
-%% Internal
+%% Writer helpers
+%% ------------------------------------------------------------------
+
+start_writer(Config, RemoteConfig) ->
+    start_writer(Config, #{}, RemoteConfig).
+
+start_writer(Config, WriterOverrides, RemoteConfig) ->
+    StreamId = ?config(stream_id, Config),
+    WriterCfg0 = ?config(writer_cfg, Config),
+    WriterCfg = maps:merge(WriterCfg0, WriterOverrides#{remote_config => RemoteConfig}),
+    {ok, Writer} = osiris_writer:start(WriterCfg),
+    flush_writer(Writer),
+    ?assertMatch(
+        Pid when is_pid(Pid),
+        rabbitmq_stream_s3_registry:whereis_name({StreamId, node()})
+    ),
+    Writer.
+
+start_cluster(Config, ReplicaNodes, RemoteConfig) ->
+    start_cluster(Config, ReplicaNodes, #{}, RemoteConfig).
+
+start_cluster(Config, ReplicaNodes, WriterOverrides, RemoteConfig) ->
+    StreamId = ?config(stream_id, Config),
+    WriterCfg0 = ?config(writer_cfg, Config),
+    ClusterCfg = maps:merge(WriterCfg0, WriterOverrides#{
+        replica_nodes => ReplicaNodes,
+        remote_config => RemoteConfig
+    }),
+    {ok, #{leader_pid := Writer, replica_pids := ReplicaPids}} =
+        osiris:start_cluster(ClusterCfg),
+    flush_writer(Writer),
+    ?assertMatch(
+        Pid when is_pid(Pid),
+        rabbitmq_stream_s3_registry:whereis_name({StreamId, node()})
+    ),
+    {Writer, ReplicaPids}.
+
+flush_writer(Writer) ->
+    _ = osiris_writer:query_replication_state(Writer),
+    ok.
+
+%% ------------------------------------------------------------------
+%% Write helpers
+%% ------------------------------------------------------------------
+
+%% Write N records (<<0:32, Padding>>, <<1:32, Padding>>, ...) in batches of
+%% at most BatchSize, flushing after each batch to force one chunk per batch.
+write_sequential(Writer, N, BatchSize) ->
+    write_sequential(Writer, 0, N, BatchSize).
+
+write_sequential(_Writer, I, N, _BatchSize) when I >= N ->
+    ok;
+write_sequential(Writer, I, N, BatchSize) ->
+    End = min(I + BatchSize, N),
+    Padding = binary:copy(<<0>>, 100),
+    [osiris_writer:write(Writer, <<J:32, Padding/binary>>) || J <- lists:seq(I, End - 1)],
+    flush_writer(Writer),
+    write_sequential(Writer, End, N, BatchSize).
+
+%% ------------------------------------------------------------------
+%% Read helpers
+%% ------------------------------------------------------------------
+
+reader_config(Writer, Config) ->
+    StreamId = ?config(stream_id, Config),
+    #{shared := Shared, dir := StreamDir} =
+        gen_batch_server:call(Writer, get_reader_context),
+    #{
+        name => StreamId,
+        dir => StreamDir,
+        epoch => 1,
+        shared => Shared,
+        options => #{transport => tcp},
+        readers_counter_fun => fun(_) -> ok end
+    }.
+
+read_all(Reader0) ->
+    read_all(Reader0, 0, []).
+
+read_all(Reader0, StartOffset) ->
+    read_all(Reader0, StartOffset, []).
+
+read_all(Reader0, StartOffset, Acc) ->
+    case rabbitmq_stream_s3_log_reader:chunk_iterator(Reader0, 1, undefined) of
+        {ok, _Header, Iter, Reader1} ->
+            Records = drain_iter(Iter, StartOffset, []),
+            read_all(Reader1, StartOffset, Acc ++ Records);
+        {end_of_stream, _Reader} ->
+            Acc;
+        {error, Reason} ->
+            error({read_error, Reason})
+    end.
+
+drain_iter(Iter, StartOffset, Acc) ->
+    case rabbitmq_stream_s3_log_reader:iterator_next(Iter) of
+        {{Offset, Record}, Iter1} when Offset >= StartOffset ->
+            drain_iter(Iter1, StartOffset, [Record | Acc]);
+        {{Offset, _Record}, Iter1} ->
+            ct:pal("drain_iter: skipping offset ~b (start_offset=~b)", [Offset, StartOffset]),
+            drain_iter(Iter1, StartOffset, Acc);
+        end_of_chunk ->
+            lists:reverse(Acc)
+    end.
+
+%% ------------------------------------------------------------------
+%% Barrier helpers
+%% ------------------------------------------------------------------
+
+%% Wait for the replica reader to upload through the given offset.
+%% On timeout, reports the replica reader's formatted state for debugging.
+await_offset(Config, Offset) ->
+    StreamId = ?config(stream_id, Config),
+    try
+        rabbitmq_stream_s3_replica_reader:await_offset(StreamId, Offset)
+    catch
+        exit:{timeout, _} ->
+            Name = {via, rabbitmq_stream_s3_registry, {StreamId, node()}},
+            State = rabbitmq_stream_s3_replica_reader:format_state(
+                sys:get_state(Name)
+            ),
+            ct:fail(
+                "await_offset timed out waiting for offset ~b.~n"
+                "  Replica reader: ~p",
+                [Offset, State]
+            )
+    end.
+
+%% ------------------------------------------------------------------
+%% Inspection helpers
+%% ------------------------------------------------------------------
+
+list_segment_offsets(Config) ->
+    list_segment_offsets(Config, node()).
+
+list_segment_offsets(Config, Node) ->
+    StreamId = ?config(stream_id, Config),
+    erpc:call(Node, ?MODULE, list_segment_offsets_local, [StreamId]).
+
+list_segment_offsets_local(StreamId) ->
+    {ok, Dir} = application:get_env(osiris, data_dir),
+    Pattern = filename:join([Dir, binary_to_list(StreamId), "*.segment"]),
+    lists:sort([
+        rabbitmq_stream_s3:segment_file_offset(list_to_binary(F))
+     || F <- filelib:wildcard(Pattern)
+    ]).
+
+list_fragment_offsets(Config) ->
+    RemoteDir = ?config(remote_dir, Config),
+    StreamId = ?config(stream_id, Config),
+    Pattern = filename:join([
+        RemoteDir,
+        "rabbitmq",
+        "stream",
+        binary_to_list(StreamId),
+        "data",
+        "*.fragment"
+    ]),
+    lists:sort([
+        rabbitmq_stream_s3:fragment_key_offset(list_to_binary(F))
+     || F <- filelib:wildcard(binary_to_list(iolist_to_binary(Pattern)))
+    ]).
+
+get_range(Config) ->
+    get_range(Config, node()).
+
+get_range(Config, Node) ->
+    StreamId = ?config(stream_id, Config),
+    erpc:call(Node, rabbitmq_stream_s3_manifest_replica, get_range, [StreamId]).
+
+%% ------------------------------------------------------------------
+%% Assertion helpers
+%% ------------------------------------------------------------------
+
+assert_sequential(Records, N) ->
+    assert_sequential(Records, 0, N - 1).
+
+assert_sequential(Records, First, Last) ->
+    Integers = [I || <<I:32, _/binary>> <- Records],
+    Expected = lists:seq(First, Last),
+    case Integers of
+        Expected ->
+            ok;
+        _ ->
+            Dups = Integers -- lists:usort(Integers),
+            Missing = Expected -- Integers,
+            Extra = Integers -- Expected,
+            ct:fail(
+                "Sequential assertion failed.~n"
+                "  Expected ~b records (~b..~b), got ~b~n"
+                "  Duplicates: ~w~n"
+                "  Missing: ~w~n"
+                "  Extra: ~w~n"
+                "  First 20: ~w~n"
+                "  Last 20: ~w",
+                [
+                    Last - First + 1,
+                    First,
+                    Last,
+                    length(Records),
+                    Dups,
+                    Missing,
+                    Extra,
+                    lists:sublist(Integers, 20),
+                    lists:sublist(lists:reverse(Integers), 20)
+                ]
+            )
+    end.
+
+%% ------------------------------------------------------------------
+%% Internal (manifest builder)
 %% ------------------------------------------------------------------
 
 build_children(Specs, Groups) ->
