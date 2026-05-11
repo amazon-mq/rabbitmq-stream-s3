@@ -54,6 +54,15 @@
 -define(C_OSIRIS_LOG_CHUNKS, 4).
 -define(C_OSIRIS_LOG_SEGMENTS, 5).
 
+%% A pointer to a fragment object. Together with the stream ID this has all
+%% the necessary info to construct the fragment's S3 key and locate the index
+%% boundary within the object.
+-record(fragment_ref, {
+    offset :: osiris:offset(),
+    uid :: rabbitmq_stream_s3:uid(),
+    size :: non_neg_integer()
+}).
+
 %% * "OSIF" (4)
 %% * version (4)
 %% * first offset (8)

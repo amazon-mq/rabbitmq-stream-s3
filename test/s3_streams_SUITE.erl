@@ -10,7 +10,7 @@
 -include_lib("amqp_client/include/amqp_client.hrl").
 -include_lib("amqp10_common/include/amqp10_framing.hrl").
 -include_lib("rabbitmq_ct_helpers/include/rabbit_assert.hrl").
--include("rabbitmq_stream_s3.hrl").
+-include("include/rabbitmq_stream_s3.hrl").
 
 all() ->
     [
