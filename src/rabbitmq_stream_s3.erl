@@ -101,6 +101,8 @@ efficiently using the `rabbitmq_stream_s3_array` module.
 setup() ->
     _ = application:ensure_all_started(seshat),
     _ = seshat:new_group(rabbitmq_stream_s3),
+    ok = application:set_env(osiris, log_hooks, rabbitmq_stream_s3_hooks),
+    ok = application:set_env(osiris, log_reader, rabbitmq_stream_s3_log_reader),
     ok.
 
 -doc "Creates a new random UID.".

@@ -114,13 +114,6 @@ end}.
 
 %% S3 tiered storage for Osiris.
 
-{mapping, "stream.log_reader", "osiris.log_reader", [
-    {datatype, {enum, [osiris_log, rabbitmq_stream_s3_log_reader]}}
-]}.
-{mapping, "stream.log_manifest", "osiris.log_manifest", [
-    {datatype, {enum, [osiris_log, rabbitmq_stream_s3_log_manifest]}}
-]}.
-
 %%
 %% Stream membership reconciliation
 %%

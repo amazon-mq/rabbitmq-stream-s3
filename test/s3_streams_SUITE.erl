@@ -57,10 +57,6 @@ init_per_group_aux(Config, NodesCount) ->
     Config2 = rabbit_ct_helpers:merge_app_env(
         Config1,
         [
-            {osiris, [
-                {log_reader, rabbitmq_stream_s3_log_reader},
-                {log_manifest, rabbitmq_stream_s3_log_manifest}
-            ]},
             {rabbitmq_stream_s3, [
                 {rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_fs},
                 {manifest_debounce_modifications, 1}
