@@ -115,6 +115,22 @@ end}.
 %% S3 tiered storage for Osiris.
 
 %%
+%% Fragment target size
+%%
+
+{mapping, "stream_s3.fragment_target_size", "rabbitmq_stream_s3.fragment_target_size", [
+    {datatype, bytesize}
+]}.
+
+{translation, "rabbitmq_stream_s3.fragment_target_size",
+fun(Conf) ->
+    case cuttlefish:conf_get("stream_s3.fragment_target_size", Conf, undefined) of
+        undefined -> cuttlefish:unset();
+        Value     -> Value
+    end
+end}.
+
+%%
 %% Stream membership reconciliation
 %%
 

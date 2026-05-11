@@ -11,7 +11,7 @@
     {rabbitmq_stream_s3_http_pools, [
         {description, "S3 HTTP connection pools"},
         {mfa, {?MODULE, start_pools, []}},
-        {requires, rabbitmq_stream_s3},
+        {requires, core_initialized},
         {enables, rabbitmq_stream_s3_server}
     ]}
 ).
@@ -40,7 +40,23 @@ start_pools() ->
     ]).
 
 init([]) ->
+    rabbitmq_stream_s3_registry:init(),
     SupFlags = #{strategy => one_for_one, intensity => 3, period => 5},
+    ManifestCache = #{
+        id => rabbitmq_stream_s3_manifest_replica,
+        type => worker,
+        start => {rabbitmq_stream_s3_manifest_replica, start_link, []}
+    },
+    Reaper = #{
+        id => rabbitmq_stream_s3_reaper,
+        type => worker,
+        start => {rabbitmq_stream_s3_reaper, start_link, []}
+    },
+    ReplicaReaderSup = #{
+        id => rabbitmq_stream_s3_replica_reader_sup,
+        type => supervisor,
+        start => {rabbitmq_stream_s3_replica_reader_sup, start_link, []}
+    },
     RemoteReaderSup = #{
         id => rabbitmq_stream_s3_remote_reader_sup,
         type => supervisor,
@@ -51,5 +67,5 @@ init([]) ->
         type => worker,
         start => {rabbitmq_stream_s3_membership_reconciliation, start_link, []}
     },
-    Procs = [RemoteReaderSup, MembershipReconciliation],
+    Procs = [ManifestCache, Reaper, ReplicaReaderSup, RemoteReaderSup, MembershipReconciliation],
     {ok, {SupFlags, Procs}}.

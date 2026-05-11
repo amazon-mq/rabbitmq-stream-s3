@@ -85,26 +85,6 @@ efficiently using the `rabbitmq_stream_s3_array` module.
     segment_file_offset/1
 ]).
 
-%% For use by a boot step:
--export([setup/0]).
-
--rabbit_boot_step(
-    {rabbitmq_stream_s3, [
-        {description, "metadata for the rabbitmq_stream_s3 plugin"},
-        {mfa, {?MODULE, setup, []}},
-        {enables, core_initialized}
-    ]}
-).
-
-%%----------------------------------------------------------------------------
-
-setup() ->
-    _ = application:ensure_all_started(seshat),
-    _ = seshat:new_group(rabbitmq_stream_s3),
-    ok = application:set_env(osiris, log_hooks, rabbitmq_stream_s3_hooks),
-    ok = application:set_env(osiris, log_reader, rabbitmq_stream_s3_log_reader),
-    ok.
-
 -doc "Creates a new random UID.".
 -spec uid() -> uid().
 uid() ->
