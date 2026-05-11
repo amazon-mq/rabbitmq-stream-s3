@@ -71,7 +71,6 @@ apply_infos0(
             next_offset = NextOffset,
             first_timestamp = FirstTs,
             last_timestamp = LastTs,
-            seq_no = SeqNo,
             size = Size
         }
         | Rest
@@ -94,15 +93,12 @@ apply_infos0(
             _ ->
                 Edit0
         end,
-    IsSeqZero =
-        case SeqNo of
-            0 -> 1;
-            _ -> 0
-        end,
     Edit = Edit1#edit{
         next_offset = NextOffset,
         size = Size0 + Size,
-        entries = <<Entries0/binary, ?FRAGMENT(Offset, FirstTs, LastTs, IsSeqZero, Size)/binary>>
+        entries =
+            <<Entries0/binary,
+                (?ENTRY(Offset, FirstTs, LastTs, ?MANIFEST_KIND_FRAGMENT, Size, 0))/binary>>
     },
     apply_infos0(Rest, Edit);
 apply_infos0([Info | _], #edit{}) ->

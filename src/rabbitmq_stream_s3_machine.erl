@@ -887,7 +887,7 @@ evaluate_retention(
     case ExceedsRetention of
         true ->
             case Entries0 of
-                ?FRAGMENT(_O, _FTs, _LTs, _Sq, _Sz, _) ->
+                ?ENTRY(_O, _FTs, _LTs, ?MANIFEST_KIND_FRAGMENT, _Sz, _Uid, _) ->
                     %% Groups are created at the array's beginning. If the
                     %% first entry is a fragment then this entries array
                     %% contains no groups.
@@ -961,7 +961,7 @@ execute_retention(
 %% NOTE: keep at least one entry so that we can set the `first_offset` and
 %% `first_timestamp` (`Rest /= <<>>`).
 execute_retention(
-    ?ENTRY(_, _, _, _, Rest) = Entries,
+    ?ENTRY(_, _, _, _, _Size, _Uid, Rest) = Entries,
     #edit{first_offset = FirstOffset} = Edit,
     TotalSize,
     Now,
@@ -971,7 +971,7 @@ execute_retention(
     Deletions
 ) ->
     case Rest of
-        ?ENTRY(RightOffset, _, _, _, _) when RightOffset < FirstOffset ->
+        ?ENTRY(RightOffset, _, _, _, _, _, _) when RightOffset < FirstOffset ->
             execute_retention(Rest, Edit, TotalSize, Now, Spec, GetGroupFun, IsRoot, Deletions);
         _ ->
             execute_retention1(Entries, Edit, TotalSize, Now, Spec, GetGroupFun, IsRoot, Deletions)
@@ -980,7 +980,7 @@ execute_retention(Entries, Edit, TotalSize, Now, Spec, GetGroupFun, IsRoot, Dele
     execute_retention1(Entries, Edit, TotalSize, Now, Spec, GetGroupFun, IsRoot, Deletions).
 
 execute_retention1(
-    ?FRAGMENT(Offset, _FTs, _LTs, _Sq, _Sz, Rest),
+    ?ENTRY(Offset, _FTs, _LTs, ?MANIFEST_KIND_FRAGMENT, _Sz, _Uid, Rest),
     #edit{first_offset = FirstOffset} = Edit,
     TotalSize,
     Now,
@@ -991,7 +991,7 @@ execute_retention1(
 ) when Offset < FirstOffset ->
     execute_retention1(Rest, Edit, TotalSize, Now, Spec, GetGroupFun, IsRoot, Deletions);
 execute_retention1(
-    ?FRAGMENT(Offset, _FTs, _LTs, _Sq, Size, Rest),
+    ?ENTRY(Offset, _FTs, _LTs, ?MANIFEST_KIND_FRAGMENT, Size, _Uid, Rest),
     #edit{size = Size0, len = Len0} = Edit0,
     TotalSize0,
     Now,
@@ -1011,7 +1011,7 @@ execute_retention1(
         end,
     execute_retention1(Rest, Edit, TotalSize, Now, Spec, GetGroupFun, IsRoot, [Offset | Deletions]);
 execute_retention1(
-    ?FRAGMENT(Offset, _FTs, LastTs, _Sq, Size, Rest),
+    ?ENTRY(Offset, _FTs, LastTs, ?MANIFEST_KIND_FRAGMENT, Size, _Uid, Rest),
     #edit{size = Size0, len = Len0} = Edit0,
     TotalSize0,
     Now,
@@ -1031,7 +1031,7 @@ execute_retention1(
         end,
     execute_retention1(Rest, Edit, TotalSize, Now, Spec, GetGroupFun, IsRoot, [Offset | Deletions]);
 execute_retention1(
-    ?FRAGMENT(Offset, FTs, LTs, _Sq, _Sz, _Rest),
+    ?ENTRY(Offset, FTs, LTs, ?MANIFEST_KIND_FRAGMENT, _Sz, _Uid, _Rest),
     Edit0,
     TotalSize,
     _Now,
@@ -1047,7 +1047,7 @@ execute_retention1(
     },
     {false, Edit, TotalSize, Deletions};
 execute_retention1(
-    ?GROUP(Offset, _FTs, _LTs, Kind, Uid, Rest),
+    ?ENTRY(Offset, _FTs, _LTs, Kind, _Sz, Uid, Rest),
     #edit{len = Len0} = Edit0,
     TotalSize0,
     Now,
@@ -1055,7 +1055,7 @@ execute_retention1(
     GetGroupFun,
     IsRoot,
     Deletions0
-) ->
+) when Kind =/= ?MANIFEST_KIND_FRAGMENT ->
     %% Rebalancing always keeps one fragment at the end of the root.
     ?assert(Rest =/= <<>> orelse not IsRoot),
     GroupRef = #group_ref{uid = Uid, kind = Kind, offset = Offset},
@@ -1138,7 +1138,7 @@ rebalance(Factor, Entries) ->
 rebalance(Factor, Entries, Idx) when
     byte_size(Entries) - (Idx * ?ENTRY_B) >= (Factor * ?ENTRY_B)
 ->
-    ?ENTRY(_, _, _, Kind, _) = rabbitmq_stream_s3_array:at(
+    ?ENTRY(_, _, _, Kind, _, _, _) = rabbitmq_stream_s3_array:at(
         Idx,
         ?ENTRY_B,
         Entries
@@ -1157,7 +1157,7 @@ rebalance(Factor, Entries, Idx) when
                 Idx + Factor - 1
         end,
     case rabbitmq_stream_s3_array:try_at(GroupEndIdx, ?ENTRY_B, Entries) of
-        ?ENTRY(_, _, _, Kind, _) ->
+        ?ENTRY(_, _, _, Kind, _, _, _) ->
             %% If the kind is the same, this chunk of entries can be extracted
             %% as a group.
             GroupKind = rabbitmq_stream_s3:next_group(Kind),
@@ -1167,7 +1167,7 @@ rebalance(Factor, Entries, Idx) when
             {GroupKind, GroupEntries, Pos, Len};
         _ ->
             NextSmallestIdx = rabbitmq_stream_s3_array:partition_point(
-                fun(?ENTRY(_O, _FTs, _LTs, K, _)) -> K >= Kind end,
+                fun(?ENTRY(_O, _FTs, _LTs, K, _, _, _)) -> K >= Kind end,
                 ?ENTRY_B,
                 Entries
             ),
@@ -1316,7 +1316,7 @@ format_manifest(#manifest{
 }) ->
     Format0 =
         case rabbitmq_stream_s3_array:last(?ENTRY_B, Entries) of
-            ?ENTRY(LastOffset, _FTs, LastTs, _K, _) ->
+            ?ENTRY(LastOffset, _FTs, LastTs, _K, _Sz, _Uid) ->
                 #{
                     last_offset => LastOffset,
                     last_timestamp => format_timestamp(LastTs)
@@ -1361,7 +1361,7 @@ format_entries(Entries) ->
 
 count_kinds(<<>>, Counts) ->
     Counts;
-count_kinds(?ENTRY(_O, _FTs, _LTs, Kind, Rest), Counts0) ->
+count_kinds(?ENTRY(_O, _FTs, _LTs, Kind, _Sz, _Uid, Rest), Counts0) ->
     Key =
         case Kind of
             ?MANIFEST_KIND_FRAGMENT -> fragments;
@@ -1565,7 +1565,14 @@ root_retention_test() ->
     %% downloading group objects.
     Ts = erlang:system_time(millisecond),
     Entries = <<
-        ?FRAGMENT((N * 20), (Ts - 100 + (N - 1) * 20), (Ts - 100 + N * 20), 0, 200)
+        ?ENTRY(
+            (N * 20),
+            (Ts - 100 + (N - 1) * 20),
+            (Ts - 100 + N * 20),
+            ?MANIFEST_KIND_FRAGMENT,
+            200,
+            0
+        )
      || N <- lists:seq(0, 4)
     >>,
     Manifest = #manifest{
@@ -1645,32 +1652,35 @@ recursive_retention_test() ->
     %% Rebalancing factor is 2 for simplicity.
     FragmentSize = 200,
     [F0, F1, F2, F3, F4, F5, F6] = [
-        ?FRAGMENT(
+        ?ENTRY(
             (N * 20),
             (Ts - 1000 + (N - 1) * 20),
             (Ts - 1000 + N * 20 - 1),
-            0,
-            FragmentSize
+            ?MANIFEST_KIND_FRAGMENT,
+            FragmentSize,
+            0
         )
      || N <- lists:seq(0, 6)
     ],
     %% Group 0 covers fragments 0 and 1, group 2 covers fragments 2 and 3, etc..
     [G0, G1, G2] = [
-        ?GROUP(
+        ?ENTRY(
             (N * 40),
             (Ts - 1000 + ((N * 2) - 1) * 20),
             (Ts - 1000 + (N * 2) * 20 - 1),
             ?MANIFEST_KIND_GROUP,
+            0,
             (rabbitmq_stream_s3:uid())
         )
      || N <- lists:seq(0, 2)
     ],
     %% Kilo-group 0 covers groups 0 and 1 (i.e. fragments 1-3).
-    KG0 = ?GROUP(
+    KG0 = ?ENTRY(
         0,
         (Ts - 1000 + -20),
         (Ts - 1000 + 39),
         ?MANIFEST_KIND_KILO_GROUP,
+        0,
         (rabbitmq_stream_s3:uid())
     ),
     Entries = <<KG0/binary, G2/binary, F6/binary>>,
@@ -1803,7 +1813,14 @@ format_duration_test() ->
 rebalance_group_test() ->
     Ts = erlang:system_time(millisecond),
     Entries = <<
-        ?FRAGMENT((N * 20), (Ts - 100 + N * 20), (Ts - 100 + (N + 1) * 20), 0, 200)
+        ?ENTRY(
+            (N * 20),
+            (Ts - 100 + N * 20),
+            (Ts - 100 + (N + 1) * 20),
+            ?MANIFEST_KIND_FRAGMENT,
+            200,
+            0
+        )
      || N <- lists:seq(0, 4)
     >>,
     Factor = 3,
@@ -1818,21 +1835,23 @@ rebalance_group_test() ->
 rebalance_kilo_group_test() ->
     Ts = erlang:system_time(millisecond),
     Groups = <<
-        ?GROUP(
+        ?ENTRY(
             (N * 20),
             (Ts - 100 + N * 20),
             (Ts - 100 + (N + 1) * 20),
             ?MANIFEST_KIND_GROUP,
+            0,
             (rabbitmq_stream_s3:uid())
         )
      || N <- lists:seq(1, 5)
     >>,
     %% Existing kilo group is before the groups...
-    Entries = ?GROUP(
+    Entries = ?ENTRY(
         0,
         (Ts - 120),
         (Ts - 100),
         ?MANIFEST_KIND_KILO_GROUP,
+        0,
         (rabbitmq_stream_s3:uid()),
         Groups
     ),

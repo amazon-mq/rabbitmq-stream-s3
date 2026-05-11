@@ -389,7 +389,14 @@ retention(Config) ->
 
     Ts = erlang:system_time(millisecond),
     Entries = <<
-        ?FRAGMENT((N * 20), (Ts - 100 + (N - 1) * 20), (Ts - 100 + N * 20), 0, 200)
+        ?ENTRY(
+            (N * 20),
+            (Ts - 100 + (N - 1) * 20),
+            (Ts - 100 + N * 20),
+            ?MANIFEST_KIND_FRAGMENT,
+            200,
+            0
+        )
      || N <- lists:seq(0, 4)
     >>,
     Manifest = #manifest{
@@ -836,17 +843,18 @@ rebalance_group(Config) ->
     {Replica3, REffects3} = ?MAC:apply(?META(), ManifestEdited2, Replica2),
     ?assertMatch([#set_range{}, #trigger_retention{}], REffects3),
 
-    ?FRAGMENT(GroupOffset, GroupFirstTs, _, _, _, _) = GroupEntries,
-    ?FRAGMENT(_, GroupLastTs, _, _, _, _) = rabbitmq_stream_s3_array:last(?ENTRY_B, GroupEntries),
+    ?ENTRY(GroupOffset, GroupFirstTs, _, _, _, _, _) = GroupEntries,
+    ?ENTRY(_, _, GroupLastTs, _, _, _, _) = rabbitmq_stream_s3_array:last(?ENTRY_B, GroupEntries),
     GroupUploaded = #group_uploaded{
         stream = StreamId,
         pos = Pos,
         len = Len,
-        entry = ?GROUP(
+        entry = ?ENTRY(
             GroupOffset,
             GroupFirstTs,
             GroupLastTs,
             ?MANIFEST_KIND_GROUP,
+            0,
             (rabbitmq_stream_s3:uid())
         )
     },
@@ -969,28 +977,23 @@ fragments_to_manifest([
         next_offset = NextOffset,
         first_timestamp = FirstTs,
         last_timestamp = LastTs,
-        size = Size,
-        seq_no = SeqNo
+        size = Size
     }
     | Rest
 ]) ->
-    IsSeqZero =
-        case SeqNo of
-            0 -> 1;
-            _ -> 0
-        end,
     fragments_to_manifest(Rest, #manifest{
         first_offset = Offset,
         next_offset = NextOffset,
         first_timestamp = FirstTs,
         first_last_timestamp = LastTs,
         total_size = Size,
-        entries = ?FRAGMENT(
+        entries = ?ENTRY(
             Offset,
             FirstTs,
             LastTs,
-            IsSeqZero,
-            Size
+            ?MANIFEST_KIND_FRAGMENT,
+            Size,
+            0
         )
     }).
 
@@ -1003,22 +1006,18 @@ fragments_to_manifest(
             next_offset = NextOffset,
             first_timestamp = FirstTs,
             last_timestamp = LastTs,
-            size = Size,
-            seq_no = SeqNo
+            size = Size
         }
         | Rest
     ],
     #manifest{total_size = TotalSize0, entries = Entries0} = Manifest0
 ) ->
-    IsSeqZero =
-        case SeqNo of
-            0 -> 1;
-            _ -> 0
-        end,
     Manifest = Manifest0#manifest{
         next_offset = NextOffset,
         total_size = TotalSize0 + Size,
-        entries = <<Entries0/binary, (?FRAGMENT(Offset, FirstTs, LastTs, IsSeqZero, Size))/binary>>
+        entries =
+            <<Entries0/binary,
+                (?ENTRY(Offset, FirstTs, LastTs, ?MANIFEST_KIND_FRAGMENT, Size, 0))/binary>>
     },
     fragments_to_manifest(Rest, Manifest).
 

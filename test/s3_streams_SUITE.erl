@@ -759,7 +759,7 @@ extract_payload(Chunk) ->
 
 decode_entries(<<>>) ->
     [];
-decode_entries(<<O:64/unsigned, FTs:64/signed, LTs:64/signed, _:48, Rest/binary>>) ->
+decode_entries(?ENTRY(O, FTs, LTs, _Kind, _Size, _Uid, Rest)) ->
     [{O, FTs, LTs} | decode_entries(Rest)].
 
 get_stream_id(Config, QName) ->

@@ -162,7 +162,10 @@ gen_fragments() ->
     ).
 
 fragments_to_entries(Fragments) ->
-    iolist_to_binary([?FRAGMENT(O, FTs, LTs, 0, 200) || {O, FTs, LTs} <- Fragments]).
+    iolist_to_binary([
+        ?ENTRY(O, FTs, LTs, ?MANIFEST_KIND_FRAGMENT, 200, 0)
+     || {O, FTs, LTs} <- Fragments
+    ]).
 
 %% -------------------------------------------------------------------------
 %% rabbitmq_stream_s3_array properties

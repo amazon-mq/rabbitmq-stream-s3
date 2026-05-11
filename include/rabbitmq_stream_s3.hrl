@@ -186,50 +186,30 @@
 %% but share the same amount of space - to make the entries arrays compact even
 %% when there are thousands of fragments.
 %%
-%% So an entry is a sort of union type between fragment and group. Both groups
-%% and fragments store the first offset and last timestamp in their range. This
-%% is used for readers to resolve offset specs. Fragments also store the
-%% segment data size. This is used for retention. Groups instead store the UID
-%% of the object.
--define(ENTRY_B, 30).
--define(ENTRY(Offset, FirstTs, LastTs, Kind), ?ENTRY(Offset, FirstTs, LastTs, Kind, <<>>)).
--define(ENTRY(Offset, FirstTs, LastTs, Kind, Rest), <<
+%% Fragment and group entries share the same 34-byte layout, differentiated by
+%% the Kind field. Both store the first offset, first timestamp, last
+%% timestamp, size, and UID. For groups, Size is zero and UID identifies the
+%% group object. For fragments, Size is the segment data size and UID
+%% identifies the fragment object.
+-define(ENTRY_B, 34).
+-define(ENTRY(Offset, FirstTs, LastTs, Kind, Size, Uid), <<
     Offset:64/unsigned,
     FirstTs:64/signed,
     LastTs:64/signed,
-    Kind:2/unsigned,
-    _:46,
-    %% Other entries:
-    Rest/binary
+    Kind:8/unsigned,
+    Size:40/unsigned,
+    Uid:32/unsigned
 >>).
--define(FRAGMENT(Offset, FirstTs, LastTs, IsSeqZero, Size),
-    ?FRAGMENT(Offset, FirstTs, LastTs, IsSeqZero, Size, <<>>)
-).
--define(FRAGMENT(Offset, FirstTs, LastTs, IsSeqZero, Size, Rest), <<
+-define(ENTRY(Offset, FirstTs, LastTs, Kind, Size, Uid, Rest), <<
     Offset:64/unsigned,
     FirstTs:64/signed,
     LastTs:64/signed,
-    ?MANIFEST_KIND_FRAGMENT:2/unsigned,
-    %% Whether the fragment was the first in the segment. This can be used to
-    %% search for a tracking snapshot.
-    IsSeqZero:1/unsigned,
-    %% 45 bits can describe segment data of up to 32 TiB.
-    %% 2^45 == 32 * 1024^4
-    Size:45/unsigned,
-    Rest/binary
->>).
-%% NOTE: ?GROUP will match fragments. Always attempt to match ?FRAGMENT first
-%% or guard on the Kind argument.
--define(GROUP(Offset, FirstTs, LastTs, Kind, Uid),
-    ?GROUP(Offset, FirstTs, LastTs, Kind, Uid, <<>>)
-).
--define(GROUP(Offset, FirstTs, LastTs, Kind, Uid, Rest), <<
-    Offset:64/unsigned,
-    FirstTs:64/signed,
-    LastTs:64/signed,
-    Kind:2/unsigned,
-    %% 46 bits of entropy. See the uid() type.
-    Uid:46/unsigned,
+    Kind:8/unsigned,
+    %% 40 bits can describe segment data of up to 1 TiB.
+    %% 2^40 == 1024^4
+    Size:40/unsigned,
+    %% 32 bits of entropy. See the uid() type.
+    Uid:32/unsigned,
     Rest/binary
 >>).
 

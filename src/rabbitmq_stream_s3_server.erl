@@ -571,11 +571,11 @@ execute_task(#upload_fragment{stream = StreamId, dir = Dir, fragment = Fragment}
 execute_task(#upload_group{
     stream = StreamId,
     kind = GroupKind,
-    entries = ?ENTRY(GroupOffset, GroupFTs, _, _, _) = GroupEntries,
+    entries = ?ENTRY(GroupOffset, GroupFTs, _, _, _, _, _) = GroupEntries,
     pos = Pos,
     len = Len
 }) ->
-    ?ENTRY(_, _, GroupLTs, _, _) = rabbitmq_stream_s3_array:last(?ENTRY_B, GroupEntries),
+    ?ENTRY(_, _, GroupLTs, _, _, _, _) = rabbitmq_stream_s3_array:last(?ENTRY_B, GroupEntries),
     Uid = rabbitmq_stream_s3:uid(),
     Ext = rabbitmq_stream_s3:group_name(GroupKind),
     GroupRef = #group_ref{uid = Uid, kind = GroupKind, offset = GroupOffset},
@@ -613,7 +613,7 @@ execute_task(#upload_group{
     counters:add(counter(), Counter, 1),
     #group_uploaded{
         stream = StreamId,
-        entry = ?GROUP(GroupOffset, GroupFTs, GroupLTs, GroupKind, Uid),
+        entry = ?ENTRY(GroupOffset, GroupFTs, GroupLTs, GroupKind, 0, Uid),
         pos = Pos,
         len = Len
     };
@@ -1045,17 +1045,11 @@ resolve_manifest_tail(
             next_offset = NextOffset,
             first_timestamp = FirstTs,
             last_timestamp = LastTs,
-            size = Size,
-            seq_no = SeqNo
+            size = Size
         }} ->
-            IsSeqZero =
-                case SeqNo of
-                    0 -> 1;
-                    _ -> 0
-                end,
             Entries =
                 <<Entries0/binary,
-                    ?FRAGMENT(NextOffset0, FirstTs, LastTs, IsSeqZero, Size)/binary>>,
+                    (?ENTRY(NextOffset0, FirstTs, LastTs, ?MANIFEST_KIND_FRAGMENT, Size, 0))/binary>>,
             Manifest = Manifest0#manifest{
                 next_offset = NextOffset,
                 total_size = TotalSize0 + Size,

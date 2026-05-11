@@ -8,20 +8,14 @@
 -doc """
 A unique, randomly generated ID.
 
-This is represented as a 46 bit integer. Why 46 bits? It fits tightly into the
-manifest entries array for group entries. (The remaining two bits are a union
-discriminant that says which `kind()` of group the entry is.) This also fits
-into an Erlang immediate term, so it is cheap to represent compared to a binary
-for example.
+This is represented as a 32-bit unsigned integer. All manifest entries
+(fragments and groups) share the same 34-byte layout with a 32-bit UID field.
+The UID is included in S3 object keys to prevent overwrites when competing
+writers upload to the same offset range.
 
-See [Birthday attack] and the related math. With the approximation formula
-there, for 46 bits of entropy: `sqrt(2^(1 + 46 - 20)) == 11585`. To have a
-one-in-a-million chance of a collision we would need to have ~11.5k objects
-with competing UIDs. Objects like groups also have offsets which make them
-further unique. And there is typically only one manifest root in the common
-case, so we say that this is _enough_ entropy.
-
-[Birthday attack]: https://en.wikipedia.org/wiki/Birthday_attack#Simple_approximation
+With 32 bits and N competing pairs, collision probability is ~N^2/2^32. In
+practice, elections producing competing uploads at the same offset are rare,
+so 32 bits is sufficient.
 """.
 -type uid() :: non_neg_integer().
 
@@ -84,8 +78,10 @@ efficiently using the `rabbitmq_stream_s3_array` module.
     group_name/1,
     next_group/1,
     fragment_key/2,
+    fragment_key/3,
     stream_prefix/1,
     index_file_offset/1,
+    fragment_key_offset/1,
     segment_file_offset/1
 ]).
 
@@ -110,13 +106,13 @@ setup() ->
 -doc "Creates a new random UID.".
 -spec uid() -> uid().
 uid() ->
-    <<_:2, Uid:46>> = crypto:strong_rand_bytes(6),
+    <<Uid:32/unsigned>> = crypto:strong_rand_bytes(4),
     Uid.
 
 -doc "Formats a UID as human-readable text".
--spec format_uid(uid()) -> <<_:96>>.
+-spec format_uid(uid()) -> <<_:64>>.
 format_uid(Uid) when is_integer(Uid) andalso Uid >= 0 ->
-    binary:encode_hex(<<0:2, Uid:46>>, lowercase).
+    binary:encode_hex(<<Uid:32/unsigned>>, lowercase).
 
 -doc """
 Creates a basename of a file or key which corresponds to the offset with the
@@ -175,6 +171,14 @@ next_group(?MANIFEST_KIND_KILO_GROUP) -> ?MANIFEST_KIND_MEGA_GROUP.
 fragment_key(StreamId, Offset) when is_binary(StreamId) andalso is_integer(Offset) ->
     stream_data_key(StreamId, offset_filename(Offset, <<"fragment">>)).
 
+-doc "Returns the key for the given fragment offset and UID".
+-spec fragment_key(stream_id(), osiris:offset(), uid()) -> key().
+fragment_key(StreamId, Offset, Uid) when
+    is_binary(StreamId) andalso is_integer(Offset) andalso is_integer(Uid)
+->
+    Filename = <<(pad_zeroes(Offset))/binary, $., (format_uid(Uid))/binary, ".fragment">>,
+    stream_data_key(StreamId, Filename).
+
 -spec stream_data_key(stream_id(), filename()) -> key().
 stream_data_key(StreamId, Filename) when is_binary(StreamId) andalso is_binary(Filename) ->
     <<"rabbitmq/stream/", StreamId/binary, "/data/", Filename/binary>>.
@@ -193,6 +197,11 @@ segment_file_offset(Filename) ->
 index_file_offset(Filename) ->
     filename_offset(filename:basename(Filename, <<".index">>)).
 
+-doc "Extracts the first offset from a fragment key".
+-spec fragment_key_offset(key()) -> osiris:offset().
+fragment_key_offset(Key) ->
+    filename_offset(filename:rootname(filename:basename(Key, <<".fragment">>))).
+
 -spec filename_offset(file:filename_all()) -> osiris:offset().
 filename_offset(Basename) when is_binary(Basename) ->
     binary_to_integer(Basename);
@@ -203,7 +212,7 @@ filename_offset(Basename) when is_list(Basename) ->
 -include_lib("eunit/include/eunit.hrl").
 
 format_uid_test() ->
-    ?assertEqual(<<"000000000000">>, format_uid(0)),
+    ?assertEqual(<<"00000000">>, format_uid(0)),
     ok.
 
 index_file_offset_test() ->
@@ -212,6 +221,12 @@ index_file_offset_test() ->
     ?assertEqual(100, index_file_offset(<<"00000000000000000100.index">>)),
     ?assertEqual(100, index_file_offset(<<"path/to/00000000000000000100.index">>)),
     ?assertEqual(100, index_file_offset(<<"/path/to/00000000000000000100.index">>)),
+    ok.
+
+fragment_key_offset_test() ->
+    StreamId = <<"__my-stream">>,
+    ?assertEqual(0, fragment_key_offset(fragment_key(StreamId, 0, 16#deadbeef))),
+    ?assertEqual(1234, fragment_key_offset(fragment_key(StreamId, 1234, 16#deadbeef))),
     ok.
 
 -endif.
