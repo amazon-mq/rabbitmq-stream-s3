@@ -13,3 +13,6 @@ PLT_APPS += ssl crypto
 
 include ../../rabbitmq-components.mk
 include ../../erlang.mk
+
+# CT suites share a node name (erlang.mk limitation), so they cannot run in parallel.
+.NOTPARALLEL:
