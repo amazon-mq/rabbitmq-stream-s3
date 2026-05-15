@@ -334,9 +334,9 @@ send_file(
                         }
                     },
                     send_file(Socket, State, Callback);
-                {become_local, Offset} ->
+                {become_local, _} ->
                     counters:add(counter(), ?C_REMOTE_CLOSE, 1),
-                    case init_local_reader(Offset, Config) of
+                    case init_local_reader(Remote1#remote.next_offset, Config) of
                         {ok, State} ->
                             send_file(Socket, State, Callback);
                         {error, _} = Err ->
@@ -345,9 +345,9 @@ send_file(
                 end_of_stream ->
                     {end_of_stream, State0#?MODULE{mode = Remote1}}
             end;
-        {become_local, Offset} ->
+        {become_local, _} ->
             counters:add(counter(), ?C_REMOTE_CLOSE, 1),
-            case init_local_reader(Offset, Config) of
+            case init_local_reader(Remote0#remote.next_offset, Config) of
                 {ok, State} ->
                     send_file(Socket, State, Callback);
                 {error, _} = Err ->
@@ -416,9 +416,9 @@ chunk_iterator(
                         }
                     },
                     chunk_iterator(State, Credit, undefined);
-                {become_local, Offset} ->
+                {become_local, _} ->
                     counters:add(counter(), ?C_REMOTE_CLOSE, 1),
-                    case init_local_reader(Offset, Config) of
+                    case init_local_reader(Remote1#remote.next_offset, Config) of
                         {ok, State} ->
                             chunk_iterator(State, Credit, undefined);
                         {error, _} = Err ->
@@ -427,9 +427,9 @@ chunk_iterator(
                 end_of_stream ->
                     {end_of_stream, State0#?MODULE{mode = Remote1}}
             end;
-        {become_local, Offset} ->
+        {become_local, _} ->
             counters:add(counter(), ?C_REMOTE_CLOSE, 1),
-            case init_local_reader(Offset, Config) of
+            case init_local_reader(Remote0#remote.next_offset, Config) of
                 {ok, State} ->
                     chunk_iterator(State, Credit, undefined);
                 {error, _} = Err ->
