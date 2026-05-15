@@ -14,6 +14,7 @@
 /sbin/
 /sbin.lock
 /xrefr
+/erl_crash.dump
 
 rabbitmq_stream_s3.d
 .rabbitmq_stream_s3.plt
