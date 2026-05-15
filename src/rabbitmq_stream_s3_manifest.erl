@@ -23,7 +23,8 @@ fragments (via tree-branch-like "group" objects, for large enough streams).
     new_edit/1,
     rebalance_edit/2,
     apply_infos/2,
-    apply_edit/2
+    apply_edit/2,
+    get_group_fun/1
 ]).
 
 %% ---------------------------------------------------------------------------
@@ -170,3 +171,25 @@ apply_edit(
         total_size = TotalSize0 + Size,
         entries = Entries
     }.
+
+-doc """
+Returns a function that downloads group objects from S3 and returns their
+entries array. Used by the fragment iterator and offset resolution.
+""".
+-spec get_group_fun(stream_id()) -> rabbitmq_stream_s3_fragment_iterator:get_group_fun().
+get_group_fun(StreamId) ->
+    fun(#group_ref{kind = Kind} = GroupRef) ->
+        Key = rabbitmq_stream_s3:group_key(StreamId, GroupRef),
+        case rabbitmq_stream_s3_api:get(Key, #{}) of
+            {ok, Data} ->
+                HeaderSize = group_header_size(Kind),
+                <<_Header:HeaderSize/binary, Entries/binary>> = Data,
+                {ok, Entries};
+            {error, _} = Err ->
+                Err
+        end
+    end.
+
+group_header_size(?MANIFEST_KIND_GROUP) -> ?MANIFEST_HEADER_SIZE;
+group_header_size(?MANIFEST_KIND_KILO_GROUP) -> ?MANIFEST_HEADER_SIZE;
+group_header_size(?MANIFEST_KIND_MEGA_GROUP) -> ?MANIFEST_HEADER_SIZE.

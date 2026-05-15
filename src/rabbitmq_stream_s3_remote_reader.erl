@@ -100,16 +100,18 @@ multiplicative decrease ([AIMD]) algorithm.
     reader_ref :: reference(),
 
     %% Current fragment state.
-    fragment :: osiris:offset(),
+    fragment_ref :: #fragment_ref{},
     key :: rabbitmq_stream_s3:key(),
-    info :: #fragment_info{} | undefined,
     buffer = <<>> :: binary(),
     start_pos :: byte_offset(),
     current_pos :: byte_offset(),
     end_pos :: byte_offset(),
 
     %% Next fragment state (pre-fetched).
-    next :: {#fragment_info{}, binary()} | undefined | not_found,
+    next :: {#fragment_ref{}, binary()} | undefined | not_found,
+
+    %% Fragment iterator for forward navigation.
+    iterator :: rabbitmq_stream_s3_fragment_iterator:iterator(),
 
     %% All in-flight requests, keyed by async_req().
     requests = #{} :: #{rabbitmq_stream_s3_api:async_req() => #request{}},
@@ -200,13 +202,13 @@ init(#{
     reader := Reader,
     stream := StreamId,
     location := #remote_location{
-        fragment = Fragment,
         position = Pos,
-        fragment_info = Info
+        fragment_ref = #fragment_ref{offset = Fragment, uid = Uid} = FragRef,
+        iterator = Iterator
     }
 }) ->
     logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
-    Key = rabbitmq_stream_s3:fragment_key(StreamId, Fragment),
+    Key = rabbitmq_stream_s3:fragment_key(StreamId, Fragment, Uid),
     State0 = #?MODULE{
         stream = StreamId,
         read_size = ?INITIAL_READ_SIZE,
@@ -216,9 +218,9 @@ init(#{
         start_pos = Pos,
         current_pos = Pos,
         end_pos = Pos,
-        fragment = Fragment,
+        fragment_ref = FragRef,
         key = Key,
-        info = Info
+        iterator = Iterator
     },
     State = maybe_start_request(State0),
     {ok, State}.
@@ -338,7 +340,7 @@ handle_info(Msg, State) ->
     {noreply, State}.
 
 handle_request_error(Reason, Req0, RetryDelay0, State) ->
-    case {Reason, Req0#request.fragment =:= State#?MODULE.fragment} of
+    case {Reason, Req0#request.fragment =:= (State#?MODULE.fragment_ref)#fragment_ref.offset} of
         {not_found, true} ->
             maybe_reply_pending(State#?MODULE{
                 current_not_found = true,
@@ -395,61 +397,49 @@ maybe_start_request(#?MODULE{} = State) ->
 maybe_start_current_request(
     #?MODULE{
         read_size = ReadSize,
-        fragment = Fragment,
+        fragment_ref = #fragment_ref{offset = Fragment, size = FragSize},
+        end_pos = EndPos,
         key = CurrentKey,
-        %% Information about the current fragment isn't available - we need to
-        %% request from the start of the fragment to read this from the
-        %% header.
-        info = undefined,
         requests = Requests0
     } = State0
 ) ->
-    case has_request_for(Fragment, Requests0) of
+    IdxStartPos = ?SEGMENT_HEADER_B + FragSize,
+    case EndPos < IdxStartPos of
         true ->
-            State0;
+            case has_request_for(Fragment, Requests0) of
+                true ->
+                    State0;
+                false ->
+                    Range = {EndPos, min(EndPos + ReadSize, IdxStartPos - 1)},
+                    start_request(CurrentKey, Range, Fragment, State0)
+            end;
         false ->
-            Range = {0, ReadSize + ?FRAGMENT_HEADER_B},
-            start_request(CurrentKey, Range, Fragment, State0)
-    end;
-maybe_start_current_request(
-    #?MODULE{
-        read_size = ReadSize,
-        fragment = Fragment,
-        end_pos = EndPos,
-        key = CurrentKey,
-        info = #fragment_info{index_start_pos = IdxStartPos},
-        requests = Requests0
-    } = State0
-) when EndPos < IdxStartPos ->
-    %% The current fragment hasn't been downloaded completely.
-    %% TODO: is this reading too aggressively?
-    case has_request_for(State0#?MODULE.fragment, Requests0) of
-        true ->
-            State0;
-        false ->
-            Range = {EndPos, min(EndPos + ReadSize, IdxStartPos - 1)},
-            start_request(CurrentKey, Range, Fragment, State0)
-    end;
-maybe_start_current_request(State) ->
-    State.
+            State0
+    end.
 
 maybe_start_next_request(
     #?MODULE{
         stream = StreamId,
         read_size = ReadSize,
-        info = #fragment_info{next_offset = NextOffset, index_start_pos = IdxStartPos},
+        fragment_ref = #fragment_ref{size = FragSize},
         end_pos = EndPos,
         next = undefined,
+        iterator = Iterator,
         requests = Requests0
     } = State0
-) when EndPos >= IdxStartPos ->
-    case has_request_for(NextOffset, Requests0) of
-        true ->
-            State0;
-        false ->
-            Key = rabbitmq_stream_s3:fragment_key(StreamId, NextOffset),
-            Range = {0, ReadSize + ?FRAGMENT_HEADER_B},
-            start_request(Key, Range, NextOffset, State0)
+) when EndPos >= ?SEGMENT_HEADER_B + FragSize ->
+    case rabbitmq_stream_s3_fragment_iterator:next(Iterator) of
+        {ok, #fragment_ref{offset = NextOffset, uid = NextUid}, _Iterator1} ->
+            case has_request_for(NextOffset, Requests0) of
+                true ->
+                    State0;
+                false ->
+                    Key = rabbitmq_stream_s3:fragment_key(StreamId, NextOffset, NextUid),
+                    Range = {?SEGMENT_HEADER_B, ?SEGMENT_HEADER_B + ReadSize},
+                    start_request(Key, Range, NextOffset, State0)
+            end;
+        _ ->
+            State0
     end;
 maybe_start_next_request(State) ->
     State.
@@ -476,19 +466,15 @@ start_request(Key, Range, Fragment, #?MODULE{requests = Requests0} = State0) ->
             State0
     end.
 
-add_data(Data, #request{fragment = Fragment}, #?MODULE{fragment = Fragment} = State) ->
+add_data(
+    Data,
+    #request{fragment = Fragment},
+    #?MODULE{fragment_ref = #fragment_ref{offset = Fragment}} = State
+) ->
     add_data_current(Data, State);
-add_data(Data, #request{}, #?MODULE{} = State) ->
-    add_data_next(Data, State).
+add_data(Data, #request{} = Req, #?MODULE{} = State) ->
+    add_data_next(Data, Req, State).
 
-add_data_current(Data, #?MODULE{info = undefined} = State0) ->
-    ?assert(byte_size(Data) >= ?FRAGMENT_HEADER_B),
-    {Info, Buffer} = rabbitmq_stream_s3_server:split_fragment_info(Data),
-    State0#?MODULE{
-        buffer = Buffer,
-        end_pos = ?FRAGMENT_HEADER_B + byte_size(Buffer),
-        info = Info
-    };
 add_data_current(
     Data,
     #?MODULE{
@@ -501,12 +487,8 @@ add_data_current(
     Buffer =
         case CurrentPos =:= StartPos0 of
             true ->
-                %% Fast-lane: appending like this creates less garbage than
-                %% reallocating with binary:part/3 even if the partition covers
-                %% the entire binary.
                 <<Buffer0/binary, Data/binary>>;
             false ->
-                %% Drop parts of the buffer that have already been served.
                 <<
                     (binary:part(Buffer0, CurrentPos - StartPos0, EndPos0 - CurrentPos))/binary,
                     Data/binary
@@ -518,14 +500,21 @@ add_data_current(
         buffer = Buffer
     }.
 
-add_data_next(Data, #?MODULE{next = Next0} = State0) ->
+add_data_next(
+    Data, #request{fragment = NextOffset}, #?MODULE{next = Next0, iterator = Iterator} = State0
+) ->
     Next =
         case Next0 of
             undefined ->
-                ?assert(byte_size(Data) >= ?FRAGMENT_HEADER_B),
-                rabbitmq_stream_s3_server:split_fragment_info(Data);
-            {Info, Buffer0} ->
-                {Info, <<Buffer0/binary, Data/binary>>}
+                %% First data for the next fragment. Look up its metadata from the iterator.
+                case rabbitmq_stream_s3_fragment_iterator:next(Iterator) of
+                    {ok, #fragment_ref{offset = NextOffset} = FragRef, _} ->
+                        {FragRef, Data};
+                    _ ->
+                        {#fragment_ref{offset = NextOffset, uid = 0, size = 0}, Data}
+                end;
+            {#fragment_ref{offset = NextOffset} = FragRef, Buffer0} ->
+                {FragRef, <<Buffer0/binary, Data/binary>>}
         end,
     State0#?MODULE{next = Next}.
 
@@ -565,14 +554,8 @@ maybe_reply_pending(
             NoReply
     end.
 
-maybe_reply(#read{offset = Offset, bytes = Bytes, hint = Hint}, #?MODULE{} = State0) ->
+maybe_reply(#read{offset = Offset, bytes = Bytes, hint = _Hint}, #?MODULE{} = State0) ->
     case try_read(State0, Offset, Bytes) of
-        {ok, _State, ?IDX_HEADER(_)} when Hint =:= chunk_boundary ->
-            %% This branch was important in the past but now that we track
-            %% `#fragment_info.index_start_pos` reliably, `try_read/3` will
-            %% never return this data. This branch is left temporarily to help
-            %% with debugging.
-            erlang:error(unreachable);
         {ok, State1, Data} ->
             rabbitmq_stream_s3_histogram:observe(?MODULE, byte_size(Data)),
             counters:add(counter(), ?C_BUFFER_HIT, 1),
@@ -583,7 +566,7 @@ maybe_reply(#read{offset = Offset, bytes = Bytes, hint = Hint}, #?MODULE{} = Sta
             counters:add(counter(), ?C_FRAGMENT_TRANSITION, 1),
             State = maybe_start_request(State1),
             {reply, {next_fragment, NextOffset}, State};
-        {become_local, #?MODULE{fragment = Off} = State} ->
+        {become_local, #?MODULE{fragment_ref = #fragment_ref{offset = Off}} = State} ->
             {stop, normal, {become_local, Off}, State};
         {end_of_stream, State} ->
             {reply, end_of_stream, State};
@@ -623,19 +606,14 @@ adjust_read_size(hit, #?MODULE{read_size = Current, read_size_max = Max} = State
     | {become_local, #?MODULE{}}
     | {await, #?MODULE{}}
     | {end_of_stream, #?MODULE{}}.
-try_read(#?MODULE{info = undefined} = State, _Offset, _Bytes) ->
-    %% The current fragment has not been read yet. The reader must wait until
-    %% the request arrives.
-    {await, State};
 try_read(
     #?MODULE{
-        fragment = ThisFragment,
-        info = #fragment_info{index_start_pos = IdxStartPos},
-        next = {#fragment_info{first_offset = NextOffset}, _Buffer}
+        fragment_ref = #fragment_ref{offset = ThisFragment, size = FragSize},
+        next = {#fragment_ref{offset = NextOffset}, _Buffer}
     } = State0,
     Offset,
     _Bytes
-) when Offset >= IdxStartPos ->
+) when Offset >= ?SEGMENT_HEADER_B + FragSize ->
     ?LOG_DEBUG(
         ?MODULE_STRING " transitioning to next fragment (~20..0B->~20..0B)",
         [ThisFragment, NextOffset]
@@ -644,153 +622,112 @@ try_read(
     {next_fragment, State, NextOffset};
 try_read(
     #?MODULE{
-        info = #fragment_info{next_offset = NextOffset, index_start_pos = IdxStartPos},
+        fragment_ref = #fragment_ref{size = FragSize},
         next = undefined,
+        iterator = Iterator,
         requests = Requests
     } = State0,
     Offset,
     _Bytes
-) when Offset >= IdxStartPos ->
-    case has_request_for(NextOffset, Requests) of
-        true ->
-            %% The next fragment's info is being requested. Wait for its arrival.
-            {await, State0};
-        false ->
-            %% No request in-flight for the next fragment. Start one.
-            {await, maybe_start_request(State0)}
+) when Offset >= ?SEGMENT_HEADER_B + FragSize ->
+    case rabbitmq_stream_s3_fragment_iterator:next(Iterator) of
+        {ok, #fragment_ref{offset = NextOffset}, _Iterator1} ->
+            case has_request_for(NextOffset, Requests) of
+                true ->
+                    {await, State0};
+                false ->
+                    {await, maybe_start_request(State0)}
+            end;
+        end_of_manifest ->
+            %% Refresh the iterator from the manifest cache.
+            case refresh_iterator(State0) of
+                {ok, State1} ->
+                    %% New entries available — try again.
+                    {await, maybe_start_request(State1)};
+                end_of_manifest ->
+                    State = goto_next_fragment(State0),
+                    {become_local, State}
+            end;
+        {error, _} ->
+            State = goto_next_fragment(State0),
+            {become_local, State}
     end;
 try_read(
     #?MODULE{
         stream = StreamId,
-        info = #fragment_info{next_offset = NextFragment, index_start_pos = IdxStartPos},
+        fragment_ref = #fragment_ref{size = FragSize},
         next = not_found
     } = State0,
     Offset,
     Bytes
-) when Offset >= IdxStartPos ->
-    %% The request for the next fragment gave a 404. The fragment doesn't exist
-    %% or hasn't been uploaded yet.
-    RemoteRange = (rabbitmq_stream_s3_server:backend()):get_range(StreamId),
-    ?LOG_DEBUG(
-        "Next fragment (~20..0B) was not found (requested ~b + ~b, idx start ~b). Remote range for this stream is ~w",
-        [
-            NextFragment,
-            Offset,
-            Bytes,
-            IdxStartPos,
-            RemoteRange
-        ]
-    ),
-    case RemoteRange of
-        {RemoteStartOffset, _EndOffset} when RemoteStartOffset >= NextFragment ->
-            %% Retention has evicted the next fragment and advanced past it.
-            %% Jump to the oldest fragment still available. Cancel any
-            %% in-flight requests and track their refs as cancelled so that
-            %% late frames are dropped silently.
-            #?MODULE{
-                fragment = CurrentFragment,
-                requests = Requests,
-                cancelled_requests = Cancelled0
-            } = State0,
-            cancel_requests(Requests),
-            Cancelled = maps:merge(
-                Cancelled0,
-                #{Req => ok || Req := _ <- Requests}
+) when Offset >= ?SEGMENT_HEADER_B + FragSize ->
+    %% The request for the next fragment gave a 404.
+    RemoteRange = rabbitmq_stream_s3_manifest_replica:get_range(StreamId),
+    IdxStartPos = ?SEGMENT_HEADER_B + FragSize,
+    case rabbitmq_stream_s3_fragment_iterator:next(State0#?MODULE.iterator) of
+        {ok, #fragment_ref{offset = NextFragment}, _} ->
+            ?LOG_DEBUG(
+                "Next fragment (~20..0B) was not found (requested ~b + ~b, idx start ~b). Remote range for this stream is ~w",
+                [NextFragment, Offset, Bytes, IdxStartPos, RemoteRange]
             ),
-            Key = rabbitmq_stream_s3:fragment_key(StreamId, RemoteStartOffset),
-            ?LOG_WARNING(
-                "Fragment ~20..0B finished but next fragment ~20..0B was evicted. "
-                "Jumping to oldest available fragment ~20..0B",
-                [CurrentFragment, NextFragment, RemoteStartOffset]
-            ),
-            State = State0#?MODULE{
-                fragment = RemoteStartOffset,
-                key = Key,
-                info = undefined,
-                buffer = <<>>,
-                start_pos = ?FRAGMENT_HEADER_B,
-                current_pos = ?FRAGMENT_HEADER_B,
-                end_pos = ?FRAGMENT_HEADER_B,
-                next = undefined,
-                current_not_found = false,
-                requests = #{},
-                cancelled_requests = Cancelled
-            },
-            {next_fragment, State, RemoteStartOffset};
-        {_StartOffset, EndOffset} when EndOffset < NextFragment ->
-            State = goto_next_fragment(State0),
-            {become_local, State};
-        {_StartOffset, _EndOffset} ->
-            %% TODO: next fragment has been uploaded. Re-request it.
-            State = goto_next_fragment(State0),
-            {await, State};
-        empty ->
-            %% TODO: become local?
-            {end_of_stream, State0}
+            case RemoteRange of
+                {RemoteStartOffset, _EndOffset} when RemoteStartOffset >= NextFragment ->
+                    %% Retention evicted the next fragment. Jump to oldest available.
+                    jump_to_oldest(State0, RemoteStartOffset);
+                {_StartOffset, EndOffset} when EndOffset =< NextFragment ->
+                    State = goto_next_fragment(State0),
+                    {become_local, State};
+                {_StartOffset, _EndOffset} ->
+                    State = goto_next_fragment(State0),
+                    {await, State};
+                empty ->
+                    {end_of_stream, State0}
+            end;
+        _ ->
+            case RemoteRange of
+                empty ->
+                    {end_of_stream, State0};
+                _ ->
+                    State = goto_next_fragment(State0),
+                    {become_local, State}
+            end
     end;
 try_read(
-    #?MODULE{info = #fragment_info{index_start_pos = IdxStartPos}} = State,
+    #?MODULE{fragment_ref = #fragment_ref{size = FragSize}} = State,
     Offset,
     _Bytes
-) when Offset >= IdxStartPos ->
+) when Offset >= ?SEGMENT_HEADER_B + FragSize ->
     ?LOG_DEBUG("Requested ~b exceeds index ~b. State: ~0p", [
-        Offset, IdxStartPos, format_state(State)
+        Offset, ?SEGMENT_HEADER_B + FragSize, format_state(State)
     ]),
     erlang:error(unreachable);
 try_read(#?MODULE{end_pos = EndPos} = State, Offset, Bytes) when Offset + Bytes > EndPos ->
-    %% The current buffer does not contain enough data to fulfill the request.
-    %% Wait until the current request is complete and then respond with the
-    %% newly added data.
-    case State of
-        #?MODULE{
-            info = #fragment_info{index_start_pos = IdxStartPos}
-        } when EndPos >= IdxStartPos andalso Offset + ?CHUNK_HEADER_B =< EndPos ->
+    IdxStartPos = ?SEGMENT_HEADER_B + (State#?MODULE.fragment_ref)#fragment_ref.size,
+    case EndPos >= IdxStartPos andalso Offset + ?CHUNK_HEADER_B =< EndPos of
+        true ->
             %% The log-reader over-reads the chunk header to try to get the
-            %% full filter. That might be larger than the chunk though. If so,
-            %% we need to cap the read at the index boundary.
+            %% full filter. Cap the read at the index boundary.
             try_read(State, Offset, EndPos - Offset);
-        #?MODULE{requests = Requests} when map_size(Requests) =/= 0 ->
-            %% The current fragment's info is being requested. Wait for its arrival.
-            {await, State};
-        #?MODULE{current_not_found = true, stream = StreamId} ->
-            %% The current fragment was deleted by retention while being read.
-            %% Requests is empty here (the first case branch catches non-empty).
-            %% Jump to the oldest fragment still available in the remote tier.
-            case (rabbitmq_stream_s3_server:backend()):get_range(StreamId) of
-                empty ->
-                    {end_of_stream, State};
-                {FirstOffset, _} ->
-                    Key = rabbitmq_stream_s3:fragment_key(StreamId, FirstOffset),
-                    ?LOG_WARNING(
-                        "Fragment ~20..0B was deleted by retention while being read. "
-                        "Jumping to oldest available fragment ~20..0B",
-                        [State#?MODULE.fragment, FirstOffset]
-                    ),
-                    NewState = State#?MODULE{
-                        fragment = FirstOffset,
-                        key = Key,
-                        info = undefined,
-                        buffer = <<>>,
-                        start_pos = ?FRAGMENT_HEADER_B,
-                        current_pos = ?FRAGMENT_HEADER_B,
-                        end_pos = ?FRAGMENT_HEADER_B,
-                        next = undefined,
-                        current_not_found = false
-                    },
-                    {next_fragment, NewState, FirstOffset}
-            end;
-        #?MODULE{read_size = ReadSize0} ->
-            %% The chunk is larger than the read-ahead. Bump read_size to
-            %% cover the needed bytes and call maybe_start_current_request
-            %% directly - bypassing the maybe_start_request guard that skips
-            %% current requests when the buffer already exceeds read_size.
-            Needed = Offset + Bytes - EndPos,
-            ReadSize = max(ReadSize0, Needed),
-            {await, maybe_start_current_request(State#?MODULE{read_size = ReadSize})}
+        false ->
+            case State of
+                #?MODULE{requests = Requests} when map_size(Requests) =/= 0 ->
+                    {await, State};
+                #?MODULE{current_not_found = true, stream = StreamId} ->
+                    case rabbitmq_stream_s3_manifest_replica:get_range(StreamId) of
+                        empty ->
+                            {end_of_stream, State};
+                        {FirstOffset, _} ->
+                            jump_to_oldest(State, FirstOffset)
+                    end;
+                #?MODULE{read_size = ReadSize0} ->
+                    Needed = Offset + Bytes - EndPos,
+                    ReadSize = max(ReadSize0, Needed),
+                    {await, maybe_start_current_request(State#?MODULE{read_size = ReadSize})}
+            end
     end;
 try_read(
     #?MODULE{
-        info = #fragment_info{index_start_pos = IdxStartPos},
+        fragment_ref = #fragment_ref{size = FragSize},
         start_pos = StartPos,
         current_pos = CurrentPos0,
         buffer = Buffer
@@ -798,17 +735,12 @@ try_read(
     Offset,
     Bytes0
 ) ->
+    IdxStartPos = ?SEGMENT_HEADER_B + FragSize,
     %%% PRECONDITIONS
-    %% We should never discard data from the buffer which the requester then
-    %% attempts to read.
     ?assert(Offset >= StartPos),
-    %% Reading never goes backwards. The requester may re-read within a chunk,
-    %% but like a cursor, the read always goes forward.
     ?assert(Offset >= CurrentPos0),
 
-    %% The log reader attempts to over-read the current chunk so that it can
-    %% read large bloom filters. So we need to cap the amount of data returned
-    %% to the start of the index in this fragment.
+    %% Cap the read at the index boundary.
     Bytes = min(Bytes0, IdxStartPos - Offset),
 
     Data = binary:part(Buffer, Offset - StartPos, Bytes),
@@ -817,28 +749,44 @@ try_read(
 goto_next_fragment(
     #?MODULE{
         stream = StreamId,
-        info = #fragment_info{next_offset = NextFragment},
-        next = Next0
+        next = Next0,
+        iterator = Iterator0
     } = State0
 ) ->
-    {Info, Buffer} =
-        case Next0 of
-            {I, _B} ->
-                ?assertEqual(NextFragment, I#fragment_info.first_offset),
-                Next0;
-            _ ->
-                {undefined, <<>>}
-        end,
-    State0#?MODULE{
-        start_pos = ?FRAGMENT_HEADER_B,
-        current_pos = ?FRAGMENT_HEADER_B,
-        end_pos = ?FRAGMENT_HEADER_B + byte_size(Buffer),
-        buffer = Buffer,
-        fragment = NextFragment,
-        key = rabbitmq_stream_s3:fragment_key(StreamId, NextFragment),
-        info = Info,
-        next = undefined
-    }.
+    case Next0 of
+        {#fragment_ref{offset = NextOffset, uid = NextUid} = NextFragRef, Buffer} ->
+            %% Advance the iterator past the entry we're transitioning to.
+            Iterator =
+                case rabbitmq_stream_s3_fragment_iterator:next(Iterator0) of
+                    {ok, _, It} -> It;
+                    _ -> Iterator0
+                end,
+            State0#?MODULE{
+                start_pos = ?SEGMENT_HEADER_B,
+                current_pos = ?SEGMENT_HEADER_B,
+                end_pos = ?SEGMENT_HEADER_B + byte_size(Buffer),
+                buffer = Buffer,
+                fragment_ref = NextFragRef,
+                key = rabbitmq_stream_s3:fragment_key(StreamId, NextOffset, NextUid),
+                iterator = Iterator,
+                next = undefined
+            };
+        _ ->
+            %% No pre-fetched next fragment data. Advance iterator and reset.
+            Iterator =
+                case rabbitmq_stream_s3_fragment_iterator:next(Iterator0) of
+                    {ok, _, It} -> It;
+                    _ -> Iterator0
+                end,
+            State0#?MODULE{
+                start_pos = ?SEGMENT_HEADER_B,
+                current_pos = ?SEGMENT_HEADER_B,
+                end_pos = ?SEGMENT_HEADER_B,
+                buffer = <<>>,
+                iterator = Iterator,
+                next = undefined
+            }
+    end.
 
 cancel_requests(Requests) ->
     maps:foreach(
@@ -848,6 +796,64 @@ cancel_requests(Requests) ->
         Requests
     ),
     counters:put(counter(), ?C_REQUESTS_IN_FLIGHT, 0).
+
+jump_to_oldest(
+    #?MODULE{stream = StreamId, requests = Requests, cancelled_requests = Cancelled0} = State0,
+    FirstOffset
+) ->
+    cancel_requests(Requests),
+    Cancelled = maps:merge(Cancelled0, #{Req => ok || Req := _ <- Requests}),
+    %% Look up the fragment entry from the manifest to get UID and size.
+    case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
+        #manifest{entries = Entries} = Manifest when byte_size(Entries) >= ?ENTRY_B ->
+            ?ENTRY(FirstOffset, _FTs, _LTs, ?MANIFEST_KIND_FRAGMENT, Size, Uid) =
+                rabbitmq_stream_s3_array:at(0, ?ENTRY_B, Entries),
+            GetGroupFun = rabbitmq_stream_s3_manifest:get_group_fun(StreamId),
+            Iterator = rabbitmq_stream_s3_fragment_iterator:init(
+                Manifest, FirstOffset, GetGroupFun
+            ),
+            %% Advance past the current entry.
+            Iterator1 =
+                case rabbitmq_stream_s3_fragment_iterator:next(Iterator) of
+                    {ok, _, It} -> It;
+                    _ -> Iterator
+                end,
+            Key = rabbitmq_stream_s3:fragment_key(StreamId, FirstOffset, Uid),
+            ?LOG_WARNING(
+                "Jumping to oldest available fragment ~20..0B",
+                [FirstOffset]
+            ),
+            State = State0#?MODULE{
+                fragment_ref = #fragment_ref{offset = FirstOffset, uid = Uid, size = Size},
+                key = Key,
+                buffer = <<>>,
+                start_pos = ?SEGMENT_HEADER_B,
+                current_pos = ?SEGMENT_HEADER_B,
+                end_pos = ?SEGMENT_HEADER_B,
+                next = undefined,
+                current_not_found = false,
+                requests = #{},
+                cancelled_requests = Cancelled,
+                iterator = Iterator1
+            },
+            {next_fragment, State, FirstOffset};
+        _ ->
+            {end_of_stream, State0}
+    end.
+
+refresh_iterator(
+    #?MODULE{stream = StreamId, fragment_ref = #fragment_ref{offset = Fragment, size = FragSize}} =
+        State
+) ->
+    NextOffset = Fragment + FragSize,
+    case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
+        #manifest{next_offset = ManifestNext} = Manifest when ManifestNext > NextOffset ->
+            GetGroupFun = rabbitmq_stream_s3_manifest:get_group_fun(StreamId),
+            Iterator = rabbitmq_stream_s3_fragment_iterator:init(Manifest, NextOffset, GetGroupFun),
+            {ok, State#?MODULE{iterator = Iterator}};
+        _ ->
+            end_of_manifest
+    end.
 
 format_state(#?MODULE{
     stream = StreamId,
@@ -859,24 +865,16 @@ format_state(#?MODULE{
     start_pos = StartPos,
     current_pos = CurrentPos,
     end_pos = EndPos,
-    info = Info0,
+    fragment_ref = #fragment_ref{offset = Fragment, uid = Uid, size = FragSize},
     next = Next0,
     requests = Requests,
     pending_read = PendingRead,
     current_not_found = CurrentNotFound
 }) ->
-    Info =
-        case Info0 of
-            #fragment_info{} ->
-                format_fragment_info(Info0);
-            undefined ->
-                undefined
-        end,
     Next =
         case Next0 of
-            {NextInfo, Buf} ->
-                I = format_fragment_info(NextInfo),
-                {I, <<(integer_to_binary(byte_size(Buf)))/binary, " bytes">>};
+            {#fragment_ref{offset = NextOff}, Buf} ->
+                {NextOff, <<(integer_to_binary(byte_size(Buf)))/binary, " bytes">>};
             _ ->
                 Next0
         end,
@@ -890,37 +888,14 @@ format_state(#?MODULE{
         start_pos => StartPos,
         current_pos => CurrentPos,
         end_pos => EndPos,
-        info => Info,
+        fragment => Fragment,
+        fragment_uid => Uid,
+        fragment_size => FragSize,
+        idx_start_pos => ?SEGMENT_HEADER_B + FragSize,
         next => Next,
         requests => #{F => R || _ := #request{fragment = F, range = R} <- Requests},
         pending_read => PendingRead =/= undefined,
         current_not_found => CurrentNotFound
-    }.
-
-%% TODO: debug/helpers module for pretty-printers like this.
-format_fragment_info(#fragment_info{
-    first_offset = FirstOffset,
-    next_offset = NextOffset,
-    first_timestamp = FirstTs,
-    last_timestamp = LastTs,
-    seq_no = SeqNo,
-    segment_offset = SegmentOffset,
-    segment_start_pos = SegmentStartPos,
-    size = Size,
-    index_start_pos = IdxStartPos,
-    roll_reason = RollReason
-}) ->
-    #{
-        first_offset => FirstOffset,
-        next_offset => NextOffset,
-        first_timestamp => FirstTs,
-        last_timestamp => LastTs,
-        seq_no => SeqNo,
-        segment_offset => SegmentOffset,
-        segment_start_pos => SegmentStartPos,
-        size => Size,
-        index_start_pos => IdxStartPos,
-        roll_reason => RollReason
     }.
 
 counter() ->

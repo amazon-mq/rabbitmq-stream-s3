@@ -131,12 +131,10 @@
 }).
 
 -record(remote_location, {
-    fragment :: osiris:offset(),
     position :: byte_offset(),
     chunk_id :: osiris:offset(),
-    %% This may be undefined if we are starting at the first offset in a
-    %% fragment and didn't download any of its data.
-    fragment_info :: #fragment_info{} | undefined
+    fragment_ref :: #fragment_ref{},
+    iterator :: rabbitmq_stream_s3_fragment_iterator:iterator()
 }).
 
 -define(INDEX_RECORD(Offset, Timestamp, FragmentFilePos), <<
