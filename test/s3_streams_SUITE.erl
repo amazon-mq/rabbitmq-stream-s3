@@ -225,7 +225,7 @@ prometheus_metrics(Config) ->
     URI = lists:flatten(io_lib:format("http://localhost:~b/metrics", [Port])),
     {ok, {{_, 200, _}, _, Body}} = httpc:request(get, {URI, []}, [], []),
 
-    % Verify seshat counters from rabbitmq_stream_s3_server
+    % Verify seshat counters
     ?assertMatch(
         match, re:run(Body, "^rabbitmq_stream_s3_active_tasks\\{", [{capture, none}, multiline])
     ),
@@ -481,7 +481,7 @@ read_from_remote_tier_by_offset(Config) ->
     ?awaitMatch(
         {0, _},
         rabbit_ct_broker_helpers:rpc(
-            Config, 0, rabbitmq_stream_s3_server, get_range, [StreamId]
+            Config, 0, rabbitmq_stream_s3_manifest_replica, get_range, [StreamId]
         ),
         5000
     ),
@@ -588,12 +588,12 @@ read_from_remote_tier_by_timestamp(Config) ->
     ?awaitMatch(
         {0, _},
         rabbit_ct_broker_helpers:rpc(
-            Config, 0, rabbitmq_stream_s3_server, get_range, [StreamId]
+            Config, 0, rabbitmq_stream_s3_manifest_replica, get_range, [StreamId]
         ),
         5000
     ),
     #manifest{next_offset = NextOffset, entries = Entries} = rabbit_ct_broker_helpers:rpc(
-        Config, 0, rabbitmq_stream_s3_server, get_manifest, [StreamId]
+        Config, 0, rabbitmq_stream_s3_manifest_replica, get_manifest, [StreamId]
     ),
     ct:pal(
         "Manifest next_offset=~p entries=~p",
@@ -615,7 +615,7 @@ read_from_remote_tier_by_timestamp(Config) ->
 
     ct:pal("Consuming from timestamp ~p (third message, remote tier)", [Timestamp3]),
     #manifest{next_offset = NextOffset3, entries = Entries3} = rabbit_ct_broker_helpers:rpc(
-        Config, 0, rabbitmq_stream_s3_server, get_manifest, [StreamId]
+        Config, 0, rabbitmq_stream_s3_manifest_replica, get_manifest, [StreamId]
     ),
     ct:pal(
         "Manifest at T3 subscription: next_offset=~p entries=~p",

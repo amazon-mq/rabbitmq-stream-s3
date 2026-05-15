@@ -12,7 +12,6 @@ lives here. Callers use these functions instead of calling
 
 -export([
     api_backend/0,
-    manifest_server_backend/0,
     aws_access_key/0,
     aws_secret_key/0,
     aws_security_token/0,
@@ -48,10 +47,6 @@ lives here. Callers use these functions instead of calling
 -spec api_backend() -> module().
 api_backend() ->
     application:get_env(?APP, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_aws).
-
--spec manifest_server_backend() -> module().
-manifest_server_backend() ->
-    application:get_env(?APP, rabbitmq_stream_s3_server, rabbitmq_stream_s3_server).
 
 %% AWS credentials. Return `undefined` when not configured (instance role is used).
 -spec aws_access_key() -> binary() | undefined.
