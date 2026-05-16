@@ -156,8 +156,7 @@ end}.
 %% large terms (such as S3 error responses) will print them in full.
 
 {mapping, "stream_s3.verbose_logging", "rabbitmq_stream_s3.verbose_logging", [
-    {datatype, {enum, [true, false]}},
-    {default, false}
+    {datatype, {enum, [true, false]}}
 ]}.
 
 {translation, "rabbitmq_stream_s3.verbose_logging",
@@ -165,5 +164,33 @@ fun(Conf) ->
     case cuttlefish:conf_get("stream_s3.verbose_logging", Conf, false) of
         false -> cuttlefish:unset();
         Value -> Value
+    end
+end}.
+
+%%
+%% Transfer rate limiting
+%%
+
+{mapping, "stream_s3.max_transfer_bytes_per_sec", "rabbitmq_stream_s3.max_transfer_bytes_per_sec", [
+    {datatype, [{atom, unlimited}, bytesize]}
+]}.
+
+{translation, "rabbitmq_stream_s3.max_transfer_bytes_per_sec",
+fun(Conf) ->
+    case cuttlefish:conf_get("stream_s3.max_transfer_bytes_per_sec", Conf, undefined) of
+        undefined -> cuttlefish:unset();
+        Value     -> Value
+    end
+end}.
+
+{mapping, "stream_s3.max_transfer_burst_bytes", "rabbitmq_stream_s3.max_transfer_burst_bytes", [
+    {datatype, bytesize}
+]}.
+
+{translation, "rabbitmq_stream_s3.max_transfer_burst_bytes",
+fun(Conf) ->
+    case cuttlefish:conf_get("stream_s3.max_transfer_burst_bytes", Conf, undefined) of
+        undefined -> cuttlefish:unset();
+        Value     -> Value
     end
 end}.

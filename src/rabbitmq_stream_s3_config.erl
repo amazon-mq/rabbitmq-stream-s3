@@ -38,7 +38,9 @@ lives here. Callers use these functions instead of calling
     task_retry_delay_exponent/0,
     verbose_logging/0,
     segment_upload_timeout/0,
-    tick_timeout_milliseconds/0
+    tick_timeout_milliseconds/0,
+    max_transfer_bytes_per_sec/0,
+    max_transfer_burst_bytes/0
 ]).
 
 -define(APP, rabbitmq_stream_s3).
@@ -168,6 +170,14 @@ segment_upload_timeout() ->
 -spec tick_timeout_milliseconds() -> non_neg_integer().
 tick_timeout_milliseconds() ->
     application:get_env(?APP, tick_timeout_milliseconds, 5000).
+
+-spec max_transfer_bytes_per_sec() -> pos_integer() | unlimited.
+max_transfer_bytes_per_sec() ->
+    application:get_env(?APP, max_transfer_bytes_per_sec, unlimited).
+
+-spec max_transfer_burst_bytes() -> pos_integer() | undefined.
+max_transfer_burst_bytes() ->
+    application:get_env(?APP, max_transfer_burst_bytes, undefined).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").

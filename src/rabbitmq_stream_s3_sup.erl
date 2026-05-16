@@ -44,6 +44,11 @@ init([]) ->
         type => supervisor,
         start => {rabbitmq_stream_s3_replica_reader_sup, start_link, []}
     },
+    Governor = #{
+        id => rabbitmq_stream_s3_governor,
+        type => worker,
+        start => {rabbitmq_stream_s3_governor, start_link, [governor_opts()]}
+    },
     MembershipReconciliation = #{
         id => rabbitmq_stream_s3_membership_reconciliation,
         type => worker,
@@ -55,9 +60,22 @@ init([]) ->
         MembershipReconciliation,
         UploadPool,
         GeneralPool,
+        Governor,
         ReplicaReaderSup
     ],
     {ok, {SupFlags, Procs}}.
+
+governor_opts() ->
+    case rabbitmq_stream_s3_config:max_transfer_bytes_per_sec() of
+        unlimited ->
+            #{rate => unlimited};
+        Rate ->
+            Opts = #{rate => Rate},
+            case rabbitmq_stream_s3_config:max_transfer_burst_bytes() of
+                undefined -> Opts;
+                Burst -> Opts#{burst => Burst}
+            end
+    end.
 
 pool_child(Id, Config) ->
     #{
