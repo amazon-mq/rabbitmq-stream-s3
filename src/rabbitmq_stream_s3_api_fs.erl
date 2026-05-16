@@ -23,7 +23,7 @@ associated file in that folder.
     stream_data/2,
     stream_finish/2,
     delete/2,
-    delete_prefix/2,
+    list/3,
     match_async/3,
     handle_async/3,
     cancel_async/2
@@ -165,19 +165,14 @@ delete(Keys, Opts) when is_list(Keys) andalso is_map(Opts) ->
         end
     end).
 
--spec delete_prefix(key(), rabbitmq_stream_s3_api:request_opts()) ->
-    {ok, map()} | {error, any()}.
-delete_prefix(Prefix, Opts) when is_binary(Prefix) andalso is_map(Opts) ->
-    Timeout = maps:get(timeout, Opts, 5000),
-    with_timeout(Timeout, fun() ->
-        Path = key_to_path(Prefix),
-        case file:del_dir_r(Path) of
-            ok ->
-                {ok, #{}};
-            {error, _} = Err ->
-                Err
-        end
-    end).
+list(Prefix, _Continuation, _Opts) when is_binary(Prefix) ->
+    Path = key_to_path(Prefix),
+    Keys = [
+        path_to_key(list_to_binary(F))
+     || F <- filelib:wildcard(binary_to_list(filename:join(Path, "**/*"))),
+        not filelib:is_dir(F)
+    ],
+    {ok, Keys, done}.
 
 -spec match_async(
     Msg :: term(),
@@ -278,11 +273,16 @@ set_data_dir(DataDir) ->
 data_dir() ->
     Dir = rabbitmq_stream_s3_config:api_fs_data_dir(),
     ?assertNotEqual(undefined, Dir),
-    Dir.
+    iolist_to_binary(Dir).
 
 -spec key_to_path(rabbitmq_stream_s3_api:key()) -> binary().
 key_to_path(Key) ->
     filename:join(data_dir(), Key).
+
+path_to_key(Path) ->
+    DataDir = data_dir(),
+    Len = byte_size(DataDir) + 1,
+    binary:part(iolist_to_binary(Path), Len, byte_size(iolist_to_binary(Path)) - Len).
 
 with_timeout(Timeout, Fun) ->
     Self = self(),

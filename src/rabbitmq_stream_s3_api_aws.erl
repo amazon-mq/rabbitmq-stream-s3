@@ -24,7 +24,6 @@ A wrapper around the AWS S3 HTTP API.
     stream_data/2,
     stream_finish/2,
     delete/2,
-    delete_prefix/2,
     list/3,
     match_async/3,
     handle_async/3,
@@ -92,11 +91,6 @@ Called "HTTP Verb" in S3 docs. "GET", "PUT", "HEAD", "POST", "DELETE", etc..
 %% Map keys must be lowercase.
 -type req_headers() :: #{binary() => binary()}.
 -type continuation_token() :: binary().
--type objects_metadata() :: #{
-    objects := non_neg_integer(),
-    total_size := non_neg_integer(),
-    pages := non_neg_integer()
-}.
 -type async_state() :: #{
     pool := ?GENERAL_POOL | ?UPLOAD_POOL,
     conn := pid(),
@@ -370,52 +364,12 @@ Because of the pagination this function is quite slow on prefixes where many
 many keys exist. So this function should only be used in the background - not
 ever blocking any other operation.
 """.
--spec delete_prefix(key(), request_opts()) ->
-    {ok, objects_metadata()} | {error, any()}.
-delete_prefix(Prefix, Opts) when is_binary(Prefix) andalso is_map(Opts) ->
-    delete_prefix(Prefix, Opts, undefined, 0, 0, 0).
-
-delete_prefix(Prefix, Opts, Token, Objects0, TotalSize0, Pages0) ->
-    case list(Prefix, Token, Opts) of
-        {ok, {[], 0, undefined}} ->
-            Meta = #{
-                objects => Objects0,
-                total_size => TotalSize0,
-                pages => Pages0
-            },
-            {ok, Meta};
-        {ok, {PageKeys, PageSize, NextToken}} ->
-            case delete(PageKeys, Opts) of
-                ok ->
-                    Objects = Objects0 + length(PageKeys),
-                    TotalSize = TotalSize0 + PageSize,
-                    Pages = Pages0 + 1,
-                    case NextToken of
-                        undefined ->
-                            Meta = #{
-                                objects => Objects,
-                                total_size => TotalSize,
-                                pages => Pages
-                            },
-                            {ok, Meta};
-                        _ ->
-                            delete_prefix(
-                                Prefix,
-                                Opts,
-                                NextToken,
-                                Objects,
-                                TotalSize,
-                                Pages
-                            )
-                    end;
-                {error, _} = Err ->
-                    Err
-            end;
-        {error, _} = Err ->
-            Err
-    end.
-
-list(Prefix, ContinuationToken, Opts) ->
+list(Prefix, Continuation, Opts) ->
+    ContinuationToken =
+        case Continuation of
+            start -> undefined;
+            _ -> Continuation
+        end,
     Params0 = [{<<"list-type">>, <<"2">>}, {<<"prefix">>, Prefix}],
     Params1 =
         case ContinuationToken of
@@ -427,7 +381,13 @@ list(Prefix, ContinuationToken, Opts) ->
     Params = uri_string:compose_query(Params1),
     case request(<<"GET">>, <<"/?", Params/binary>>, #{}, <<>>, Opts) of
         {ok, #{status := 200, body := Body}} ->
-            {ok, decode_list_bucket_result(Body)};
+            {Keys, _TotalSize, NextToken} = decode_list_bucket_result(Body),
+            Next =
+                case NextToken of
+                    undefined -> done;
+                    _ -> NextToken
+                end,
+            {ok, Keys, Next};
         {ok, #{status := Status} = Other} ->
             log_unexpected_status(?FUNCTION_NAME, Status),
             {error, Other};
