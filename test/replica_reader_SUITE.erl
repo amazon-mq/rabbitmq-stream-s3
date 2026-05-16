@@ -41,6 +41,8 @@ have a way to form a barrier. To assert the results of retention we use the
     start_cluster/3,
     start_cluster/4,
     flush_writer/1,
+    seed_log/2,
+    await_offset/2,
     list_fragment_offsets/1,
     list_segment_offsets/1,
     list_segment_offsets/2,
@@ -66,7 +68,8 @@ groups() ->
             range_advances_monotonically,
             retention_reclaims_uploaded_segments,
             resumes_after_restart,
-            large_record_cuts_immediately
+            large_record_cuts_immediately,
+            seed_log_uploads_deterministic
         ]},
         {with_replica, [], [
             replication_happy_path
@@ -154,7 +157,7 @@ uploads_fragments(Config) ->
     flush_writer(Writer),
 
     %% Barrier: wait for replica reader to upload past all written data.
-    ok = rabbitmq_stream_s3_test_helpers:await_offset(StreamId, 199),
+    ok = await_offset(StreamId, 199),
 
     %% Multiple fragments produced.
     Fragments = list_fragment_offsets(Config),
@@ -185,7 +188,7 @@ fragment_spans_segment_boundary(Config) ->
      || _ <- lists:seq(1, 12)
     ],
 
-    ok = rabbitmq_stream_s3_test_helpers:await_offset(StreamId, 8),
+    ok = await_offset(StreamId, 8),
 
     %% With one chunk per segment and a 1500-byte fragment target,
     %% each fragment must span multiple segments. Two fragments
@@ -205,7 +208,7 @@ range_advances_monotonically(Config) ->
         fun(_) -> osiris_writer:write(Writer, <<"monotonic range test data!!">>) end,
         lists:seq(1, 100)
     ),
-    ok = rabbitmq_stream_s3_test_helpers:await_offset(StreamId, 50),
+    ok = await_offset(StreamId, 50),
     {0, N1} = get_range(Config),
     ?assert(N1 >= 50),
 
@@ -213,7 +216,7 @@ range_advances_monotonically(Config) ->
         fun(_) -> osiris_writer:write(Writer, <<"monotonic range test data!!">>) end,
         lists:seq(1, 100)
     ),
-    ok = rabbitmq_stream_s3_test_helpers:await_offset(StreamId, 150),
+    ok = await_offset(StreamId, 150),
     {0, N2} = get_range(Config),
     ?assert(N2 > N1).
 
@@ -237,7 +240,7 @@ retention_reclaims_uploaded_segments(Config) ->
 
     %% Replica reader barrier: await fragment upload.
     CurrentSegment = lists:last(Segments),
-    rabbitmq_stream_s3_test_helpers:await_offset(StreamId, CurrentSegment),
+    await_offset(StreamId, CurrentSegment),
     Fragments = list_fragment_offsets(Config),
     ?assert(length(Fragments) > 1),
 
@@ -254,7 +257,7 @@ resumes_after_restart(Config) ->
         fun(_) -> osiris_writer:write(Writer1, <<"first generation data">>) end,
         lists:seq(1, 100)
     ),
-    ok = rabbitmq_stream_s3_test_helpers:await_offset(StreamId, 50),
+    ok = await_offset(StreamId, 50),
     {0, RangeAfterFirst} = get_range(Config),
     FragmentsAfterFirst = length(list_fragment_offsets(Config)),
 
@@ -266,7 +269,7 @@ resumes_after_restart(Config) ->
         fun(_) -> osiris_writer:write(Writer2, <<"second generation data">>) end,
         lists:seq(1, 100)
     ),
-    ok = rabbitmq_stream_s3_test_helpers:await_offset(StreamId, RangeAfterFirst + 50),
+    ok = await_offset(StreamId, RangeAfterFirst + 50),
 
     %% Range continued from where it was, not from 0.
     {0, RangeAfterSecond} = get_range(Config),
@@ -286,8 +289,38 @@ large_record_cuts_immediately(Config) ->
     flush_writer(Writer),
 
     %% One record, one chunk, one fragment.
-    ok = rabbitmq_stream_s3_test_helpers:await_offset(StreamId, 1),
+    ok = await_offset(StreamId, 1),
     ?assertEqual([0], list_fragment_offsets(Config)).
+
+seed_log_uploads_deterministic(Config) ->
+    %% Seed: 2 segments, 3 chunks each, 200 bytes payload per chunk.
+    %% Fragment target: 500 bytes.
+    %% Chunks 0+1+2 = 600 bytes >= 500 -> cut after chunk 2 (fragment at offset 0).
+    %% Chunks 3+4+5 = 600 bytes >= 500 -> cut after chunk 5 (fragment at offset 3).
+    %% Result: exactly 2 fragments at offsets [0, 3].
+    #{next_offset := NextOffset} = seed_log(Config, [
+        {segment, [
+            {chunk, #{size => 200}},
+            {chunk, #{size => 200}},
+            {chunk, #{size => 200}}
+        ]},
+        {segment, [
+            {chunk, #{size => 200}},
+            {chunk, #{size => 200}},
+            {chunk, #{size => 200}}
+        ]}
+    ]),
+
+    ?assertEqual(6, NextOffset),
+
+    Writer = start_writer(Config, #{}, #{fragment_target_size => 500}),
+    flush_writer(Writer),
+
+    ok = await_offset(Config, NextOffset),
+
+    ?assertEqual([0, 3], list_fragment_offsets(Config)),
+    {0, N} = get_range(Config),
+    ?assertEqual(6, N).
 
 replication_happy_path(Config) ->
     StreamId = ?config(stream_id, Config),
@@ -309,7 +342,7 @@ replication_happy_path(Config) ->
     end,
 
     %% Wait for upload on the writer node.
-    ok = rabbitmq_stream_s3_test_helpers:await_offset(StreamId, 5),
+    ok = await_offset(StreamId, 5),
 
     %% Replica's manifest cache reflects the upload (broadcast arrived).
     ?awaitMatch(

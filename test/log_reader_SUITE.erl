@@ -27,6 +27,7 @@ is the only source for old data.
     start_cluster/3,
     start_cluster/4,
     flush_writer/1,
+    seed_log/2,
     write_sequential/3,
     reader_config/2,
     read_all/1,
@@ -148,24 +149,31 @@ read_from_remote_first_large_filter(Config) ->
     assert_sequential(Records, N).
 
 read_across_fragment_boundaries(Config) ->
-    Writer = start_writer(Config, #{fragment_target_size => 500}),
+    %% 3 segments, one chunk each, 600 bytes payload, fragment target 500.
+    %% Each chunk exceeds the target so each becomes its own fragment.
+    %% Exactly 3 fragments at offsets [0, 10, 20].
+    %% Multiple segments allow retention to reclaim uploaded data.
+    #{next_offset := NextOffset} = seed_log(Config, [
+        {segment, [{chunk, #{records => 10, size => 600}}]},
+        {segment, [{chunk, #{records => 10, size => 600}}]},
+        {segment, [{chunk, #{records => 10, size => 600}}]}
+    ]),
 
-    N = 200,
-    write_sequential(Writer, N, 5),
+    Writer = start_writer(Config, #{}, #{fragment_target_size => 500}),
+    flush_writer(Writer),
+    await_offset(Config, NextOffset),
 
-    %% Verify multiple fragments were produced.
-    ?assert(length(list_fragment_offsets(Config)) >= 3),
+    ?assertEqual([0, 10, 20], list_fragment_offsets(Config)),
 
     ReaderCfg = reader_config(Writer, Config),
     #{shared := Shared} = ReaderCfg,
-    ?awaitMatch([S] when S > 0, list_segment_offsets(Config), 1000),
     ?awaitMatch(F when F > 0, osiris_log_shared:first_chunk_id(Shared), 1000),
 
     {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg),
     ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),
 
     Records = read_all(Reader0),
-    assert_sequential(Records, N).
+    assert_sequential(Records, NextOffset).
 
 read_from_remote_offset(Config) ->
     Writer = start_writer(Config, #{fragment_target_size => 500}),

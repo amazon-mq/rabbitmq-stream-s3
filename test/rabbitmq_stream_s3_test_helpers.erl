@@ -13,6 +13,143 @@ Shared test helpers for rabbitmq_stream_s3 CT suites.
 -compile([export_all, nowarn_export_all]).
 
 %% ------------------------------------------------------------------
+%% Log seeding DSL
+%% ------------------------------------------------------------------
+
+-type chunk_spec() :: {chunk, #{size := non_neg_integer(), records => non_neg_integer()}}.
+-type segment_spec() :: {segment, [chunk_spec()]}.
+-type log_metadata() :: #{
+    next_offset := non_neg_integer(),
+    total_size := non_neg_integer(),
+    segments := [
+        #{offset := non_neg_integer(), size := non_neg_integer(), num_chunks := non_neg_integer()}
+    ],
+    chunks := [
+        #{
+            offset := non_neg_integer(),
+            records := non_neg_integer(),
+            size := non_neg_integer(),
+            segment_offset := non_neg_integer()
+        }
+    ]
+}.
+
+-doc """
+Seed a local osiris log with deterministic chunk layout.
+
+Writes chunks directly via `osiris_log:write/5`, bypassing the writer
+process. Each `{chunk, #{size => S}}` becomes exactly one chunk on disk
+with `data_size = S`. Segment boundaries are explicit.
+
+Usage:
+
+    Meta = seed_log(Config, [
+        {segment, [
+            {chunk, #{size => 300}},
+            {chunk, #{size => 300}}
+        ]},
+        {segment, [
+            {chunk, #{size => 300}}
+        ]}
+    ])
+
+Returns metadata for use in assertions and barrier calls.
+""".
+-spec seed_log(ct_suite:ct_config(), [segment_spec()]) -> log_metadata().
+seed_log(Config, SegmentSpecs) ->
+    WriterCfg = ?config(writer_cfg, Config),
+    OsirisDir = ?config(osiris_dir, Config),
+    Name = maps:get(name, WriterCfg),
+    Dir = filename:join(OsirisDir, Name),
+    ok = filelib:ensure_path(Dir),
+    Shared = osiris_log_shared:new(),
+    seed_segments(Dir, Name, Shared, SegmentSpecs, 0, [], []).
+
+seed_segments(_Dir, _Name, _Shared, [], _Offset, SegAcc, ChunkAcc) ->
+    Chunks = ChunkAcc,
+    Segments = lists:reverse(SegAcc),
+    TotalSize = lists:sum([maps:get(size, C) || C <- Chunks]),
+    NextOffset =
+        case Chunks of
+            [] -> 0;
+            _ -> maps:get(offset, lists:last(Chunks)) + maps:get(records, lists:last(Chunks))
+        end,
+    #{
+        next_offset => NextOffset,
+        total_size => TotalSize,
+        segments => Segments,
+        chunks => Chunks
+    };
+seed_segments(Dir, Name, Shared, [{segment, ChunkSpecs} | Rest], Offset, SegAcc, ChunkAcc) ->
+    MaxSegSize =
+        case SegAcc of
+            [] -> 1_000_000_000;
+            _ -> 9
+        end,
+    LogCfg = #{
+        dir => Dir,
+        name => Name,
+        epoch => 1,
+        shared => Shared,
+        max_segment_size_bytes => MaxSegSize,
+        log_hooks => undefined,
+        readers_counter_fun => fun(_) -> ok end,
+        options => #{}
+    },
+    Log0 = osiris_log:init(LogCfg),
+    {Log1, NextOffset, SegChunks} = write_chunks(Log0, ChunkSpecs, Offset, []),
+    osiris_log:close(Log1),
+    SegSize = lists:sum([maps:get(size, C) || C <- SegChunks]),
+    SegMeta = #{offset => Offset, size => SegSize, num_chunks => length(SegChunks)},
+    seed_segments(Dir, Name, Shared, Rest, NextOffset, [SegMeta | SegAcc], ChunkAcc ++ SegChunks).
+
+write_chunks(Log, [], Offset, Acc) ->
+    {Log, Offset, lists:reverse(Acc)};
+write_chunks(Log0, [{chunk, Props} | Rest], Offset, Acc) ->
+    Size = maps:get(size, Props),
+    Records = maps:get(records, Props, 1),
+    Entries = make_entries(Offset, Records, Size),
+    Now = Offset * 10,
+    Log1 = osiris_log:write(Entries, Now, Log0),
+    ChunkMeta = #{
+        offset => Offset,
+        records => Records,
+        size => Size,
+        segment_offset => segment_offset_from_log(Log0)
+    },
+    write_chunks(Log1, Rest, Offset + Records, [ChunkMeta | Acc]).
+
+%% Generate N entries whose encoded data_size totals exactly Size bytes.
+%% Each entry is encoded as <<0:1, Len:31, Data/binary>> (4 + Len bytes).
+%% So total data_size = N * 4 + sum(payload lengths) = Size.
+%% We distribute payload evenly, with remainder on the last record.
+%% Entries are returned in reverse order as osiris_log:write/3 expects.
+make_entries(StartOffset, N, Size) ->
+    TotalPayload = Size - (N * 4),
+    BasePayload = TotalPayload div N,
+    Remainder = TotalPayload rem N,
+    lists:reverse([
+        make_record(StartOffset + I, BasePayload, I == N - 1, Remainder)
+     || I <- lists:seq(0, N - 1)
+    ]).
+
+make_record(Index, BaseSize, true = _IsLast, Remainder) ->
+    Pad = binary:copy(<<0>>, BaseSize + Remainder - 4),
+    <<Index:32, Pad/binary>>;
+make_record(Index, BaseSize, false, _Remainder) ->
+    Pad = binary:copy(<<0>>, max(0, BaseSize - 4)),
+    <<Index:32, Pad/binary>>.
+
+segment_offset_from_log(Log) ->
+    File = osiris_log:get_current_file(Log),
+    Bin =
+        if
+            is_list(File) -> list_to_binary(File);
+            true -> File
+        end,
+    rabbitmq_stream_s3:segment_file_offset(Bin).
+
+%% ------------------------------------------------------------------
 %% Manifest tree builder
 %% ------------------------------------------------------------------
 

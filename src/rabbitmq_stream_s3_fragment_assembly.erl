@@ -53,6 +53,9 @@ size threshold. Does not perform I/O.
     first_timestamp :: osiris:timestamp() | undefined,
     last_timestamp :: osiris:timestamp() | undefined,
     next_offset :: osiris:offset() | undefined,
+    %% Payload bytes accumulated (for cut decision).
+    payload_size = 0 :: non_neg_integer(),
+    %% On-disk bytes accumulated (for manifest size field).
     size = 0 :: non_neg_integer(),
     num_chunks = 0 :: non_neg_integer(),
     spans = [] :: [#span{}],
@@ -96,6 +99,7 @@ add_chunk(Chunk, #state{cut = false} = State0) ->
         chunk_id := ChunkId,
         timestamp := Ts,
         num_records := NumRecords,
+        data_size := DataSize,
         position := Pos,
         next_position := NextPos,
         segment_offset := SegOffset,
@@ -111,6 +115,7 @@ add_chunk(Chunk, #state{cut = false} = State0) ->
             _ ->
                 State0
         end,
+    PayloadSize = State1#state.payload_size + DataSize,
     Size = State1#state.size + (NextPos - Pos),
     NumChunks = State1#state.num_chunks + 1,
     Spans = update_spans(SegOffset, Pos, NextPos, State1#state.spans),
@@ -127,12 +132,13 @@ add_chunk(Chunk, #state{cut = false} = State0) ->
     State2 = State1#state{
         last_timestamp = Ts,
         next_offset = ChunkId + NumRecords,
+        payload_size = PayloadSize,
         size = Size,
         num_chunks = NumChunks,
         spans = Spans,
         chunks = Chunks
     },
-    case Size >= State2#state.target_size of
+    case PayloadSize >= State2#state.target_size of
         true -> State2#state{cut = true};
         false -> State2
     end.
@@ -148,6 +154,7 @@ info(#state{
     target_size = Target,
     first_offset = FirstOffset,
     next_offset = NextOffset,
+    payload_size = PayloadSize,
     size = Size,
     num_chunks = NumChunks,
     cut = Cut
@@ -156,6 +163,7 @@ info(#state{
         target_size => Target,
         first_offset => FirstOffset,
         next_offset => NextOffset,
+        payload_size => PayloadSize,
         size => Size,
         num_chunks => NumChunks,
         cut => Cut
