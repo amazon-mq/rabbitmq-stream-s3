@@ -7,19 +7,16 @@
 -export([start_link/0]).
 -export([init/1]).
 
--rabbit_boot_step(
-    {rabbitmq_stream_s3_infrastructure, [
-        {description, "rabbitmq_stream_s3 infrastructure"},
-        {mfa, {application, ensure_all_started, [rabbitmq_stream_s3]}},
-        {requires, kernel_ready},
-        {enables, core_initialized}
-    ]}
-).
-
 start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 init([]) ->
+    _ = seshat:new_group(rabbitmq_stream_s3),
+    ok = rabbitmq_stream_s3_api:init(),
+    application:set_env(osiris, log_hooks, rabbitmq_stream_s3_hooks),
+    application:set_env(osiris, log_reader, rabbitmq_stream_s3_log_reader),
+    catch rabbitmq_stream_s3_prometheus_collector:register(),
+    catch rabbitmq_stream_s3_db:setup(),
     rabbitmq_stream_s3_registry:init(),
     SupFlags = #{strategy => one_for_one, intensity => 3, period => 5},
     UploadPool = pool_child(rabbitmq_stream_s3_upload_pool, #{

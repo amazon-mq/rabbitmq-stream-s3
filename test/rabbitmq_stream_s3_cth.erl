@@ -47,13 +47,17 @@ pre_init_per_suite(_SuiteName, Config, State) ->
     application:set_env(osiris, data_dir, OsirisDir),
     application:set_env(osiris, replica_ip_address_family, inet),
 
-    %% Start the plugin (pulls in osiris, seshat, etc.).
-    {ok, _} = application:ensure_all_started(rabbitmq_stream_s3),
+    %% Start osiris and our supervisor directly.
+    %% We cannot use ensure_all_started(rabbitmq_stream_s3) because that would
+    %% pull in rabbit. The sup init handles all plugin setup (hooks, api, etc.).
+    {ok, _} = application:ensure_all_started(osiris),
+    {ok, SupPid} = rabbitmq_stream_s3_sup:start_link(),
+    unlink(SupPid),
 
     {[{osiris_dir, OsirisDir}, {remote_dir, RemoteDir} | Config], State}.
 
 post_end_per_suite(_SuiteName, _Config, Return, State) ->
-    _ = application:stop(rabbitmq_stream_s3),
+    catch exit(whereis(rabbitmq_stream_s3_sup), shutdown),
     _ = application:stop(osiris),
     {Return, State}.
 
@@ -85,7 +89,12 @@ setup_peer(Config) ->
     ]),
     ok = erpc:call(Node, rabbitmq_stream_s3_api_fs, set_data_dir, [?config(remote_dir, Config)]),
 
-    %% Start the plugin (pulls in osiris, seshat, hooks, manifest cache, registry).
-    {ok, _} = erpc:call(Node, application, ensure_all_started, [rabbitmq_stream_s3]),
+    %% Start osiris and our supervisor on the peer.
+    {ok, _} = erpc:call(Node, application, ensure_all_started, [osiris]),
+    {ok, _} = erpc:call(Node, fun() ->
+        {ok, Pid} = rabbitmq_stream_s3_sup:start_link(),
+        unlink(Pid),
+        {ok, Pid}
+    end),
 
     {Peer, Node}.
