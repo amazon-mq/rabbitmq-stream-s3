@@ -10,7 +10,7 @@
 -include_lib("amqp_client/include/amqp_client.hrl").
 -include_lib("amqp10_common/include/amqp10_framing.hrl").
 -include_lib("rabbitmq_ct_helpers/include/rabbit_assert.hrl").
--include("include/rabbitmq_stream_s3.hrl").
+-include("rabbitmq_stream_s3.hrl").
 
 all() ->
     [
@@ -21,6 +21,7 @@ all() ->
 groups() ->
     [
         {cluster_size_1, [], [
+            smoke_test,
             tiered_data_generation,
             read_from_remote_tier_by_offset,
             read_from_remote_tier_by_timestamp,
@@ -53,23 +54,22 @@ init_per_group_aux(Config, NodesCount) ->
         {rmq_nodes_clustered, false},
         {rmq_nodename_suffix, ?MODULE}
     ]),
-    % Configure Osiris to use S3 components and set the S3 API backend
+    % Configure the S3 API backend to use the filesystem with a small fragment target
     Config2 = rabbit_ct_helpers:merge_app_env(
         Config1,
         [
             {rabbitmq_stream_s3, [
                 {rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_fs},
+                {fragment_target_size, 1000},
                 {manifest_debounce_modifications, 1}
-            ]},
-            {rabbit, [
-                {max_message_size, 134217728}
             ]}
         ]
     ),
     rabbit_ct_helpers:run_setup_steps(
         Config2,
         rabbit_ct_broker_helpers:setup_steps() ++
-            rabbit_ct_client_helpers:setup_steps()
+            rabbit_ct_client_helpers:setup_steps() ++
+            [fun enable_stream_s3_plugin/1]
     ).
 
 end_per_group(_, Config) ->
@@ -104,18 +104,84 @@ end_per_testcase(Testcase, Config) ->
 %% Testcases
 %% -------------------------------------------------------------------
 
-tiered_data_generation(Config) ->
-    % Generate payloads
-    Payload1K = <<0:(1024 * 8)>>,
-    Payload64M = <<1:(64 * 1024 * 1024 * 8)>>,
-
-    % Open channel
+smoke_test(Config) ->
+    %% Verify plugin is running
+    {ok, _} = rabbit_ct_broker_helpers:rpc(
+        Config,
+        0,
+        application,
+        ensure_all_started,
+        [rabbitmq_stream_s3]
+    ),
+    %% Verify hooks are configured
+    {ok, rabbitmq_stream_s3_hooks} = rabbit_ct_broker_helpers:rpc(
+        Config,
+        0,
+        application,
+        get_env,
+        [osiris, log_hooks]
+    ),
+    %% Verify supervisor is alive
+    true = is_pid(
+        rabbit_ct_broker_helpers:rpc(
+            Config,
+            0,
+            erlang,
+            whereis,
+            [rabbitmq_stream_s3_sup]
+        )
+    ),
+    %% Create a stream and verify a replica reader starts
     Ch = rabbit_ct_client_helpers:open_channel(Config),
-    #'basic.qos_ok'{} = amqp_channel:call(Ch, #'basic.qos'{prefetch_count = 1}),
+    QName = <<"smoke_stream">>,
+    ?assertEqual(ok, stream_declare(Ch, QName)),
+    %% Publish one message to trigger writer init (and thus the hook)
+    ?assertEqual(
+        ok,
+        amqp_channel:call(
+            Ch,
+            #'basic.publish'{routing_key = QName},
+            #amqp_msg{payload = <<"hello">>}
+        )
+    ),
+    %% The replica reader should register
+    ?awaitMatch(
+        [{_, Pid}] when is_pid(Pid),
+        rabbit_ct_broker_helpers:rpc(
+            Config,
+            0,
+            ets,
+            tab2list,
+            [rabbitmq_stream_s3_registry]
+        ),
+        5000
+    ),
+    %% Check the replica reader state
+    [{_, ReplicaPid}] = rabbit_ct_broker_helpers:rpc(
+        Config,
+        0,
+        ets,
+        tab2list,
+        [rabbitmq_stream_s3_registry]
+    ),
+    State = rabbit_ct_broker_helpers:rpc(
+        Config,
+        0,
+        sys,
+        get_state,
+        [ReplicaPid]
+    ),
+    ct:pal("replica_reader state: ~p", [State]),
+    %% Cleanup
+    amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
+    rabbit_ct_client_helpers:close_channel(Ch),
+    ok.
 
+tiered_data_generation(Config) ->
+    Ch = rabbit_ct_client_helpers:open_channel(Config),
     QName = <<"stream_1">>,
 
-    % Should not be data for the stream we haven't declared yet
+    % No data before stream exists
     ?assertMatch(
         {error, not_found},
         rabbit_ct_broker_helpers:rpc(
@@ -127,46 +193,35 @@ tiered_data_generation(Config) ->
         )
     ),
 
-    % Create a stream.
+    % Create a stream and publish enough to exceed the 1000-byte fragment target
     ?assertEqual(ok, stream_declare(Ch, QName)),
-    ?assertEqual(
-        ok,
+    %% Verify hook is set
+    ?assertMatch(
+        {ok, rabbitmq_stream_s3_hooks},
+        rabbit_ct_broker_helpers:rpc(Config, 0, application, get_env, [osiris, log_hooks])
+    ),
+    Payload = crypto:strong_rand_bytes(600),
+    [
         amqp_channel:call(
             Ch,
             #'basic.publish'{routing_key = QName},
-            #amqp_msg{payload = Payload1K}
+            #amqp_msg{payload = Payload}
         )
-    ),
+     || _ <- lists:seq(1, 5)
+    ],
 
-    % Publishing a >= 64MB message triggers upload, since there is already a
-    % chunk (the 1KB one) in the stream.
-    ?assertEqual(
-        ok,
-        amqp_channel:call(
-            Ch,
-            #'basic.publish'{routing_key = QName},
-            #amqp_msg{payload = Payload64M}
-        )
-    ),
-
-    % One fragment should exist
+    %% Verify replica reader registered
     ?awaitMatch(
-        {ok, Manifest, [_Fragment]} when Manifest /= undefined,
-        rabbit_ct_broker_helpers:rpc(
-            Config,
-            0,
-            rabbitmq_stream_s3_api_fs,
-            get_stream_data,
-            [QName]
-        ),
-        500
+        [{_, _}],
+        rabbit_ct_broker_helpers:rpc(Config, 0, ets, tab2list, [rabbitmq_stream_s3_registry]),
+        2000
     ),
 
-    % If we delete the stream, the data in the tiered storage should eventually
-    % be cleared out.
-    amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
+    % A fragment should appear in the FS backend
+    await_fragment_upload(Config, QName, 5000),
 
-    % Wait for cleanup to complete
+    % Deleting the stream should clean up remote data
+    amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
     ?awaitMatch(
         {error, not_found},
         rabbit_ct_broker_helpers:rpc(
@@ -176,7 +231,7 @@ tiered_data_generation(Config) ->
             get_stream_data,
             [QName]
         ),
-        10000
+        5000
     ),
 
     rabbit_ct_client_helpers:close_channel(Ch),
@@ -225,7 +280,7 @@ prometheus_metrics(Config) ->
     URI = lists:flatten(io_lib:format("http://localhost:~b/metrics", [Port])),
     {ok, {{_, 200, _}, _, Body}} = httpc:request(get, {URI, []}, [], []),
 
-    % Verify seshat counters
+    % Verify seshat counters from rabbitmq_stream_s3_server
     ?assertMatch(
         match, re:run(Body, "^rabbitmq_stream_s3_active_tasks\\{", [{capture, none}, multiline])
     ),
@@ -481,7 +536,7 @@ read_from_remote_tier_by_offset(Config) ->
     ?awaitMatch(
         {0, _},
         rabbit_ct_broker_helpers:rpc(
-            Config, 0, rabbitmq_stream_s3_manifest_replica, get_range, [StreamId]
+            Config, 0, rabbitmq_stream_s3_server, get_range, [StreamId]
         ),
         5000
     ),
@@ -588,12 +643,12 @@ read_from_remote_tier_by_timestamp(Config) ->
     ?awaitMatch(
         {0, _},
         rabbit_ct_broker_helpers:rpc(
-            Config, 0, rabbitmq_stream_s3_manifest_replica, get_range, [StreamId]
+            Config, 0, rabbitmq_stream_s3_server, get_range, [StreamId]
         ),
         5000
     ),
     #manifest{next_offset = NextOffset, entries = Entries} = rabbit_ct_broker_helpers:rpc(
-        Config, 0, rabbitmq_stream_s3_manifest_replica, get_manifest, [StreamId]
+        Config, 0, rabbitmq_stream_s3_server, get_manifest, [StreamId]
     ),
     ct:pal(
         "Manifest next_offset=~p entries=~p",
@@ -615,7 +670,7 @@ read_from_remote_tier_by_timestamp(Config) ->
 
     ct:pal("Consuming from timestamp ~p (third message, remote tier)", [Timestamp3]),
     #manifest{next_offset = NextOffset3, entries = Entries3} = rabbit_ct_broker_helpers:rpc(
-        Config, 0, rabbitmq_stream_s3_manifest_replica, get_manifest, [StreamId]
+        Config, 0, rabbitmq_stream_s3_server, get_manifest, [StreamId]
     ),
     ct:pal(
         "Manifest at T3 subscription: next_offset=~p entries=~p",
@@ -763,3 +818,83 @@ get_stream_id(Config, QName) ->
     {ok, Q} = rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_amqqueue, lookup, [RName]),
     TypeState = rabbit_ct_broker_helpers:rpc(Config, 0, amqqueue, get_type_state, [Q]),
     list_to_binary(maps:get(name, TypeState)).
+
+enable_stream_s3_plugin(Config) ->
+    Nodes = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+    [
+        rabbit_ct_broker_helpers:enable_plugin(Config, N, rabbitmq_stream_s3)
+     || N <- lists:seq(0, length(Nodes) - 1)
+    ],
+    Config.
+
+await_fragment_upload(Config, QName, Timeout) ->
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    await_fragment_upload_loop(Config, QName, Deadline).
+
+await_fragment_upload_loop(Config, QName, Deadline) ->
+    case
+        rabbit_ct_broker_helpers:rpc(
+            Config,
+            0,
+            rabbitmq_stream_s3_api_fs,
+            get_stream_data,
+            [QName]
+        )
+    of
+        {ok, _Manifest, [_ | _]} = Result ->
+            Result;
+        Other ->
+            case erlang:monotonic_time(millisecond) >= Deadline of
+                true ->
+                    %% Timed out — dump replica reader state for diagnosis
+                    Registry = rabbit_ct_broker_helpers:rpc(
+                        Config,
+                        0,
+                        ets,
+                        tab2list,
+                        [rabbitmq_stream_s3_registry]
+                    ),
+                    ReaderState =
+                        case Registry of
+                            [{_, Pid}] ->
+                                Raw = rabbit_ct_broker_helpers:rpc(
+                                    Config, 0, sys, get_state, [Pid]
+                                ),
+                                rabbit_ct_broker_helpers:rpc(
+                                    Config,
+                                    0,
+                                    rabbitmq_stream_s3_replica_reader,
+                                    format_state,
+                                    [Raw]
+                                );
+                            _ ->
+                                no_reader_registered
+                        end,
+                    %% Get writer state to verify offset_listeners and committed_chunk_id
+                    WriterInfo =
+                        case Registry of
+                            [{_, RPid}] ->
+                                RawState = rabbit_ct_broker_helpers:rpc(
+                                    Config, 0, sys, get_state, [RPid]
+                                ),
+                                WrPid = element(4, element(2, RawState)),
+                                WrState = rabbit_ct_broker_helpers:rpc(
+                                    Config, 0, sys, get_state, [WrPid]
+                                ),
+                                #{writer_pid => WrPid, writer_state => WrState};
+                            _ ->
+                                no_writer
+                        end,
+                    ct:fail(
+                        "Fragment upload timed out.~n"
+                        "  get_stream_data: ~p~n"
+                        "  registry: ~p~n"
+                        "  reader_state: ~p~n"
+                        "  writer_info: ~p~n",
+                        [Other, Registry, ReaderState, WriterInfo]
+                    );
+                false ->
+                    timer:sleep(50),
+                    await_fragment_upload_loop(Config, QName, Deadline)
+            end
+    end.

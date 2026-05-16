@@ -17,6 +17,7 @@ replica nodes. Monitors the writer process and stops on writer DOWN.
 -include("include/rabbitmq_stream_s3.hrl").
 
 -export([start_link/1, await_offset/2, format_state/1]).
+-export([identity_formatter/1]).
 -export([
     init/1,
     handle_call/3,
@@ -33,8 +34,12 @@ replica nodes. Monitors the writer process and stops on writer DOWN.
     writer_pid :: pid(),
     shared :: atomics:atomics_ref(),
     counter :: counters:counters_ref(),
-    fragment_target_size :: non_neg_integer()
+    fragment_target_size :: non_neg_integer(),
+    reference :: term(),
+    epoch :: non_neg_integer()
 }).
+
+-define(OFFSET_FORMATTER, {?MODULE, identity_formatter, []}).
 
 -record(state, {
     cfg :: #cfg{},
@@ -67,7 +72,15 @@ await_offset(StreamId, Offset) ->
         1000
     ).
 
-init(#{stream := StreamId, writer_pid := WriterPid, dir := Dir} = Args) ->
+init(
+    #{
+        stream := StreamId,
+        writer_pid := WriterPid,
+        dir := Dir,
+        reference := Reference,
+        epoch := Epoch
+    } = Args
+) ->
     logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
     monitor(process, WriterPid),
     TargetSize = maps:get(
@@ -83,7 +96,9 @@ init(#{stream := StreamId, writer_pid := WriterPid, dir := Dir} = Args) ->
         writer_pid = WriterPid,
         shared = Shared,
         counter = maps:get(counter, Args),
-        fragment_target_size = TargetSize
+        fragment_target_size = TargetSize,
+        reference = Reference,
+        epoch = Epoch
     },
     {ok, #state{cfg = Cfg, manifest = #manifest{}}, {continue, resolve_manifest}}.
 
@@ -121,7 +136,8 @@ handle_continue(resolve_manifest, #state{cfg = #cfg{stream = StreamId}} = State0
     State = start_reading(State0#state{manifest = Manifest}),
     {noreply, State}.
 
-handle_info({osiris_offset, _Ref, _Offset}, #state{} = State0) ->
+handle_info({osiris_offset, _Ref, Offset}, #state{cfg = #cfg{stream = StreamId}} = State0) ->
+    ?LOG_DEBUG("~ts osiris_offset notification offset=~b", [StreamId, Offset]),
     State = drain(State0),
     {noreply, State};
 handle_info(retry_resolve, #state{cfg = #cfg{stream = StreamId}} = State0) ->
@@ -181,6 +197,10 @@ format_state(#state{
 %% ------------------------------------------------------------------
 %% Internal
 %% ------------------------------------------------------------------
+
+%% @doc Identity event formatter — overrides the writer's process-scoped
+%% formatter so offset notifications arrive as raw {osiris_offset, ...} messages.
+identity_formatter(Evt) -> Evt.
 
 -spec apply_upload(
     rabbitmq_stream_s3:uid(), rabbitmq_stream_s3_fragment_assembly:fragment_meta(), #state{}
@@ -313,7 +333,8 @@ start_reading(
     %% Writer barrier: ensures handle_continue has completed and the
     %% log is fully initialized before we open a data reader.
     _ = osiris_writer:query_replication_state(WriterPid),
-    osiris:register_offset_listener(WriterPid, StartOffset),
+    osiris:register_offset_listener(WriterPid, StartOffset, ?OFFSET_FORMATTER),
+    ?LOG_DEBUG("~ts start_reading start_offset=~b", [StreamId, StartOffset]),
     case osiris_writer:init_data_reader(WriterPid, {StartOffset, empty}, #{}) of
         {ok, Log} ->
             Assembly = rabbitmq_stream_s3_fragment_assembly:new(TargetSize),
@@ -377,8 +398,8 @@ drain(
             end;
         {end_of_stream, Log1} ->
             NextOffset = osiris_log:next_offset(Log1),
-            osiris:register_offset_listener(WriterPid, NextOffset),
-            osiris:register_offset_listener(WriterPid, NextOffset),
+            ?LOG_DEBUG("~ts drain end_of_stream next_offset=~b", [StreamId, NextOffset]),
+            osiris:register_offset_listener(WriterPid, NextOffset, ?OFFSET_FORMATTER),
             State#state{log = Log1, assembly = Assembly0};
         {error, Reason} ->
             ?LOG_ERROR("Read error for stream ~ts: ~p", [StreamId, Reason]),
