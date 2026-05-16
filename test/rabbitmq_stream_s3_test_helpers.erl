@@ -93,7 +93,8 @@ start_writer(Config, RemoteConfig) ->
 start_writer(Config, WriterOverrides, RemoteConfig) ->
     StreamId = ?config(stream_id, Config),
     WriterCfg0 = ?config(writer_cfg, Config),
-    WriterCfg = maps:merge(WriterCfg0, WriterOverrides#{remote_config => RemoteConfig}),
+    RemoteConfig1 = maps:merge(#{durable_commit_threshold => 1}, RemoteConfig),
+    WriterCfg = maps:merge(WriterCfg0, WriterOverrides#{remote_config => RemoteConfig1}),
     {ok, Writer} = osiris_writer:start(WriterCfg),
     flush_writer(Writer),
     ?assertMatch(
@@ -108,9 +109,10 @@ start_cluster(Config, ReplicaNodes, RemoteConfig) ->
 start_cluster(Config, ReplicaNodes, WriterOverrides, RemoteConfig) ->
     StreamId = ?config(stream_id, Config),
     WriterCfg0 = ?config(writer_cfg, Config),
+    RemoteConfig1 = maps:merge(#{durable_commit_threshold => 1}, RemoteConfig),
     ClusterCfg = maps:merge(WriterCfg0, WriterOverrides#{
         replica_nodes => ReplicaNodes,
-        remote_config => RemoteConfig
+        remote_config => RemoteConfig1
     }),
     {ok, #{leader_pid := Writer, replica_pids := ReplicaPids}} =
         osiris:start_cluster(ClusterCfg),
@@ -124,6 +126,46 @@ start_cluster(Config, ReplicaNodes, WriterOverrides, RemoteConfig) ->
 flush_writer(Writer) ->
     _ = osiris_writer:query_replication_state(Writer),
     ok.
+
+%% @doc Block until the remote replica reader has durably committed past `Offset`.
+%%
+%% `Offset` is an exclusive upper bound: `await_offset(StreamId, N)` returns
+%% when the durable `next_offset >= N`. This means all records with offsets
+%% 0..N-1 are in S3 and referenced by a committed manifest.
+%%
+%% Use this as the barrier between writing data and asserting on the remote
+%% tier. Do not assert on fragment count, segment count, or remote tier
+%% contents without calling this first.
+%%
+%% Accepts either a StreamId binary or a CT Config proplist as the first
+%% argument. The Config form provides better diagnostics on timeout.
+-spec await_offset(binary() | list(), osiris:offset()) -> ok.
+await_offset(StreamId, Offset) when is_binary(StreamId) ->
+    await_offset(StreamId, Offset, 1000);
+await_offset(Config, Offset) when is_list(Config) ->
+    StreamId = ?config(stream_id, Config),
+    try
+        await_offset(StreamId, Offset, 1000)
+    catch
+        exit:{timeout, _} ->
+            Name = {via, rabbitmq_stream_s3_registry, {StreamId, node()}},
+            State = rabbitmq_stream_s3_replica_reader:format_state(
+                sys:get_state(Name)
+            ),
+            ct:fail(
+                "await_offset timed out waiting for offset ~b.~n"
+                "  Replica reader: ~p",
+                [Offset, State]
+            )
+    end.
+
+-spec await_offset(stream_id(), osiris:offset(), timeout()) -> ok.
+await_offset(StreamId, Offset, Timeout) ->
+    ok = gen_server:call(
+        {via, rabbitmq_stream_s3_registry, {StreamId, node()}},
+        {await_offset, Offset},
+        Timeout
+    ).
 
 %% ------------------------------------------------------------------
 %% Write helpers
@@ -191,25 +233,6 @@ drain_iter(Iter, StartOffset, Acc) ->
 %% ------------------------------------------------------------------
 %% Barrier helpers
 %% ------------------------------------------------------------------
-
-%% Wait for the replica reader to upload through the given offset.
-%% On timeout, reports the replica reader's formatted state for debugging.
-await_offset(Config, Offset) ->
-    StreamId = ?config(stream_id, Config),
-    try
-        rabbitmq_stream_s3_replica_reader:await_offset(StreamId, Offset)
-    catch
-        exit:{timeout, _} ->
-            Name = {via, rabbitmq_stream_s3_registry, {StreamId, node()}},
-            State = rabbitmq_stream_s3_replica_reader:format_state(
-                sys:get_state(Name)
-            ),
-            ct:fail(
-                "await_offset timed out waiting for offset ~b.~n"
-                "  Replica reader: ~p",
-                [Offset, State]
-            )
-    end.
 
 %% ------------------------------------------------------------------
 %% Inspection helpers

@@ -6,8 +6,8 @@
 Per-stream gen_server owning the upload lifecycle.
 
 Reads committed chunks from the local log, assembles fragments,
-uploads them to S3, updates the manifest, and broadcasts edits to
-replica nodes. Monitors the writer process and stops on writer DOWN.
+submits them to the governor for transfer, and executes effects
+returned by the functional core module.
 """.
 
 -behaviour(gen_server).
@@ -16,7 +16,7 @@ replica nodes. Monitors the writer process and stops on writer DOWN.
 -include("include/logging.hrl").
 -include("include/rabbitmq_stream_s3.hrl").
 
--export([start_link/1, await_offset/2, format_state/1]).
+-export([start_link/1, format_state/1]).
 -export([identity_formatter/1]).
 -export([
     init/1,
@@ -40,17 +40,25 @@ replica nodes. Monitors the writer process and stops on writer DOWN.
 }).
 
 -define(OFFSET_FORMATTER, {?MODULE, identity_formatter, []}).
+%% Once Osiris supports `identity` as an atom argument to
+%% `register_offset_listener/3` (i.e. a `wrap_osiris_event(identity, Evt) ->
+%% Evt;` clause in osiris_writer), we can replace ?OFFSET_FORMATTER with the
+%% atom `identity` and drop the identity_formatter export. Change is on the
+%% Osiris-upstream wishlist.
 
 -record(state, {
     cfg :: #cfg{},
+    %% The remote replica reader configuration map.
+    config :: map(),
     %% Set after manifest resolve + data reader open.
     log :: osiris_log:state() | undefined,
     assembly :: rabbitmq_stream_s3_fragment_assembly:state() | undefined,
-    manifest :: #manifest{},
+    %% Functional core state.
+    core :: rabbitmq_stream_s3_replica_reader_core:state(),
     %% Nodes registered for manifest broadcast.
     replicas = #{} :: #{node() => reference()},
-    %% Callers blocked until next_offset passes their requested offset.
-    waiters = [] :: [{osiris:offset(), gen_server:from()}]
+    %% Commit timer reference.
+    commit_timer :: reference() | undefined
 }).
 
 -doc "Start a remote replica reader for the given stream.".
@@ -61,15 +69,6 @@ start_link(#{stream := StreamId} = Args) ->
         ?MODULE,
         Args,
         []
-    ).
-
--doc "Block until the replica reader has uploaded past `Offset`.".
--spec await_offset(stream_id(), osiris:offset()) -> ok | {error, stopped}.
-await_offset(StreamId, Offset) ->
-    gen_server:call(
-        {via, rabbitmq_stream_s3_registry, {StreamId, node()}},
-        {await_offset, Offset},
-        1000
     ).
 
 init(
@@ -100,28 +99,24 @@ init(
         reference = Reference,
         epoch = Epoch
     },
-    {ok, #state{cfg = Cfg, manifest = #manifest{}}, {continue, resolve_manifest}}.
+    {ok, #state{cfg = Cfg, config = Args, core = undefined}, {continue, resolve_manifest}}.
 
-handle_call({await_offset, Offset}, From, #state{manifest = Manifest} = State) ->
-    case Manifest#manifest.next_offset >= Offset of
-        true ->
-            {reply, ok, State};
-        false ->
-            {noreply, State#state{waiters = [{Offset, From} | State#state.waiters]}}
-    end;
+handle_call({await_offset, Offset}, From, #state{core = Core0} = State) ->
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:await_offset(Offset, From, Core0),
+    {noreply, execute_effects(Effects, State#state{core = Core})};
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown}, State}.
 
 handle_cast(
     {register_acceptor, Node},
-    #state{replicas = Replicas, manifest = Manifest, cfg = #cfg{stream = StreamId}} = State
+    #state{replicas = Replicas, core = Core, cfg = #cfg{stream = StreamId}} = State
 ) ->
     case maps:is_key(Node, Replicas) of
         true ->
             {noreply, State};
         false ->
             MonRef = monitor(process, {rabbitmq_stream_s3_manifest_replica, Node}),
-            %% Send current manifest to the new replica.
+            Manifest = core_manifest(Core),
             rabbitmq_stream_s3_manifest_replica:put_manifest(StreamId, Manifest, Node),
             {noreply, State#state{replicas = Replicas#{Node => MonRef}}}
     end;
@@ -133,7 +128,8 @@ handle_cast(_Msg, State) ->
 
 handle_continue(resolve_manifest, #state{cfg = #cfg{stream = StreamId}} = State0) ->
     Manifest = resolve_manifest(StreamId),
-    State = start_reading(State0#state{manifest = Manifest}),
+    {Core, _Effects} = rabbitmq_stream_s3_replica_reader_core:init(Manifest, State0#state.config),
+    State = start_reading(State0#state{core = Core}),
     {noreply, State}.
 
 handle_info({osiris_offset, _Ref, Offset}, #state{cfg = #cfg{stream = StreamId}} = State0) ->
@@ -142,8 +138,26 @@ handle_info({osiris_offset, _Ref, Offset}, #state{cfg = #cfg{stream = StreamId}}
     {noreply, State};
 handle_info(retry_resolve, #state{cfg = #cfg{stream = StreamId}} = State0) ->
     Manifest = resolve_manifest(StreamId),
-    State = start_reading(State0#state{manifest = Manifest}),
+    {Core, _} = rabbitmq_stream_s3_replica_reader_core:init(Manifest, State0#state.config),
+    State = start_reading(State0#state{core = Core}),
     {noreply, State};
+handle_info({transfer_result, Ref, {ok, Uid}}, #state{core = Core0, cfg = Cfg} = State0) ->
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_complete(Ref, Uid, Core0),
+    State1 = State0#state{core = Core},
+    %% Update the manifest cache before executing effects so that
+    %% reply_waiters callers see the updated range immediately.
+    ok = rabbitmq_stream_s3_manifest_replica:put_manifest(
+        Cfg#cfg.stream, core_manifest(Core)
+    ),
+    State2 = execute_effects(Effects, State1),
+    {noreply, State2};
+handle_info({transfer_result, Ref, {error, Reason}}, #state{core = Core0} = State0) ->
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(Ref, Reason, Core0),
+    {noreply, execute_effects(Effects, State0#state{core = Core})};
+handle_info(commit_timer, #state{core = Core0} = State0) ->
+    Now = erlang:system_time(millisecond),
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:tick(Now, Core0),
+    {noreply, execute_effects(Effects, State0#state{core = Core, commit_timer = undefined})};
 handle_info(
     {'DOWN', _Mon, process, Pid, _Reason},
     #state{cfg = #cfg{writer_pid = Pid, stream = StreamId}} = State
@@ -161,8 +175,7 @@ handle_info(
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(_Reason, #state{cfg = #cfg{stream = StreamId}, waiters = Waiters}) ->
-    [gen_server:reply(From, {error, stopped}) || {_Offset, From} <- Waiters],
+terminate(_Reason, #state{cfg = #cfg{stream = StreamId}}) ->
     rabbitmq_stream_s3_registry:unregister_name({StreamId, node()}),
     ok.
 
@@ -173,14 +186,16 @@ format_state(#state{
     cfg = #cfg{stream = StreamId, fragment_target_size = Target},
     log = Log,
     assembly = Assembly,
-    manifest = Manifest,
-    waiters = Waiters
+    core = Core
 }) ->
     #{
         stream => StreamId,
         fragment_target_size => Target,
-        manifest_next_offset => Manifest#manifest.next_offset,
-        manifest_entries => byte_size(Manifest#manifest.entries) div ?ENTRY_B,
+        manifest_next_offset =>
+            case Core of
+                undefined -> undefined;
+                _ -> (core_manifest(Core))#manifest.next_offset
+            end,
         log_next_offset =>
             case Log of
                 undefined -> undefined;
@@ -190,64 +205,98 @@ format_state(#state{
             case Assembly of
                 undefined -> undefined;
                 _ -> rabbitmq_stream_s3_fragment_assembly:info(Assembly)
-            end,
-        waiters => [Offset || {Offset, _From} <- Waiters]
+            end
     }.
 
 %% ------------------------------------------------------------------
 %% Internal
 %% ------------------------------------------------------------------
 
-%% @doc Identity event formatter — overrides the writer's process-scoped
-%% formatter so offset notifications arrive as raw {osiris_offset, ...} messages.
 identity_formatter(Evt) -> Evt.
 
--spec apply_upload(
-    rabbitmq_stream_s3:uid(), rabbitmq_stream_s3_fragment_assembly:fragment_meta(), #state{}
-) -> #state{}.
-apply_upload(Uid, Meta, #state{cfg = #cfg{stream = StreamId}, manifest = Manifest0} = State) ->
-    #{
-        first_offset := FirstOffset,
-        first_timestamp := FirstTs,
-        last_timestamp := LastTs,
-        next_offset := NextOffset,
-        size := Size
-    } = Meta,
-    Entry = ?ENTRY(FirstOffset, FirstTs, LastTs, ?MANIFEST_KIND_FRAGMENT, Size, Uid),
-    Edit = #edit{
-        first_offset = Manifest0#manifest.first_offset,
-        first_timestamp = Manifest0#manifest.first_timestamp,
-        first_last_timestamp = Manifest0#manifest.first_last_timestamp,
-        next_offset = NextOffset,
-        size = Size,
-        entries = Entry,
-        pos = byte_size(Manifest0#manifest.entries),
-        len = 0
-    },
-    %% For the very first fragment, set the manifest's first_* fields.
-    Edit1 =
-        case Manifest0#manifest.next_offset of
-            0 ->
-                Edit#edit{
-                    first_offset = FirstOffset,
-                    first_timestamp = FirstTs,
-                    first_last_timestamp = LastTs
-                };
-            _ ->
-                Edit
-        end,
-    Manifest = rabbitmq_stream_s3_manifest:apply_edit(Edit1, Manifest0),
-    ok = rabbitmq_stream_s3_manifest_replica:put_manifest(StreamId, Manifest),
-    broadcast_edit(StreamId, Edit1, State),
-    maybe_evaluate_retention(Manifest0, Manifest, State),
-    notify_waiters(State#state{manifest = Manifest}).
+%% ------------------------------------------------------------------
+%% Effect execution
+%% ------------------------------------------------------------------
 
-%% Kick retention evaluation when the uploaded range advances.
-%% This allows osiris to reclaim fully-uploaded segments without
-%% waiting for the next segment roll.
--spec maybe_evaluate_retention(#manifest{}, #manifest{}, #state{}) -> ok.
-maybe_evaluate_retention(OldManifest, NewManifest, #state{cfg = Cfg}) ->
-    case NewManifest#manifest.next_offset > OldManifest#manifest.next_offset of
+-spec execute_effects([rabbitmq_stream_s3_replica_reader_core:core_effect()], #state{}) -> #state{}.
+execute_effects([], State) ->
+    State;
+execute_effects([Effect | Rest], State0) ->
+    State = execute_effect(Effect, State0),
+    execute_effects(Rest, State).
+
+execute_effect({submit_transfer, Ref, _StreamId, Dir, Meta}, #state{cfg = Cfg} = State) ->
+    StreamId = Cfg#cfg.stream,
+    Size = maps:get(size, Meta),
+    Self = self(),
+    Fun = fun() ->
+        case upload_fragment(Dir, StreamId, Meta) of
+            {ok, Uid} -> {ok, Uid};
+            {error, _} = Err -> Err
+        end
+    end,
+    rabbitmq_stream_s3_governor:submit(Fun, Size, Self, Ref),
+    State;
+execute_effect({resubmit_transfer, Ref, _StreamId, Dir, Meta}, #state{cfg = Cfg} = State) ->
+    StreamId = Cfg#cfg.stream,
+    Size = maps:get(size, Meta),
+    Self = self(),
+    Fun = fun() ->
+        case upload_fragment(Dir, StreamId, Meta) of
+            {ok, Uid} -> {ok, Uid};
+            {error, _} = Err -> Err
+        end
+    end,
+    rabbitmq_stream_s3_governor:submit(Fun, Size, Self, Ref),
+    State;
+execute_effect(
+    {start_commit, _Manifest, _Epoch, _Reference, _Revision, _Edits}, #state{core = Core0} = State
+) ->
+    %% For now, complete the commit immediately (no Khepri).
+    %% TODO: wire Khepri conditional write here.
+    Revision = (core_manifest(Core0))#manifest.revision + 1,
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:commit_complete(Revision, Core0),
+    execute_effects(Effects, State#state{core = Core});
+execute_effect({update_range, _FirstOffset, _NextOffset}, #state{cfg = Cfg, core = Core} = State) ->
+    Manifest = core_manifest(Core),
+    ok = rabbitmq_stream_s3_manifest_replica:put_manifest(Cfg#cfg.stream, Manifest),
+    State;
+execute_effect({broadcast, StreamId, Edits}, #state{replicas = Replicas} = State) ->
+    maps:foreach(
+        fun(Node, _MonRef) ->
+            [rabbitmq_stream_s3_manifest_replica:apply_edit(StreamId, Edit, Node) || Edit <- Edits]
+        end,
+        Replicas
+    ),
+    State;
+execute_effect({evaluate_retention, _StreamId, _Dir}, #state{core = Core} = State) ->
+    maybe_evaluate_retention(core_manifest(Core), State),
+    State;
+execute_effect({reply_waiters, Replies}, State) ->
+    [gen_server:reply(From, Reply) || {From, Reply} <- Replies],
+    State;
+execute_effect({start_commit_timer, Ms}, #state{commit_timer = OldRef} = State) ->
+    cancel_timer(OldRef),
+    Ref = erlang:send_after(Ms, self(), commit_timer),
+    State#state{commit_timer = Ref};
+execute_effect({cancel_commit_timer}, #state{commit_timer = Ref} = State) ->
+    cancel_timer(Ref),
+    State#state{commit_timer = undefined};
+execute_effect({reinitialize}, #state{cfg = Cfg} = State) ->
+    ?LOG_WARNING("Commit conflict, re-resolving manifest for ~ts", [Cfg#cfg.stream]),
+    erlang:send_after(0, self(), retry_resolve),
+    State.
+
+cancel_timer(undefined) -> ok;
+cancel_timer(Ref) -> erlang:cancel_timer(Ref).
+
+%% ------------------------------------------------------------------
+%% Retention
+%% ------------------------------------------------------------------
+
+-spec maybe_evaluate_retention(#manifest{}, #state{}) -> ok.
+maybe_evaluate_retention(Manifest, #state{cfg = Cfg}) ->
+    case Manifest#manifest.next_offset > 0 of
         true ->
             #cfg{stream = StreamId, dir = Dir, shared = Shared, counter = Cnt} = Cfg,
             Spec = [{'fun', rabbitmq_stream_s3_hooks:local_retention_fun(StreamId)}],
@@ -267,24 +316,18 @@ update_counter(Cnt, FstOff, NumSegLeft) ->
     counters:put(Cnt, ?C_OSIRIS_LOG_FIRST_OFFSET, FstOff),
     counters:put(Cnt, ?C_OSIRIS_LOG_SEGMENTS, NumSegLeft).
 
--spec notify_waiters(#state{}) -> #state{}.
-notify_waiters(#state{manifest = Manifest, waiters = Waiters} = State) ->
-    NextOffset = Manifest#manifest.next_offset,
-    {Satisfied, Remaining} = lists:partition(
-        fun({Offset, _From}) -> NextOffset >= Offset end,
-        Waiters
-    ),
-    [gen_server:reply(From, ok) || {_Offset, From} <- Satisfied],
-    State#state{waiters = Remaining}.
+%% ------------------------------------------------------------------
+%% Manifest access
+%% ------------------------------------------------------------------
 
--spec broadcast_edit(stream_id(), #edit{}, #state{}) -> ok.
-broadcast_edit(StreamId, Edit, #state{replicas = Replicas}) ->
-    maps:foreach(
-        fun(Node, _MonRef) ->
-            rabbitmq_stream_s3_manifest_replica:apply_edit(StreamId, Edit, Node)
-        end,
-        Replicas
-    ).
+-spec core_manifest(rabbitmq_stream_s3_replica_reader_core:state()) -> #manifest{}.
+core_manifest(Core) ->
+    %% #state{cfg, manifest, ...} - manifest is element 3.
+    element(3, Core).
+
+%% ------------------------------------------------------------------
+%% Reading
+%% ------------------------------------------------------------------
 
 -spec resolve_manifest(stream_id()) -> #manifest{}.
 resolve_manifest(StreamId) ->
@@ -321,17 +364,12 @@ parse_manifest_root(?MANIFEST(FirstOffset, NextOffset, FirstTs, FirstLastTs, Tot
 start_reading(
     #state{
         cfg = #cfg{
-            writer_pid = WriterPid,
-            fragment_target_size = TargetSize,
-            stream = StreamId,
-            dir = _CfgDir
-        },
-        manifest = Manifest
+            writer_pid = WriterPid
+        }
     } = State
 ) ->
+    Manifest = core_manifest(Core),
     StartOffset = Manifest#manifest.next_offset,
-    %% Writer barrier: ensures handle_continue has completed and the
-    %% log is fully initialized before we open a data reader.
     _ = osiris_writer:query_replication_state(WriterPid),
     osiris:register_offset_listener(WriterPid, StartOffset, ?OFFSET_FORMATTER),
     ?LOG_DEBUG("~ts start_reading start_offset=~b", [StreamId, StartOffset]),
@@ -355,12 +393,12 @@ drain(
     #state{
         cfg = #cfg{
             stream = StreamId,
-            dir = Dir,
             writer_pid = WriterPid,
             fragment_target_size = TargetSize
         },
         log = Log0,
-        assembly = Assembly0
+        assembly = Assembly0,
+        core = Core0
     } = State
 ) ->
     case osiris_log:read_header(Log0) of
@@ -380,19 +418,17 @@ drain(
             Assembly1 = rabbitmq_stream_s3_fragment_assembly:add_chunk(Chunk, Assembly0),
             case rabbitmq_stream_s3_fragment_assembly:is_cut(Assembly1) of
                 true ->
-                    State1 =
-                        case upload_fragment(Dir, StreamId, Assembly1) of
-                            {ok, Uid, Meta} ->
-                                apply_upload(Uid, Meta, State);
-                            {error, Reason} ->
-                                ?LOG_ERROR(
-                                    "Fragment upload failed for stream ~ts: ~p",
-                                    [StreamId, Reason]
-                                ),
-                                State
-                        end,
+                    Meta = rabbitmq_stream_s3_fragment_assembly:metadata(Assembly1),
+                    IdxRecords = rabbitmq_stream_s3_fragment_assembly:index_records(Assembly1),
+                    {Core, _Ref, Effects} =
+                        rabbitmq_stream_s3_replica_reader_core:fragment_cut(
+                            Meta#{index_records => IdxRecords}, Core0
+                        ),
                     Assembly2 = rabbitmq_stream_s3_fragment_assembly:new(TargetSize),
-                    drain(State1#state{log = Log1, assembly = Assembly2});
+                    State1 = execute_effects(
+                        Effects, State#state{log = Log1, assembly = Assembly2, core = Core}
+                    ),
+                    drain(State1);
                 false ->
                     drain(State#state{log = Log1, assembly = Assembly1})
             end;
@@ -407,18 +443,18 @@ drain(
     end.
 
 %% ------------------------------------------------------------------
-%% Upload
+%% Upload (executed inside governor task)
 %% ------------------------------------------------------------------
 
 %% 4 MiB
 -define(READ_BUFFER_SIZE, 4_194_304).
 
--spec upload_fragment(directory(), stream_id(), rabbitmq_stream_s3_fragment_assembly:state()) ->
-    {ok, rabbitmq_stream_s3:uid(), rabbitmq_stream_s3_fragment_assembly:fragment_meta()}
-    | {error, term()}.
-upload_fragment(Dir, StreamId, Assembly) ->
+-spec upload_fragment(
+    directory(), stream_id(), rabbitmq_stream_s3_fragment_assembly:fragment_meta()
+) ->
+    {ok, rabbitmq_stream_s3:uid()} | {error, term()}.
+upload_fragment(Dir, StreamId, Meta) ->
     Uid = rabbitmq_stream_s3:uid(),
-    Meta = rabbitmq_stream_s3_fragment_assembly:metadata(Assembly),
     Spans = maps:get(spans, Meta),
     Size = maps:get(size, Meta),
     NumChunks = maps:get(num_chunks, Meta),
@@ -433,13 +469,12 @@ upload_fragment(Dir, StreamId, Assembly) ->
         Header = <<"OSIF", ?FRAGMENT_VERSION:32/unsigned>>,
         Stream1 = rabbitmq_stream_s3_api:stream_data(Stream0, Header),
         Crc0 = erlang:crc32(Header),
-        %% TODO: per-chunk CRC validation during streaming
         {ok, Stream2, Crc1} ?= stream_spans(Stream1, Crc0, Dir, Spans),
-        IdxRecords = rabbitmq_stream_s3_fragment_assembly:index_records(Assembly),
+        IdxRecords = maps:get(index_records, Meta),
         Stream3 = rabbitmq_stream_s3_api:stream_data(Stream2, IdxRecords),
         Crc = erlang:crc32(Crc1, IdxRecords),
         ok ?= rabbitmq_stream_s3_api:stream_finish(Stream3, Crc),
-        {ok, Uid, Meta}
+        {ok, Uid}
     end.
 
 stream_spans(Stream, Crc, _Dir, []) ->
