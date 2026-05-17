@@ -226,7 +226,7 @@ when
     Manifest :: file:filename() | undefined,
     FragmentFile :: file:filename().
 get_stream_data(StreamName0) ->
-    DataDir = data_dir(),
+    DataDir = binary_to_list(data_dir()),
     StreamNameWildcard = binary_to_list(<<"*", StreamName0/binary, "*">>),
     case filelib:wildcard(filename:join([DataDir, "**", StreamNameWildcard])) of
         [] ->
@@ -256,7 +256,10 @@ get_stream_data(StreamName0) ->
 list_fragments(StreamName) ->
     case get_stream_data(StreamName) of
         {ok, _Manifest, Fragments} ->
-            lists:sort([binary_to_integer(filename:basename(F, <<".fragment">>)) || F <- Fragments]);
+            lists:sort([
+                list_to_integer(filename:basename(F, ".fragment"))
+             || F <- Fragments
+            ]);
         _ ->
             []
     end.
@@ -269,6 +272,11 @@ clear() ->
 set_data_dir(DataDir) ->
     application:set_env(rabbitmq_stream_s3, api_fs_data_dir, DataDir).
 
+-doc """
+Returns the data directory as a binary. `filelib:wildcard/1` only accepts
+strings, so callers that list files must convert with `binary_to_list/1`.
+`path_to_key/1` expects binary input.
+""".
 -spec data_dir() -> file:filename_all().
 data_dir() ->
     Dir = rabbitmq_stream_s3_config:api_fs_data_dir(),
