@@ -229,6 +229,29 @@ format_state(#state{
 
 identity_formatter(Evt) -> Evt.
 
+delete_manifest_objects(StreamId, Manifest) ->
+    spawn(fun() ->
+        GetGroupFun = fun(GroupRef) ->
+            Key = rabbitmq_stream_s3:group_key(StreamId, GroupRef),
+            case rabbitmq_stream_s3_api:get(Key) of
+                {ok, Data} -> {ok, Data};
+                {error, _} = Err -> Err
+            end
+        end,
+        Refs = rabbitmq_stream_s3_fragment_iterator:all_refs(Manifest, GetGroupFun),
+        Keys = lists:map(
+            fun
+                (#fragment_ref{offset = Offset, uid = Uid}) ->
+                    rabbitmq_stream_s3:fragment_key(StreamId, Offset, Uid);
+                (#group_ref{} = GroupRef) ->
+                    rabbitmq_stream_s3:group_key(StreamId, GroupRef)
+            end,
+            Refs
+        ),
+        rabbitmq_stream_s3_reaper:delete_objects(StreamId, Keys)
+    end),
+    ok.
+
 %% ------------------------------------------------------------------
 %% Effect execution
 %% ------------------------------------------------------------------
@@ -388,14 +411,39 @@ start_reading(
     _ = osiris_writer:query_replication_state(WriterPid),
     osiris:register_offset_listener(WriterPid, StartOffset, ?OFFSET_FORMATTER),
     ?LOG_DEBUG("~ts start_reading start_offset=~b", [StreamId, StartOffset]),
-    case osiris_writer:init_data_reader(WriterPid, {StartOffset, empty}, #{}) of
+    try osiris_writer:init_data_reader(WriterPid, {StartOffset, empty}, #{}) of
         {ok, Log} ->
             Assembly = rabbitmq_stream_s3_fragment_assembly:new(TargetSize),
             drain(State#state{log = Log, assembly = Assembly});
+        {error, {offset_out_of_range, {LocalFirst, _}}} when LocalFirst > StartOffset ->
+            %% Local retention deleted data the remote tier never received.
+            %% Discard the remote manifest (the data would have been retained
+            %% there too) and restart from the local log's first offset.
+            ?LOG_INFO(
+                "~ts local log ahead of manifest "
+                "(local_first=~b, manifest_next=~b). "
+                "Discarding remote manifest and restarting.",
+                [StreamId, LocalFirst, StartOffset]
+            ),
+            delete_manifest_objects(StreamId, Manifest),
+            FreshManifest = #manifest{next_offset = LocalFirst},
+            {Core1, _} = rabbitmq_stream_s3_replica_reader_core:init(
+                FreshManifest, State#state.config
+            ),
+            ok = rabbitmq_stream_s3_manifest_replica:put_manifest(StreamId, FreshManifest),
+            start_reading(State#state{core = Core1});
         {error, Reason} ->
             ?LOG_WARNING(
                 "Failed to open data reader for stream ~ts: ~p",
                 [StreamId, Reason]
+            ),
+            erlang:send_after(1000, self(), retry_resolve),
+            State
+    catch
+        missing_file ->
+            ?LOG_WARNING(
+                "Segment file missing for stream ~ts, retrying",
+                [StreamId]
             ),
             erlang:send_after(1000, self(), retry_resolve),
             State

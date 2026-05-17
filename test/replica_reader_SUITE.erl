@@ -69,7 +69,8 @@ groups() ->
             retention_reclaims_uploaded_segments,
             resumes_after_restart,
             large_record_cuts_immediately,
-            seed_log_uploads_deterministic
+            seed_log_uploads_deterministic,
+            local_ahead_discards_manifest
         ]},
         {with_replica, [], [
             replication_happy_path
@@ -321,6 +322,75 @@ seed_log_uploads_deterministic(Config) ->
     ?assertEqual([0, 3], list_fragment_offsets(Config)),
     {0, N} = get_range(Config),
     ?assertEqual(6, N).
+
+local_ahead_discards_manifest(Config) ->
+    StreamId = ?config(stream_id, Config),
+
+    %% Phase 1: seed, upload, confirm fragments exist.
+    #{next_offset := N1} = seed_log(Config, [
+        {segment, [{chunk, #{records => 10, size => 600}}]},
+        {segment, [{chunk, #{records => 10, size => 600}}]}
+    ]),
+    Writer = start_writer(
+        Config, #{max_segment_size_bytes => 5000, retention => [{max_bytes, 10000}]}, #{
+            fragment_target_size => 500
+        }
+    ),
+    flush_writer(Writer),
+    await_offset(Config, N1),
+    OldFragments = list_fragment_offsets(Config),
+    ?assert(length(OldFragments) > 0),
+
+    %% Phase 2: stop replica reader, write until retention deletes old segments.
+    ReaderPid = rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}),
+    ok = rabbitmq_stream_s3_replica_reader_sup:stop_child(ReaderPid),
+    ?assertEqual(undefined, rabbitmq_stream_s3_registry:whereis_name({StreamId, node()})),
+
+    Record = binary:copy(<<"x">>, 500),
+    lists:foreach(
+        fun(_) ->
+            osiris_writer:write(Writer, Record),
+            flush_writer(Writer)
+        end,
+        lists:seq(1, 50)
+    ),
+    %% Wait for retention to reclaim the seeded segments (offsets 0 and 10).
+    ?awaitMatch(
+        [S | _] when S > 10,
+        list_segment_offsets(Config),
+        1000
+    ),
+
+    %% Phase 3: restart replica reader. It should discard old manifest and upload new data.
+    ReaderCtx = gen_batch_server:call(Writer, get_reader_context),
+    #{shared := Shared, dir := Dir} = ReaderCtx,
+    Counter = osiris_counters:fetch({osiris_writer, StreamId}),
+    {ok, _} = rabbitmq_stream_s3_replica_reader_sup:start_child(#{
+        stream => StreamId,
+        writer_pid => Writer,
+        dir => iolist_to_binary(Dir),
+        shared => Shared,
+        counter => Counter,
+        reference => StreamId,
+        epoch => 1,
+        fragment_target_size => 500,
+        durable_commit_threshold => 1
+    }),
+
+    %% Wait for the new replica reader to upload.
+    [FirstLocal | _] = list_segment_offsets(Config),
+    await_offset(Config, FirstLocal + 10),
+
+    %% Old fragments should be gone (deleted asynchronously by the replica reader).
+    ?awaitMatch(
+        [],
+        [F || F <- OldFragments, lists:member(F, list_fragment_offsets(Config))],
+        1000
+    ),
+    %% New fragments exist starting at or after the local first offset.
+    NewFragments = list_fragment_offsets(Config),
+    ?assert(length(NewFragments) > 0),
+    ?assert(hd(NewFragments) >= FirstLocal).
 
 replication_happy_path(Config) ->
     StreamId = ?config(stream_id, Config),
