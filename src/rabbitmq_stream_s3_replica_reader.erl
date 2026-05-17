@@ -94,6 +94,7 @@ init(
         epoch := Epoch
     } = Args
 ) ->
+    process_flag(trap_exit, true),
     logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
     monitor(process, WriterPid),
     TargetSize = maps:get(
