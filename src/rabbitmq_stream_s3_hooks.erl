@@ -17,7 +17,8 @@ retention is updated.
 -export([
     on_init/3,
     on_retention_updated/2,
-    local_retention_fun/1
+    local_retention_fun/1,
+    discover/0
 ]).
 
 -doc """
@@ -83,6 +84,21 @@ on_retention_updated(Retention, #{name := Name}) ->
     end,
     [{'fun', local_retention_fun(StreamId)} | Retention].
 
+-doc """
+Discover existing osiris writers and replicas on this node and attach
+the plugin to them. Called on plugin start to handle streams that were
+already running before the plugin was enabled (or re-enabled).
+""".
+-spec discover() -> ok.
+discover() ->
+    Children =
+        try
+            supervisor:which_children(osiris_server_sup)
+        catch
+            exit:{noproc, _} -> []
+        end,
+    lists:foreach(fun discover_child/1, Children).
+
 %% ------------------------------------------------------------------
 %% Internal
 %% ------------------------------------------------------------------
@@ -90,6 +106,51 @@ on_retention_updated(Retention, #{name := Name}) ->
 append_retention(StreamId, Config) ->
     Fun = {'fun', local_retention_fun(StreamId)},
     maps:update_with(retention, fun(R) -> [Fun | R] end, [Fun], Config).
+
+discover_child({_Id, Pid, worker, [osiris_writer]}) when is_pid(Pid) ->
+    try
+        attach_writer(Pid)
+    catch
+        _:_ -> ok
+    end;
+discover_child({_Id, Pid, worker, [osiris_replica]}) when is_pid(Pid) ->
+    try
+        attach_replica(Pid)
+    catch
+        _:_ -> ok
+    end;
+discover_child(_) ->
+    ok.
+
+attach_writer(Pid) ->
+    #{name := Name, dir := Dir, shared := Shared, reference := Reference} =
+        osiris_util:get_reader_context(Pid),
+    StreamId = iolist_to_binary(Name),
+    %% Seshat registers writer counters under {osiris_writer, Reference}.
+    Counter = osiris_counters:fetch({osiris_writer, Reference}),
+    #{epoch := Epoch} = osiris_counters:overview({osiris_writer, Reference}),
+    Config = #{
+        stream => StreamId,
+        writer_pid => Pid,
+        dir => iolist_to_binary(Dir),
+        shared => Shared,
+        counter => Counter,
+        reference => Reference,
+        epoch => Epoch
+    },
+    case rabbitmq_stream_s3_replica_reader_sup:start_child(Config) of
+        {ok, _} -> ok;
+        {error, {already_started, _}} -> ok;
+        {error, _} -> ok
+    end.
+
+attach_replica(Pid) ->
+    #{name := Name, dir := Dir, shared := Shared, reference := Reference} =
+        osiris_util:get_reader_context(Pid),
+    StreamId = iolist_to_binary(Name),
+    %% Seshat registers replica counters under {osiris_replica, Reference}.
+    Counter = osiris_counters:fetch({osiris_replica, Reference}),
+    rabbitmq_stream_s3_manifest_replica:register_replica_context(StreamId, Dir, Shared, Counter).
 
 local_retention_fun(StreamId) ->
     fun(IdxFiles) ->

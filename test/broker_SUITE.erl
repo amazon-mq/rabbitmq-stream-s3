@@ -20,7 +20,8 @@ groups() ->
             publish_uploads_to_remote_tier,
             stream_deletion_cleans_remote_tier,
             consumer_reads_across_tiers,
-            leadership_transfer_continues_upload
+            leadership_transfer_continues_upload,
+            plugin_disable_reenable
         ]}
     ].
 
@@ -45,6 +46,7 @@ init_per_group(cluster_size_3, Config) ->
         {rabbitmq_stream_s3, [
             {rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_fs},
             {fragment_target_size, 1000},
+            {durable_commit_threshold, 1},
             {api_fs_data_dir, DataDir}
         ]}
     ]),
@@ -190,6 +192,75 @@ leadership_transfer_continues_upload(Config) ->
     %% Fragments cover the full range (no gap).
     Fragments = list_fragment_keys(Config, WriterNode2, StreamId),
     ?assert(length(Fragments) >= 2),
+
+    amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
+    ok.
+
+plugin_disable_reenable(Config) ->
+    QName = <<"disable_reenable_test">>,
+    Ch = rabbit_ct_client_helpers:open_channel(Config),
+    stream_declare(Ch, QName),
+    #'confirm.select_ok'{} = amqp_channel:call(Ch, #'confirm.select'{}),
+
+    Payload = binary:copy(<<0>>, 600),
+    N1 = 3,
+    [publish(Ch, QName, Payload) || _ <- lists:seq(1, N1)],
+    true = amqp_channel:wait_for_confirms(Ch, 30),
+
+    #{stream_id := StreamId, writer_node := WriterNode} = get_stream_info(Config, QName),
+    ok = await_offset(Config, WriterNode, StreamId, N1),
+
+    %% Disable the plugin on all nodes.
+    Nodes = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+    [
+        rabbit_ct_broker_helpers:disable_plugin(Config, I, rabbitmq_stream_s3)
+     || I <- lists:seq(0, length(Nodes) - 1)
+    ],
+
+    %% Replica reader is gone.
+    ?awaitMatch(
+        undefined,
+        rabbit_ct_broker_helpers:rpc(
+            Config,
+            WriterNode,
+            rabbitmq_stream_s3_registry,
+            whereis_name,
+            [{StreamId, WriterNode}]
+        ),
+        5000
+    ),
+
+    %% Stream still works without the plugin.
+    N2 = 3,
+    [publish(Ch, QName, Payload) || _ <- lists:seq(1, N2)],
+    true = amqp_channel:wait_for_confirms(Ch, 30),
+
+    %% Re-enable the plugin on all nodes.
+    [
+        rabbit_ct_broker_helpers:enable_plugin(Config, I, rabbitmq_stream_s3)
+     || I <- lists:seq(0, length(Nodes) - 1)
+    ],
+
+    %% Discovery attaches a new replica reader.
+    ?awaitMatch(
+        Pid when is_pid(Pid),
+        rabbit_ct_broker_helpers:rpc(
+            Config,
+            WriterNode,
+            rabbitmq_stream_s3_registry,
+            whereis_name,
+            [{StreamId, WriterNode}]
+        ),
+        5000
+    ),
+
+    %% All data (including what was published while disabled) gets uploaded.
+    Total = N1 + N2,
+    ok = await_offset(Config, WriterNode, StreamId, Total),
+
+    %% Remote + local tiers cover the full stream range.
+    Fragments = list_fragment_keys(Config, WriterNode, StreamId),
+    ?assert(length(Fragments) >= 1),
 
     amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
     ok.

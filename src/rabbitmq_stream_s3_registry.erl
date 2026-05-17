@@ -47,9 +47,11 @@ unregister_name({StreamId, Node}) when Node =:= node() ->
 -doc "Look up the pid for a name. Returns `undefined` if not registered.".
 -spec whereis_name({stream_id(), node()}) -> pid() | undefined.
 whereis_name({StreamId, Node}) when Node =:= node() ->
-    case ets:lookup(?TABLE, StreamId) of
+    try ets:lookup(?TABLE, StreamId) of
         [{_, Pid}] -> Pid;
         [] -> undefined
+    catch
+        error:badarg -> undefined
     end;
 whereis_name({StreamId, Node}) ->
     try erpc:call(Node, ets, lookup, [?TABLE, StreamId]) of

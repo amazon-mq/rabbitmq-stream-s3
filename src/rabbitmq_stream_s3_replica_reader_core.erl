@@ -89,8 +89,16 @@ init(Manifest, Opts) ->
         dir = maps:get(dir, Opts),
         epoch = maps:get(epoch, Opts),
         reference = maps:get(reference, Opts),
-        durable_commit_threshold = maps:get(durable_commit_threshold, Opts, 5),
-        durable_commit_interval_ms = maps:get(durable_commit_interval_ms, Opts, 2000),
+        durable_commit_threshold = maps:get(
+            durable_commit_threshold,
+            Opts,
+            application:get_env(rabbitmq_stream_s3, durable_commit_threshold, 5)
+        ),
+        durable_commit_interval_ms = maps:get(
+            durable_commit_interval_ms,
+            Opts,
+            application:get_env(rabbitmq_stream_s3, durable_commit_interval_ms, 2000)
+        ),
         rebalance_threshold = maps:get(rebalance_threshold, Opts, 1024)
     },
     State = #state{

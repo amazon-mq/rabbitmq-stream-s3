@@ -71,7 +71,8 @@ groups() ->
             large_record_cuts_immediately,
             seed_log_uploads_deterministic,
             local_ahead_discards_manifest,
-            stream_deletion_cleans_remote_tier
+            stream_deletion_cleans_remote_tier,
+            discover_attaches_to_existing_writer
         ]},
         {with_replica, [], [
             replication_happy_path
@@ -120,6 +121,9 @@ end_per_testcase(_TestCase, Config) ->
     %% Stop the writer if still running (cascades to replica reader).
     WriterCfg = ?config(writer_cfg, Config),
     catch osiris_writer:stop(WriterCfg),
+    %% Clean up any per-test app env overrides.
+    application:unset_env(rabbitmq_stream_s3, fragment_target_size),
+    application:unset_env(rabbitmq_stream_s3, durable_commit_threshold),
     Config.
 
 %% ------------------------------------------------------------------
@@ -420,6 +424,51 @@ stream_deletion_cleans_remote_tier(Config) ->
     ),
     osiris_log:delete_directory(WriterCfg),
     ?assertNot(filelib:is_dir(Dir)).
+
+discover_attaches_to_existing_writer(Config) ->
+    StreamId = ?config(stream_id, Config),
+
+    %% Set a small fragment target and commit threshold in app env so the
+    %% discovered replica reader uses them (discovery doesn't have access to
+    %% per-stream remote_config).
+    application:set_env(rabbitmq_stream_s3, fragment_target_size, 500),
+    application:set_env(rabbitmq_stream_s3, durable_commit_threshold, 1),
+
+    %% Seed two segments, each with a chunk exceeding the fragment target.
+    #{next_offset := NextOffset} = seed_log(Config, [
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]}
+    ]),
+    Writer = start_writer(Config, #{}, #{fragment_target_size => 500}),
+    flush_writer(Writer),
+    ok = await_offset(Config, NextOffset),
+    ?assert(length(list_fragment_offsets(Config)) >= 1),
+
+    %% Kill the replica reader (simulates plugin disable).
+    Pid1 = rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}),
+    ?assert(is_pid(Pid1)),
+    rabbitmq_stream_s3_replica_reader_sup:stop_child(Pid1),
+    ?awaitMatch(
+        undefined,
+        rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}),
+        1000
+    ),
+
+    %% Discovery re-attaches.
+    ok = rabbitmq_stream_s3_hooks:discover(),
+    Pid2 = rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}),
+    ?assert(is_pid(Pid2)),
+    ?assertNotEqual(Pid1, Pid2),
+
+    %% Write more data via the writer (enough to exceed fragment target).
+    Record = binary:copy(<<"D">>, 600),
+    osiris_writer:write(Writer, Record),
+    flush_writer(Writer),
+    ok = await_offset(Config, NextOffset + 1),
+
+    %% Remote + local tiers cover the full range from offset 0.
+    {0, FinalOffset} = get_range(Config),
+    ?assert(FinalOffset >= NextOffset + 1).
 
 replication_happy_path(Config) ->
     StreamId = ?config(stream_id, Config),
