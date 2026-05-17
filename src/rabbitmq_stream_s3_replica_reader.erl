@@ -131,7 +131,7 @@ handle_cast(
             {noreply, State};
         false ->
             MonRef = monitor(process, {rabbitmq_stream_s3_manifest_replica, Node}),
-            Manifest = core_manifest(Core),
+            Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(Core),
             rabbitmq_stream_s3_manifest_replica:put_manifest(StreamId, Manifest, Node),
             {noreply, State#state{replicas = Replicas#{Node => MonRef}}}
     end;
@@ -162,7 +162,7 @@ handle_info({transfer_result, Ref, {ok, Uid}}, #state{core = Core0, cfg = Cfg} =
     %% Update the manifest cache before executing effects so that
     %% reply_waiters callers see the updated range immediately.
     ok = rabbitmq_stream_s3_manifest_replica:put_manifest(
-        Cfg#cfg.stream, core_manifest(Core)
+        Cfg#cfg.stream, rabbitmq_stream_s3_replica_reader_core:manifest(Core)
     ),
     State2 = execute_effects(Effects, State1),
     {noreply, State2};
@@ -209,7 +209,7 @@ format_state(#state{
         manifest_next_offset =>
             case Core of
                 undefined -> undefined;
-                _ -> (core_manifest(Core))#manifest.next_offset
+                _ -> (rabbitmq_stream_s3_replica_reader_core:manifest(Core))#manifest.next_offset
             end,
         log_next_offset =>
             case Log of
@@ -292,11 +292,11 @@ execute_effect(
 ) ->
     %% For now, complete the commit immediately (no Khepri).
     %% TODO: wire Khepri conditional write here.
-    Revision = (core_manifest(Core0))#manifest.revision + 1,
+    Revision = (rabbitmq_stream_s3_replica_reader_core:manifest(Core0))#manifest.revision + 1,
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:commit_complete(Revision, Core0),
     execute_effects(Effects, State#state{core = Core});
 execute_effect({update_range, _FirstOffset, _NextOffset}, #state{cfg = Cfg, core = Core} = State) ->
-    Manifest = core_manifest(Core),
+    Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(Core),
     ok = rabbitmq_stream_s3_manifest_replica:put_manifest(Cfg#cfg.stream, Manifest),
     State;
 execute_effect({broadcast, StreamId, Edits}, #state{replicas = Replicas} = State) ->
@@ -308,7 +308,7 @@ execute_effect({broadcast, StreamId, Edits}, #state{replicas = Replicas} = State
     ),
     State;
 execute_effect({evaluate_retention, _StreamId, _Dir}, #state{core = Core} = State) ->
-    maybe_evaluate_retention(core_manifest(Core), State),
+    maybe_evaluate_retention(rabbitmq_stream_s3_replica_reader_core:manifest(Core), State),
     State;
 execute_effect({reply_waiters, Replies}, State) ->
     [gen_server:reply(From, Reply) || {From, Reply} <- Replies],
@@ -355,15 +355,6 @@ update_counter(Cnt, FstOff, NumSegLeft) ->
     counters:put(Cnt, ?C_OSIRIS_LOG_SEGMENTS, NumSegLeft).
 
 %% ------------------------------------------------------------------
-%% Manifest access
-%% ------------------------------------------------------------------
-
--spec core_manifest(rabbitmq_stream_s3_replica_reader_core:state()) -> #manifest{}.
-core_manifest(Core) ->
-    %% #state{cfg, manifest, ...} - manifest is element 3.
-    element(3, Core).
-
-%% ------------------------------------------------------------------
 %% Reading
 %% ------------------------------------------------------------------
 
@@ -406,7 +397,7 @@ start_reading(
         }
     } = State
 ) ->
-    Manifest = core_manifest(Core),
+    Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(Core),
     StartOffset = Manifest#manifest.next_offset,
     _ = osiris_writer:query_replication_state(WriterPid),
     osiris:register_offset_listener(WriterPid, StartOffset, ?OFFSET_FORMATTER),
