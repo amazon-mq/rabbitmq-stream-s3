@@ -17,7 +17,9 @@ all() ->
         put_and_get,
         apply_append_edit,
         apply_retention_edit,
-        range_updates_on_edit
+        range_updates_on_edit,
+        sequenced_edits_applied_in_order,
+        gap_triggers_resync
     ].
 
 init_per_suite(Config) ->
@@ -129,3 +131,92 @@ range_updates_on_edit(_Config) ->
     },
     ok = rabbitmq_stream_s3_manifest_replica:apply_edit(StreamId, Edit),
     ?assertEqual({100, 201}, rabbitmq_stream_s3_manifest_replica:get_range(StreamId)).
+
+sequenced_edits_applied_in_order(_Config) ->
+    StreamId = <<"stream-seq">>,
+    {Manifest0, _} = build_manifest([
+        {fragment, #{offset => 0, size => 1000}}
+    ]),
+    %% Sync establishes the baseline: seq=0, epoch=1.
+    ok = rabbitmq_stream_s3_manifest_replica:sync(StreamId, 0, 1, Manifest0),
+    ?assertEqual(Manifest0, rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId)),
+
+    %% Edit at seq=1 is applied.
+    Edit1 = #edit{
+        first_offset = 0,
+        first_timestamp = Manifest0#manifest.first_timestamp,
+        first_last_timestamp = Manifest0#manifest.first_last_timestamp,
+        next_offset = 51,
+        size = 2000,
+        entries = ?ENTRY(50, 500, 600, ?MANIFEST_KIND_FRAGMENT, 2000, 42),
+        pos = byte_size(Manifest0#manifest.entries),
+        len = 0
+    },
+    ok = rabbitmq_stream_s3_manifest_replica:apply_edits(StreamId, [Edit1], 1, 1),
+    ?assertEqual(
+        51, (rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId))#manifest.next_offset
+    ),
+
+    %% Edit at seq=2 is applied.
+    Edit2 = #edit{
+        first_offset = 0,
+        first_timestamp = Manifest0#manifest.first_timestamp,
+        first_last_timestamp = Manifest0#manifest.first_last_timestamp,
+        next_offset = 101,
+        size = 3000,
+        entries = ?ENTRY(100, 1000, 1100, ?MANIFEST_KIND_FRAGMENT, 3000, 43),
+        pos = byte_size(Manifest0#manifest.entries) + ?ENTRY_B,
+        len = 0
+    },
+    ok = rabbitmq_stream_s3_manifest_replica:apply_edits(StreamId, [Edit2], 2, 1),
+    ?assertEqual(
+        101, (rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId))#manifest.next_offset
+    ).
+
+gap_triggers_resync(_Config) ->
+    StreamId = <<"stream-gap">>,
+    {Manifest0, _} = build_manifest([
+        {fragment, #{offset => 0, size => 1000}}
+    ]),
+
+    %% Register a fake writer in the registry so the resync request has a target.
+    rabbitmq_stream_s3_registry:init(),
+    Self = self(),
+    WriterPid = spawn_link(fun() -> fake_writer(Self) end),
+    yes = rabbitmq_stream_s3_registry:register_name({StreamId, node()}, WriterPid),
+
+    %% Sync establishes baseline: seq=0, epoch=1.
+    ok = rabbitmq_stream_s3_manifest_replica:sync(StreamId, 0, 1, Manifest0),
+
+    %% Send edit with seq=2 (gap: expected 1). Should trigger resync.
+    Edit = #edit{
+        first_offset = 0,
+        first_timestamp = Manifest0#manifest.first_timestamp,
+        first_last_timestamp = Manifest0#manifest.first_last_timestamp,
+        next_offset = 51,
+        size = 2000,
+        entries = ?ENTRY(50, 500, 600, ?MANIFEST_KIND_FRAGMENT, 2000, 42),
+        pos = byte_size(Manifest0#manifest.entries),
+        len = 0
+    },
+    {error, gap} = rabbitmq_stream_s3_manifest_replica:apply_edits(StreamId, [Edit], 2, 1),
+
+    %% The edit was NOT applied (gap detected).
+    ?assertEqual(Manifest0, rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId)),
+
+    %% The fake writer received a resync request.
+    receive
+        {resync_received, Node} -> ?assertEqual(node(), Node)
+    after 1000 ->
+        ct:fail("resync request not received by writer")
+    end,
+
+    rabbitmq_stream_s3_registry:unregister_name({StreamId, node()}),
+    unlink(WriterPid),
+    exit(WriterPid, kill).
+
+fake_writer(TestPid) ->
+    receive
+        {'$gen_cast', {resync, Node}} ->
+            TestPid ! {resync_received, Node}
+    end.

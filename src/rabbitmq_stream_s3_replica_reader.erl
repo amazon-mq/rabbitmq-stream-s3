@@ -71,6 +71,9 @@ returned by the functional core module.
     core :: rabbitmq_stream_s3_replica_reader_core:state() | undefined,
     %% Nodes registered for manifest broadcast.
     replicas = #{} :: #{node() => reference()},
+    %% Monotonic sequence number for broadcast edits. Incremented per edit
+    %% batch sent. Replicas use this to detect gaps and request re-sync.
+    broadcast_seq = 0 :: non_neg_integer(),
     %% Commit timer reference.
     commit_timer :: reference() | undefined,
     %% Monitor ref and PID for the in-flight commit task.
@@ -127,7 +130,12 @@ handle_call(_Request, _From, State) ->
 
 handle_cast(
     {register_acceptor, Node},
-    #state{replicas = Replicas, core = Core, cfg = #cfg{stream = StreamId}} = State
+    #state{
+        replicas = Replicas,
+        core = Core,
+        broadcast_seq = Seq,
+        cfg = #cfg{stream = StreamId, epoch = Epoch}
+    } = State
 ) ->
     case maps:is_key(Node, Replicas) of
         true ->
@@ -135,11 +143,22 @@ handle_cast(
         false ->
             MonRef = monitor(process, {rabbitmq_stream_s3_manifest_replica, Node}),
             Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(Core),
-            rabbitmq_stream_s3_manifest_replica:put_manifest(StreamId, Manifest, Node),
+            rabbitmq_stream_s3_manifest_replica:sync(StreamId, Seq, Epoch, Manifest, Node),
             {noreply, State#state{replicas = Replicas#{Node => MonRef}}}
     end;
 handle_cast({retention_updated, _Retention}, State) ->
     %% TODO: forward to remote-tier retention evaluation
+    {noreply, State};
+handle_cast(
+    {resync, Node},
+    #state{
+        core = Core,
+        broadcast_seq = Seq,
+        cfg = #cfg{stream = StreamId, epoch = Epoch}
+    } = State
+) ->
+    Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(Core),
+    rabbitmq_stream_s3_manifest_replica:sync(StreamId, Seq, Epoch, Manifest, Node),
     {noreply, State};
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -393,14 +412,18 @@ execute_effect({update_range, _FirstOffset, _NextOffset}, #state{cfg = Cfg, core
     Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(Core),
     ok = rabbitmq_stream_s3_manifest_replica:put_manifest(Cfg#cfg.stream, Manifest),
     State;
-execute_effect({broadcast, StreamId, Edits}, #state{replicas = Replicas} = State) ->
+execute_effect(
+    {broadcast, StreamId, Edits},
+    #state{replicas = Replicas, broadcast_seq = Seq0, cfg = #cfg{epoch = Epoch}} = State
+) ->
+    Seq = Seq0 + 1,
     maps:foreach(
         fun(Node, _MonRef) ->
-            [rabbitmq_stream_s3_manifest_replica:apply_edit(StreamId, Edit, Node) || Edit <- Edits]
+            rabbitmq_stream_s3_manifest_replica:apply_edits(StreamId, Edits, Seq, Epoch, Node)
         end,
         Replicas
     ),
-    State;
+    State#state{broadcast_seq = Seq};
 execute_effect({evaluate_retention, _StreamId, _Dir}, #state{core = Core} = State) ->
     maybe_evaluate_retention(rabbitmq_stream_s3_replica_reader_core:manifest(Core), State),
     State;
