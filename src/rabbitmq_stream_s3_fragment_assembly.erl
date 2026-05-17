@@ -79,7 +79,8 @@ size threshold. Does not perform I/O.
             StartPos :: non_neg_integer(),
             EndPos :: non_neg_integer()
         }
-    ]
+    ],
+    index_records => binary()
 }.
 
 -doc "Create a new fragment assembly state with the given size target.".

@@ -68,7 +68,7 @@ returned by the functional core module.
     log :: osiris_log:state() | undefined,
     assembly :: rabbitmq_stream_s3_fragment_assembly:state() | undefined,
     %% Functional core state.
-    core :: rabbitmq_stream_s3_replica_reader_core:state(),
+    core :: rabbitmq_stream_s3_replica_reader_core:state() | undefined,
     %% Nodes registered for manifest broadcast.
     replicas = #{} :: #{node() => reference()},
     %% Commit timer reference.
@@ -314,16 +314,12 @@ execute_effect({reply_waiters, Replies}, State) ->
     [gen_server:reply(From, Reply) || {From, Reply} <- Replies],
     State;
 execute_effect({start_commit_timer, Ms}, #state{commit_timer = OldRef} = State) ->
-    cancel_timer(OldRef),
+    _ = cancel_timer(OldRef),
     Ref = erlang:send_after(Ms, self(), commit_timer),
     State#state{commit_timer = Ref};
 execute_effect({cancel_commit_timer}, #state{commit_timer = Ref} = State) ->
-    cancel_timer(Ref),
-    State#state{commit_timer = undefined};
-execute_effect({reinitialize}, #state{cfg = Cfg} = State) ->
-    ?LOG_WARNING("Commit conflict, re-resolving manifest for ~ts", [Cfg#cfg.stream]),
-    erlang:send_after(0, self(), retry_resolve),
-    State.
+    _ = cancel_timer(Ref),
+    State#state{commit_timer = undefined}.
 
 cancel_timer(undefined) -> ok;
 cancel_timer(Ref) -> erlang:cancel_timer(Ref).
@@ -395,6 +391,23 @@ start_reading(
         cfg = #cfg{
             writer_pid = WriterPid
         }
+    } = State
+) ->
+    case is_process_alive(WriterPid) of
+        false ->
+            State;
+        true ->
+            start_reading0(State)
+    end.
+
+start_reading0(
+    #state{
+        cfg = #cfg{
+            writer_pid = WriterPid,
+            fragment_target_size = TargetSize,
+            stream = StreamId
+        },
+        core = Core
     } = State
 ) ->
     Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(Core),

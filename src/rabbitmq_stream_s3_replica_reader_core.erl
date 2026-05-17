@@ -75,7 +75,8 @@ testable without mocks or timing.
     | {reply_waiters, [{gen_server:from(), ok}]}
     | {start_commit_timer, non_neg_integer()}
     | {cancel_commit_timer}
-    | {resubmit_transfer, reference(), stream_id(), directory(), fragment_meta()}.
+    | {resubmit_transfer, reference(), stream_id(), directory(), fragment_meta()}
+    | {reinitialize}.
 
 %% ------------------------------------------------------------------
 %% API
