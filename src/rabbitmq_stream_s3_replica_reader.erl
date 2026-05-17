@@ -28,6 +28,20 @@ returned by the functional core module.
     format_status/1
 ]).
 
+-export_type([config/0]).
+
+-type config() :: #{
+    stream := stream_id(),
+    writer_pid := pid(),
+    dir := directory(),
+    counter := counters:counters_ref(),
+    reference := term(),
+    epoch := non_neg_integer(),
+    shared => atomics:atomics_ref(),
+    fragment_target_size => non_neg_integer(),
+    durable_commit_threshold => non_neg_integer()
+}.
+
 -record(cfg, {
     stream :: stream_id(),
     dir :: directory(),
@@ -62,7 +76,7 @@ returned by the functional core module.
 }).
 
 -doc "Start a remote replica reader for the given stream.".
--spec start_link(map()) -> gen_server:start_ret().
+-spec start_link(config()) -> gen_server:start_ret().
 start_link(#{stream := StreamId} = Args) ->
     gen_server:start_link(
         {via, rabbitmq_stream_s3_registry, {StreamId, node()}},
