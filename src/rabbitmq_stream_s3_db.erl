@@ -46,7 +46,7 @@ Zero indicates that the manifest has not been created yet.
 
 -export([setup/0]).
 
--export([get/1, list/0, count/0, put/5]).
+-export([get/1, list/0, count/0, put/5, queue_path/1]).
 
 -define(C_SPROC_TRIGGERS, 1).
 -define(C_GETS, 2).
@@ -164,7 +164,7 @@ modifications which would inconvenience the successor writer.
 """.
 -spec put(
     stream_id(),
-    Q :: rabbit_amqqueue:name(),
+    Q :: rabbit_amqqueue:name() | term(),
     osiris:epoch(),
     Expected :: revision(),
     rabbitmq_stream_s3:uid()
@@ -173,13 +173,17 @@ modifications which would inconvenience the successor writer.
     | {error, {conflict, entry()}}
     | {error, not_found}
     | {error, any()}.
-put(
-    StreamId,
-    #resource{virtual_host = VHost, kind = queue, name = QName},
-    Epoch,
-    ExpectedRevision,
-    Uid
-) when is_binary(StreamId) andalso is_integer(ExpectedRevision) andalso is_integer(Uid) ->
+put(StreamId, Reference, Epoch, ExpectedRevision, Uid) when
+    is_binary(StreamId) andalso is_integer(ExpectedRevision) andalso is_integer(Uid)
+->
+    do_put(StreamId, Epoch, ExpectedRevision, Uid, keep_while_options(Reference)).
+
+-spec do_put(stream_id(), osiris:epoch(), revision(), rabbitmq_stream_s3:uid(), map()) ->
+    {ok, {rabbitmq_stream_s3:uid(), osiris:epoch()} | undefined, revision()}
+    | {error, {conflict, entry()}}
+    | {error, not_found}
+    | {error, any()}.
+do_put(StreamId, Epoch, ExpectedRevision, Uid, Options0) ->
     Cnt = counter(),
     counters:add(Cnt, ?C_PUTS, 1),
     Path = ?PATH(StreamId),
@@ -203,13 +207,7 @@ put(
                 ]
         end,
     VersionedPath = khepri_path:combine_with_conditions(Path, Conditions),
-    Options = #{
-        %% Automatically clean up this entry if the stream queue is deleted.
-        %% This triggers the stored procedure which attempts to delete the
-        %% remote tier data.
-        keep_while => #{?RABBITMQ_KHEPRI_QUEUE_PATH(VHost, QName) => #if_node_exists{}}
-    },
-    case rabbit_khepri:adv_put(VersionedPath, {Uid, Epoch}, Options) of
+    case rabbit_khepri:adv_put(VersionedPath, {Uid, Epoch}, Options0) of
         {ok, #{Path := #{payload_version := NewRevision, data := {OldUid, OldEpoch}}}} ->
             counters:add(Cnt, ?C_PUT_SUCCESSES, 1),
             {ok, {OldUid, OldEpoch}, NewRevision};
@@ -240,3 +238,14 @@ put(
 
 counter() ->
     persistent_term:get({?MODULE, counter}).
+
+-spec keep_while_options(term()) -> map().
+keep_while_options(#resource{virtual_host = VHost, kind = queue, name = QName}) ->
+    #{keep_while => #{?RABBITMQ_KHEPRI_QUEUE_PATH(VHost, QName) => #if_node_exists{}}};
+keep_while_options(_) ->
+    #{}.
+
+-doc "Returns the Khepri path for a queue resource. Useful for test setup.".
+-spec queue_path(rabbit_amqqueue:name()) -> khepri_path:native_path().
+queue_path(#resource{virtual_host = VHost, kind = queue, name = QName}) ->
+    ?RABBITMQ_KHEPRI_QUEUE_PATH(VHost, QName).

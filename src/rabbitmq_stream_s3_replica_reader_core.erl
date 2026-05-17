@@ -223,8 +223,8 @@ tick(_Now, State) ->
 
 -spec await_offset(osiris:offset(), gen_server:from(), state()) ->
     {state(), [core_effect()]}.
-await_offset(Offset, From, #state{manifest = Manifest} = State) ->
-    case Manifest#manifest.next_offset >= Offset of
+await_offset(Offset, From, #state{last_committed_manifest = Committed} = State) ->
+    case Committed#manifest.next_offset >= Offset of
         true ->
             {State, [{reply_waiters, [{From, ok}]}]};
         false ->
@@ -353,8 +353,8 @@ compute_edits(From, To) ->
     end.
 
 -spec notify_waiters(state()) -> {state(), [core_effect()]}.
-notify_waiters(#state{manifest = Manifest, waiters = Waiters} = State) ->
-    NextOffset = Manifest#manifest.next_offset,
+notify_waiters(#state{last_committed_manifest = Committed, waiters = Waiters} = State) ->
+    NextOffset = Committed#manifest.next_offset,
     {Satisfied, Remaining} = lists:partition(
         fun({Offset, _From}) -> NextOffset >= Offset end,
         Waiters

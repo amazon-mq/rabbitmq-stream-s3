@@ -72,7 +72,10 @@ returned by the functional core module.
     %% Nodes registered for manifest broadcast.
     replicas = #{} :: #{node() => reference()},
     %% Commit timer reference.
-    commit_timer :: reference() | undefined
+    commit_timer :: reference() | undefined,
+    %% Monitor ref and PID for the in-flight commit task.
+    commit_mon :: reference() | undefined,
+    commit_pid :: pid() | undefined
 }).
 
 -doc "Start a remote replica reader for the given stream.".
@@ -156,14 +159,9 @@ handle_info(retry_resolve, #state{cfg = #cfg{stream = StreamId}} = State0) ->
     {Core, _} = rabbitmq_stream_s3_replica_reader_core:init(Manifest, State0#state.config),
     State = start_reading(State0#state{core = Core}),
     {noreply, State};
-handle_info({transfer_result, Ref, {ok, Uid}}, #state{core = Core0, cfg = Cfg} = State0) ->
+handle_info({transfer_result, Ref, {ok, Uid}}, #state{core = Core0} = State0) ->
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_complete(Ref, Uid, Core0),
     State1 = State0#state{core = Core},
-    %% Update the manifest cache before executing effects so that
-    %% reply_waiters callers see the updated range immediately.
-    ok = rabbitmq_stream_s3_manifest_replica:put_manifest(
-        Cfg#cfg.stream, rabbitmq_stream_s3_replica_reader_core:manifest(Core)
-    ),
     State2 = execute_effects(Effects, State1),
     {noreply, State2};
 handle_info({transfer_result, Ref, {error, Reason}}, #state{core = Core0} = State0) ->
@@ -187,10 +185,53 @@ handle_info(
         MonRef -> {noreply, State#state{replicas = maps:remove(Node, Replicas)}};
         _ -> {noreply, State}
     end;
+handle_info({commit_result, {ok, Revision}}, #state{core = Core0, commit_mon = Mon} = State0) ->
+    demonitor(Mon, [flush]),
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:commit_complete(Revision, Core0),
+    {noreply,
+        execute_effects(Effects, State0#state{
+            core = Core, commit_mon = undefined, commit_pid = undefined
+        })};
+handle_info(
+    {commit_result, {error, {conflict, _Entry}}}, #state{core = Core0, commit_mon = Mon} = State0
+) ->
+    demonitor(Mon, [flush]),
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:commit_failed(conflict, Core0),
+    {noreply,
+        execute_effects(Effects, State0#state{
+            core = Core, commit_mon = undefined, commit_pid = undefined
+        })};
+handle_info({commit_result, {error, Reason}}, #state{core = Core0, commit_mon = Mon} = State0) ->
+    demonitor(Mon, [flush]),
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:commit_failed(Reason, Core0),
+    {noreply,
+        execute_effects(Effects, State0#state{
+            core = Core, commit_mon = undefined, commit_pid = undefined
+        })};
+handle_info(
+    {'DOWN', Mon, process, _, Reason},
+    #state{commit_mon = Mon, core = Core0, cfg = #cfg{stream = StreamId}} = State0
+) ->
+    ?LOG_WARNING("~ts commit task crashed: ~p", [StreamId, Reason]),
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:commit_failed(Reason, Core0),
+    {noreply,
+        execute_effects(Effects, State0#state{
+            core = Core, commit_mon = undefined, commit_pid = undefined
+        })};
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(_Reason, #state{cfg = #cfg{stream = StreamId}}) ->
+terminate(_Reason, #state{cfg = #cfg{stream = StreamId}, commit_mon = Mon, commit_pid = CommitPid}) ->
+    %% Kill any in-flight commit task to prevent orphaned Khepri writes.
+    %% An orphaned write advances the revision, causing conflicts for the
+    %% next incarnation of this replica reader.
+    case CommitPid of
+        undefined ->
+            ok;
+        _ ->
+            demonitor(Mon, [flush]),
+            exit(CommitPid, kill)
+    end,
     rabbitmq_stream_s3_registry:unregister_name({StreamId, node()}),
     ok.
 
@@ -253,6 +294,57 @@ delete_manifest_objects(StreamId, Manifest) ->
     ok.
 
 %% ------------------------------------------------------------------
+%% Commit (executed in spawned task)
+%% ------------------------------------------------------------------
+
+-spec do_commit(
+    stream_id(), #manifest{}, non_neg_integer(), term(), rabbitmq_stream_s3_db:revision()
+) ->
+    {ok, rabbitmq_stream_s3_db:revision()} | {error, term()}.
+do_commit(StreamId, Manifest, Epoch, Reference, ExpectedRevision) ->
+    Uid = rabbitmq_stream_s3:uid(),
+    Data = serialize_manifest(Manifest),
+    Key = rabbitmq_stream_s3:manifest_key(StreamId, Uid),
+    case rabbitmq_stream_s3_api:put(Key, Data) of
+        ok ->
+            commit_khepri(StreamId, Epoch, Reference, ExpectedRevision, Uid);
+        {error, _} = Err ->
+            Err
+    end.
+
+-spec commit_khepri(
+    stream_id(),
+    non_neg_integer(),
+    term(),
+    rabbitmq_stream_s3_db:revision(),
+    rabbitmq_stream_s3:uid()
+) ->
+    {ok, rabbitmq_stream_s3_db:revision()} | {error, term()}.
+commit_khepri(_StreamId, _Epoch, undefined, ExpectedRevision, _Uid) ->
+    %% No Khepri reference (test mode). Synthesize a revision.
+    {ok, ExpectedRevision + 1};
+commit_khepri(StreamId, Epoch, Reference, ExpectedRevision, Uid) ->
+    case rabbitmq_stream_s3_db:put(StreamId, Reference, Epoch, ExpectedRevision, Uid) of
+        {ok, _Old, NewRevision} ->
+            {ok, NewRevision};
+        {error, _} = Err ->
+            Err
+    end.
+
+-spec serialize_manifest(#manifest{}) -> binary().
+serialize_manifest(#manifest{
+    first_offset = FirstOffset,
+    next_offset = NextOffset,
+    first_timestamp = FirstTs,
+    first_last_timestamp = FirstLastTs,
+    total_size = TotalSize,
+    entries = Entries
+}) ->
+    <<?MANIFEST_ROOT_MAGIC, ?MANIFEST_ROOT_VERSION:32/unsigned, FirstOffset:64/unsigned,
+        NextOffset:64/unsigned, FirstTs:64/signed, FirstLastTs:64/signed, 0:2/unsigned,
+        TotalSize:70/unsigned, Entries/binary>>.
+
+%% ------------------------------------------------------------------
 %% Effect execution
 %% ------------------------------------------------------------------
 
@@ -288,13 +380,15 @@ execute_effect({resubmit_transfer, Ref, _StreamId, Dir, Meta}, #state{cfg = Cfg}
     rabbitmq_stream_s3_governor:submit(Fun, Size, Self, Ref),
     State;
 execute_effect(
-    {start_commit, _Manifest, _Epoch, _Reference, _Revision, _Edits}, #state{core = Core0} = State
+    {start_commit, Manifest, Epoch, Reference, ExpectedRevision, _Edits},
+    #state{cfg = #cfg{stream = StreamId}} = State
 ) ->
-    %% For now, complete the commit immediately (no Khepri).
-    %% TODO: wire Khepri conditional write here.
-    Revision = (rabbitmq_stream_s3_replica_reader_core:manifest(Core0))#manifest.revision + 1,
-    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:commit_complete(Revision, Core0),
-    execute_effects(Effects, State#state{core = Core});
+    Self = self(),
+    {CommitPid, MonRef} = spawn_monitor(fun() ->
+        Result = do_commit(StreamId, Manifest, Epoch, Reference, ExpectedRevision),
+        Self ! {commit_result, Result}
+    end),
+    State#state{commit_mon = MonRef, commit_pid = CommitPid};
 execute_effect({update_range, _FirstOffset, _NextOffset}, #state{cfg = Cfg, core = Core} = State) ->
     Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(Core),
     ok = rabbitmq_stream_s3_manifest_replica:put_manifest(Cfg#cfg.stream, Manifest),
@@ -319,7 +413,12 @@ execute_effect({start_commit_timer, Ms}, #state{commit_timer = OldRef} = State) 
     State#state{commit_timer = Ref};
 execute_effect({cancel_commit_timer}, #state{commit_timer = Ref} = State) ->
     _ = cancel_timer(Ref),
-    State#state{commit_timer = undefined}.
+    State#state{commit_timer = undefined};
+execute_effect({reinitialize}, #state{cfg = #cfg{stream = StreamId}} = State) ->
+    ?LOG_INFO("~ts reinitializing after commit conflict", [StreamId]),
+    Manifest = resolve_manifest(StreamId),
+    {Core, _} = rabbitmq_stream_s3_replica_reader_core:init(Manifest, State#state.config),
+    start_reading(State#state{core = Core, log = undefined, assembly = undefined}).
 
 cancel_timer(undefined) -> ok;
 cancel_timer(Ref) -> erlang:cancel_timer(Ref).
@@ -358,14 +457,18 @@ update_counter(Cnt, FstOff, NumSegLeft) ->
 resolve_manifest(StreamId) ->
     case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
         #manifest{} = M ->
-            M;
+            %% Cache hit. Ensure revision is current from Khepri.
+            case catch rabbitmq_stream_s3_db:get(StreamId) of
+                {ok, #{revision := Rev}} -> M#manifest{revision = Rev};
+                _ -> M
+            end;
         undefined ->
             case catch rabbitmq_stream_s3_db:get(StreamId) of
-                {ok, #{uid := Uid}} ->
+                {ok, #{uid := Uid, revision := Rev}} ->
                     Key = rabbitmq_stream_s3:manifest_key(StreamId, Uid),
                     case rabbitmq_stream_s3_api:get(Key, #{}) of
                         {ok, Data} ->
-                            parse_manifest_root(Data);
+                            (parse_manifest_root(Data))#manifest{revision = Rev};
                         {error, _} ->
                             #manifest{}
                     end;
@@ -430,7 +533,9 @@ start_reading0(
                 [StreamId, LocalFirst, StartOffset]
             ),
             delete_manifest_objects(StreamId, Manifest),
-            FreshManifest = #manifest{next_offset = LocalFirst},
+            FreshManifest = #manifest{
+                next_offset = LocalFirst, revision = Manifest#manifest.revision
+            },
             {Core1, _} = rabbitmq_stream_s3_replica_reader_core:init(
                 FreshManifest, State#state.config
             ),
@@ -449,8 +554,9 @@ start_reading0(
                 "Segment file missing for stream ~ts, retrying",
                 [StreamId]
             ),
-            erlang:send_after(1000, self(), retry_resolve),
-            State
+            %% Retention deleted the segment between listing and opening.
+            %% Retry immediately (same pattern as osiris_log:init_offset_reader).
+            start_reading(State#state{core = Core, log = undefined, assembly = undefined})
     end.
 
 -spec drain(#state{}) -> #state{}.

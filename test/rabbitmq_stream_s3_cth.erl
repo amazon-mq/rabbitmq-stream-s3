@@ -38,6 +38,20 @@ pre_init_per_suite(_SuiteName, Config, State) ->
     ok = filelib:ensure_path(RemoteDir),
     rabbitmq_stream_s3_api_fs:set_data_dir(RemoteDir),
 
+    %% Khepri store for metadata (optimistic lock on manifest commits).
+    {ok, _} = application:ensure_all_started(khepri),
+    KhepriDir = filename:join(PrivDir, "khepri"),
+    ok = filelib:ensure_path(KhepriDir),
+    Default = ra_system:default_config(),
+    RaSystemConfig = Default#{
+        name => coordination,
+        data_dir => KhepriDir,
+        wal_data_dir => KhepriDir,
+        names => ra_system:derive_names(coordination)
+    },
+    {ok, _} = ra_system:start(RaSystemConfig),
+    {ok, _} = khepri:start(coordination, #{cluster_name => rabbitmq_metadata}),
+
     %% Osiris data directory.
     %% load(osiris) before set_env: osiris.app.src declares {data_dir, "/tmp/osiris"}
     %% which overwrites any set_env that precedes the load.
@@ -57,8 +71,15 @@ pre_init_per_suite(_SuiteName, Config, State) ->
     {[{osiris_dir, OsirisDir}, {remote_dir, RemoteDir} | Config], State}.
 
 post_end_per_suite(_SuiteName, _Config, Return, State) ->
-    catch exit(whereis(rabbitmq_stream_s3_sup), shutdown),
+    case whereis(rabbitmq_stream_s3_sup) of
+        undefined -> ok;
+        %% proc_lib:stop uses the sys protocol. Plain exit/2 from a CTH
+        %% callback does not deliver the signal to the supervisor.
+        Pid -> proc_lib:stop(Pid, shutdown, 5_000)
+    end,
     _ = application:stop(osiris),
+    ok = khepri:stop(rabbitmq_metadata),
+    ok = ra_system:stop(coordination),
     {Return, State}.
 
 -doc """

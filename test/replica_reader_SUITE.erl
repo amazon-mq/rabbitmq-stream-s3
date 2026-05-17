@@ -70,7 +70,8 @@ groups() ->
             resumes_after_restart,
             large_record_cuts_immediately,
             seed_log_uploads_deterministic,
-            local_ahead_discards_manifest
+            local_ahead_discards_manifest,
+            stream_deletion_cleans_remote_tier
         ]},
         {with_replica, [], [
             replication_happy_path
@@ -391,6 +392,34 @@ local_ahead_discards_manifest(Config) ->
     NewFragments = list_fragment_offsets(Config),
     ?assert(length(NewFragments) > 0),
     ?assert(hd(NewFragments) >= FirstLocal).
+
+stream_deletion_cleans_remote_tier(Config) ->
+    StreamId = ?config(stream_id, Config),
+    WriterCfg = ?config(writer_cfg, Config),
+
+    #{next_offset := NextOffset} = seed_log(Config, [
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]}
+    ]),
+    Writer = start_writer(Config, #{}, #{fragment_target_size => 500}),
+    flush_writer(Writer),
+    await_offset(Config, NextOffset),
+    ?assert(length(list_fragment_offsets(Config)) > 0),
+
+    %% Stop the writer (cascades to replica reader).
+    osiris_writer:stop(WriterCfg),
+
+    %% Delete remote tier objects.
+    ok = rabbitmq_stream_s3_reaper:delete_stream(StreamId),
+    ?awaitMatch([], list_fragment_offsets(Config), 1000),
+
+    %% Delete local tier.
+    Dir = filename:join(
+        application:get_env(osiris, data_dir, "/tmp/osiris"),
+        maps:get(name, WriterCfg)
+    ),
+    osiris_log:delete_directory(WriterCfg),
+    ?assertNot(filelib:is_dir(Dir)).
 
 replication_happy_path(Config) ->
     StreamId = ?config(stream_id, Config),
