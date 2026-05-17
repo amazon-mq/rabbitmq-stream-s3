@@ -17,3 +17,10 @@ include ../../erlang.mk
 
 # CT suites share a node name (erlang.mk limitation), so they cannot run in parallel.
 .NOTPARALLEL:
+
+CT_QUICK_SUITES = db replica_reader_core replica_reader log_reader fragment_iterator fragment_assembly prop manifest_replica
+
+.PHONY: ct-quick
+ct-quick: test-build
+	$(verbose) mkdir -p $(CT_LOGS_DIR)
+	$(gen_verbose) $(CT_RUN) -sname ct_$(PROJECT) -suite $(addsuffix _SUITE,$(CT_QUICK_SUITES)) $(CT_EXTRA) $(CT_OPTS)
