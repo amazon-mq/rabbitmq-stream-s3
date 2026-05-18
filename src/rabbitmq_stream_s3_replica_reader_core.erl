@@ -49,17 +49,17 @@ testable without mocks or timing.
     in_flight :: queue:queue({reference(), fragment_meta()}),
     %% Completions that arrived out of order.
     pending_completions :: #{reference() => {rabbitmq_stream_s3:uid(), fragment_meta()}},
-    %% Fragments applied since last durable commit.
+    %% Fragments applied since last durable persist.
     since_persist :: non_neg_integer(),
-    %% Number of fragments included in the current in-flight commit.
+    %% Number of fragments included in the current in-flight persist.
     in_persist_count = 0 :: non_neg_integer(),
-    %% Timestamp (milliseconds) of last durable commit.
+    %% Timestamp (milliseconds) of last durable persist.
     last_persist_ts :: integer(),
-    %% Whether a durable commit is currently in flight.
+    %% Whether a durable persist is currently in flight.
     persist_in_flight :: boolean(),
-    %% Manifest state at last successful durable commit.
+    %% Manifest state at last successful durable persist.
     last_persisted_manifest :: #manifest{},
-    %% Manifest being committed (set when commit starts, used on completion).
+    %% Manifest being persisted (set when persist starts, used on completion).
     persisting_manifest :: #manifest{} | undefined,
     %% Edits computed at persist start time, used for broadcast on completion.
     persisting_edits = [] :: [#edit{}],
@@ -143,7 +143,7 @@ persisted_manifest(#state{last_persisted_manifest = Manifest}) ->
 fragment_cut(Meta, #state{cfg = Cfg, in_flight = Q, since_persist = 0} = State) ->
     case queue:is_empty(Q) of
         true ->
-            %% First fragment since last commit. Start the timer.
+            %% First fragment since last persist. Start the timer.
             Ref = make_ref(),
             Q1 = queue:in({Ref, Meta}, Q),
             Effects = [
@@ -210,7 +210,7 @@ persist_complete(
     ],
     {State2, WaiterEffects} = notify_waiters(State1),
     Effects1 = Effects0 ++ WaiterEffects,
-    %% If more fragments applied while commit was in flight, trigger another.
+    %% If more fragments applied while persist was in flight, trigger another.
     case State2#state.since_persist > 0 of
         true ->
             {State3, CommitEffects} = maybe_start_persist(State2),
@@ -225,7 +225,7 @@ persist_failed(conflict, State) ->
     %% and re-init the core. We signal this by returning a special effect.
     {State#state{persist_in_flight = false}, [reinitialize]};
 persist_failed(_Reason, #state{cfg = Cfg} = State0) ->
-    %% S3 or transient error. Retry the commit.
+    %% S3 or transient error. Retry the persist.
     State1 = State0#state{persist_in_flight = false},
     {State2, Effects} = maybe_start_persist(State1),
     case Effects of
@@ -328,7 +328,7 @@ group_upload_failed(Reason, #state{cfg = Cfg, manifest = Manifest} = State) ->
 
 -doc """
 Apply a remote retention edit to the manifest. Updates both the in-memory
-and last-committed manifests. Returns effects to broadcast and update range.
+and last-persisted manifests. Returns effects to broadcast and update range.
 """.
 -spec apply_retention_edit(#edit{}, state()) -> {state(), [core_effect()]}.
 apply_retention_edit(
@@ -363,7 +363,7 @@ drain_completions(#state{in_flight = Q, pending_completions = PC} = State0) ->
                     },
                     %% Continue draining contiguous completions.
                     {State3, Effects} = drain_completions(State2),
-                    %% After all draining, check rebalance then commit trigger.
+                    %% After all draining, check rebalance then persist trigger.
                     {State4, RebalanceEffects} = maybe_start_rebalance(State3),
                     {State5, CommitEffects} = maybe_start_persist(State4),
                     {State5, Effects ++ RebalanceEffects ++ CommitEffects}
