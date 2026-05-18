@@ -15,12 +15,12 @@ testable without mocks or timing.
 -export([
     init/2,
     manifest/1,
-    committed_manifest/1,
+    persisted_manifest/1,
     fragment_cut/2,
     transfer_complete/3,
     transfer_failed/3,
-    commit_complete/2,
-    commit_failed/2,
+    persist_complete/2,
+    persist_failed/2,
     tick/2,
     await_offset/3,
     apply_retention_edit/2
@@ -35,8 +35,8 @@ testable without mocks or timing.
     dir :: directory(),
     epoch :: non_neg_integer(),
     reference :: term(),
-    durable_commit_threshold :: non_neg_integer(),
-    durable_commit_interval_ms :: non_neg_integer(),
+    persist_threshold :: non_neg_integer(),
+    persist_interval_ms :: non_neg_integer(),
     rebalance_threshold :: non_neg_integer()
 }).
 
@@ -48,17 +48,17 @@ testable without mocks or timing.
     %% Completions that arrived out of order.
     pending_completions :: #{reference() => {rabbitmq_stream_s3:uid(), fragment_meta()}},
     %% Fragments applied since last durable commit.
-    since_commit :: non_neg_integer(),
+    since_persist :: non_neg_integer(),
     %% Number of fragments included in the current in-flight commit.
-    in_commit_count = 0 :: non_neg_integer(),
+    in_persist_count = 0 :: non_neg_integer(),
     %% Timestamp (milliseconds) of last durable commit.
-    last_commit_ts :: integer(),
+    last_persist_ts :: integer(),
     %% Whether a durable commit is currently in flight.
-    commit_in_flight :: boolean(),
+    persist_in_flight :: boolean(),
     %% Manifest state at last successful durable commit.
-    last_committed_manifest :: #manifest{},
+    last_persisted_manifest :: #manifest{},
     %% Manifest being committed (set when commit starts, used on completion).
-    committing_manifest :: #manifest{} | undefined,
+    persisting_manifest :: #manifest{} | undefined,
     %% Callers blocked on await_offset.
     waiters :: [{osiris:offset(), gen_server:from()}]
 }).
@@ -68,17 +68,17 @@ testable without mocks or timing.
 
 -type core_effect() ::
     {submit_transfer, reference(), stream_id(), directory(), fragment_meta()}
-    | {start_commit, #manifest{}, non_neg_integer(), term(), rabbitmq_stream_s3_db:revision(), [
+    | {start_persist, #manifest{}, non_neg_integer(), term(), rabbitmq_stream_s3_db:revision(), [
         #edit{}
     ]}
     | {update_range, osiris:offset(), osiris:offset()}
     | {broadcast, stream_id(), [#edit{}]}
     | {evaluate_retention, stream_id(), directory()}
     | {reply_waiters, [{gen_server:from(), ok}]}
-    | {start_commit_timer, non_neg_integer()}
-    | {cancel_commit_timer}
+    | {start_persist_timer, non_neg_integer()}
+    | cancel_persist_timer
     | {resubmit_transfer, reference(), stream_id(), directory(), fragment_meta()}
-    | {reinitialize}.
+    | reinitialize.
 
 %% ------------------------------------------------------------------
 %% API
@@ -91,15 +91,15 @@ init(Manifest, Opts) ->
         dir = maps:get(dir, Opts),
         epoch = maps:get(epoch, Opts),
         reference = maps:get(reference, Opts),
-        durable_commit_threshold = maps:get(
-            durable_commit_threshold,
+        persist_threshold = maps:get(
+            persist_threshold,
             Opts,
-            application:get_env(rabbitmq_stream_s3, durable_commit_threshold, 5)
+            application:get_env(rabbitmq_stream_s3, persist_threshold, 5)
         ),
-        durable_commit_interval_ms = maps:get(
-            durable_commit_interval_ms,
+        persist_interval_ms = maps:get(
+            persist_interval_ms,
             Opts,
-            application:get_env(rabbitmq_stream_s3, durable_commit_interval_ms, 2000)
+            application:get_env(rabbitmq_stream_s3, persist_interval_ms, 2000)
         ),
         rebalance_threshold = maps:get(rebalance_threshold, Opts, 1024)
     },
@@ -108,11 +108,11 @@ init(Manifest, Opts) ->
         manifest = Manifest,
         in_flight = queue:new(),
         pending_completions = #{},
-        since_commit = 0,
-        last_commit_ts = erlang:system_time(millisecond),
-        commit_in_flight = false,
-        last_committed_manifest = Manifest,
-        committing_manifest = undefined,
+        since_persist = 0,
+        last_persist_ts = erlang:system_time(millisecond),
+        persist_in_flight = false,
+        last_persisted_manifest = Manifest,
+        persisting_manifest = undefined,
         waiters = []
     },
     {State, []}.
@@ -121,12 +121,12 @@ init(Manifest, Opts) ->
 manifest(#state{manifest = Manifest}) ->
     Manifest.
 
--spec committed_manifest(state()) -> #manifest{}.
-committed_manifest(#state{last_committed_manifest = Manifest}) ->
+-spec persisted_manifest(state()) -> #manifest{}.
+persisted_manifest(#state{last_persisted_manifest = Manifest}) ->
     Manifest.
 
 -spec fragment_cut(fragment_meta(), state()) -> {state(), reference(), [core_effect()]}.
-fragment_cut(Meta, #state{cfg = Cfg, in_flight = Q, since_commit = 0} = State) ->
+fragment_cut(Meta, #state{cfg = Cfg, in_flight = Q, since_persist = 0} = State) ->
     case queue:is_empty(Q) of
         true ->
             %% First fragment since last commit. Start the timer.
@@ -134,7 +134,7 @@ fragment_cut(Meta, #state{cfg = Cfg, in_flight = Q, since_commit = 0} = State) -
             Q1 = queue:in({Ref, Meta}, Q),
             Effects = [
                 {submit_transfer, Ref, Cfg#cfg.stream, Cfg#cfg.dir, Meta},
-                {start_commit_timer, Cfg#cfg.durable_commit_interval_ms}
+                {start_persist_timer, Cfg#cfg.persist_interval_ms}
             ],
             {State#state{in_flight = Q1}, Ref, Effects};
         false ->
@@ -167,56 +167,56 @@ transfer_failed(Ref, Reason, #state{cfg = Cfg} = State) ->
             drain_completions(State1)
     end.
 
--spec commit_complete(rabbitmq_stream_s3_db:revision(), state()) -> {state(), [core_effect()]}.
-commit_complete(
+-spec persist_complete(rabbitmq_stream_s3_db:revision(), state()) -> {state(), [core_effect()]}.
+persist_complete(
     Revision,
     #state{
         cfg = Cfg,
-        committing_manifest = CommittingManifest,
-        in_commit_count = Committed,
-        since_commit = N
+        persisting_manifest = CommittingManifest,
+        in_persist_count = Committed,
+        since_persist = N
     } = State0
 ) ->
     Manifest = CommittingManifest#manifest{revision = Revision},
     State1 = State0#state{
-        commit_in_flight = false,
-        last_committed_manifest = Manifest,
-        committing_manifest = undefined,
-        since_commit = N - Committed,
-        in_commit_count = 0,
-        last_commit_ts = erlang:system_time(millisecond)
+        persist_in_flight = false,
+        last_persisted_manifest = Manifest,
+        persisting_manifest = undefined,
+        since_persist = N - Committed,
+        in_persist_count = 0,
+        last_persist_ts = erlang:system_time(millisecond)
     },
     Effects0 = [
         {update_range, Manifest#manifest.first_offset, Manifest#manifest.next_offset},
         {broadcast, Cfg#cfg.stream,
-            compute_edits(State0#state.last_committed_manifest, CommittingManifest)},
+            compute_edits(State0#state.last_persisted_manifest, CommittingManifest)},
         {evaluate_retention, Cfg#cfg.stream, Cfg#cfg.dir},
-        {cancel_commit_timer}
+        cancel_persist_timer
     ],
     {State2, WaiterEffects} = notify_waiters(State1),
     Effects1 = Effects0 ++ WaiterEffects,
     %% If more fragments applied while commit was in flight, trigger another.
-    case State2#state.since_commit > 0 of
+    case State2#state.since_persist > 0 of
         true ->
-            {State3, CommitEffects} = maybe_start_commit(State2),
+            {State3, CommitEffects} = maybe_start_persist(State2),
             {State3, Effects1 ++ CommitEffects};
         false ->
             {State2, Effects1}
     end.
 
--spec commit_failed(term(), state()) -> {state(), [core_effect()]}.
-commit_failed(conflict, State) ->
+-spec persist_failed(term(), state()) -> {state(), [core_effect()]}.
+persist_failed(conflict, State) ->
     %% Khepri conflict. The shell must re-resolve the manifest externally
     %% and re-init the core. We signal this by returning a special effect.
-    {State#state{commit_in_flight = false}, [{reinitialize}]};
-commit_failed(_Reason, #state{cfg = Cfg} = State0) ->
+    {State#state{persist_in_flight = false}, [reinitialize]};
+persist_failed(_Reason, #state{cfg = Cfg} = State0) ->
     %% S3 or transient error. Retry the commit.
-    State1 = State0#state{commit_in_flight = false},
-    {State2, Effects} = maybe_start_commit(State1),
+    State1 = State0#state{persist_in_flight = false},
+    {State2, Effects} = maybe_start_persist(State1),
     case Effects of
         [] ->
             %% Fallback: use timer to retry.
-            {State2, [{start_commit_timer, Cfg#cfg.durable_commit_interval_ms}]};
+            {State2, [{start_persist_timer, Cfg#cfg.persist_interval_ms}]};
         _ ->
             {State2, Effects}
     end.
@@ -225,19 +225,19 @@ commit_failed(_Reason, #state{cfg = Cfg} = State0) ->
 tick(
     Now,
     #state{
-        since_commit = SinceCommit,
-        commit_in_flight = false,
-        last_commit_ts = LastTs,
-        cfg = #cfg{durable_commit_interval_ms = Interval}
+        since_persist = SinceCommit,
+        persist_in_flight = false,
+        last_persist_ts = LastTs,
+        cfg = #cfg{persist_interval_ms = Interval}
     } = State
 ) when SinceCommit > 0, (Now - LastTs) >= Interval ->
-    start_commit(State);
+    start_persist(State);
 tick(_Now, State) ->
     {State, []}.
 
 -spec await_offset(osiris:offset(), gen_server:from(), state()) ->
     {state(), [core_effect()]}.
-await_offset(Offset, From, #state{last_committed_manifest = Committed} = State) ->
+await_offset(Offset, From, #state{last_persisted_manifest = Committed} = State) ->
     case Committed#manifest.next_offset >= Offset of
         true ->
             {State, [{reply_waiters, [{From, ok}]}]};
@@ -251,11 +251,11 @@ and last-committed manifests. Returns effects to broadcast and update range.
 """.
 -spec apply_retention_edit(#edit{}, state()) -> {state(), [core_effect()]}.
 apply_retention_edit(
-    Edit, #state{cfg = Cfg, manifest = Manifest0, last_committed_manifest = Committed0} = State
+    Edit, #state{cfg = Cfg, manifest = Manifest0, last_persisted_manifest = Committed0} = State
 ) ->
     Manifest = rabbitmq_stream_s3_manifest:apply_edit(Edit, Manifest0),
     Committed = rabbitmq_stream_s3_manifest:apply_edit(Edit, Committed0),
-    State1 = State#state{manifest = Manifest, last_committed_manifest = Committed},
+    State1 = State#state{manifest = Manifest, last_persisted_manifest = Committed},
     Effects = [
         {broadcast, Cfg#cfg.stream, [Edit]},
         {update_range, Manifest#manifest.first_offset, Manifest#manifest.next_offset}
@@ -283,7 +283,7 @@ drain_completions(#state{in_flight = Q, pending_completions = PC} = State0) ->
                     %% Continue draining contiguous completions.
                     {State3, Effects} = drain_completions(State2),
                     %% After all draining, check commit trigger.
-                    {State4, CommitEffects} = maybe_start_commit(State3),
+                    {State4, CommitEffects} = maybe_start_persist(State3),
                     {State4, Effects ++ CommitEffects}
             end;
         empty ->
@@ -291,7 +291,7 @@ drain_completions(#state{in_flight = Q, pending_completions = PC} = State0) ->
     end.
 
 -spec apply_fragment(rabbitmq_stream_s3:uid(), fragment_meta(), state()) -> state().
-apply_fragment(Uid, Meta, #state{manifest = Manifest0, since_commit = N} = State) ->
+apply_fragment(Uid, Meta, #state{manifest = Manifest0, since_persist = N} = State) ->
     #{
         first_offset := FirstOffset,
         first_timestamp := FirstTs,
@@ -322,39 +322,41 @@ apply_fragment(Uid, Meta, #state{manifest = Manifest0, since_commit = N} = State
                 Edit
         end,
     Manifest = rabbitmq_stream_s3_manifest:apply_edit(Edit1, Manifest0),
-    State#state{manifest = Manifest, since_commit = N + 1}.
+    State#state{manifest = Manifest, since_persist = N + 1}.
 
--spec maybe_start_commit(state()) -> {state(), [core_effect()]}.
-maybe_start_commit(#state{commit_in_flight = true} = State) ->
+-spec maybe_start_persist(state()) -> {state(), [core_effect()]}.
+maybe_start_persist(#state{persist_in_flight = true} = State) ->
     {State, []};
-maybe_start_commit(#state{since_commit = 0} = State) ->
+maybe_start_persist(#state{since_persist = 0} = State) ->
     {State, []};
-maybe_start_commit(
+maybe_start_persist(
     #state{
         cfg = Cfg,
-        since_commit = N,
-        commit_in_flight = false
+        since_persist = N,
+        persist_in_flight = false
     } = State
-) when N >= Cfg#cfg.durable_commit_threshold ->
-    start_commit(State);
-maybe_start_commit(State) ->
+) when N >= Cfg#cfg.persist_threshold ->
+    start_persist(State);
+maybe_start_persist(State) ->
     {State, []}.
 
--spec start_commit(state()) -> {state(), [core_effect()]}.
-start_commit(
-    #state{cfg = Cfg, manifest = Manifest, last_committed_manifest = LastManifest, since_commit = N} =
+-spec start_persist(state()) -> {state(), [core_effect()]}.
+start_persist(
+    #state{
+        cfg = Cfg, manifest = Manifest, last_persisted_manifest = LastManifest, since_persist = N
+    } =
         State
 ) ->
-    Edits = edits_since_commit(State),
+    Edits = edits_since_persist(State),
     Effect =
-        {start_commit, Manifest, Cfg#cfg.epoch, Cfg#cfg.reference, LastManifest#manifest.revision,
+        {start_persist, Manifest, Cfg#cfg.epoch, Cfg#cfg.reference, LastManifest#manifest.revision,
             Edits},
-    {State#state{commit_in_flight = true, in_commit_count = N, committing_manifest = Manifest}, [
+    {State#state{persist_in_flight = true, in_persist_count = N, persisting_manifest = Manifest}, [
         Effect
     ]}.
 
--spec edits_since_commit(state()) -> [#edit{}].
-edits_since_commit(#state{manifest = Manifest, last_committed_manifest = Last}) ->
+-spec edits_since_persist(state()) -> [#edit{}].
+edits_since_persist(#state{manifest = Manifest, last_persisted_manifest = Last}) ->
     compute_edits(Last, Manifest).
 
 -spec compute_edits(#manifest{}, #manifest{}) -> [#edit{}].
@@ -384,7 +386,7 @@ compute_edits(From, To) ->
     end.
 
 -spec notify_waiters(state()) -> {state(), [core_effect()]}.
-notify_waiters(#state{last_committed_manifest = Committed, waiters = Waiters} = State) ->
+notify_waiters(#state{last_persisted_manifest = Committed, waiters = Waiters} = State) ->
     NextOffset = Committed#manifest.next_offset,
     {Satisfied, Remaining} = lists:partition(
         fun({Offset, _From}) -> NextOffset >= Offset end,

@@ -20,7 +20,7 @@ epoch mismatch, the replica requests a full re-sync from the writer.
 
 No heartbeat or reconnection mechanism is needed because:
 - Message loss on a live connection is detected when the next edit
-  arrives (gap in sequence). The durable commit interval (default 2s)
+  arrives (gap in sequence). The persist interval (default 2s)
   bounds the window before the next edit.
 - Network partitions cause the stream coordinator to restart the
   acceptor. Acceptor restart fires the `on_init(acceptor, ...)` hook

@@ -124,7 +124,7 @@ end_per_testcase(_TestCase, Config) ->
     catch osiris_writer:stop(WriterCfg),
     %% Clean up any per-test app env overrides.
     application:unset_env(rabbitmq_stream_s3, fragment_target_size),
-    application:unset_env(rabbitmq_stream_s3, durable_commit_threshold),
+    application:unset_env(rabbitmq_stream_s3, persist_threshold),
     Config.
 
 %% ------------------------------------------------------------------
@@ -380,7 +380,7 @@ local_ahead_discards_manifest(Config) ->
         reference => StreamId,
         epoch => 1,
         fragment_target_size => 500,
-        durable_commit_threshold => 1
+        persist_threshold => 1
     }),
 
     %% Wait for the new replica reader to upload.
@@ -433,7 +433,7 @@ discover_attaches_to_existing_writer(Config) ->
     %% discovered replica reader uses them (discovery doesn't have access to
     %% per-stream remote_config).
     application:set_env(rabbitmq_stream_s3, fragment_target_size, 500),
-    application:set_env(rabbitmq_stream_s3, durable_commit_threshold, 1),
+    application:set_env(rabbitmq_stream_s3, persist_threshold, 1),
 
     %% Seed two segments, each with a chunk exceeding the fragment target.
     #{next_offset := NextOffset} = seed_log(Config, [

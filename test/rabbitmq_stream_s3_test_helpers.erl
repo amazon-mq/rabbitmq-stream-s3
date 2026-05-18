@@ -230,7 +230,7 @@ start_writer(Config, RemoteConfig) ->
 start_writer(Config, WriterOverrides, RemoteConfig) ->
     StreamId = ?config(stream_id, Config),
     WriterCfg0 = ?config(writer_cfg, Config),
-    RemoteConfig1 = maps:merge(#{durable_commit_threshold => 1}, RemoteConfig),
+    RemoteConfig1 = maps:merge(#{persist_threshold => 1}, RemoteConfig),
     WriterCfg = maps:merge(WriterCfg0, WriterOverrides#{remote_config => RemoteConfig1}),
     {ok, Writer} = osiris_writer:start(WriterCfg),
     flush_writer(Writer),
@@ -246,7 +246,7 @@ start_cluster(Config, ReplicaNodes, RemoteConfig) ->
 start_cluster(Config, ReplicaNodes, WriterOverrides, RemoteConfig) ->
     StreamId = ?config(stream_id, Config),
     WriterCfg0 = ?config(writer_cfg, Config),
-    RemoteConfig1 = maps:merge(#{durable_commit_threshold => 1}, RemoteConfig),
+    RemoteConfig1 = maps:merge(#{persist_threshold => 1}, RemoteConfig),
     ClusterCfg = maps:merge(WriterCfg0, WriterOverrides#{
         replica_nodes => ReplicaNodes,
         remote_config => RemoteConfig1
@@ -264,11 +264,11 @@ flush_writer(Writer) ->
     _ = osiris_writer:query_replication_state(Writer),
     ok.
 
-%% @doc Block until the remote replica reader has durably committed past `Offset`.
+%% @doc Block until the remote replica reader has persisted past `Offset`.
 %%
 %% `Offset` is an exclusive upper bound: `await_offset(StreamId, N)` returns
 %% when the durable `next_offset >= N`. This means all records with offsets
-%% 0..N-1 are in S3 and referenced by a committed manifest.
+%% 0..N-1 are in S3 and referenced by a persisted manifest.
 %%
 %% Use this as the barrier between writing data and asserting on the remote
 %% tier. Do not assert on fragment count, segment count, or remote tier

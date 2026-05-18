@@ -46,7 +46,7 @@ init_per_group(cluster_size_3, Config) ->
         {rabbitmq_stream_s3, [
             {rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_fs},
             {fragment_target_size, 1000},
-            {durable_commit_threshold, 1},
+            {persist_threshold, 1},
             {api_fs_data_dir, DataDir}
         ]}
     ]),

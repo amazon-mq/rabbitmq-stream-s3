@@ -39,7 +39,7 @@ returned by the functional core module.
     epoch := non_neg_integer(),
     shared => atomics:atomics_ref(),
     fragment_target_size => non_neg_integer(),
-    durable_commit_threshold => non_neg_integer(),
+    persist_threshold => non_neg_integer(),
     retention => [osiris:retention_spec()]
 }.
 
@@ -78,10 +78,10 @@ returned by the functional core module.
     %% User-configured retention specs for remote tier evaluation.
     retention = [] :: [osiris:retention_spec()],
     %% Commit timer reference.
-    commit_timer :: reference() | undefined,
+    persist_timer :: reference() | undefined,
     %% Monitor ref and PID for the in-flight commit task.
-    commit_mon :: reference() | undefined,
-    commit_pid :: pid() | undefined
+    persist_mon :: reference() | undefined,
+    persist_pid :: pid() | undefined
 }).
 
 -doc "Start a remote replica reader for the given stream.".
@@ -191,10 +191,10 @@ handle_info({transfer_result, Ref, {ok, Uid}}, #state{core = Core0} = State0) ->
 handle_info({transfer_result, Ref, {error, Reason}}, #state{core = Core0} = State0) ->
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(Ref, Reason, Core0),
     {noreply, execute_effects(Effects, State0#state{core = Core})};
-handle_info(commit_timer, #state{core = Core0} = State0) ->
+handle_info(persist_timer, #state{core = Core0} = State0) ->
     Now = erlang:system_time(millisecond),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:tick(Now, Core0),
-    {noreply, execute_effects(Effects, State0#state{core = Core, commit_timer = undefined})};
+    {noreply, execute_effects(Effects, State0#state{core = Core, persist_timer = undefined})};
 handle_info(
     {'DOWN', _Mon, process, Pid, _Reason},
     #state{cfg = #cfg{writer_pid = Pid, stream = StreamId}} = State
@@ -209,43 +209,43 @@ handle_info(
         MonRef -> {noreply, State#state{replicas = maps:remove(Node, Replicas)}};
         _ -> {noreply, State}
     end;
-handle_info({commit_result, {ok, Revision}}, #state{core = Core0, commit_mon = Mon} = State0) ->
+handle_info({persist_result, {ok, Revision}}, #state{core = Core0, persist_mon = Mon} = State0) ->
     demonitor(Mon, [flush]),
-    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:commit_complete(Revision, Core0),
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_complete(Revision, Core0),
     {noreply,
         execute_effects(Effects, State0#state{
-            core = Core, commit_mon = undefined, commit_pid = undefined
+            core = Core, persist_mon = undefined, persist_pid = undefined
         })};
 handle_info(
-    {commit_result, {error, {conflict, _Entry}}}, #state{core = Core0, commit_mon = Mon} = State0
+    {persist_result, {error, {conflict, _Entry}}}, #state{core = Core0, persist_mon = Mon} = State0
 ) ->
     demonitor(Mon, [flush]),
-    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:commit_failed(conflict, Core0),
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_failed(conflict, Core0),
     {noreply,
         execute_effects(Effects, State0#state{
-            core = Core, commit_mon = undefined, commit_pid = undefined
+            core = Core, persist_mon = undefined, persist_pid = undefined
         })};
-handle_info({commit_result, {error, Reason}}, #state{core = Core0, commit_mon = Mon} = State0) ->
+handle_info({persist_result, {error, Reason}}, #state{core = Core0, persist_mon = Mon} = State0) ->
     demonitor(Mon, [flush]),
-    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:commit_failed(Reason, Core0),
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_failed(Reason, Core0),
     {noreply,
         execute_effects(Effects, State0#state{
-            core = Core, commit_mon = undefined, commit_pid = undefined
+            core = Core, persist_mon = undefined, persist_pid = undefined
         })};
 handle_info(
     {'DOWN', Mon, process, _, Reason},
-    #state{commit_mon = Mon, core = Core0, cfg = #cfg{stream = StreamId}} = State0
+    #state{persist_mon = Mon, core = Core0, cfg = #cfg{stream = StreamId}} = State0
 ) ->
     ?LOG_WARNING("~ts commit task crashed: ~p", [StreamId, Reason]),
-    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:commit_failed(Reason, Core0),
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_failed(Reason, Core0),
     {noreply,
         execute_effects(Effects, State0#state{
-            core = Core, commit_mon = undefined, commit_pid = undefined
+            core = Core, persist_mon = undefined, persist_pid = undefined
         })};
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(_Reason, #state{cfg = #cfg{stream = StreamId}, commit_mon = Mon, commit_pid = CommitPid}) ->
+terminate(_Reason, #state{cfg = #cfg{stream = StreamId}, persist_mon = Mon, persist_pid = CommitPid}) ->
     %% Kill any in-flight commit task to prevent orphaned Khepri writes.
     %% An orphaned write advances the revision, causing conflicts for the
     %% next incarnation of this replica reader.
@@ -318,7 +318,7 @@ delete_manifest_objects(StreamId, Manifest) ->
     ok.
 
 %% ------------------------------------------------------------------
-%% Commit (executed in spawned task)
+%% Persist (executed in spawned task)
 %% ------------------------------------------------------------------
 
 -spec do_commit(
@@ -404,15 +404,15 @@ execute_effect({resubmit_transfer, Ref, _StreamId, Dir, Meta}, #state{cfg = Cfg}
     rabbitmq_stream_s3_governor:submit(Fun, Size, Self, Ref),
     State;
 execute_effect(
-    {start_commit, Manifest, Epoch, Reference, ExpectedRevision, _Edits},
+    {start_persist, Manifest, Epoch, Reference, ExpectedRevision, _Edits},
     #state{cfg = #cfg{stream = StreamId}} = State
 ) ->
     Self = self(),
     {CommitPid, MonRef} = spawn_monitor(fun() ->
         Result = do_commit(StreamId, Manifest, Epoch, Reference, ExpectedRevision),
-        Self ! {commit_result, Result}
+        Self ! {persist_result, Result}
     end),
-    State#state{commit_mon = MonRef, commit_pid = CommitPid};
+    State#state{persist_mon = MonRef, persist_pid = CommitPid};
 execute_effect({update_range, _FirstOffset, _NextOffset}, #state{cfg = Cfg, core = Core} = State) ->
     Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(Core),
     ok = rabbitmq_stream_s3_manifest_replica:put_manifest(Cfg#cfg.stream, Manifest),
@@ -433,20 +433,20 @@ execute_effect(
     {evaluate_retention, _StreamId, _Dir},
     #state{core = Core, retention = Retention, cfg = Cfg} = State
 ) ->
-    Manifest = rabbitmq_stream_s3_replica_reader_core:committed_manifest(Core),
+    Manifest = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(Core),
     maybe_evaluate_retention(Manifest, State),
     maybe_evaluate_remote_retention(Manifest, Retention, Cfg#cfg.stream, State);
 execute_effect({reply_waiters, Replies}, State) ->
     [gen_server:reply(From, Reply) || {From, Reply} <- Replies],
     State;
-execute_effect({start_commit_timer, Ms}, #state{commit_timer = OldRef} = State) ->
+execute_effect({start_persist_timer, Ms}, #state{persist_timer = OldRef} = State) ->
     _ = cancel_timer(OldRef),
-    Ref = erlang:send_after(Ms, self(), commit_timer),
-    State#state{commit_timer = Ref};
-execute_effect({cancel_commit_timer}, #state{commit_timer = Ref} = State) ->
+    Ref = erlang:send_after(Ms, self(), persist_timer),
+    State#state{persist_timer = Ref};
+execute_effect(cancel_persist_timer, #state{persist_timer = Ref} = State) ->
     _ = cancel_timer(Ref),
-    State#state{commit_timer = undefined};
-execute_effect({reinitialize}, #state{cfg = #cfg{stream = StreamId}} = State) ->
+    State#state{persist_timer = undefined};
+execute_effect(reinitialize, #state{cfg = #cfg{stream = StreamId}} = State) ->
     ?LOG_INFO("~ts reinitializing after commit conflict", [StreamId]),
     Manifest = resolve_manifest(StreamId),
     {Core, _} = rabbitmq_stream_s3_replica_reader_core:init(Manifest, State#state.config),
