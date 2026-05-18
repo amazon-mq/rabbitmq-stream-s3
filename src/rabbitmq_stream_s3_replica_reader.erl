@@ -472,6 +472,30 @@ format_state(#state{
 
 identity_formatter(Evt) -> Evt.
 
+%% Proactively register replica nodes for manifest broadcast.
+%% Idempotent: skips nodes already in the replicas map.
+register_replicas(Nodes, State) ->
+    lists:foldl(fun register_replica/2, State, Nodes).
+
+register_replica(
+    Node,
+    #state{
+        replicas = Replicas,
+        core = Core,
+        broadcast_seq = Seq,
+        cfg = #cfg{stream = StreamId, epoch = Epoch}
+    } = State
+) ->
+    case maps:is_key(Node, Replicas) of
+        true ->
+            State;
+        false ->
+            MonRef = monitor(process, {rabbitmq_stream_s3_manifest_replica, Node}),
+            Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(Core),
+            rabbitmq_stream_s3_manifest_replica:sync(StreamId, Seq, Epoch, Manifest, Node),
+            State#state{replicas = Replicas#{Node => MonRef}}
+    end.
+
 delete_manifest_objects(StreamId, Manifest) ->
     spawn(fun() ->
         GetGroupFun = fun(GroupRef) ->
@@ -821,13 +845,18 @@ start_reading0(
 ) ->
     Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(Core),
     StartOffset = Manifest#manifest.next_offset,
-    _ = osiris_writer:query_replication_state(WriterPid),
+    RepState = osiris_writer:query_replication_state(WriterPid),
+    %% Proactively sync any replica nodes that are already running.
+    %% If their manifest_replica isn't up yet, the cast is dropped and
+    %% they will send {register_acceptor, ...} when their plugin starts.
+    ReplicaNodes = maps:keys(RepState) -- [node()],
+    State1 = register_replicas(ReplicaNodes, State),
     osiris:register_offset_listener(WriterPid, StartOffset, ?OFFSET_FORMATTER),
     ?LOG_DEBUG("~ts start_reading start_offset=~b", [StreamId, StartOffset]),
     try osiris_writer:init_data_reader(WriterPid, {StartOffset, empty}, #{}) of
         {ok, Log} ->
             Assembly = rabbitmq_stream_s3_fragment_assembly:new(TargetSize),
-            drain(State#state{log = Log, assembly = Assembly});
+            drain(State1#state{log = Log, assembly = Assembly});
         {error, {offset_out_of_range, {LocalFirst, _}}} when LocalFirst > StartOffset ->
             %% Local retention deleted data the remote tier never received.
             %% Discard the remote manifest (the data would have been retained
@@ -838,23 +867,23 @@ start_reading0(
                 "Discarding remote manifest and restarting.",
                 [StreamId, LocalFirst, StartOffset]
             ),
-            inc(State, ?C_LOCAL_LOG_AHEAD_RECOVERIES, 1),
+            inc(State1, ?C_LOCAL_LOG_AHEAD_RECOVERIES, 1),
             delete_manifest_objects(StreamId, Manifest),
             FreshManifest = #manifest{
                 next_offset = LocalFirst, revision = Manifest#manifest.revision
             },
             {Core1, _} = rabbitmq_stream_s3_replica_reader_core:init(
-                FreshManifest, State#state.config
+                FreshManifest, State1#state.config
             ),
             ok = rabbitmq_stream_s3_manifest_replica:put_manifest(StreamId, FreshManifest),
-            start_reading(State#state{core = Core1});
+            start_reading(State1#state{core = Core1});
         {error, Reason} ->
             ?LOG_WARNING(
                 "Failed to open data reader for stream ~ts: ~p",
                 [StreamId, Reason]
             ),
             erlang:send_after(1000, self(), retry_resolve),
-            State
+            State1
     catch
         missing_file ->
             ?LOG_WARNING(
@@ -863,7 +892,7 @@ start_reading0(
             ),
             %% Retention deleted the segment between listing and opening.
             %% Retry immediately (same pattern as osiris_log:init_offset_reader).
-            start_reading(State#state{core = Core, log = undefined, assembly = undefined})
+            start_reading(State1#state{core = Core, log = undefined, assembly = undefined})
     end.
 
 -spec drain(#state{}) -> #state{}.

@@ -129,6 +129,7 @@ attach_writer(Pid) ->
     %% Seshat registers writer counters under {osiris_writer, Reference}.
     Counter = osiris_counters:fetch({osiris_writer, Reference}),
     #{epoch := Epoch} = osiris_counters:overview({osiris_writer, Reference}),
+    UserRetention = user_retention_from_queue(Reference),
     Config = #{
         stream => StreamId,
         writer_pid => Pid,
@@ -136,13 +137,17 @@ attach_writer(Pid) ->
         shared => Shared,
         counter => Counter,
         reference => Reference,
-        epoch => Epoch
+        epoch => Epoch,
+        retention => UserRetention
     },
     case rabbitmq_stream_s3_replica_reader_sup:start_child(Config) of
         {ok, _} -> ok;
         {error, {already_started, _}} -> ok;
         {error, _} -> ok
-    end.
+    end,
+    %% Inject the local retention function into the running writer.
+    %% The hook in on_retention_updated/2 prepends {'fun', ...} automatically.
+    osiris:update_retention(Pid, UserRetention).
 
 attach_replica(Pid) ->
     #{name := Name, dir := Dir, shared := Shared, reference := Reference} =
@@ -150,7 +155,23 @@ attach_replica(Pid) ->
     StreamId = iolist_to_binary(Name),
     %% Seshat registers replica counters under {osiris_replica, Reference}.
     Counter = osiris_counters:fetch({osiris_replica, Reference}),
-    rabbitmq_stream_s3_manifest_replica:register_replica_context(StreamId, Dir, Shared, Counter).
+    rabbitmq_stream_s3_manifest_replica:register_replica_context(StreamId, Dir, Shared, Counter),
+    %% Register with the writer's replica reader for manifest broadcast.
+    %% If the writer's replica reader isn't up yet, the cast is dropped;
+    %% the replica reader will proactively sync us on its startup.
+    case rabbit_amqqueue:lookup(Reference) of
+        {ok, Q} ->
+            WriterNode = maps:get(leader_node, amqqueue:get_type_state(Q)),
+            gen_server:cast(
+                {via, rabbitmq_stream_s3_registry, {StreamId, WriterNode}},
+                {register_acceptor, node()}
+            );
+        _ ->
+            ok
+    end,
+    %% Inject the local retention function into the running replica.
+    UserRetention = user_retention_from_queue(Reference),
+    osiris:update_retention(Pid, UserRetention).
 
 local_retention_fun(StreamId) ->
     fun(IdxFiles) ->
@@ -160,6 +181,23 @@ local_retention_fun(StreamId) ->
             empty ->
                 {[], IdxFiles}
         end
+    end.
+
+%% Derive the user-configured retention spec from the queue record.
+%% This handles both queue arguments and operator policies.
+%% Returns [] if the queue record is unavailable (e.g. in tests without
+%% a running broker, or if the queue was deleted).
+user_retention_from_queue(Reference) ->
+    try rabbit_amqqueue:lookup(Reference) of
+        {ok, Q} ->
+            case rabbit_stream_queue:update_stream_conf(Q, #{}) of
+                #{retention := Retention} -> Retention;
+                _ -> []
+            end;
+        _ ->
+            []
+    catch
+        _:_ -> []
     end.
 
 -spec eval_local_retention(IdxFiles :: [filename()], osiris:offset()) ->
