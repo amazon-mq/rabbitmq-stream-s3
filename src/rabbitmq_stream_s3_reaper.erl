@@ -22,8 +22,18 @@ for batched deletion. The task exits when the listing is exhausted.
 -export([start_link/0]).
 -export([delete_objects/2, delete_stream/1]).
 -export([init/1, handle_batch/2, terminate/2]).
+-export([init_counters/0]).
 
 -define(MAX_BATCH, 1000).
+
+-define(C_OBJECTS_DELETED, 1).
+-define(C_STREAMS_DELETED, 2).
+-define(COUNTERS, [
+    {objects_deleted, ?C_OBJECTS_DELETED, counter,
+        "Total individual objects deleted via the reaper (retention or stream deletion)"},
+    {streams_deleted, ?C_STREAMS_DELETED, counter, "Streams whose deletion task ran to completion"}
+]).
+-define(COUNTER_KEY, {?MODULE, counter}).
 
 -record(state, {}).
 
@@ -76,9 +86,11 @@ collect(Ops) ->
 delete_batched([]) ->
     ok;
 delete_batched(Keys) when length(Keys) =< ?MAX_BATCH ->
+    inc(?C_OBJECTS_DELETED, length(Keys)),
     rabbitmq_stream_s3_api:delete(Keys);
 delete_batched(Keys) ->
     {Batch, Rest} = lists:split(?MAX_BATCH, Keys),
+    inc(?C_OBJECTS_DELETED, length(Batch)),
     _ = rabbitmq_stream_s3_api:delete(Batch),
     delete_batched(Rest).
 
@@ -87,7 +99,11 @@ spawn_list_task(StreamId) ->
 
 list_and_delete(StreamId) ->
     Prefix = rabbitmq_stream_s3:stream_prefix(StreamId),
-    list_and_delete_loop(Prefix, start).
+    Result = list_and_delete_loop(Prefix, start),
+    case Result of
+        ok -> inc(?C_STREAMS_DELETED, 1);
+        _ -> ok
+    end.
 
 list_and_delete_loop(_Prefix, done) ->
     ok;
@@ -101,5 +117,21 @@ list_and_delete_loop(Prefix, Continuation) ->
         {error, Reason} ->
             ?LOG_WARNING("Failed to list objects for prefix ~ts: ~p", [Prefix, Reason]),
             %% Best effort - orphan GC will catch anything we miss.
-            ok
+            error
+    end.
+
+%% ------------------------------------------------------------------
+%% Counters
+%% ------------------------------------------------------------------
+
+-spec init_counters() -> ok.
+init_counters() ->
+    Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?COUNTERS, #{module => ?MODULE}),
+    persistent_term:put(?COUNTER_KEY, Cnt),
+    ok.
+
+inc(Idx, N) ->
+    case persistent_term:get(?COUNTER_KEY, undefined) of
+        undefined -> ok;
+        Cnt -> counters:add(Cnt, Idx, N)
     end.

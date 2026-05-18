@@ -132,6 +132,9 @@ init() ->
     persistent_term:put(?COUNTER_KEY, Cnt),
     ok = rabbitmq_stream_s3_remote_reader:init_counters(),
     ok = rabbitmq_stream_s3_log_reader:init_counters(),
+    ok = rabbitmq_stream_s3_governor:init_counters(),
+    ok = rabbitmq_stream_s3_reaper:init_counters(),
+    ok = rabbitmq_stream_s3_replica_reader:init_counters(),
     lists:foreach(
         fun(Kind) ->
             rabbitmq_stream_s3_histogram:new(

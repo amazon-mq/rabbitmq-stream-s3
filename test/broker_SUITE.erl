@@ -21,7 +21,8 @@ groups() ->
             stream_deletion_cleans_remote_tier,
             consumer_reads_across_tiers,
             leadership_transfer_continues_upload,
-            plugin_disable_reenable
+            plugin_disable_reenable,
+            prometheus_metrics
         ]}
     ].
 
@@ -31,6 +32,7 @@ groups() ->
 
 init_per_suite(Config) ->
     rabbit_ct_helpers:log_environment(),
+    {ok, _} = application:ensure_all_started(inets),
     Config.
 
 end_per_suite(Config) ->
@@ -264,6 +266,150 @@ plugin_disable_reenable(Config) ->
 
     amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
     ok.
+
+%% -------------------------------------------------------------------
+%% Helpers
+%% -------------------------------------------------------------------
+
+prometheus_metrics(Config) ->
+    QName = <<"prometheus_test_stream">>,
+    Ch = rabbit_ct_client_helpers:open_channel(Config),
+    stream_declare(Ch, QName),
+    #'confirm.select_ok'{} = amqp_channel:call(Ch, #'confirm.select'{}),
+
+    Payload = binary:copy(<<0>>, 600),
+    [publish(Ch, QName, Payload) || _ <- lists:seq(1, 3)],
+    true = amqp_channel:wait_for_confirms(Ch, 30),
+
+    #{stream_id := StreamId, writer_node := WriterNode} = get_stream_info(Config, QName),
+    ok = await_offset(Config, WriterNode, StreamId, 3),
+
+    %% Scrape the default /metrics endpoint. Per-stream gauges fold into
+    %% labelless aggregates here. Per-stream counters are dropped from
+    %% this view; their aggregate value comes from the node-level shadow
+    %% counter (which has a `module=` label but no queue/vhost label).
+    Default = scrape(Config, WriterNode, "/metrics"),
+
+    %% Aggregate gauges from the replica reader appear with no labels
+    %% (the labelless fold of per-stream values).
+    AggregateGauges = [
+        <<"rabbitmq_stream_s3_manifest_next_offset">>,
+        <<"rabbitmq_stream_s3_remote_bytes">>,
+        <<"rabbitmq_stream_s3_remote_messages">>
+    ],
+    [
+        ?assertMatch(
+            match,
+            re:run(Default, <<"^", M/binary, " ">>, [{capture, none}, multiline]),
+            #{metric => M}
+        )
+     || M <- AggregateGauges
+    ],
+
+    %% Per-stream pipeline gauges are also folded into labelless aggregates.
+    PipelineGauges = [
+        <<"rabbitmq_stream_s3_bytes_in_assembly">>,
+        <<"rabbitmq_stream_s3_bytes_in_transfer">>,
+        <<"rabbitmq_stream_s3_bytes_in_persist">>
+    ],
+    [
+        ?assertMatch(
+            match,
+            re:run(Default, <<"^", M/binary, " ">>, [{capture, none}, multiline]),
+            #{metric => M}
+        )
+     || M <- PipelineGauges
+    ],
+
+    %% Per-stream counters appear via their node-level shadow with the
+    %% `module=` label (no queue label). These must remain monotonic
+    %% across stream lifecycle changes, which is why we don't sum
+    %% per-stream counter values into a labelless aggregate.
+    ShadowCounters = [
+        <<"rabbitmq_stream_s3_transfers_completed">>,
+        <<"rabbitmq_stream_s3_bytes_transferred">>,
+        <<"rabbitmq_stream_s3_persists_completed">>,
+        <<"rabbitmq_stream_s3_roots_created">>,
+        <<"rabbitmq_stream_s3_manifests_resolved_empty">>,
+        <<"rabbitmq_stream_s3_bytes_drained_total">>,
+        <<"rabbitmq_stream_s3_bytes_persisted_total">>
+    ],
+    [
+        ?assertMatch(
+            match,
+            re:run(
+                Default,
+                <<"^", M/binary, "\\{module=\"rabbitmq_stream_s3_replica_reader\"\\} ">>,
+                [{capture, none}, multiline]
+            ),
+            #{metric => M}
+        )
+     || M <- ShadowCounters
+    ],
+
+    %% Per-stream counter values must NOT appear on the default endpoint
+    %% (queue= label). The shadow counter has only a module label.
+    [
+        ?assertMatch(
+            nomatch,
+            re:run(
+                Default,
+                <<"^", M/binary, "\\{[^}]*queue=">>,
+                [{capture, none}, multiline]
+            ),
+            #{metric => M}
+        )
+     || M <- ShadowCounters
+    ],
+
+    %% Per-node-only counters from other modules pass through unchanged.
+    NodeOnlyMetrics = [
+        <<"rabbitmq_stream_s3_governor_submissions_received">>,
+        <<"rabbitmq_stream_s3_objects_deleted">>,
+        <<"rabbitmq_stream_s3_put">>,
+        <<"rabbitmq_stream_s3_request_duration_seconds_bucket">>
+    ],
+    [
+        ?assertMatch(
+            match,
+            re:run(Default, <<"^", M/binary, "[ {]">>, [{capture, none}, multiline]),
+            #{metric => M}
+        )
+     || M <- NodeOnlyMetrics
+    ],
+
+    %% Scrape the per-object endpoint. This emits per-stream metrics with
+    %% queue= and vhost= labels alongside any node-level entries.
+    PerObject = scrape(Config, WriterNode, "/metrics/per-object"),
+    [
+        ?assertMatch(
+            match,
+            re:run(
+                PerObject,
+                <<"^", M/binary, "\\{[^}]*queue=\"prometheus_test_stream\"">>,
+                [{capture, none}, multiline]
+            ),
+            #{metric => M}
+        )
+     || M <- [
+            <<"rabbitmq_stream_s3_transfers_completed">>,
+            <<"rabbitmq_stream_s3_bytes_drained_total">>,
+            <<"rabbitmq_stream_s3_bytes_persisted_total">>,
+            <<"rabbitmq_stream_s3_bytes_in_assembly">>,
+            <<"rabbitmq_stream_s3_bytes_in_transfer">>,
+            <<"rabbitmq_stream_s3_bytes_in_persist">>
+        ]
+    ],
+
+    amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
+    rabbit_ct_client_helpers:close_channel(Ch),
+    ok.
+
+scrape(Config, Node, Path) ->
+    Port = rabbit_ct_broker_helpers:get_node_config(Config, Node, tcp_port_prometheus),
+    URI = lists:flatten(io_lib:format("http://localhost:~b~ts", [Port, Path])),
+    {ok, {{_, 200, _}, _, Body}} = httpc:request(get, {URI, []}, [], []),
+    iolist_to_binary(Body).
 
 %% -------------------------------------------------------------------
 %% Helpers

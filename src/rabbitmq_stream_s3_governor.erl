@@ -24,7 +24,23 @@ with no pacing.
     format_status/1
 ]).
 
+-export([init_counters/0]).
+
 -define(REFILL_INTERVAL_MS, 100).
+
+%% Per-node counters.
+-define(C_SUBMISSIONS_RECEIVED, 1).
+-define(C_TASKS_IN_FLIGHT, 2).
+-define(C_PENDING_SUBMISSIONS, 3).
+-define(COUNTERS, [
+    {governor_submissions_received, ?C_SUBMISSIONS_RECEIVED, counter,
+        "Total transfer submissions received by the governor"},
+    {governor_tasks_in_flight, ?C_TASKS_IN_FLIGHT, gauge,
+        "Number of transfer tasks currently executing"},
+    {governor_pending_submissions, ?C_PENDING_SUBMISSIONS, gauge,
+        "Number of submissions queued waiting for token-bucket capacity"}
+]).
+-define(COUNTER_KEY, {?MODULE, counter}).
 
 -record(state, {
     bucket :: rabbitmq_stream_s3_token_bucket:t() | unlimited,
@@ -78,12 +94,14 @@ init(Opts) ->
             unlimited -> undefined;
             _ -> schedule_refill()
         end,
+    %% Counter is created by init_counters/0 from the API init step.
     {ok, #state{bucket = Bucket, pending = queue:new(), timer_ref = TimerRef}}.
 
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown}, State}.
 
 handle_cast({submit, Fun, Size, ReplyTo, Ref}, State) ->
+    inc(?C_SUBMISSIONS_RECEIVED, 1),
     {noreply, dispatch({Fun, Size, ReplyTo, Ref}, State)};
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -128,9 +146,9 @@ dispatch({_Fun, Size, _ReplyTo, _Ref} = Item, #state{bucket = Bucket0} = State) 
             State#state{bucket = Bucket};
         {insufficient, _, _} ->
             %% Queue for later. Start timer if not running.
-            State1 = State#state{
-                pending = queue:in(Item, State#state.pending)
-            },
+            Pending = queue:in(Item, State#state.pending),
+            set(?C_PENDING_SUBMISSIONS, queue:len(Pending)),
+            State1 = State#state{pending = Pending},
             case State1#state.timer_ref of
                 undefined -> State1#state{timer_ref = schedule_refill()};
                 _ -> State1
@@ -145,8 +163,10 @@ drain_pending(#state{pending = Pending0, bucket = Bucket0} = State) ->
             case rabbitmq_stream_s3_token_bucket:request(Size, Bucket0) of
                 {ok, Bucket} ->
                     spawn_task(Item),
+                    Pending = queue:drop(Pending0),
+                    set(?C_PENDING_SUBMISSIONS, queue:len(Pending)),
                     drain_pending(State#state{
-                        pending = queue:drop(Pending0),
+                        pending = Pending,
                         bucket = Bucket
                     });
                 {insufficient, _, _} ->
@@ -155,6 +175,7 @@ drain_pending(#state{pending = Pending0, bucket = Bucket0} = State) ->
     end.
 
 spawn_task({Fun, _Size, ReplyTo, Ref}) ->
+    inc(?C_TASKS_IN_FLIGHT, 1),
     spawn(fun() ->
         Result =
             try
@@ -162,11 +183,43 @@ spawn_task({Fun, _Size, ReplyTo, Ref}) ->
             catch
                 Class:Reason -> {error, {Class, Reason}}
             end,
+        dec(?C_TASKS_IN_FLIGHT, 1),
         ReplyTo ! {transfer_result, Ref, Result}
     end).
 
 schedule_refill() ->
     erlang:send_after(?REFILL_INTERVAL_MS, self(), refill).
+
+%% ------------------------------------------------------------------
+%% Counters
+%% ------------------------------------------------------------------
+
+-spec init_counters() -> ok.
+init_counters() ->
+    Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?COUNTERS, #{module => ?MODULE}),
+    persistent_term:put(?COUNTER_KEY, Cnt),
+    ok.
+
+counter() ->
+    persistent_term:get(?COUNTER_KEY, undefined).
+
+inc(Idx, N) ->
+    case counter() of
+        undefined -> ok;
+        Cnt -> counters:add(Cnt, Idx, N)
+    end.
+
+dec(Idx, N) ->
+    case counter() of
+        undefined -> ok;
+        Cnt -> counters:sub(Cnt, Idx, N)
+    end.
+
+set(Idx, V) ->
+    case counter() of
+        undefined -> ok;
+        Cnt -> counters:put(Cnt, Idx, V)
+    end.
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").

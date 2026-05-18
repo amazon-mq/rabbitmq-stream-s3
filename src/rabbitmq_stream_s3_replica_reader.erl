@@ -13,11 +13,13 @@ returned by the functional core module.
 -behaviour(gen_server).
 
 -include_lib("kernel/include/logger.hrl").
+-include_lib("rabbit_common/include/resource.hrl").
 -include("include/logging.hrl").
 -include("include/rabbitmq_stream_s3.hrl").
 
 -export([start_link/1, format_state/1]).
 -export([identity_formatter/1]).
+-export([counter_fields/0, init_counters/0]).
 -export([
     init/1,
     handle_call/3,
@@ -61,6 +63,130 @@ returned by the functional core module.
 %% atom `identity` and drop the identity_formatter export. Change is on the
 %% Osiris-upstream wishlist.
 
+%% Per-stream counters. Created in init/1 with stream-identifying labels and
+%% deleted in terminate/2. The Prometheus collector folds these per-stream
+%% counter sets into a single per-node aggregate for the default endpoint
+%% and emits them with full labels for the per-object endpoint.
+%%
+%% Index numbering:
+%%   1-N: counters / gauges that the collector emits.
+-define(C_TRANSFERS_COMPLETED, 1).
+-define(C_TRANSFERS_FAILED, 2).
+-define(C_BYTES_TRANSFERRED, 3).
+-define(C_GROUPS_CREATED, 4).
+-define(C_KILO_GROUPS_CREATED, 5).
+-define(C_MEGA_GROUPS_CREATED, 6).
+-define(C_ROOTS_CREATED, 7).
+-define(C_PERSISTS_COMPLETED, 8).
+-define(C_PERSISTS_FAILED, 9).
+-define(C_PERSIST_CONFLICTS, 10).
+-define(C_MANIFESTS_RESOLVED, 11).
+-define(C_MANIFESTS_RESOLVED_EMPTY, 12).
+-define(C_FRAGMENTS_DELETED, 13).
+-define(C_GROUPS_DELETED, 14).
+-define(C_KILO_GROUPS_DELETED, 15).
+-define(C_MEGA_GROUPS_DELETED, 16).
+-define(C_LOCAL_TIER_RETENTION_EVALUATIONS, 17).
+-define(C_REMOTE_TIER_RETENTION_EVALUATIONS, 18).
+-define(C_LOCAL_LOG_AHEAD_RECOVERIES, 19).
+-define(C_BYTES_DRAINED, 20).
+-define(C_BYTES_PERSISTED, 21).
+%% Counters above; gauges below. The macro ?NODE_COUNTERS filters by
+%% type, and seshat requires counter indexes to be 1..N sequential. Add
+%% new counters before this divider and renumber the gauges that follow.
+-define(C_TRANSFERS_IN_FLIGHT, 22).
+-define(C_LAST_PERSIST_TIMESTAMP_MS, 23).
+-define(C_MANIFEST_FIRST_OFFSET, 24).
+-define(C_MANIFEST_NEXT_OFFSET, 25).
+-define(C_MANIFEST_FIRST_TIMESTAMP_MS, 26).
+-define(C_REMOTE_BYTES, 27).
+-define(C_REMOTE_MESSAGES, 28).
+-define(C_BYTES_IN_ASSEMBLY, 29).
+-define(C_BYTES_IN_TRANSFER, 30).
+-define(C_BYTES_IN_PERSIST, 31).
+
+-define(STREAM_COUNTERS, [
+    {transfers_completed, ?C_TRANSFERS_COMPLETED, counter,
+        "Fragment uploads to the remote tier that succeeded"},
+    {transfers_failed, ?C_TRANSFERS_FAILED, counter,
+        "Fragment uploads to the remote tier that failed"},
+    {bytes_transferred, ?C_BYTES_TRANSFERRED, counter,
+        "Total payload bytes uploaded to the remote tier"},
+    {groups_created, ?C_GROUPS_CREATED, counter, "Number of group manifest objects created"},
+    {kilo_groups_created, ?C_KILO_GROUPS_CREATED, counter,
+        "Number of kilo-group manifest objects created"},
+    {mega_groups_created, ?C_MEGA_GROUPS_CREATED, counter,
+        "Number of mega-group manifest objects created"},
+    {roots_created, ?C_ROOTS_CREATED, counter, "Number of root manifest objects uploaded"},
+    {persists_completed, ?C_PERSISTS_COMPLETED, counter,
+        "Manifest persists (S3 + Khepri) that succeeded"},
+    {persists_failed, ?C_PERSISTS_FAILED, counter, "Manifest persists that failed for any reason"},
+    {persist_conflicts, ?C_PERSIST_CONFLICTS, counter,
+        "Manifest persists that failed due to a Khepri conflict (competing writer)"},
+    {manifests_resolved, ?C_MANIFESTS_RESOLVED, counter,
+        "Number of times a non-empty manifest was resolved on startup"},
+    {manifests_resolved_empty, ?C_MANIFESTS_RESOLVED_EMPTY, counter,
+        "Number of times an empty manifest was resolved on startup"},
+    {fragments_deleted, ?C_FRAGMENTS_DELETED, counter,
+        "Number of fragment objects deleted by remote tier retention"},
+    {groups_deleted, ?C_GROUPS_DELETED, counter,
+        "Number of group objects deleted by remote tier retention"},
+    {kilo_groups_deleted, ?C_KILO_GROUPS_DELETED, counter,
+        "Number of kilo-group objects deleted by remote tier retention"},
+    {mega_groups_deleted, ?C_MEGA_GROUPS_DELETED, counter,
+        "Number of mega-group objects deleted by remote tier retention"},
+    {local_tier_retention_evaluations, ?C_LOCAL_TIER_RETENTION_EVALUATIONS, counter,
+        "Number of times retention has been evaluated against the local tier"},
+    {remote_tier_retention_evaluations, ?C_REMOTE_TIER_RETENTION_EVALUATIONS, counter,
+        "Number of times retention has been evaluated against the remote tier"},
+    {local_log_ahead_recoveries, ?C_LOCAL_LOG_AHEAD_RECOVERIES, counter,
+        "Times the replica reader discarded the remote manifest because the local log "
+        "was ahead (e.g. local retention deleted un-uploaded data)"},
+    {bytes_drained_total, ?C_BYTES_DRAINED, counter,
+        "Cumulative bytes the replica reader has drained from osiris (sum of chunk "
+        "byte sizes read via osiris_log:read_header)"},
+    {bytes_persisted_total, ?C_BYTES_PERSISTED, counter,
+        "Cumulative bytes whose fragment manifest update has succeeded (each persist "
+        "covers one or more uploaded fragments)"},
+    {transfers_in_flight, ?C_TRANSFERS_IN_FLIGHT, gauge,
+        "Fragments cut and submitted to the governor that have not yet completed"},
+    {last_persist_timestamp_ms, ?C_LAST_PERSIST_TIMESTAMP_MS, gauge,
+        "Wall-clock time (ms since epoch) of the last successful manifest persist"},
+    {manifest_first_offset, ?C_MANIFEST_FIRST_OFFSET, gauge,
+        "Offset of the oldest record present in the remote tier"},
+    {manifest_next_offset, ?C_MANIFEST_NEXT_OFFSET, gauge,
+        "Next offset to upload to the remote tier"},
+    {manifest_first_timestamp_ms, ?C_MANIFEST_FIRST_TIMESTAMP_MS, gauge,
+        "Timestamp (ms since epoch) of the oldest record present in the remote tier, "
+        "or 0 when empty"},
+    {remote_bytes, ?C_REMOTE_BYTES, gauge,
+        "Total bytes of segment data stored in the remote tier for this stream"},
+    {remote_messages, ?C_REMOTE_MESSAGES, gauge,
+        "Approximate number of records stored in the remote tier (next_offset - "
+        "first_offset)"},
+    {bytes_in_assembly, ?C_BYTES_IN_ASSEMBLY, gauge,
+        "Bytes drained from osiris but not yet cut into a fragment. Pipeline stage 1."},
+    {bytes_in_transfer, ?C_BYTES_IN_TRANSFER, gauge,
+        "Bytes in fragments waiting at the governor or being uploaded to S3. Pipeline "
+        "stage 2."},
+    {bytes_in_persist, ?C_BYTES_IN_PERSIST, gauge,
+        "Bytes in fragments uploaded to S3 whose manifest update has not yet "
+        "succeeded. Pipeline stage 3."}
+]).
+
+%% Node-level shadow counter set. Per-stream counters are dropped from
+%% the labelless `/metrics` aggregate by the prometheus collector to
+%% preserve Prometheus monotonicity across stream deletion. The shadow
+%% holds the cluster-cumulative value (one counter ref per node, no
+%% per-stream label). Each `inc/3` call writes both refs in lockstep.
+%%
+%% The shadow only contains counter-typed fields; gauges aggregate
+%% naturally (sum across streams) on the default endpoint and don't
+%% need a shadow.
+-define(NODE_COUNTERS, [F || {_, _, counter, _} = F <- ?STREAM_COUNTERS]).
+
+-define(NODE_COUNTER_KEY, {?MODULE, node_counter}).
+
 -record(state, {
     cfg :: #cfg{},
     %% The remote replica reader configuration map.
@@ -81,7 +207,26 @@ returned by the functional core module.
     persist_timer :: reference() | undefined,
     %% Monitor ref and PID for the in-flight commit task.
     persist_mon :: reference() | undefined,
-    persist_pid :: pid() | undefined
+    persist_pid :: pid() | undefined,
+    %% Per-stream seshat counter ref. The id used to register this counter
+    %% in the rabbitmq_stream_s3 seshat group, used for cleanup on terminate.
+    metrics :: counters:counters_ref() | undefined,
+    metrics_id :: term() | undefined,
+    %% Map from in-flight transfer ref to its byte size. Tracked in the
+    %% shell so we can attribute bytes_transferred and decrement
+    %% transfers_in_flight when the result message arrives.
+    transfer_sizes = #{} :: #{reference() => non_neg_integer()},
+    %% Bytes uploaded but not yet covered by a started persist. Moves to
+    %% persisting_bytes when the next start_persist effect fires.
+    persist_pending_bytes = 0 :: non_neg_integer(),
+    %% Bytes covered by the currently-in-flight persist. Snapshotted from
+    %% persist_pending_bytes at start_persist; cleared on persist_result.
+    %% bytes_in_persist gauge = persist_pending_bytes + persisting_bytes.
+    persisting_bytes = 0 :: non_neg_integer(),
+    %% Kind of the group upload currently in flight. Cleared when the
+    %% group_upload_result message arrives. Only one rebalance is in
+    %% flight at a time so a single slot suffices.
+    pending_group_kind :: rabbitmq_stream_s3:kind() | undefined
 }).
 
 -doc "Start a remote replica reader for the given stream.".
@@ -112,6 +257,7 @@ init(
         application:get_env(rabbitmq_stream_s3, fragment_target_size, ?MAX_FRAGMENT_SIZE_B)
     ),
     Shared = maps:get(shared, Args, undefined),
+    {MetricsId, Metrics} = init_metrics(StreamId, Reference),
     ?LOG_INFO("Remote replica reader starting for stream ~ts", [StreamId]),
     Cfg = #cfg{
         stream = StreamId,
@@ -124,7 +270,15 @@ init(
         epoch = Epoch
     },
     Retention = maps:get(retention, Args, []),
-    {ok, #state{cfg = Cfg, config = Args, retention = Retention, core = undefined},
+    {ok,
+        #state{
+            cfg = Cfg,
+            config = Args,
+            retention = Retention,
+            core = undefined,
+            metrics = Metrics,
+            metrics_id = MetricsId
+        },
         {continue, resolve_manifest}}.
 
 handle_call({await_offset, Offset}, From, #state{core = Core0} = State) ->
@@ -170,8 +324,9 @@ handle_cast(_Msg, State) ->
 
 handle_continue(resolve_manifest, #state{cfg = #cfg{stream = StreamId}} = State0) ->
     Manifest = resolve_manifest(StreamId),
-    {Core, _Effects} = rabbitmq_stream_s3_replica_reader_core:init(Manifest, State0#state.config),
-    State = start_reading(State0#state{core = Core}),
+    State1 = on_manifest_resolved(Manifest, State0),
+    {Core, _Effects} = rabbitmq_stream_s3_replica_reader_core:init(Manifest, State1#state.config),
+    State = start_reading(State1#state{core = Core}),
     {noreply, State}.
 
 handle_info({osiris_offset, _Ref, Offset}, #state{cfg = #cfg{stream = StreamId}} = State0) ->
@@ -180,27 +335,31 @@ handle_info({osiris_offset, _Ref, Offset}, #state{cfg = #cfg{stream = StreamId}}
     {noreply, State};
 handle_info(retry_resolve, #state{cfg = #cfg{stream = StreamId}} = State0) ->
     Manifest = resolve_manifest(StreamId),
-    {Core, _} = rabbitmq_stream_s3_replica_reader_core:init(Manifest, State0#state.config),
-    State = start_reading(State0#state{core = Core}),
+    State1 = on_manifest_resolved(Manifest, State0),
+    {Core, _} = rabbitmq_stream_s3_replica_reader_core:init(Manifest, State1#state.config),
+    State = start_reading(State1#state{core = Core}),
     {noreply, State};
 handle_info({transfer_result, Ref, {ok, Uid}}, #state{core = Core0} = State0) ->
+    State1 = on_transfer_result(Ref, ok, State0),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_complete(Ref, Uid, Core0),
-    State1 = State0#state{core = Core},
-    State2 = execute_effects(Effects, State1),
-    {noreply, State2};
+    State2 = State1#state{core = Core},
+    State3 = execute_effects(Effects, State2),
+    {noreply, State3};
 handle_info({transfer_result, Ref, {error, Reason}}, #state{core = Core0} = State0) ->
+    State1 = on_transfer_result(Ref, {error, Reason}, State0),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(Ref, Reason, Core0),
-    {noreply, execute_effects(Effects, State0#state{core = Core})};
+    {noreply, execute_effects(Effects, State1#state{core = Core})};
 handle_info({group_upload_result, {ok, Uid}}, #state{core = Core0} = State0) ->
+    State1 = on_group_upload_completed(State0),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:group_upload_complete(Uid, Core0),
-    {noreply, execute_effects(Effects, State0#state{core = Core})};
+    {noreply, execute_effects(Effects, State1#state{core = Core})};
 handle_info(
     {group_upload_result, {error, Reason}},
     #state{core = Core0, cfg = #cfg{stream = StreamId}} = State0
 ) ->
     ?LOG_WARNING("~ts group upload failed: ~p", [StreamId, Reason]),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:group_upload_failed(Reason, Core0),
-    {noreply, execute_effects(Effects, State0#state{core = Core})};
+    {noreply, execute_effects(Effects, State0#state{core = Core, pending_group_kind = undefined})};
 handle_info(persist_timer, #state{core = Core0} = State0) ->
     Now = erlang:system_time(millisecond),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:tick(Now, Core0),
@@ -230,16 +389,18 @@ handle_info(
     {persist_result, {error, {conflict, _Entry}}}, #state{core = Core0, persist_mon = Mon} = State0
 ) ->
     demonitor(Mon, [flush]),
+    State1 = on_persist_failed(conflict, State0),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_failed(conflict, Core0),
     {noreply,
-        execute_effects(Effects, State0#state{
+        execute_effects(Effects, State1#state{
             core = Core, persist_mon = undefined, persist_pid = undefined
         })};
 handle_info({persist_result, {error, Reason}}, #state{core = Core0, persist_mon = Mon} = State0) ->
     demonitor(Mon, [flush]),
+    State1 = on_persist_failed(Reason, State0),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_failed(Reason, Core0),
     {noreply,
-        execute_effects(Effects, State0#state{
+        execute_effects(Effects, State1#state{
             core = Core, persist_mon = undefined, persist_pid = undefined
         })};
 handle_info(
@@ -247,15 +408,21 @@ handle_info(
     #state{persist_mon = Mon, core = Core0, cfg = #cfg{stream = StreamId}} = State0
 ) ->
     ?LOG_WARNING("~ts commit task crashed: ~p", [StreamId, Reason]),
+    State1 = on_persist_failed(Reason, State0),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_failed(Reason, Core0),
     {noreply,
-        execute_effects(Effects, State0#state{
+        execute_effects(Effects, State1#state{
             core = Core, persist_mon = undefined, persist_pid = undefined
         })};
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(_Reason, #state{cfg = #cfg{stream = StreamId}, persist_mon = Mon, persist_pid = CommitPid}) ->
+terminate(_Reason, #state{
+    cfg = #cfg{stream = StreamId},
+    persist_mon = Mon,
+    persist_pid = CommitPid,
+    metrics_id = MetricsId
+}) ->
     %% Kill any in-flight commit task to prevent orphaned Khepri writes.
     %% An orphaned write advances the revision, causing conflicts for the
     %% next incarnation of this replica reader.
@@ -266,6 +433,7 @@ terminate(_Reason, #state{cfg = #cfg{stream = StreamId}, persist_mon = Mon, pers
             demonitor(Mon, [flush]),
             exit(CommitPid, kill)
     end,
+    ok = delete_metrics(MetricsId),
     rabbitmq_stream_s3_registry:unregister_name({StreamId, node()}),
     ok.
 
@@ -416,7 +584,7 @@ execute_effects([Effect | Rest], State0) ->
     State = execute_effect(Effect, State0),
     execute_effects(Rest, State).
 
-execute_effect({submit_transfer, Ref, _StreamId, Dir, Meta}, #state{cfg = Cfg} = State) ->
+execute_effect({submit_transfer, Ref, _StreamId, Dir, Meta}, #state{cfg = Cfg} = State0) ->
     StreamId = Cfg#cfg.stream,
     Size = maps:get(size, Meta),
     Self = self(),
@@ -427,8 +595,8 @@ execute_effect({submit_transfer, Ref, _StreamId, Dir, Meta}, #state{cfg = Cfg} =
         end
     end,
     rabbitmq_stream_s3_governor:submit(Fun, Size, Self, Ref),
-    State;
-execute_effect({resubmit_transfer, Ref, _StreamId, Dir, Meta}, #state{cfg = Cfg} = State) ->
+    on_transfer_submitted(Ref, Size, State0);
+execute_effect({resubmit_transfer, Ref, _StreamId, Dir, Meta}, #state{cfg = Cfg} = State0) ->
     StreamId = Cfg#cfg.stream,
     Size = maps:get(size, Meta),
     Self = self(),
@@ -439,10 +607,12 @@ execute_effect({resubmit_transfer, Ref, _StreamId, Dir, Meta}, #state{cfg = Cfg}
         end
     end,
     rabbitmq_stream_s3_governor:submit(Fun, Size, Self, Ref),
-    State;
+    %% Resubmissions don't bump transfers_in_flight again (already counted
+    %% on the first submit) and don't add to transfer_sizes (already there).
+    State0;
 execute_effect(
     {upload_group, StreamId, Kind, Entries, _Pos, _Len},
-    State
+    State0
 ) ->
     Self = self(),
     spawn_link(fun() ->
@@ -458,7 +628,7 @@ execute_effect(
             end,
         Self ! {group_upload_result, Result}
     end),
-    State;
+    State0#state{pending_group_kind = Kind};
 execute_effect(
     {start_persist, Manifest, Epoch, Reference, ExpectedRevision, _Edits},
     #state{cfg = #cfg{stream = StreamId}} = State
@@ -468,11 +638,22 @@ execute_effect(
         Result = do_commit(StreamId, Manifest, Epoch, Reference, ExpectedRevision),
         Self ! {persist_result, Result}
     end),
-    State#state{persist_mon = MonRef, persist_pid = CommitPid};
+    %% Snapshot the bytes that this persist will cover. New transfer
+    %% completions during the persist accumulate in persist_pending_bytes
+    %% and will be covered by the next persist. The bytes_in_persist
+    %% gauge is unchanged here (its value equals
+    %% persisting_bytes + persist_pending_bytes both before and after).
+    Snapshot = State#state.persist_pending_bytes,
+    State#state{
+        persist_mon = MonRef,
+        persist_pid = CommitPid,
+        persisting_bytes = Snapshot,
+        persist_pending_bytes = 0
+    };
 execute_effect({update_range, _FirstOffset, _NextOffset}, #state{cfg = Cfg, core = Core} = State) ->
     Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(Core),
     ok = rabbitmq_stream_s3_manifest_replica:put_manifest(Cfg#cfg.stream, Manifest),
-    State;
+    on_persist_completed(Manifest, State);
 execute_effect(
     {broadcast, StreamId, Edits},
     #state{replicas = Replicas, broadcast_seq = Seq0, cfg = #cfg{epoch = Epoch}} = State
@@ -502,9 +683,10 @@ execute_effect({start_persist_timer, Ms}, #state{persist_timer = OldRef} = State
 execute_effect(cancel_persist_timer, #state{persist_timer = Ref} = State) ->
     _ = cancel_timer(Ref),
     State#state{persist_timer = undefined};
-execute_effect(reinitialize, #state{cfg = #cfg{stream = StreamId}} = State) ->
+execute_effect(reinitialize, #state{cfg = #cfg{stream = StreamId}} = State0) ->
     ?LOG_INFO("~ts reinitializing after commit conflict", [StreamId]),
     Manifest = resolve_manifest(StreamId),
+    State = on_manifest_resolved(Manifest, State0),
     {Core, _} = rabbitmq_stream_s3_replica_reader_core:init(Manifest, State#state.config),
     start_reading(State#state{core = Core, log = undefined, assembly = undefined}).
 
@@ -516,11 +698,12 @@ cancel_timer(Ref) -> erlang:cancel_timer(Ref).
 %% ------------------------------------------------------------------
 
 -spec maybe_evaluate_retention(#manifest{}, #state{}) -> ok.
-maybe_evaluate_retention(Manifest, #state{cfg = Cfg}) ->
+maybe_evaluate_retention(Manifest, #state{cfg = Cfg} = State) ->
     case Manifest#manifest.next_offset > 0 of
         true ->
             #cfg{stream = StreamId, dir = Dir, shared = Shared, counter = Cnt} = Cfg,
             Spec = [{'fun', rabbitmq_stream_s3_hooks:local_retention_fun(StreamId)}],
+            inc(State, ?C_LOCAL_TIER_RETENTION_EVALUATIONS, 1),
             EvalFun = fun
                 ({{FstOff, _}, _FstTs, NumSegLeft}) when is_integer(FstOff) ->
                     osiris_log_shared:set_first_chunk_id(Shared, FstOff),
@@ -544,6 +727,7 @@ update_counter(Cnt, FstOff, NumSegLeft) ->
 maybe_evaluate_remote_retention(_Manifest, [], _StreamId, State) ->
     State;
 maybe_evaluate_remote_retention(Manifest, Retention, StreamId, #state{core = Core0} = State) ->
+    inc(State, ?C_REMOTE_TIER_RETENTION_EVALUATIONS, 1),
     Now = erlang:system_time(millisecond),
     GetGroupFun = rabbitmq_stream_s3_manifest:get_group_fun(StreamId),
     case
@@ -552,6 +736,7 @@ maybe_evaluate_remote_retention(Manifest, Retention, StreamId, #state{core = Cor
         unchanged ->
             State;
         {Edit, Refs} ->
+            on_remote_retention_deleted(Refs, State),
             %% Delete the objects in the background.
             Keys = lists:map(
                 fun
@@ -653,6 +838,7 @@ start_reading0(
                 "Discarding remote manifest and restarting.",
                 [StreamId, LocalFirst, StartOffset]
             ),
+            inc(State, ?C_LOCAL_LOG_AHEAD_RECOVERIES, 1),
             delete_manifest_objects(StreamId, Manifest),
             FreshManifest = #manifest{
                 next_offset = LocalFirst, revision = Manifest#manifest.revision
@@ -699,20 +885,36 @@ drain(
         {ok, Header, Log1} ->
             SegFile = osiris_log:get_current_file(Log1),
             SegOffset = rabbitmq_stream_s3:segment_file_offset(SegFile),
+            Pos = maps:get(position, Header),
+            NextPos = maps:get(next_position, Header),
+            ChunkSize = NextPos - Pos,
             Chunk = #{
                 chunk_id => maps:get(chunk_id, Header),
                 timestamp => maps:get(timestamp, Header),
                 num_records => maps:get(num_records, Header),
                 data_size => maps:get(data_size, Header),
-                position => maps:get(position, Header),
-                next_position => maps:get(next_position, Header),
+                position => Pos,
+                next_position => NextPos,
                 segment_offset => SegOffset,
                 crc => maps:get(crc, Header)
             },
+            %% Pipeline stage 1: bytes have been read from osiris and are
+            %% about to be added to the assembly. Increment the cumulative
+            %% drained counter and the in-assembly gauge. The gauge is
+            %% decremented when the assembly is cut into a fragment.
+            inc(State, ?C_BYTES_DRAINED, ChunkSize),
+            inc_gauge(State, ?C_BYTES_IN_ASSEMBLY, ChunkSize),
             Assembly1 = rabbitmq_stream_s3_fragment_assembly:add_chunk(Chunk, Assembly0),
             case rabbitmq_stream_s3_fragment_assembly:is_cut(Assembly1) of
                 true ->
                     Meta = rabbitmq_stream_s3_fragment_assembly:metadata(Assembly1),
+                    FragmentSize = maps:get(size, Meta),
+                    %% Pipeline stage 1 -> 2: the fragment leaves the
+                    %% assembly. Bytes are removed from the in-assembly
+                    %% gauge; the in-transfer gauge is incremented in
+                    %% on_transfer_submitted when the submit_transfer
+                    %% effect fires.
+                    dec(State, ?C_BYTES_IN_ASSEMBLY, FragmentSize),
                     IdxRecords = rabbitmq_stream_s3_fragment_assembly:index_records(Assembly1),
                     {Core, _Ref, Effects} =
                         rabbitmq_stream_s3_replica_reader_core:fragment_cut(
@@ -807,3 +1009,252 @@ stream_span(Stream0, Crc0, Fd, Pos, Remaining) ->
         {error, _} = Err ->
             Err
     end.
+
+%% ------------------------------------------------------------------
+%% Metrics
+%% ------------------------------------------------------------------
+
+-doc "Field spec used by the prometheus collector to enumerate per-stream metrics.".
+-spec counter_fields() -> [{atom(), pos_integer(), counter | gauge, string()}].
+counter_fields() ->
+    ?STREAM_COUNTERS.
+
+-doc """
+Initialise the node-level shadow counter set.
+
+Called once at plugin start from `rabbitmq_stream_s3_api:init/0`. The
+shadow counter holds the cluster-cumulative value of every per-stream
+counter; the per-stream values are emitted on `/metrics/per-object`
+while the labelless aggregate on `/metrics` is sourced from this
+shadow. The shadow is independent of any stream's lifetime, which
+preserves Prometheus monotonicity when streams are deleted.
+""".
+-spec init_counters() -> ok.
+init_counters() ->
+    Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?NODE_COUNTERS, #{module => ?MODULE}),
+    persistent_term:put(?NODE_COUNTER_KEY, Cnt),
+    ok.
+
+%% Node-level counter ref accessor. Returns `undefined` when the plugin
+%% has not initialised counters yet (e.g. some test setups). Callers
+%% must handle that case.
+node_counter() ->
+    persistent_term:get(?NODE_COUNTER_KEY, undefined).
+
+%% Build the seshat ID and labels and create the per-stream counter ref.
+%% Falls back to a labelless registration when the reference is not a
+%% queue resource (e.g. some test setups). seshat:format/2 with
+%% labels => as_binary skips entries without labels, so unlabelled
+%% counters never appear in the prometheus output.
+init_metrics(StreamId, #resource{kind = queue, virtual_host = VHost, name = Name}) ->
+    Id = {?MODULE, {VHost, Name}},
+    Labels = #{
+        module => ?MODULE,
+        vhost => VHost,
+        queue => Name,
+        stream_id => StreamId
+    },
+    Cnt = seshat:new(rabbitmq_stream_s3, Id, ?STREAM_COUNTERS, Labels),
+    {Id, Cnt};
+init_metrics(StreamId, _Reference) ->
+    %% Fallback: register without labels so the counter still works in tests
+    %% that don't supply a queue resource. seshat:format/2 with
+    %% labels => as_binary will skip these, keeping the prometheus output
+    %% clean.
+    Id = {?MODULE, StreamId},
+    Cnt = seshat:new(rabbitmq_stream_s3, Id, ?STREAM_COUNTERS, #{}),
+    {Id, Cnt}.
+
+delete_metrics(undefined) ->
+    ok;
+delete_metrics(Id) ->
+    seshat:delete(rabbitmq_stream_s3, Id).
+
+%% Increment a per-stream counter by N. Writes both the per-stream
+%% counter ref and the node-level shadow counter ref (if initialised).
+%% No-op when per-stream metrics are not set up.
+%%
+%% This must only be called for fields whose type is `counter` in
+%% ?STREAM_COUNTERS. The node-level shadow only contains counter
+%% fields; calling this with a gauge index would write past the end of
+%% the shadow array.
+inc(#state{metrics = undefined}, _Idx, _N) ->
+    ok;
+inc(#state{metrics = Cnt}, Idx, N) when is_integer(N), N > 0 ->
+    counters:add(Cnt, Idx, N),
+    case node_counter() of
+        undefined -> ok;
+        NodeCnt -> counters:add(NodeCnt, Idx, N)
+    end;
+inc(_, _, _) ->
+    ok.
+
+%% Increment a per-stream gauge by N (for gauges used as in-flight
+%% counters). Per-stream only. The node-level aggregate for gauges is
+%% computed at scrape time by the prometheus collector folding
+%% per-stream values.
+inc_gauge(#state{metrics = undefined}, _Idx, _N) ->
+    ok;
+inc_gauge(#state{metrics = Cnt}, Idx, N) when is_integer(N), N > 0 ->
+    counters:add(Cnt, Idx, N);
+inc_gauge(_, _, _) ->
+    ok.
+
+%% Set a gauge.
+set(#state{metrics = undefined}, _Idx, _V) ->
+    ok;
+set(#state{metrics = Cnt}, Idx, V) when is_integer(V) ->
+    counters:put(Cnt, Idx, V).
+
+%% Decrement a gauge by N.
+dec(#state{metrics = undefined}, _Idx, _N) ->
+    ok;
+dec(#state{metrics = Cnt}, Idx, N) when is_integer(N), N > 0 ->
+    counters:sub(Cnt, Idx, N);
+dec(_, _, _) ->
+    ok.
+
+%% Called from execute_effect/2 for {submit_transfer, ...}.
+on_transfer_submitted(Ref, Size, #state{transfer_sizes = Sizes} = State) ->
+    inc_gauge(State, ?C_TRANSFERS_IN_FLIGHT, 1),
+    %% Pipeline stage 2: bytes enter the transfer phase (governor queue
+    %% or in-flight S3 PUT). Decremented in on_transfer_result.
+    inc_gauge(State, ?C_BYTES_IN_TRANSFER, Size),
+    State#state{transfer_sizes = Sizes#{Ref => Size}}.
+
+%% Called from handle_info on transfer_result. Outcome is `ok' or
+%% `{error, Reason}'.
+on_transfer_result(Ref, Outcome, #state{transfer_sizes = Sizes} = State0) ->
+    case maps:take(Ref, Sizes) of
+        {Size, Sizes1} ->
+            dec(State0, ?C_TRANSFERS_IN_FLIGHT, 1),
+            %% Pipeline stage 2 -> 3 (on success) or 2 -> dropped (on
+            %% error). On retriable errors the existing flow does not
+            %% re-add the ref on resubmit, so transfers_in_flight and
+            %% bytes_in_transfer under-report by one fragment until the
+            %% retry completes. This is consistent with pre-existing
+            %% transfers_in_flight accounting; fixing it requires a
+            %% restructure of the retry path.
+            dec(State0, ?C_BYTES_IN_TRANSFER, Size),
+            case Outcome of
+                ok ->
+                    inc(State0, ?C_TRANSFERS_COMPLETED, 1),
+                    inc(State0, ?C_BYTES_TRANSFERRED, Size),
+                    %% Stage 3: bytes are now waiting for a manifest
+                    %% persist to confirm them.
+                    inc_gauge(State0, ?C_BYTES_IN_PERSIST, Size),
+                    Pending = State0#state.persist_pending_bytes + Size,
+                    State0#state{
+                        transfer_sizes = Sizes1,
+                        persist_pending_bytes = Pending
+                    };
+                {error, _} ->
+                    inc(State0, ?C_TRANSFERS_FAILED, 1),
+                    State0#state{transfer_sizes = Sizes1}
+            end;
+        error ->
+            %% Should not happen but be defensive.
+            State0
+    end.
+
+on_group_upload_completed(#state{pending_group_kind = Kind} = State) ->
+    Idx =
+        case Kind of
+            ?MANIFEST_KIND_GROUP -> ?C_GROUPS_CREATED;
+            ?MANIFEST_KIND_KILO_GROUP -> ?C_KILO_GROUPS_CREATED;
+            ?MANIFEST_KIND_MEGA_GROUP -> ?C_MEGA_GROUPS_CREATED;
+            undefined -> undefined
+        end,
+    case Idx of
+        undefined -> ok;
+        _ -> inc(State, Idx, 1)
+    end,
+    State#state{pending_group_kind = undefined}.
+
+%% Called from execute_effect/2 for {update_range, ...}, which the core
+%% only emits after a successful manifest persist.
+on_persist_completed(#manifest{} = Manifest, State) ->
+    inc(State, ?C_PERSISTS_COMPLETED, 1),
+    inc(State, ?C_ROOTS_CREATED, 1),
+    set(State, ?C_LAST_PERSIST_TIMESTAMP_MS, erlang:system_time(millisecond)),
+    %% Pipeline stage 3: the bytes covered by this persist exit the
+    %% pipeline. Decrement the in-persist gauge and bump the cumulative
+    %% persisted-bytes counter. persisting_bytes was snapshotted from
+    %% persist_pending_bytes at start_persist; reset it now that it has
+    %% been credited.
+    PersistedBytes = State#state.persisting_bytes,
+    dec(State, ?C_BYTES_IN_PERSIST, PersistedBytes),
+    inc(State, ?C_BYTES_PERSISTED, PersistedBytes),
+    update_manifest_gauges(Manifest, State),
+    State#state{persisting_bytes = 0}.
+
+update_manifest_gauges(
+    #manifest{
+        first_offset = FirstOff,
+        next_offset = NextOff,
+        first_timestamp = FirstTs,
+        total_size = TotalSize
+    },
+    State
+) ->
+    set(State, ?C_MANIFEST_FIRST_OFFSET, FirstOff),
+    set(State, ?C_MANIFEST_NEXT_OFFSET, NextOff),
+    %% first_timestamp may be -1 when manifest is empty: clamp to 0 for the
+    %% gauge so dashboards can use `> 0` filters on the gauge.
+    FirstTsMs =
+        case FirstTs of
+            T when T < 0 -> 0;
+            T -> T
+        end,
+    set(State, ?C_MANIFEST_FIRST_TIMESTAMP_MS, FirstTsMs),
+    set(State, ?C_REMOTE_BYTES, TotalSize),
+    %% remote_messages is approximate: counts the offset range covered by
+    %% the manifest. Non-negative because next >= first.
+    set(State, ?C_REMOTE_MESSAGES, max(0, NextOff - FirstOff)),
+    ok.
+
+on_persist_failed(conflict, State0) ->
+    inc(State0, ?C_PERSISTS_FAILED, 1),
+    inc(State0, ?C_PERSIST_CONFLICTS, 1),
+    return_persisting_bytes(State0);
+on_persist_failed(_Reason, State0) ->
+    inc(State0, ?C_PERSISTS_FAILED, 1),
+    return_persisting_bytes(State0).
+
+%% A failed persist returns its snapshotted bytes to persist_pending_bytes
+%% so the next persist will cover them. The bytes_in_persist gauge is
+%% unchanged (the bytes are still in stage 3, just back in the pending
+%% bucket rather than the in-flight slot).
+return_persisting_bytes(#state{persisting_bytes = 0} = State) ->
+    State;
+return_persisting_bytes(
+    #state{persisting_bytes = Snapshot, persist_pending_bytes = Pending} = State
+) ->
+    State#state{persisting_bytes = 0, persist_pending_bytes = Pending + Snapshot}.
+
+on_manifest_resolved(#manifest{next_offset = 0}, State) ->
+    inc(State, ?C_MANIFESTS_RESOLVED_EMPTY, 1),
+    update_manifest_gauges(#manifest{}, State),
+    State;
+on_manifest_resolved(#manifest{} = Manifest, State) ->
+    inc(State, ?C_MANIFESTS_RESOLVED, 1),
+    update_manifest_gauges(Manifest, State),
+    State.
+
+on_remote_retention_deleted(Refs, State) ->
+    Counts = lists:foldl(
+        fun
+            (#fragment_ref{}, Acc) ->
+                maps:update_with(?C_FRAGMENTS_DELETED, fun(N) -> N + 1 end, 1, Acc);
+            (#group_ref{kind = ?MANIFEST_KIND_GROUP}, Acc) ->
+                maps:update_with(?C_GROUPS_DELETED, fun(N) -> N + 1 end, 1, Acc);
+            (#group_ref{kind = ?MANIFEST_KIND_KILO_GROUP}, Acc) ->
+                maps:update_with(?C_KILO_GROUPS_DELETED, fun(N) -> N + 1 end, 1, Acc);
+            (#group_ref{kind = ?MANIFEST_KIND_MEGA_GROUP}, Acc) ->
+                maps:update_with(?C_MEGA_GROUPS_DELETED, fun(N) -> N + 1 end, 1, Acc)
+        end,
+        #{},
+        Refs
+    ),
+    maps:foreach(fun(Idx, N) -> inc(State, Idx, N) end, Counts),
+    ok.
