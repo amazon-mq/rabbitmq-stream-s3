@@ -24,7 +24,8 @@ fragments (via tree-branch-like "group" objects, for large enough streams).
     rebalance_edit/2,
     apply_infos/2,
     apply_edit/2,
-    get_group_fun/1
+    get_group_fun/1,
+    evaluate_remote_retention/3
 ]).
 
 %% ---------------------------------------------------------------------------
@@ -189,6 +190,115 @@ get_group_fun(StreamId) ->
                 Err
         end
     end.
+
+-doc """
+Evaluate remote tier retention against the manifest.
+
+Returns `unchanged` if no entries need to be removed, or
+`{edit(), [#fragment_ref{}]}` with the edit to apply and the fragment
+references to delete from S3.
+
+Only evaluates fragment entries at the head of the root. If the root
+starts with a group entry, returns `unchanged` (group-level retention
+requires downloading the group object and is not yet implemented).
+""".
+-spec evaluate_remote_retention(t(), [osiris:retention_spec()], integer()) ->
+    unchanged | {edit(), [#fragment_ref{}]}.
+evaluate_remote_retention(#manifest{entries = <<>>}, _Specs, _Now) ->
+    unchanged;
+evaluate_remote_retention(#manifest{}, [], _Now) ->
+    unchanged;
+evaluate_remote_retention(#manifest{} = Manifest, Specs, Now) ->
+    case eval_retention_specs(Manifest, Specs, Now) of
+        0 ->
+            unchanged;
+        NumEntries ->
+            build_retention_result(Manifest, NumEntries)
+    end.
+
+%% Returns the number of leading fragment entries to remove.
+eval_retention_specs(Manifest, Specs, Now) ->
+    lists:foldl(
+        fun(Spec, Acc) ->
+            max(Acc, entries_to_remove(Manifest, Spec, Now))
+        end,
+        0,
+        Specs
+    ).
+
+entries_to_remove(
+    #manifest{total_size = TotalSize, entries = Entries}, {max_bytes, MaxBytes}, _Now
+) ->
+    remove_for_max_bytes(Entries, TotalSize, MaxBytes, 0);
+entries_to_remove(#manifest{entries = Entries}, {max_age, MaxAgeMs}, Now) ->
+    Cutoff = Now - MaxAgeMs,
+    remove_for_max_age(Entries, Cutoff, 0);
+entries_to_remove(_, _, _) ->
+    0.
+
+remove_for_max_bytes(_Entries, TotalSize, MaxBytes, N) when TotalSize =< MaxBytes ->
+    N;
+remove_for_max_bytes(<<>>, _TotalSize, _MaxBytes, N) ->
+    N;
+remove_for_max_bytes(Entries, TotalSize, MaxBytes, N) ->
+    <<_Offset:64, _FirstTs:64, _LastTs:64, Kind:8, Size:40, _Uid:32, Rest/binary>> = Entries,
+    case Kind of
+        ?MANIFEST_KIND_FRAGMENT when Rest =/= <<>> ->
+            remove_for_max_bytes(Rest, TotalSize - Size, MaxBytes, N + 1);
+        _ ->
+            %% Hit a group entry or last entry. Stop here.
+            N
+    end.
+
+remove_for_max_age(<<>>, _Cutoff, N) ->
+    N;
+remove_for_max_age(Entries, Cutoff, N) ->
+    <<_Offset:64, _FirstTs:64/signed, LastTs:64/signed, Kind:8, _Size:40, _Uid:32, Rest/binary>> =
+        Entries,
+    case Kind of
+        ?MANIFEST_KIND_FRAGMENT when LastTs < Cutoff andalso Rest =/= <<>> ->
+            remove_for_max_age(Rest, Cutoff, N + 1);
+        _ ->
+            N
+    end.
+
+build_retention_result(#manifest{entries = Entries} = Manifest, NumEntries) ->
+    BytesToRemove = NumEntries * ?ENTRY_B,
+    {Removed, Remaining} = {
+        binary:part(Entries, 0, BytesToRemove),
+        binary:part(Entries, BytesToRemove, byte_size(Entries) - BytesToRemove)
+    },
+    %% Collect fragment refs for deletion.
+    Refs = collect_fragment_refs(Removed, []),
+    %% Compute the size delta.
+    SizeDelta = lists:foldl(fun(#fragment_ref{size = S}, Acc) -> Acc - S end, 0, Refs),
+    %% Determine new first_offset and timestamps from the remaining entries.
+    {NewFirstOffset, NewFirstTs, NewFirstLastTs} =
+        case Remaining of
+            <<>> ->
+                {Manifest#manifest.next_offset, -1, -1};
+            ?ENTRY(Offset, FirstTs, LastTs, _, _, _, _) ->
+                {Offset, FirstTs, LastTs}
+        end,
+    Edit = #edit{
+        first_offset = NewFirstOffset,
+        first_timestamp = NewFirstTs,
+        first_last_timestamp = NewFirstLastTs,
+        next_offset = undefined,
+        size = SizeDelta,
+        entries = <<>>,
+        pos = 0,
+        len = BytesToRemove
+    },
+    {Edit, Refs}.
+
+collect_fragment_refs(<<>>, Acc) ->
+    lists:reverse(Acc);
+collect_fragment_refs(Entries, Acc) ->
+    <<Offset:64/unsigned, _FirstTs:64/signed, _LastTs:64/signed, ?MANIFEST_KIND_FRAGMENT:8/unsigned,
+        Size:40/unsigned, Uid:32/unsigned, Rest/binary>> = Entries,
+    Ref = #fragment_ref{offset = Offset, uid = Uid, size = Size},
+    collect_fragment_refs(Rest, [Ref | Acc]).
 
 group_header_size(?MANIFEST_KIND_GROUP) -> ?MANIFEST_HEADER_SIZE;
 group_header_size(?MANIFEST_KIND_KILO_GROUP) -> ?MANIFEST_HEADER_SIZE;

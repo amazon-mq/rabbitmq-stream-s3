@@ -39,7 +39,8 @@ returned by the functional core module.
     epoch := non_neg_integer(),
     shared => atomics:atomics_ref(),
     fragment_target_size => non_neg_integer(),
-    durable_commit_threshold => non_neg_integer()
+    durable_commit_threshold => non_neg_integer(),
+    retention => [osiris:retention_spec()]
 }.
 
 -record(cfg, {
@@ -74,6 +75,8 @@ returned by the functional core module.
     %% Monotonic sequence number for broadcast edits. Incremented per edit
     %% batch sent. Replicas use this to detect gaps and request re-sync.
     broadcast_seq = 0 :: non_neg_integer(),
+    %% User-configured retention specs for remote tier evaluation.
+    retention = [] :: [osiris:retention_spec()],
     %% Commit timer reference.
     commit_timer :: reference() | undefined,
     %% Monitor ref and PID for the in-flight commit task.
@@ -120,7 +123,9 @@ init(
         reference = Reference,
         epoch = Epoch
     },
-    {ok, #state{cfg = Cfg, config = Args, core = undefined}, {continue, resolve_manifest}}.
+    Retention = maps:get(retention, Args, []),
+    {ok, #state{cfg = Cfg, config = Args, retention = Retention, core = undefined},
+        {continue, resolve_manifest}}.
 
 handle_call({await_offset, Offset}, From, #state{core = Core0} = State) ->
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:await_offset(Offset, From, Core0),
@@ -146,9 +151,9 @@ handle_cast(
             rabbitmq_stream_s3_manifest_replica:sync(StreamId, Seq, Epoch, Manifest, Node),
             {noreply, State#state{replicas = Replicas#{Node => MonRef}}}
     end;
-handle_cast({retention_updated, _Retention}, State) ->
-    %% TODO: forward to remote-tier retention evaluation
-    {noreply, State};
+handle_cast({retention_updated, Retention}, State) ->
+    UserRetention = [S || S <- Retention, element(1, S) =/= 'fun'],
+    {noreply, State#state{retention = UserRetention}};
 handle_cast(
     {resync, Node},
     #state{
@@ -424,9 +429,13 @@ execute_effect(
         Replicas
     ),
     State#state{broadcast_seq = Seq};
-execute_effect({evaluate_retention, _StreamId, _Dir}, #state{core = Core} = State) ->
-    maybe_evaluate_retention(rabbitmq_stream_s3_replica_reader_core:manifest(Core), State),
-    State;
+execute_effect(
+    {evaluate_retention, _StreamId, _Dir},
+    #state{core = Core, retention = Retention, cfg = Cfg} = State
+) ->
+    Manifest = rabbitmq_stream_s3_replica_reader_core:committed_manifest(Core),
+    maybe_evaluate_retention(Manifest, State),
+    maybe_evaluate_remote_retention(Manifest, Retention, Cfg#cfg.stream, State);
 execute_effect({reply_waiters, Replies}, State) ->
     [gen_server:reply(From, Reply) || {From, Reply} <- Replies],
     State;
@@ -471,6 +480,31 @@ maybe_evaluate_retention(Manifest, #state{cfg = Cfg}) ->
 update_counter(Cnt, FstOff, NumSegLeft) ->
     counters:put(Cnt, ?C_OSIRIS_LOG_FIRST_OFFSET, FstOff),
     counters:put(Cnt, ?C_OSIRIS_LOG_SEGMENTS, NumSegLeft).
+
+-spec maybe_evaluate_remote_retention(
+    #manifest{}, [osiris:retention_spec()], stream_id(), #state{}
+) ->
+    #state{}.
+maybe_evaluate_remote_retention(_Manifest, [], _StreamId, State) ->
+    State;
+maybe_evaluate_remote_retention(Manifest, Retention, StreamId, #state{core = Core0} = State) ->
+    Now = erlang:system_time(millisecond),
+    case rabbitmq_stream_s3_manifest:evaluate_remote_retention(Manifest, Retention, Now) of
+        unchanged ->
+            State;
+        {Edit, FragmentRefs} ->
+            %% Delete the fragment objects in the background.
+            Keys = [
+                rabbitmq_stream_s3:fragment_key(StreamId, R#fragment_ref.offset, R#fragment_ref.uid)
+             || R <- FragmentRefs
+            ],
+            rabbitmq_stream_s3_reaper:delete_objects(StreamId, Keys),
+            %% Apply the edit to the core's manifest and execute effects.
+            {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:apply_retention_edit(
+                Edit, Core0
+            ),
+            execute_effects(Effects, State#state{core = Core})
+    end.
 
 %% ------------------------------------------------------------------
 %% Reading

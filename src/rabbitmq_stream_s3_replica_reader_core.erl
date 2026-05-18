@@ -15,13 +15,15 @@ testable without mocks or timing.
 -export([
     init/2,
     manifest/1,
+    committed_manifest/1,
     fragment_cut/2,
     transfer_complete/3,
     transfer_failed/3,
     commit_complete/2,
     commit_failed/2,
     tick/2,
-    await_offset/3
+    await_offset/3,
+    apply_retention_edit/2
 ]).
 
 -export_type([state/0, cfg/0, core_effect/0]).
@@ -117,6 +119,10 @@ init(Manifest, Opts) ->
 
 -spec manifest(state()) -> #manifest{}.
 manifest(#state{manifest = Manifest}) ->
+    Manifest.
+
+-spec committed_manifest(state()) -> #manifest{}.
+committed_manifest(#state{last_committed_manifest = Manifest}) ->
     Manifest.
 
 -spec fragment_cut(fragment_meta(), state()) -> {state(), reference(), [core_effect()]}.
@@ -238,6 +244,23 @@ await_offset(Offset, From, #state{last_committed_manifest = Committed} = State) 
         false ->
             {State#state{waiters = [{Offset, From} | State#state.waiters]}, []}
     end.
+
+-doc """
+Apply a remote retention edit to the manifest. Updates both the in-memory
+and last-committed manifests. Returns effects to broadcast and update range.
+""".
+-spec apply_retention_edit(#edit{}, state()) -> {state(), [core_effect()]}.
+apply_retention_edit(
+    Edit, #state{cfg = Cfg, manifest = Manifest0, last_committed_manifest = Committed0} = State
+) ->
+    Manifest = rabbitmq_stream_s3_manifest:apply_edit(Edit, Manifest0),
+    Committed = rabbitmq_stream_s3_manifest:apply_edit(Edit, Committed0),
+    State1 = State#state{manifest = Manifest, last_committed_manifest = Committed},
+    Effects = [
+        {broadcast, Cfg#cfg.stream, [Edit]},
+        {update_range, Manifest#manifest.first_offset, Manifest#manifest.next_offset}
+    ],
+    {State1, Effects}.
 
 %% ------------------------------------------------------------------
 %% Internal

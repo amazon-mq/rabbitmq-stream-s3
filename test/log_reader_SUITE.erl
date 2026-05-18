@@ -57,7 +57,8 @@ groups() ->
             read_from_remote_first,
             read_from_remote_first_large_filter,
             read_across_fragment_boundaries,
-            read_from_remote_offset
+            read_from_remote_offset,
+            read_repositions_on_fragment_not_found
         ]},
         {with_replica, [], [
             read_from_replica_node
@@ -196,6 +197,39 @@ read_from_remote_offset(Config) ->
 
     Records = read_all(Reader0, TargetOffset),
     assert_sequential(Records, TargetOffset, N - 1).
+
+read_repositions_on_fragment_not_found(Config) ->
+    %% 3 fragments (600 bytes each, target 500). Remote retention with
+    %% max_bytes=1000 deletes the first two, leaving only offset 10.
+    %% A reader requesting offset 0 gets 404 and repositions at 10.
+    #{next_offset := NextOffset} = seed_log(Config, [
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]}
+    ]),
+    Writer = start_writer(
+        Config,
+        #{retention => [{max_bytes, 1000}]},
+        #{fragment_target_size => 500}
+    ),
+    flush_writer(Writer),
+    await_offset(Config, NextOffset),
+
+    %% Wait for remote retention to delete the first two fragments.
+    ?awaitMatch([10], list_fragment_offsets(Config), 2000),
+
+    %% Wait for local retention to reclaim uploaded segments.
+    ReaderCfg = reader_config(Writer, Config),
+    #{shared := Shared} = ReaderCfg,
+    ?awaitMatch(F when F > 0, osiris_log_shared:first_chunk_id(Shared), 1000),
+
+    %% Open a reader at offset 0. The fragment is gone (retention deleted it).
+    %% The reader should reposition at the oldest available offset (10).
+    {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(0, ReaderCfg),
+    ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),
+
+    Records = read_all(Reader0, 10),
+    assert_sequential(Records, 10, NextOffset - 1).
 
 read_from_replica_node(Config) ->
     StreamId = ?config(stream_id, Config),

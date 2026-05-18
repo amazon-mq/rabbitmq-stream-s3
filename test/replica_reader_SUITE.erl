@@ -72,7 +72,8 @@ groups() ->
             seed_log_uploads_deterministic,
             local_ahead_discards_manifest,
             stream_deletion_cleans_remote_tier,
-            discover_attaches_to_existing_writer
+            discover_attaches_to_existing_writer,
+            remote_retention_deletes_fragments
         ]},
         {with_replica, [], [
             replication_happy_path
@@ -469,6 +470,33 @@ discover_attaches_to_existing_writer(Config) ->
     %% Remote + local tiers cover the full range from offset 0.
     {0, FinalOffset} = get_range(Config),
     ?assert(FinalOffset >= NextOffset + 1).
+
+remote_retention_deletes_fragments(Config) ->
+    %% 3 segments, each producing a fragment (600 bytes > 500 target).
+    %% Total remote size: 1800 bytes. max_bytes = 1000 should delete 2.
+    #{next_offset := NextOffset} = seed_log(Config, [
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]}
+    ]),
+    _Writer = start_writer(
+        Config,
+        #{retention => [{max_bytes, 1000}]},
+        #{fragment_target_size => 500}
+    ),
+    await_offset(Config, NextOffset),
+
+    %% Remote retention should have deleted the first two fragments.
+    %% Only the last fragment (offset 10) should remain.
+    ?awaitMatch(
+        [10],
+        list_fragment_offsets(Config),
+        2000
+    ),
+
+    %% Manifest reflects the deletion.
+    {FirstOffset, NextOffset} = get_range(Config),
+    ?assertEqual(10, FirstOffset).
 
 replication_happy_path(Config) ->
     StreamId = ?config(stream_id, Config),
