@@ -73,7 +73,9 @@ groups() ->
             local_ahead_discards_manifest,
             stream_deletion_cleans_remote_tier,
             discover_attaches_to_existing_writer,
-            remote_retention_deletes_fragments
+            remote_retention_deletes_fragments,
+            uploads_rebalance_into_group,
+            remote_retention_deletes_within_group
         ]},
         {with_replica, [], [
             replication_happy_path
@@ -497,6 +499,93 @@ remote_retention_deletes_fragments(Config) ->
     %% Manifest reflects the deletion.
     {FirstOffset, NextOffset} = get_range(Config),
     ?assertEqual(10, FirstOffset).
+
+uploads_rebalance_into_group(Config) ->
+    %% 5 segments, each producing a fragment (600 bytes > 500 target).
+    %% Rebalance threshold = 4, so after 4 fragments the oldest 4 are
+    %% factored into a group. Final manifest: 1 group + 1 fragment.
+    %% A consumer reading from offset 0 must traverse the group.
+    StreamId = ?config(stream_id, Config),
+    #{next_offset := NextOffset} = seed_log(Config, [
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]}
+    ]),
+    _Writer = start_writer(
+        Config, #{}, #{fragment_target_size => 500, rebalance_threshold => 4}
+    ),
+    await_offset(Config, NextOffset),
+
+    %% Verify a group object exists in the remote tier.
+    Dir = ?config(remote_dir, Config),
+    MetadataDir = filename:join([Dir, <<"rabbitmq/stream">>, StreamId, <<"metadata">>]),
+    {ok, Files} = file:list_dir(MetadataDir),
+    GroupFiles = [F || F <- Files, lists:suffix(".group", F)],
+    ?assert(length(GroupFiles) >= 1, "Expected at least one group object"),
+
+    %% Read from offset 0 through the group and verify all records are readable.
+    Manifest = rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId),
+    GetGroupFun = rabbitmq_stream_s3_manifest:get_group_fun(StreamId),
+    %% The iterator should be able to walk all fragments (descending into the group).
+    AllRefs = rabbitmq_stream_s3_fragment_iterator:all_refs(Manifest, GetGroupFun),
+    FragRefs = [R || #fragment_ref{} = R <- AllRefs],
+    ?assertEqual(5, length(FragRefs)),
+
+    %% Range covers all data.
+    {0, NextOffset} = get_range(Config).
+
+remote_retention_deletes_within_group(Config) ->
+    %% 6 segments, each producing a fragment (600 bytes > 500 target).
+    %% Rebalance threshold = 4: first 4 fragments factored into a group.
+    %% Total remote size: 6 * 600 = 3600 bytes. max_bytes = 1500 should
+    %% delete fragments within the group until total_size <= 1500.
+    %% That means deleting 4 fragments (removing 2400 bytes: 3600-2400=1200 <= 1500).
+    %% Wait, 3600 - 600*4 = 0... let me recalculate.
+    %% Actually: delete until total <= max_bytes. 3600 > 1500, remove 600 -> 3000 > 1500,
+    %% remove 600 -> 2400 > 1500, remove 600 -> 1800 > 1500, remove 600 -> 1200 <= 1500.
+    %% So 4 fragments deleted. The group had 4 fragments, all deleted.
+    %% The group entry should be removed. 2 fragment entries remain.
+    #{next_offset := NextOffset} = seed_log(Config, [
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]}
+    ]),
+    StreamId = ?config(stream_id, Config),
+    _Writer = start_writer(
+        Config,
+        #{retention => [{max_bytes, 1500}]},
+        #{fragment_target_size => 500, rebalance_threshold => 4}
+    ),
+    await_offset(Config, NextOffset),
+
+    %% Remote retention should delete the 4 fragments in the group
+    %% (entire group consumed) leaving only the last 2 fragments.
+    ?awaitMatch(
+        [20, 25],
+        list_fragment_offsets(Config),
+        2000
+    ),
+
+    %% The group object should be deleted.
+    Dir = ?config(remote_dir, Config),
+    MetadataDir = filename:join([Dir, <<"rabbitmq/stream">>, StreamId, <<"metadata">>]),
+    ?awaitMatch(
+        [],
+        begin
+            {ok, Files} = file:list_dir(MetadataDir),
+            [F || F <- Files, lists:suffix(".group", F)]
+        end,
+        2000
+    ),
+
+    %% Range reflects the deletion.
+    {FirstOffset, NextOffset} = get_range(Config),
+    ?assertEqual(20, FirstOffset).
 
 replication_happy_path(Config) ->
     StreamId = ?config(stream_id, Config),

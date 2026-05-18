@@ -792,20 +792,21 @@ advance_past_current(Iterator) ->
 resolve_first(StreamId, FirstOffset) ->
     case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
         #manifest{entries = Entries} = Manifest when byte_size(Entries) >= ?ENTRY_B ->
-            ?ENTRY(FirstOffset, _FTs, _LTs, ?MANIFEST_KIND_FRAGMENT, Size, Uid) =
-                rabbitmq_stream_s3_array:at(0, ?ENTRY_B, Entries),
-            FragRef = #fragment_ref{offset = FirstOffset, uid = Uid, size = Size},
             GetGroupFun = rabbitmq_stream_s3_manifest:get_group_fun(StreamId),
             Iterator = rabbitmq_stream_s3_fragment_iterator:init(
                 Manifest, FirstOffset, GetGroupFun
             ),
-            Iterator1 = advance_past_current(Iterator),
-            {ok, #remote_location{
-                chunk_id = FirstOffset,
-                position = ?SEGMENT_HEADER_B,
-                fragment_ref = FragRef,
-                iterator = Iterator1
-            }};
+            case rabbitmq_stream_s3_fragment_iterator:next(Iterator) of
+                {ok, FragRef, Iterator1} ->
+                    {ok, #remote_location{
+                        chunk_id = FragRef#fragment_ref.offset,
+                        position = ?SEGMENT_HEADER_B,
+                        fragment_ref = FragRef,
+                        iterator = Iterator1
+                    }};
+                _ ->
+                    {local, first}
+            end;
         _ ->
             {local, first}
     end.

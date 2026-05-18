@@ -148,10 +148,10 @@ next_group(?MANIFEST_KIND_FRAGMENT) -> ?MANIFEST_KIND_GROUP;
 next_group(?MANIFEST_KIND_GROUP) -> ?MANIFEST_KIND_KILO_GROUP;
 next_group(?MANIFEST_KIND_KILO_GROUP) -> ?MANIFEST_KIND_MEGA_GROUP.
 
--doc "Returns the key for the given fragment offset".
--spec fragment_key(stream_id(), osiris:offset()) -> key().
-fragment_key(StreamId, Offset) when is_binary(StreamId) andalso is_integer(Offset) ->
-    stream_data_key(StreamId, offset_filename(Offset, <<"fragment">>)).
+-doc "Returns the key for the given fragment ref".
+-spec fragment_key(stream_id(), #fragment_ref{}) -> key().
+fragment_key(StreamId, #fragment_ref{offset = Offset, uid = Uid}) ->
+    fragment_key(StreamId, Offset, Uid).
 
 -doc "Returns the key for the given fragment offset and UID".
 -spec fragment_key(stream_id(), osiris:offset(), uid()) -> key().

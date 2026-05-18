@@ -191,6 +191,16 @@ handle_info({transfer_result, Ref, {ok, Uid}}, #state{core = Core0} = State0) ->
 handle_info({transfer_result, Ref, {error, Reason}}, #state{core = Core0} = State0) ->
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(Ref, Reason, Core0),
     {noreply, execute_effects(Effects, State0#state{core = Core})};
+handle_info({group_upload_result, {ok, Uid}}, #state{core = Core0} = State0) ->
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:group_upload_complete(Uid, Core0),
+    {noreply, execute_effects(Effects, State0#state{core = Core})};
+handle_info(
+    {group_upload_result, {error, Reason}},
+    #state{core = Core0, cfg = #cfg{stream = StreamId}} = State0
+) ->
+    ?LOG_WARNING("~ts group upload failed: ~p", [StreamId, Reason]),
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:group_upload_failed(Reason, Core0),
+    {noreply, execute_effects(Effects, State0#state{core = Core})};
 handle_info(persist_timer, #state{core = Core0} = State0) ->
     Now = erlang:system_time(millisecond),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:tick(Now, Core0),
@@ -306,8 +316,8 @@ delete_manifest_objects(StreamId, Manifest) ->
         Refs = rabbitmq_stream_s3_fragment_iterator:all_refs(Manifest, GetGroupFun),
         Keys = lists:map(
             fun
-                (#fragment_ref{offset = Offset, uid = Uid}) ->
-                    rabbitmq_stream_s3:fragment_key(StreamId, Offset, Uid);
+                (#fragment_ref{} = FRef) ->
+                    rabbitmq_stream_s3:fragment_key(StreamId, FRef);
                 (#group_ref{} = GroupRef) ->
                     rabbitmq_stream_s3:group_key(StreamId, GroupRef)
             end,
@@ -320,6 +330,33 @@ delete_manifest_objects(StreamId, Manifest) ->
 %% ------------------------------------------------------------------
 %% Persist (executed in spawned task)
 %% ------------------------------------------------------------------
+
+-spec do_upload_group(stream_id(), rabbitmq_stream_s3:kind(), binary()) ->
+    {ok, rabbitmq_stream_s3:uid()} | {error, term()}.
+do_upload_group(StreamId, Kind, Entries) ->
+    Uid = rabbitmq_stream_s3:uid(),
+    %% First offset from the first entry in the group.
+    <<FirstOffset:64/unsigned, FirstTs:64/signed, _/binary>> = Entries,
+    GroupRef = #group_ref{offset = FirstOffset, kind = Kind, uid = Uid},
+    Key = rabbitmq_stream_s3:group_key(StreamId, GroupRef),
+    Header = serialize_group_header(Kind, FirstOffset, FirstTs),
+    Data = <<Header/binary, Entries/binary>>,
+    case rabbitmq_stream_s3_api:put(Key, Data) of
+        ok -> {ok, Uid};
+        {error, _} = Err -> Err
+    end.
+
+serialize_group_header(Kind, FirstOffset, FirstTs) ->
+    {Magic, Version} = group_magic(Kind),
+    <<Magic/binary, Version:32/unsigned, FirstOffset:64/unsigned, 0:64/unsigned, FirstTs:64/signed,
+        0:64/signed, 0:2/unsigned, 0:70/unsigned>>.
+
+group_magic(?MANIFEST_KIND_GROUP) ->
+    {<<?MANIFEST_GROUP_MAGIC>>, ?MANIFEST_GROUP_VERSION};
+group_magic(?MANIFEST_KIND_KILO_GROUP) ->
+    {<<?MANIFEST_KILO_GROUP_MAGIC>>, ?MANIFEST_KILO_GROUP_VERSION};
+group_magic(?MANIFEST_KIND_MEGA_GROUP) ->
+    {<<?MANIFEST_MEGA_GROUP_MAGIC>>, ?MANIFEST_MEGA_GROUP_VERSION}.
 
 -spec do_commit(
     stream_id(), #manifest{}, non_neg_integer(), term(), rabbitmq_stream_s3_db:revision()
@@ -402,6 +439,25 @@ execute_effect({resubmit_transfer, Ref, _StreamId, Dir, Meta}, #state{cfg = Cfg}
         end
     end,
     rabbitmq_stream_s3_governor:submit(Fun, Size, Self, Ref),
+    State;
+execute_effect(
+    {upload_group, StreamId, Kind, Entries, _Pos, _Len},
+    State
+) ->
+    Self = self(),
+    spawn_link(fun() ->
+        Result =
+            try
+                do_upload_group(StreamId, Kind, Entries)
+            catch
+                Class:Reason:Stack ->
+                    ?LOG_WARNING(
+                        "Group upload crashed: ~p:~p~n~p", [Class, Reason, Stack]
+                    ),
+                    {error, {crashed, Reason}}
+            end,
+        Self ! {group_upload_result, Result}
+    end),
     State;
 execute_effect(
     {start_persist, Manifest, Epoch, Reference, ExpectedRevision, _Edits},
@@ -489,15 +545,23 @@ maybe_evaluate_remote_retention(_Manifest, [], _StreamId, State) ->
     State;
 maybe_evaluate_remote_retention(Manifest, Retention, StreamId, #state{core = Core0} = State) ->
     Now = erlang:system_time(millisecond),
-    case rabbitmq_stream_s3_manifest:evaluate_remote_retention(Manifest, Retention, Now) of
+    GetGroupFun = rabbitmq_stream_s3_manifest:get_group_fun(StreamId),
+    case
+        rabbitmq_stream_s3_manifest:evaluate_remote_retention(Manifest, Retention, Now, GetGroupFun)
+    of
         unchanged ->
             State;
-        {Edit, FragmentRefs} ->
-            %% Delete the fragment objects in the background.
-            Keys = [
-                rabbitmq_stream_s3:fragment_key(StreamId, R#fragment_ref.offset, R#fragment_ref.uid)
-             || R <- FragmentRefs
-            ],
+        {Edit, Refs} ->
+            %% Delete the objects in the background.
+            Keys = lists:map(
+                fun
+                    (#fragment_ref{} = FRef) ->
+                        rabbitmq_stream_s3:fragment_key(StreamId, FRef);
+                    (#group_ref{} = GRef) ->
+                        rabbitmq_stream_s3:group_key(StreamId, GRef)
+                end,
+                Refs
+            ),
             rabbitmq_stream_s3_reaper:delete_objects(StreamId, Keys),
             %% Apply the edit to the core's manifest and execute effects.
             {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:apply_retention_edit(

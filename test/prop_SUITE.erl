@@ -48,7 +48,9 @@ all() ->
         %% Fragment/index lookup
         find_fragment_timestamp,
         find_index_position_offset,
-        find_index_position_timestamp
+        find_index_position_timestamp,
+        %% Replica reader core: rebalancing
+        broadcast_edits_reproduce_manifest
     ].
 
 init_per_suite(Config) -> Config.
@@ -153,6 +155,102 @@ prop_sequence_of_edits_maintains_invariants() ->
                 Final#manifest.next_offset >= Final#manifest.first_offset
         end
     ).
+
+%% =========================================================================
+%% Replica reader core: rebalancing
+%% =========================================================================
+
+broadcast_edits_reproduce_manifest(_Config) ->
+    rabbit_ct_proper_helpers:run_proper(
+        fun prop_broadcast_edits_reproduce_manifest/0, [], 500
+    ).
+
+%% Property: for any sequence of fragment completions (possibly triggering
+%% rebalancing), the broadcast edits produced at persist time transform the
+%% last-persisted manifest into the persisting manifest.
+prop_broadcast_edits_reproduce_manifest() ->
+    ?FORALL(
+        NumFragments,
+        integer(1, 30),
+        begin
+            %% Use a low threshold so rebalancing triggers within the test.
+            Threshold = 4,
+            Opts = #{
+                stream => <<"stream">>,
+                dir => <<"/dir">>,
+                epoch => 1,
+                reference => test_ref,
+                persist_threshold => 100,
+                persist_interval_ms => 999999,
+                rebalance_threshold => Threshold
+            },
+            {S0, _} = rabbitmq_stream_s3_replica_reader_core:init(#manifest{}, Opts),
+            %% Apply NumFragments fragments, completing group uploads as they arise.
+            S1 = apply_n_fragments(NumFragments, Threshold, S0),
+            %% Force a persist via tick.
+            Now = erlang:system_time(millisecond) + 999999,
+            case rabbitmq_stream_s3_replica_reader_core:tick(Now, S1) of
+                {S2, [{start_persist, _, _, _, _, _}]} ->
+                    From = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(S2),
+                    {S3, Effects} =
+                        rabbitmq_stream_s3_replica_reader_core:persist_complete(1, S2),
+                    To = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(S3),
+                    [Edits] = [Es || {broadcast, _, Es} <- Effects],
+                    Replicated = lists:foldl(
+                        fun(Edit, M) ->
+                            rabbitmq_stream_s3_manifest:apply_edit(Edit, M)
+                        end,
+                        From,
+                        Edits
+                    ),
+                    Replicated#manifest.entries =:= To#manifest.entries andalso
+                        Replicated#manifest.first_offset =:= To#manifest.first_offset andalso
+                        Replicated#manifest.next_offset =:= To#manifest.next_offset andalso
+                        Replicated#manifest.total_size =:= To#manifest.total_size;
+                {_S2, []} ->
+                    %% Nothing to persist (no fragments applied). Trivially true.
+                    true
+            end
+        end
+    ).
+
+%% Apply N fragments to the core, completing group uploads as they trigger.
+apply_n_fragments(N, Threshold, State) ->
+    lists:foldl(
+        fun(I, S0) ->
+            FirstOff = I * 100,
+            NextOff = (I + 1) * 100,
+            Meta = #{
+                first_offset => FirstOff,
+                first_timestamp => FirstOff * 1000,
+                last_timestamp => (NextOff - 1) * 1000,
+                next_offset => NextOff,
+                size => 64_000_000,
+                num_chunks => 100,
+                spans => [{0, 8, 64_000_008}]
+            },
+            {S1, Ref, _} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(Meta, S0),
+            {S2, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_complete(
+                Ref, 1000 + I, S1
+            ),
+            %% If rebalance was triggered, complete it immediately.
+            complete_pending_rebalances(Effects, S2, Threshold)
+        end,
+        State,
+        lists:seq(0, N - 1)
+    ).
+
+%% Recursively complete group uploads until no more are pending.
+complete_pending_rebalances(Effects, State, Threshold) ->
+    case [E || {upload_group, _, _, _, _, _} = E <- Effects] of
+        [] ->
+            State;
+        [_ | _] ->
+            Uid = erlang:unique_integer([positive]),
+            {S1, Effects1} =
+                rabbitmq_stream_s3_replica_reader_core:group_upload_complete(Uid, State),
+            complete_pending_rebalances(Effects1, S1, Threshold)
+    end.
 
 %% =========================================================================
 %% Fragment assembly properties

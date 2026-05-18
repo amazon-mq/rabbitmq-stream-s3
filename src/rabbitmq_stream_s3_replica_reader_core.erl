@@ -19,6 +19,8 @@ testable without mocks or timing.
     fragment_cut/2,
     transfer_complete/3,
     transfer_failed/3,
+    group_upload_complete/2,
+    group_upload_failed/2,
     persist_complete/2,
     persist_failed/2,
     tick/2,
@@ -59,8 +61,18 @@ testable without mocks or timing.
     last_persisted_manifest :: #manifest{},
     %% Manifest being committed (set when commit starts, used on completion).
     persisting_manifest :: #manifest{} | undefined,
+    %% Edits computed at persist start time, used for broadcast on completion.
+    persisting_edits = [] :: [#edit{}],
     %% Callers blocked on await_offset.
-    waiters :: [{osiris:offset(), gen_server:from()}]
+    waiters :: [{osiris:offset(), gen_server:from()}],
+    %% Whether a group upload is currently in flight.
+    rebalance_in_flight = false :: boolean(),
+    %% Edits from rebalancing since last persist. Tracked so that broadcast
+    %% produces the correct edit sequence (rebalance edits first, then appends).
+    rebalance_edits = [] :: [#edit{}],
+    %% Fragment entries appended since last persist (pre-rebalance binary).
+    %% Used to produce the correct append edit for broadcast.
+    appended_since_persist = <<>> :: binary()
 }).
 
 -opaque state() :: #state{}.
@@ -71,6 +83,8 @@ testable without mocks or timing.
     | {start_persist, #manifest{}, non_neg_integer(), term(), rabbitmq_stream_s3_db:revision(), [
         #edit{}
     ]}
+    | {upload_group, stream_id(), rabbitmq_stream_s3:kind(), binary(), non_neg_integer(),
+        non_neg_integer()}
     | {update_range, osiris:offset(), osiris:offset()}
     | {broadcast, stream_id(), [#edit{}]}
     | {evaluate_retention, stream_id(), directory()}
@@ -184,12 +198,13 @@ persist_complete(
         persisting_manifest = undefined,
         since_persist = N - Committed,
         in_persist_count = 0,
-        last_persist_ts = erlang:system_time(millisecond)
+        last_persist_ts = erlang:system_time(millisecond),
+        rebalance_edits = [],
+        appended_since_persist = <<>>
     },
     Effects0 = [
         {update_range, Manifest#manifest.first_offset, Manifest#manifest.next_offset},
-        {broadcast, Cfg#cfg.stream,
-            compute_edits(State0#state.last_persisted_manifest, CommittingManifest)},
+        {broadcast, Cfg#cfg.stream, State0#state.persisting_edits},
         {evaluate_retention, Cfg#cfg.stream, Cfg#cfg.dir},
         cancel_persist_timer
     ],
@@ -227,6 +242,7 @@ tick(
     #state{
         since_persist = SinceCommit,
         persist_in_flight = false,
+        rebalance_in_flight = false,
         last_persist_ts = LastTs,
         cfg = #cfg{persist_interval_ms = Interval}
     } = State
@@ -243,6 +259,71 @@ await_offset(Offset, From, #state{last_persisted_manifest = Committed} = State) 
             {State, [{reply_waiters, [{From, ok}]}]};
         false ->
             {State#state{waiters = [{Offset, From} | State#state.waiters]}, []}
+    end.
+
+-doc """
+A group upload completed. Apply the rebalance edit to the in-memory manifest,
+then check for recursive rebalancing (groups→kilo-group, etc.). Once no more
+rebalancing is needed, trigger persist if warranted.
+""".
+-spec group_upload_complete(rabbitmq_stream_s3:uid(), state()) -> {state(), [core_effect()]}.
+group_upload_complete(
+    Uid, #state{cfg = Cfg, manifest = Manifest0, rebalance_edits = Edits} = State0
+) ->
+    %% The pending rebalance info is encoded in the effect that was emitted.
+    %% We reconstruct the edit from the current manifest state: the leading
+    %% entries of the kind being factored are the ones to replace.
+    {Kind, Pos, Len} = pending_rebalance(Manifest0, Cfg#cfg.rebalance_threshold),
+    %% Build the group entry. First offset and timestamps come from the
+    %% first entry being factored out.
+    <<FirstOffset:64/unsigned, FirstTs:64/signed, _:64/signed, _:8, _:40, _:32, _/binary>> =
+        binary:part(Manifest0#manifest.entries, Pos, ?ENTRY_B),
+    %% Last timestamp comes from the last entry being factored out.
+    <<_:64, _:64/signed, LastTs:64/signed, _:8, _:40, _:32, _/binary>> =
+        binary:part(Manifest0#manifest.entries, Pos + Len - ?ENTRY_B, ?ENTRY_B),
+    GroupKind = Kind + 1,
+    GroupEntry = ?ENTRY(FirstOffset, FirstTs, LastTs, GroupKind, 0, Uid),
+    Edit = #edit{
+        first_offset = Manifest0#manifest.first_offset,
+        first_timestamp = Manifest0#manifest.first_timestamp,
+        first_last_timestamp = Manifest0#manifest.first_last_timestamp,
+        next_offset = undefined,
+        size = 0,
+        entries = GroupEntry,
+        pos = Pos,
+        len = Len
+    },
+    Manifest = rabbitmq_stream_s3_manifest:apply_edit(Edit, Manifest0),
+    State1 = State0#state{
+        manifest = Manifest,
+        rebalance_in_flight = false,
+        rebalance_edits = [Edit | Edits]
+    },
+    %% Check for recursive rebalancing (e.g. too many groups → kilo-group).
+    {State2, RebalanceEffects} = maybe_start_rebalance(State1),
+    {State3, PersistEffects} = maybe_start_persist(State2),
+    {State3, RebalanceEffects ++ PersistEffects}.
+
+-doc """
+A group upload failed. On retriable errors, re-emit the upload effect.
+On fatal errors, abandon this rebalance attempt (the root stays oversized).
+The next drain_completions cycle will re-detect the threshold and try again.
+""".
+-spec group_upload_failed(term(), state()) -> {state(), [core_effect()]}.
+group_upload_failed(Reason, #state{cfg = Cfg, manifest = Manifest} = State) ->
+    case is_retriable(Reason) of
+        true ->
+            %% Re-emit the upload_group effect with the same parameters.
+            {Kind, Pos, Len} = pending_rebalance(Manifest, Cfg#cfg.rebalance_threshold),
+            Entries = binary:part(Manifest#manifest.entries, Pos, Len),
+            GroupKind = Kind + 1,
+            {State, [{upload_group, Cfg#cfg.stream, GroupKind, Entries, Pos, Len}]};
+        false ->
+            %% Abandon. Clear rebalance_in_flight so persist can proceed.
+            %% The threshold will be re-detected on the next drain cycle.
+            State1 = State#state{rebalance_in_flight = false},
+            {State2, PersistEffects} = maybe_start_persist(State1),
+            {State2, PersistEffects}
     end.
 
 -doc """
@@ -282,16 +363,21 @@ drain_completions(#state{in_flight = Q, pending_completions = PC} = State0) ->
                     },
                     %% Continue draining contiguous completions.
                     {State3, Effects} = drain_completions(State2),
-                    %% After all draining, check commit trigger.
-                    {State4, CommitEffects} = maybe_start_persist(State3),
-                    {State4, Effects ++ CommitEffects}
+                    %% After all draining, check rebalance then commit trigger.
+                    {State4, RebalanceEffects} = maybe_start_rebalance(State3),
+                    {State5, CommitEffects} = maybe_start_persist(State4),
+                    {State5, Effects ++ RebalanceEffects ++ CommitEffects}
             end;
         empty ->
             {State0, []}
     end.
 
 -spec apply_fragment(rabbitmq_stream_s3:uid(), fragment_meta(), state()) -> state().
-apply_fragment(Uid, Meta, #state{manifest = Manifest0, since_persist = N} = State) ->
+apply_fragment(
+    Uid,
+    Meta,
+    #state{manifest = Manifest0, since_persist = N, appended_since_persist = Appended} = State
+) ->
     #{
         first_offset := FirstOffset,
         first_timestamp := FirstTs,
@@ -322,10 +408,16 @@ apply_fragment(Uid, Meta, #state{manifest = Manifest0, since_persist = N} = Stat
                 Edit
         end,
     Manifest = rabbitmq_stream_s3_manifest:apply_edit(Edit1, Manifest0),
-    State#state{manifest = Manifest, since_persist = N + 1}.
+    State#state{
+        manifest = Manifest,
+        since_persist = N + 1,
+        appended_since_persist = <<Appended/binary, Entry/binary>>
+    }.
 
 -spec maybe_start_persist(state()) -> {state(), [core_effect()]}.
 maybe_start_persist(#state{persist_in_flight = true} = State) ->
+    {State, []};
+maybe_start_persist(#state{rebalance_in_flight = true} = State) ->
     {State, []};
 maybe_start_persist(#state{since_persist = 0} = State) ->
     {State, []};
@@ -351,39 +443,116 @@ start_persist(
     Effect =
         {start_persist, Manifest, Cfg#cfg.epoch, Cfg#cfg.reference, LastManifest#manifest.revision,
             Edits},
-    {State#state{persist_in_flight = true, in_persist_count = N, persisting_manifest = Manifest}, [
-        Effect
-    ]}.
+    {
+        State#state{
+            persist_in_flight = true,
+            in_persist_count = N,
+            persisting_manifest = Manifest,
+            persisting_edits = Edits
+        },
+        [Effect]
+    }.
+
+%% Check if the manifest root needs rebalancing. If the leading entries
+%% exceed the threshold for any kind, emit an upload_group effect.
+-spec maybe_start_rebalance(state()) -> {state(), [core_effect()]}.
+maybe_start_rebalance(#state{rebalance_in_flight = true} = State) ->
+    {State, []};
+maybe_start_rebalance(#state{cfg = Cfg, manifest = Manifest} = State) ->
+    case needs_rebalance(Manifest#manifest.entries, Cfg#cfg.rebalance_threshold) of
+        false ->
+            {State, []};
+        {Kind, Pos, Len} ->
+            %% Factor out the entries into a group of the next-higher kind.
+            Entries = binary:part(Manifest#manifest.entries, Pos, Len),
+            GroupKind = Kind + 1,
+            Effect = {upload_group, Cfg#cfg.stream, GroupKind, Entries, Pos, Len},
+            {State#state{rebalance_in_flight = true}, [Effect]}
+    end.
+
+%% Determine if the root has >= threshold entries of the same kind at any
+%% position. Scans from the beginning, counting contiguous runs of each kind.
+%% Returns {Kind, Pos, Len} where Pos is byte offset and Len is byte length
+%% of the entries to factor out, or false.
+-spec needs_rebalance(binary(), non_neg_integer()) ->
+    {rabbitmq_stream_s3:kind(), non_neg_integer(), non_neg_integer()} | false.
+needs_rebalance(Entries, Threshold) ->
+    count_leading_kind(Entries, 0, Threshold).
+
+count_leading_kind(<<>>, _Pos, _Threshold) ->
+    false;
+count_leading_kind(Entries, Pos, Threshold) ->
+    <<_:64, _:64/signed, _:64/signed, Kind:8, _:40, _:32, _/binary>> =
+        binary:part(Entries, Pos, ?ENTRY_B),
+    Count = count_kind(Entries, Pos, Kind, 0),
+    case Count >= Threshold of
+        true ->
+            {Kind, Pos, Threshold * ?ENTRY_B};
+        false ->
+            %% Skip past this run and check the next kind.
+            NextPos = Pos + Count * ?ENTRY_B,
+            case NextPos >= byte_size(Entries) of
+                true -> false;
+                false -> count_leading_kind(Entries, NextPos, Threshold)
+            end
+    end.
+
+count_kind(Entries, Pos, Kind, Count) ->
+    case Pos + ?ENTRY_B =< byte_size(Entries) of
+        false ->
+            Count;
+        true ->
+            <<_:64, _:64/signed, _:64/signed, K:8, _:40, _:32, _/binary>> =
+                binary:part(Entries, Pos, ?ENTRY_B),
+            case K of
+                Kind -> count_kind(Entries, Pos + ?ENTRY_B, Kind, Count + 1);
+                _ -> Count
+            end
+    end.
+
+%% Find the pending rebalance position in the manifest. This is called from
+%% group_upload_complete to reconstruct what was being rebalanced.
+-spec pending_rebalance(#manifest{}, non_neg_integer()) ->
+    {rabbitmq_stream_s3:kind(), non_neg_integer(), non_neg_integer()}.
+pending_rebalance(#manifest{entries = Entries}, Threshold) ->
+    %% The rebalance that was in flight must still be detectable.
+    {Kind, Pos, Len} = needs_rebalance(Entries, Threshold),
+    {Kind, Pos, Len}.
 
 -spec edits_since_persist(state()) -> [#edit{}].
-edits_since_persist(#state{manifest = Manifest, last_persisted_manifest = Last}) ->
-    compute_edits(Last, Manifest).
+edits_since_persist(#state{
+    manifest = Manifest,
+    last_persisted_manifest = Last,
+    rebalance_edits = RebalanceEdits,
+    appended_since_persist = Appended
+}) ->
+    %% Ordering constraint: append edits MUST precede rebalance edits.
+    %%
+    %% Replicas apply edits sequentially. A rebalance edit replaces entries
+    %% at a byte position with a group pointer. Those entries must already
+    %% exist in the replica's array for the replacement to be valid. The
+    %% append edit creates them. If the rebalance came first, the replica
+    %% would attempt to replace bytes that don't exist yet.
+    AppendEdits = compute_append_edits(Last, Manifest, Appended),
+    AppendEdits ++ lists:reverse(RebalanceEdits).
 
--spec compute_edits(#manifest{}, #manifest{}) -> [#edit{}].
-compute_edits(From, To) ->
-    case To#manifest.next_offset =:= From#manifest.next_offset of
-        true ->
-            [];
-        false ->
-            OldSize = byte_size(From#manifest.entries),
-            NewEntries = binary:part(
-                To#manifest.entries,
-                OldSize,
-                byte_size(To#manifest.entries) - OldSize
-            ),
-            [
-                #edit{
-                    first_offset = To#manifest.first_offset,
-                    first_timestamp = To#manifest.first_timestamp,
-                    first_last_timestamp = To#manifest.first_last_timestamp,
-                    next_offset = To#manifest.next_offset,
-                    size = To#manifest.total_size - From#manifest.total_size,
-                    entries = NewEntries,
-                    pos = OldSize,
-                    len = 0
-                }
-            ]
-    end.
+%% Compute the append edit from the tracked appended entries.
+-spec compute_append_edits(#manifest{}, #manifest{}, binary()) -> [#edit{}].
+compute_append_edits(_From, _To, <<>>) ->
+    [];
+compute_append_edits(From, To, Appended) ->
+    [
+        #edit{
+            first_offset = To#manifest.first_offset,
+            first_timestamp = To#manifest.first_timestamp,
+            first_last_timestamp = To#manifest.first_last_timestamp,
+            next_offset = To#manifest.next_offset,
+            size = To#manifest.total_size - From#manifest.total_size,
+            entries = Appended,
+            pos = byte_size(From#manifest.entries),
+            len = 0
+        }
+    ].
 
 -spec notify_waiters(state()) -> {state(), [core_effect()]}.
 notify_waiters(#state{last_persisted_manifest = Committed, waiters = Waiters} = State) ->

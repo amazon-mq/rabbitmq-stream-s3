@@ -58,7 +58,8 @@ groups() ->
             read_from_remote_first_large_filter,
             read_across_fragment_boundaries,
             read_from_remote_offset,
-            read_repositions_on_fragment_not_found
+            read_repositions_on_fragment_not_found,
+            read_through_group
         ]},
         {with_replica, [], [
             read_from_replica_node
@@ -230,6 +231,37 @@ read_repositions_on_fragment_not_found(Config) ->
 
     Records = read_all(Reader0, 10),
     assert_sequential(Records, 10, NextOffset - 1).
+
+read_through_group(Config) ->
+    %% 5 segments, each producing a fragment (600 bytes > 500 target).
+    %% Rebalance threshold = 4: after 4 fragments, the oldest 4 are factored
+    %% into a group. Final manifest: 1 group entry + 1 fragment entry.
+    %% A consumer reading from offset 0 must descend into the group to find
+    %% the first fragment, then continue through all 5 fragments.
+    #{next_offset := NextOffset} = seed_log(Config, [
+        {segment, [{chunk, #{records => 10, size => 600}}]},
+        {segment, [{chunk, #{records => 10, size => 600}}]},
+        {segment, [{chunk, #{records => 10, size => 600}}]},
+        {segment, [{chunk, #{records => 10, size => 600}}]},
+        {segment, [{chunk, #{records => 10, size => 600}}]}
+    ]),
+    Writer = start_writer(
+        Config, #{}, #{fragment_target_size => 500, rebalance_threshold => 4}
+    ),
+    flush_writer(Writer),
+    await_offset(Config, NextOffset),
+
+    %% Wait for local retention to reclaim uploaded segments.
+    ReaderCfg = reader_config(Writer, Config),
+    #{shared := Shared} = ReaderCfg,
+    ?awaitMatch(F when F > 0, osiris_log_shared:first_chunk_id(Shared), 1000),
+
+    %% Read from offset 0. The iterator must descend into the group.
+    {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg),
+    ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),
+
+    Records = read_all(Reader0),
+    assert_sequential(Records, NextOffset).
 
 read_from_replica_node(Config) ->
     StreamId = ?config(stream_id, Config),
