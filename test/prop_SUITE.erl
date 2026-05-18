@@ -50,7 +50,8 @@ all() ->
         find_index_position_offset,
         find_index_position_timestamp,
         %% Replica reader core: rebalancing
-        broadcast_edits_reproduce_manifest
+        broadcast_edits_reproduce_manifest,
+        broadcast_edits_complete_across_persist_cycles
     ].
 
 init_per_suite(Config) -> Config.
@@ -250,6 +251,136 @@ complete_pending_rebalances(Effects, State, Threshold) ->
             {S1, Effects1} =
                 rabbitmq_stream_s3_replica_reader_core:group_upload_complete(Uid, State),
             complete_pending_rebalances(Effects1, S1, Threshold)
+    end.
+
+%% =========================================================================
+%% Replica reader core: multi-cycle broadcast completeness
+%% =========================================================================
+
+broadcast_edits_complete_across_persist_cycles(_Config) ->
+    rabbit_ct_proper_helpers:run_proper(
+        fun prop_broadcast_edits_complete_across_persist_cycles/0, [], 500
+    ).
+
+%% Property: for any interleaving of fragment completions across multiple
+%% persist cycles (including fragments completing during in-flight persists),
+%% the concatenation of all broadcast edits reproduces the final persisted
+%% manifest from the initial state.
+prop_broadcast_edits_complete_across_persist_cycles() ->
+    ?FORALL(
+        {Threshold, Batches},
+        {integer(1, 5), gen_persist_batches()},
+        begin
+            Opts = #{
+                stream => <<"stream">>,
+                dir => <<"/dir">>,
+                epoch => 1,
+                reference => test_ref,
+                persist_threshold => Threshold,
+                persist_interval_ms => 999999,
+                rebalance_threshold => 1024
+            },
+            {S0, _} = rabbitmq_stream_s3_replica_reader_core:init(#manifest{}, Opts),
+            {_FinalState, AllEdits} = run_persist_cycles(Batches, S0, 0, 1, []),
+            %% Verify: applying all broadcast edits to an empty manifest
+            %% produces the final persisted manifest.
+            FinalPersisted = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(
+                _FinalState
+            ),
+            Replicated = lists:foldl(
+                fun(Edit, M) ->
+                    rabbitmq_stream_s3_manifest:apply_edit(Edit, M)
+                end,
+                #manifest{},
+                AllEdits
+            ),
+            Replicated#manifest.entries =:= FinalPersisted#manifest.entries andalso
+                Replicated#manifest.next_offset =:= FinalPersisted#manifest.next_offset andalso
+                Replicated#manifest.total_size =:= FinalPersisted#manifest.total_size
+        end
+    ).
+
+%% Generate a list of batches. Each batch is a count of fragments to complete
+%% before the next persist fires. Multiple batches = multiple persist cycles
+%% with fragments arriving between and during persists.
+gen_persist_batches() ->
+    ?LET(N, integer(2, 6), [integer(1, 8) || _ <- lists:seq(1, N)]).
+
+%% Run persist cycles driven by the batch list.
+%% For each batch: complete that many fragments, then force a persist and
+%% complete it. Fragments in later batches may arrive while a persist from
+%% an earlier batch is conceptually in flight (simulated by completing
+%% fragments between start_persist and persist_complete).
+run_persist_cycles([], State, _Offset, Rev, Edits) ->
+    %% Final persist to flush any remaining applied fragments.
+    Now = erlang:system_time(millisecond) + 999999,
+    case rabbitmq_stream_s3_replica_reader_core:tick(Now, State) of
+        {S1, [{start_persist, _, _, _, _, _}]} ->
+            {S2, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_complete(Rev, S1),
+            BroadcastEdits = lists:append([Es || {broadcast, _, Es} <- Effects]),
+            {S2, Edits ++ BroadcastEdits};
+        {S1, []} ->
+            {S1, Edits}
+    end;
+run_persist_cycles([Count | Rest], State0, Offset0, Rev0, Edits0) ->
+    %% Complete Count fragments. Some may trigger a persist via threshold.
+    {State1, Offset1, PersistTriggered1} = complete_fragments(Count, State0, Offset0),
+    %% If no persist was triggered by threshold, force one via tick.
+    {State2, PersistTriggered2} =
+        case PersistTriggered1 of
+            true ->
+                {State1, true};
+            false ->
+                Now = erlang:system_time(millisecond) + 999999,
+                {S, Effs} = rabbitmq_stream_s3_replica_reader_core:tick(Now, State1),
+                {S, Effs =/= []}
+        end,
+    %% Drain persists if one is in flight.
+    {State3, Rev1, NewEdits} =
+        case PersistTriggered2 of
+            true -> drain_persists(State2, Rev0);
+            false -> {State2, Rev0, []}
+        end,
+    run_persist_cycles(Rest, State3, Offset1, Rev1, Edits0 ++ NewEdits).
+
+complete_fragments(0, State, Offset) ->
+    {State, Offset, false};
+complete_fragments(N, State0, Offset) ->
+    Meta = #{
+        first_offset => Offset,
+        first_timestamp => Offset * 1000,
+        last_timestamp => (Offset + 99) * 1000,
+        next_offset => Offset + 100,
+        size => 64_000_000,
+        num_chunks => 100,
+        spans => [{0, 8, 64_000_008}]
+    },
+    {S1, Ref, _} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(Meta, State0),
+    {S2, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_complete(
+        Ref, erlang:unique_integer([positive]), S1
+    ),
+    Triggered = [E || {start_persist, _, _, _, _, _} = E <- Effects] =/= [],
+    case N - 1 of
+        0 ->
+            {S2, Offset + 100, Triggered};
+        Rem ->
+            {S3, Off, T2} = complete_fragments(Rem, S2, Offset + 100),
+            {S3, Off, Triggered orelse T2}
+    end.
+
+%% Drain all persists. A persist_complete may trigger another persist
+%% immediately (if fragments accumulated during the in-flight one).
+drain_persists(State, Rev) ->
+    drain_persists(State, Rev, []).
+
+drain_persists(State0, Rev, Acc) ->
+    {State1, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_complete(Rev, State0),
+    BroadcastEdits = lists:append([Es || {broadcast, _, Es} <- Effects]),
+    case [E || {start_persist, _, _, _, _, _} = E <- Effects] of
+        [_ | _] ->
+            drain_persists(State1, Rev + 1, Acc ++ BroadcastEdits);
+        [] ->
+            {State1, Rev + 1, Acc ++ BroadcastEdits}
     end.
 
 %% =========================================================================

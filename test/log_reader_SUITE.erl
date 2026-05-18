@@ -274,11 +274,13 @@ read_from_replica_node(Config) ->
     N = 200,
     write_sequential(Writer, N, 5),
 
-    %% Wait for broadcast to reach the replica's manifest cache.
+    %% Wait for the full upload to reach the replica's manifest cache.
+    %% Retention can only reclaim segments fully below next_offset, so we
+    %% must wait for all data to be uploaded before expecting reclamation.
     ?awaitMatch(
-        {_, NextOffset} when NextOffset > 0,
+        {_, NextOffset} when NextOffset >= N,
         get_range(Config, ReplicaNode),
-        1000
+        5000
     ),
 
     %% Wait for retention on the replica to reclaim uploaded segments.

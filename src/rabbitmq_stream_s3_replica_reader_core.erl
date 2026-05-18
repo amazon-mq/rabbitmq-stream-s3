@@ -192,6 +192,13 @@ persist_complete(
     } = State0
 ) ->
     Manifest = CommittingManifest#manifest{revision = Revision},
+    %% Only discard the portion of appended_since_persist that was captured
+    %% in the persisting edits. Fragments that arrived during the in-flight
+    %% persist appended to appended_since_persist after start_persist
+    %% captured its snapshot; those bytes must be preserved for the next
+    %% persist's broadcast.
+    PersistedBytes = Committed * ?ENTRY_B,
+    <<_:PersistedBytes/binary, Remaining/binary>> = State0#state.appended_since_persist,
     State1 = State0#state{
         persist_in_flight = false,
         last_persisted_manifest = Manifest,
@@ -200,7 +207,7 @@ persist_complete(
         in_persist_count = 0,
         last_persist_ts = erlang:system_time(millisecond),
         rebalance_edits = [],
-        appended_since_persist = <<>>
+        appended_since_persist = Remaining
     },
     Effects0 = [
         {update_range, Manifest#manifest.first_offset, Manifest#manifest.next_offset},

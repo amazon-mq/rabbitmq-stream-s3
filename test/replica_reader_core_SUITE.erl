@@ -40,6 +40,8 @@ all() ->
         interleaved_cut_complete_cut,
         timer_restarts_after_persist_and_new_cut,
         persist_broadcast_only_includes_persisted_edits,
+        transfer_during_persist_broadcast_in_next_persist,
+        multiple_transfers_during_persist_all_broadcast,
         many_in_flight_reverse_completion,
         fatal_only_transfer_then_new_cut_restarts_timer,
         %% Rebalancing
@@ -337,6 +339,64 @@ persist_broadcast_only_includes_persisted_edits(_Config) ->
     {_S3, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_complete(1, S2),
     [BroadcastEdits] = [Edits || {broadcast, _, Edits} <- Effects],
     ?assertMatch([#edit{next_offset = 100}], BroadcastEdits).
+
+transfer_during_persist_broadcast_in_next_persist(_Config) ->
+    %% A fragment that completes during an in-flight persist must appear
+    %% in the *next* persist's broadcast. Regression: previously the entry
+    %% was silently dropped because persist_complete reset
+    %% appended_since_persist unconditionally.
+    {S0, _} = init_core(#{persist_threshold => 1}),
+    %% Fragment A completes, triggers persist (threshold=1).
+    {S1, RefA, _} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(0, 100), S0),
+    {S2, _} = rabbitmq_stream_s3_replica_reader_core:transfer_complete(RefA, 1001, S1),
+    %% Persist is now in flight. Fragment B completes during it.
+    {S3, RefB, _} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(100, 200), S2),
+    {S4, _} = rabbitmq_stream_s3_replica_reader_core:transfer_complete(RefB, 1002, S3),
+    ?assertEqual(200, manifest_next_offset(S4)),
+    %% First persist completes. Its broadcast covers only A (0..100).
+    {S5, E1} = rabbitmq_stream_s3_replica_reader_core:persist_complete(1, S4),
+    [Edits1] = [Edits || {broadcast, _, Edits} <- E1],
+    ?assertMatch([#edit{next_offset = 100}], Edits1),
+    %% The first persist_complete should trigger another persist (B is pending).
+    ?assertMatch([{start_persist, _, _, _, _, _} | _], [
+        E
+     || {start_persist, _, _, _, _, _} = E <- E1
+    ]),
+    %% Second persist completes. Its broadcast must cover B (100..200).
+    {_S6, E2} = rabbitmq_stream_s3_replica_reader_core:persist_complete(2, S5),
+    [Edits2] = [Edits || {broadcast, _, Edits} <- E2],
+    ?assertMatch([#edit{next_offset = 200}], Edits2),
+    %% Verify the full chain: applying both broadcasts to an empty manifest
+    %% reproduces the final manifest.
+    FinalManifest = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(_S6),
+    assert_edits_reproduce_manifest(#manifest{}, FinalManifest, Edits1 ++ Edits2).
+
+multiple_transfers_during_persist_all_broadcast(_Config) ->
+    %% Multiple fragments complete during a single in-flight persist.
+    %% All must appear in the subsequent broadcast.
+    {S0, _} = init_core(#{persist_threshold => 1}),
+    %% Fragment A triggers persist.
+    {S1, RefA, _} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(0, 100), S0),
+    {S2, _} = rabbitmq_stream_s3_replica_reader_core:transfer_complete(RefA, 1001, S1),
+    %% Fragments B, C, D complete during the persist.
+    {S3, RefB, _} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(100, 200), S2),
+    {S4, RefC, _} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(200, 300), S3),
+    {S5, RefD, _} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(300, 400), S4),
+    {S6, _} = rabbitmq_stream_s3_replica_reader_core:transfer_complete(RefB, 1002, S5),
+    {S7, _} = rabbitmq_stream_s3_replica_reader_core:transfer_complete(RefC, 1003, S6),
+    {S8, _} = rabbitmq_stream_s3_replica_reader_core:transfer_complete(RefD, 1004, S7),
+    ?assertEqual(400, manifest_next_offset(S8)),
+    %% First persist completes (covers A only).
+    {S9, E1} = rabbitmq_stream_s3_replica_reader_core:persist_complete(1, S8),
+    [Edits1] = [Edits || {broadcast, _, Edits} <- E1],
+    ?assertMatch([#edit{next_offset = 100}], Edits1),
+    %% Second persist completes (must cover B+C+D).
+    {_S10, E2} = rabbitmq_stream_s3_replica_reader_core:persist_complete(2, S9),
+    [Edits2] = [Edits || {broadcast, _, Edits} <- E2],
+    ?assertMatch([#edit{next_offset = 400}], Edits2),
+    %% Full chain reproduces the manifest.
+    FinalManifest = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(_S10),
+    assert_edits_reproduce_manifest(#manifest{}, FinalManifest, Edits1 ++ Edits2).
 
 fatal_failure_mid_sequence(_Config) ->
     %% Cut 4 fragments. Complete 1 and 4. Fragment 2 fails fatally.
