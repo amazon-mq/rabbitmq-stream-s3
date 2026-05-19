@@ -842,15 +842,27 @@ jump_to_oldest(
     end.
 
 refresh_iterator(
-    #?MODULE{stream = StreamId, fragment_ref = #fragment_ref{offset = Fragment, size = FragSize}} =
-        State
+    #?MODULE{stream = StreamId, fragment_ref = #fragment_ref{offset = Fragment}} = State
 ) ->
-    NextOffset = Fragment + FragSize,
     case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
-        #manifest{next_offset = ManifestNext} = Manifest when ManifestNext > NextOffset ->
+        #manifest{} = Manifest ->
             GetGroupFun = rabbitmq_stream_s3_manifest:get_group_fun(StreamId),
-            Iterator = rabbitmq_stream_s3_fragment_iterator:init(Manifest, NextOffset, GetGroupFun),
-            {ok, State#?MODULE{iterator = Iterator}};
+            Iterator0 = rabbitmq_stream_s3_fragment_iterator:init(
+                Manifest, Fragment, GetGroupFun
+            ),
+            %% Advance past the current fragment.
+            Iterator =
+                case rabbitmq_stream_s3_fragment_iterator:next(Iterator0) of
+                    {ok, _, It} -> It;
+                    _ -> Iterator0
+                end,
+            %% Check if there's anything after.
+            case rabbitmq_stream_s3_fragment_iterator:next(Iterator) of
+                {ok, _, _} ->
+                    {ok, State#?MODULE{iterator = Iterator}};
+                _ ->
+                    end_of_manifest
+            end;
         _ ->
             end_of_manifest
     end.
