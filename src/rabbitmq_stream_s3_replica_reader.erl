@@ -448,10 +448,10 @@ format_state(#state{
     #{
         stream => StreamId,
         fragment_target_size => Target,
-        manifest_next_offset =>
+        core =>
             case Core of
                 undefined -> undefined;
-                _ -> (rabbitmq_stream_s3_replica_reader_core:manifest(Core))#manifest.next_offset
+                _ -> rabbitmq_stream_s3_replica_reader_core:format_state(Core)
             end,
         log_next_offset =>
             case Log of

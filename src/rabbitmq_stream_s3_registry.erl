@@ -21,6 +21,8 @@ Cross-node lookups use `erpc:call/4` to read the remote node's table.
     send/2
 ]).
 
+-export([overview/0]).
+
 -define(TABLE, rabbitmq_stream_s3_registry).
 
 -doc "Create the registry ETS table.".
@@ -71,3 +73,8 @@ send(Name, Msg) ->
             erlang:send(Pid, Msg),
             Pid
     end.
+
+-doc "Return the registry as a mapping of stream ID to PID.".
+-spec overview() -> #{stream_id() => pid()}.
+overview() ->
+    #{StreamId => Pid || {StreamId, Pid} <- ets:tab2list(?TABLE)}.

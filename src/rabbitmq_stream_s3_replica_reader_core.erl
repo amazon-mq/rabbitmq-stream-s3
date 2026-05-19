@@ -16,6 +16,7 @@ testable without mocks or timing.
     init/2,
     manifest/1,
     persisted_manifest/1,
+    format_state/1,
     fragment_cut/2,
     transfer_complete/3,
     transfer_failed/3,
@@ -138,6 +139,34 @@ manifest(#state{manifest = Manifest}) ->
 -spec persisted_manifest(state()) -> #manifest{}.
 persisted_manifest(#state{last_persisted_manifest = Manifest}) ->
     Manifest.
+
+-spec format_state(state()) -> map().
+format_state(#state{
+    manifest = #manifest{first_offset = FirstOff, next_offset = NextOff, total_size = TotalSize},
+    last_persisted_manifest = #manifest{next_offset = PersistedNextOff},
+    in_flight = Q,
+    pending_completions = PC,
+    since_persist = SincePersist,
+    in_persist_count = InPersistCount,
+    last_persist_ts = LastPersistTs,
+    persist_in_flight = PersistInFlight,
+    rebalance_in_flight = RebalanceInFlight,
+    waiters = Waiters
+}) ->
+    #{
+        manifest_first_offset => FirstOff,
+        manifest_next_offset => NextOff,
+        manifest_total_size => TotalSize,
+        persisted_next_offset => PersistedNextOff,
+        transfers_in_flight => queue:len(Q),
+        transfers_pending_order => maps:size(PC),
+        since_persist => SincePersist,
+        in_persist_count => InPersistCount,
+        persist_in_flight => PersistInFlight,
+        last_persist_ts => LastPersistTs,
+        rebalance_in_flight => RebalanceInFlight,
+        waiters => length(Waiters)
+    }.
 
 -spec fragment_cut(fragment_meta(), state()) -> {state(), reference(), [core_effect()]}.
 fragment_cut(Meta, #state{cfg = Cfg, in_flight = Q, since_persist = 0} = State) ->
