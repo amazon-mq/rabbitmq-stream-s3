@@ -22,8 +22,6 @@ fragments (via tree-branch-like "group" objects, for large enough streams).
 
 -export([
     new_edit/1,
-    rebalance_edit/2,
-    apply_infos/2,
     apply_edit/2,
     get_group_fun/1,
     evaluate_remote_retention/3,
@@ -46,67 +44,6 @@ new_edit(#manifest{
         first_last_timestamp = FirstLastTs,
         next_offset = NextOffset
     }.
-
--doc "Create an edit which describes a rebalance from a group being uploaded".
--spec rebalance_edit(#group_uploaded{}, t()) -> edit().
-rebalance_edit(#group_uploaded{entry = Entry, pos = Pos, len = Len}, #manifest{} = Manifest) ->
-    %% TODO: I'm pretty sure we need to clear next_offset here. Add a test
-    %% case for the machine where rebalancing starts, a fragment is uploaded
-    %% and applied, and then the rebalancing completes.
-    (new_edit(Manifest))#edit{entries = Entry, pos = Pos, len = Len}.
-
--doc """
-Create an edit that adds successfully uploaded fragments to their manifest
-entries array.
-
-`Infos` is expected to be sorted by offset ascending.
-""".
--spec apply_infos([#fragment_info{}], t()) -> {ok, edit() | undefined} | {error, #fragment_info{}}.
-apply_infos(Infos, #manifest{entries = Entries} = Manifest) ->
-    Edit0 = (new_edit(Manifest))#edit{pos = byte_size(Entries)},
-    apply_infos0(Infos, Edit0).
-
-apply_infos0([], Edit) ->
-    {ok, Edit};
-apply_infos0(
-    [
-        #fragment_info{
-            first_offset = Offset,
-            next_offset = NextOffset,
-            first_timestamp = FirstTs,
-            last_timestamp = LastTs,
-            size = Size
-        }
-        | Rest
-    ],
-    #edit{
-        next_offset = Offset,
-        size = Size0,
-        entries = Entries0
-    } = Edit0
-) ->
-    Edit1 =
-        case Offset of
-            0 ->
-                %% For the very first fragment, also set the offset and timestamps.
-                Edit0#edit{
-                    first_offset = Offset,
-                    first_timestamp = FirstTs,
-                    first_last_timestamp = LastTs
-                };
-            _ ->
-                Edit0
-        end,
-    Edit = Edit1#edit{
-        next_offset = NextOffset,
-        size = Size0 + Size,
-        entries =
-            <<Entries0/binary,
-                (?ENTRY(Offset, FirstTs, LastTs, ?MANIFEST_KIND_FRAGMENT, Size, 0))/binary>>
-    },
-    apply_infos0(Rest, Edit);
-apply_infos0([Info | _], #edit{}) ->
-    {error, Info}.
 
 -doc """
 Apply an edit to a manifest.

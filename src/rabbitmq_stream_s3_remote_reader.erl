@@ -65,7 +65,7 @@ multiplicative decrease ([AIMD]) algorithm.
 -record(read, {
     offset :: byte_offset(),
     bytes :: pos_integer(),
-    %% NOTE: unused since we reliably track #fragment_info.index_start_pos now.
+    %% NOTE: unused since we reliably track fragment data size now.
     hint :: hint()
 }).
 
