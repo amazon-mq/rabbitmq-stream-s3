@@ -124,7 +124,8 @@ end_per_group(_Group, Config) ->
 
 init_per_testcase(_Testcase, Config) ->
     application:ensure_all_started(gun),
-    ok = rabbitmq_stream_s3:setup(),
+    application:ensure_all_started(seshat),
+    _ = seshat:new_group(rabbitmq_stream_s3),
     ok = rabbitmq_stream_s3_api_aws:init(),
     Config.
 
