@@ -329,8 +329,7 @@ handle_continue(resolve_manifest, #state{cfg = #cfg{stream = StreamId}} = State0
     State = start_reading(State1#state{core = Core}),
     {noreply, State}.
 
-handle_info({osiris_offset, _Ref, Offset}, #state{cfg = #cfg{stream = StreamId}} = State0) ->
-    ?LOG_DEBUG("~ts osiris_offset notification offset=~b", [StreamId, Offset]),
+handle_info({osiris_offset, _Ref, _Offset}, State0) ->
     State = drain(State0),
     {noreply, State};
 handle_info(retry_resolve, #state{cfg = #cfg{stream = StreamId}} = State0) ->
@@ -560,7 +559,13 @@ do_commit(StreamId, Manifest, Epoch, Reference, ExpectedRevision) ->
     Key = rabbitmq_stream_s3:manifest_key(StreamId, Uid),
     case rabbitmq_stream_s3_api:put(Key, Data) of
         ok ->
-            commit_khepri(StreamId, Epoch, Reference, ExpectedRevision, Uid);
+            case commit_khepri(StreamId, Epoch, Reference, ExpectedRevision, Uid) of
+                {ok, OldUidEpoch, NewRevision} ->
+                    delete_old_manifest(StreamId, OldUidEpoch),
+                    {ok, NewRevision};
+                {error, _} = Err ->
+                    Err
+            end;
         {error, _} = Err ->
             Err
     end.
@@ -572,17 +577,24 @@ do_commit(StreamId, Manifest, Epoch, Reference, ExpectedRevision) ->
     rabbitmq_stream_s3_db:revision(),
     rabbitmq_stream_s3:uid()
 ) ->
-    {ok, rabbitmq_stream_s3_db:revision()} | {error, term()}.
+    {ok, {rabbitmq_stream_s3:uid(), osiris:epoch()} | undefined, rabbitmq_stream_s3_db:revision()}
+    | {error, term()}.
 commit_khepri(_StreamId, _Epoch, undefined, ExpectedRevision, _Uid) ->
     %% No Khepri reference (test mode). Synthesize a revision.
-    {ok, ExpectedRevision + 1};
+    {ok, undefined, ExpectedRevision + 1};
 commit_khepri(StreamId, Epoch, Reference, ExpectedRevision, Uid) ->
     case rabbitmq_stream_s3_db:put(StreamId, Reference, Epoch, ExpectedRevision, Uid) of
-        {ok, _Old, NewRevision} ->
-            {ok, NewRevision};
+        {ok, Old, NewRevision} ->
+            {ok, Old, NewRevision};
         {error, _} = Err ->
             Err
     end.
+
+delete_old_manifest(_StreamId, undefined) ->
+    ok;
+delete_old_manifest(StreamId, {OldUid, _Epoch}) ->
+    Key = rabbitmq_stream_s3:manifest_key(StreamId, OldUid),
+    rabbitmq_stream_s3_reaper:delete_objects(StreamId, [Key]).
 
 -spec serialize_manifest(#manifest{}) -> binary().
 serialize_manifest(#manifest{
@@ -959,7 +971,6 @@ drain(
             end;
         {end_of_stream, Log1} ->
             NextOffset = osiris_log:next_offset(Log1),
-            ?LOG_DEBUG("~ts drain end_of_stream next_offset=~b", [StreamId, NextOffset]),
             osiris:register_offset_listener(WriterPid, NextOffset, ?OFFSET_FORMATTER),
             State#state{log = Log1, assembly = Assembly0};
         {error, Reason} ->

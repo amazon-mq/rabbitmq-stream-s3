@@ -75,7 +75,8 @@ groups() ->
             discover_attaches_to_existing_writer,
             remote_retention_deletes_fragments,
             uploads_rebalance_into_group,
-            remote_retention_deletes_within_group
+            remote_retention_deletes_within_group,
+            old_manifest_roots_deleted
         ]},
         {with_replica, [], [
             replication_happy_path
@@ -586,6 +587,32 @@ remote_retention_deletes_within_group(Config) ->
     %% Range reflects the deletion.
     {FirstOffset, NextOffset} = get_range(Config),
     ?assertEqual(20, FirstOffset).
+
+old_manifest_roots_deleted(Config) ->
+    StreamId = ?config(stream_id, Config),
+
+    %% 3 segments, each producing a fragment (600 bytes > 500 target).
+    %% persist_threshold=1 means each fragment triggers a persist, producing
+    %% 3 manifest root objects. Only the latest should survive.
+    #{next_offset := NextOffset} = seed_log(Config, [
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]}
+    ]),
+    _Writer = start_writer(Config, #{}, #{fragment_target_size => 500}),
+    await_offset(Config, NextOffset),
+
+    %% The reaper deletes old manifest roots asynchronously.
+    Dir = ?config(remote_dir, Config),
+    MetadataDir = filename:join([Dir, <<"rabbitmq/stream">>, StreamId, <<"metadata">>]),
+    ?awaitMatch(
+        [_],
+        begin
+            {ok, Files} = file:list_dir(MetadataDir),
+            [F || F <- Files, lists:suffix(".manifest", F)]
+        end,
+        2000
+    ).
 
 replication_happy_path(Config) ->
     StreamId = ?config(stream_id, Config),
