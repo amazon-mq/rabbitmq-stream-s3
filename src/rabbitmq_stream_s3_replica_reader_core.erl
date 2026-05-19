@@ -373,7 +373,18 @@ drain_completions(#state{in_flight = Q, pending_completions = PC} = State0) ->
                     %% After all draining, check rebalance then persist trigger.
                     {State4, RebalanceEffects} = maybe_start_rebalance(State3),
                     {State5, CommitEffects} = maybe_start_persist(State4),
-                    {State5, Effects ++ RebalanceEffects ++ CommitEffects}
+                    %% If persist didn't fire but fragments are pending, ensure
+                    %% a timer is running so the tick will flush them. Without
+                    %% this, bytes can sit in the persist stage indefinitely
+                    %% when publishing stops and the threshold is not met.
+                    TimerEffects =
+                        case CommitEffects of
+                            [] when State5#state.since_persist > 0 ->
+                                [{start_persist_timer, (State5#state.cfg)#cfg.persist_interval_ms}];
+                            _ ->
+                                []
+                        end,
+                    {State5, Effects ++ RebalanceEffects ++ CommitEffects ++ TimerEffects}
             end;
         empty ->
             {State0, []}

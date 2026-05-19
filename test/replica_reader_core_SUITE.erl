@@ -22,6 +22,7 @@ all() ->
         persist_not_triggered_below_threshold,
         persist_not_triggered_while_in_flight,
         persist_triggered_by_tick,
+        transfer_complete_below_threshold_starts_timer,
         tick_no_op_when_nothing_applied,
         tick_no_op_when_persist_in_flight,
         tick_no_op_before_interval,
@@ -155,6 +156,20 @@ persist_triggered_by_tick(_Config) ->
     {_S2, Effects} = rabbitmq_stream_s3_replica_reader_core:tick(Now, S1),
     Commits = [E || {start_persist, _, _, _, _, _} = E <- Effects],
     ?assertMatch([{start_persist, _, _, _, _, _}], Commits).
+
+%% When a transfer completes but since_persist is below the threshold,
+%% a persist timer must be started so the tick will eventually flush.
+%% Without this, bytes sit in the persist stage indefinitely when
+%% publishing stops.
+transfer_complete_below_threshold_starts_timer(_Config) ->
+    %% Threshold=5, so a single completion won't trigger a persist.
+    {S0, _} = init_core(#{persist_threshold => 5, persist_interval_ms => 2000}),
+    {_S1, Effects} = cut_and_complete_effects(S0, 0, 100, 1001),
+    Timers = [E || {start_persist_timer, _} = E <- Effects],
+    ?assertMatch([{start_persist_timer, 2000}], Timers),
+    %% No persist should have started.
+    Commits = [E || {start_persist, _, _, _, _, _} = E <- Effects],
+    ?assertEqual([], Commits).
 
 tick_no_op_when_nothing_applied(_Config) ->
     {S0, _} = init_core(),
