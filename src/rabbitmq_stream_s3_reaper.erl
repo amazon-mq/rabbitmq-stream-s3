@@ -52,16 +52,19 @@ delete_objects(_StreamId, Keys) ->
 -doc "Delete all remote tier objects for a stream (async).".
 -spec delete_stream(stream_id()) -> ok.
 delete_stream(StreamId) ->
-    gen_batch_server:cast(?MODULE, {delete_stream, StreamId}).
+    spawn(fun() ->
+        logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
+        list_and_delete(StreamId)
+    end),
+    ok.
 
 init([]) ->
     logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
     {ok, #state{}}.
 
 handle_batch(Ops, State) ->
-    {Keys, Streams} = collect(Ops),
+    Keys = collect(Ops),
     _ = delete_batched(Keys),
-    [spawn_list_task(S) || S <- Streams],
     {ok, State}.
 
 terminate(_Reason, _State) ->
@@ -72,18 +75,7 @@ terminate(_Reason, _State) ->
 %% ------------------------------------------------------------------
 
 collect(Ops) ->
-    lists:foldl(
-        fun
-            ({cast, {delete, K}}, {Keys, Streams}) ->
-                {K ++ Keys, Streams};
-            ({cast, {delete_stream, StreamId}}, {Keys, Streams}) ->
-                {Keys, [StreamId | Streams]};
-            (_, Acc) ->
-                Acc
-        end,
-        {[], []},
-        Ops
-    ).
+    lists:append([K || {cast, {delete, K}} <- Ops]).
 
 delete_batched([]) ->
     ok;
@@ -95,12 +87,6 @@ delete_batched(Keys) ->
     inc(?C_OBJECTS_DELETED, length(Batch)),
     _ = rabbitmq_stream_s3_api:delete(Batch),
     delete_batched(Rest).
-
-spawn_list_task(StreamId) ->
-    spawn_link(fun() ->
-        logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
-        list_and_delete(StreamId)
-    end).
 
 list_and_delete(StreamId) ->
     Prefix = rabbitmq_stream_s3:stream_prefix(StreamId),
