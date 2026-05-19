@@ -728,7 +728,14 @@ execute_effect(reinitialize, #state{cfg = #cfg{stream = StreamId}} = State0) ->
     Manifest = resolve_manifest(StreamId),
     State = on_manifest_resolved(Manifest, State0),
     {Core, _} = rabbitmq_stream_s3_replica_reader_core:init(Manifest, State#state.config),
-    start_reading(State#state{core = Core, log = undefined, assembly = undefined}).
+    start_reading(State#state{
+        core = Core,
+        log = undefined,
+        assembly = undefined,
+        transfer_sizes = #{},
+        persist_pending_bytes = 0,
+        persisting_bytes = 0
+    }).
 
 cancel_timer(undefined) -> ok;
 cancel_timer(Ref) -> erlang:cancel_timer(Ref).
