@@ -93,7 +93,7 @@
         "x": 0,
         "y": 1
       },
-      "id": 1,
+      "id": 200,
       "options": {
         "colorMode": "background",
         "graphMode": "none",
@@ -106,12 +106,12 @@
       },
       "targets": [
         {
-          "expr": "sum by(rabbitmq_cluster) (rabbitmq_stream_s3_active_tasks * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_cluster) (rabbitmq_stream_s3_transfers_in_flight * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "",
           "refId": "A"
         }
       ],
-      "title": "Active tasks",
+      "title": "Transfers in-flight",
       "type": "stat"
     },
     {
@@ -149,7 +149,7 @@
         "x": 4,
         "y": 1
       },
-      "id": 2,
+      "id": 201,
       "options": {
         "colorMode": "background",
         "graphMode": "none",
@@ -162,12 +162,12 @@
       },
       "targets": [
         {
-          "expr": "sum by(rabbitmq_cluster) (rabbitmq_stream_s3_task_failures * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_cluster) (rabbitmq_stream_s3_transfers_failed * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "",
           "refId": "A"
         }
       ],
-      "title": "Task failures",
+      "title": "Transfer failures",
       "type": "stat"
     },
     {
@@ -205,7 +205,7 @@
         "x": 8,
         "y": 1
       },
-      "id": 3,
+      "id": 202,
       "options": {
         "colorMode": "background",
         "graphMode": "none",
@@ -257,7 +257,7 @@
         "x": 12,
         "y": 1
       },
-      "id": 4,
+      "id": 203,
       "options": {
         "colorMode": "background",
         "graphMode": "none",
@@ -309,7 +309,7 @@
         "x": 16,
         "y": 1
       },
-      "id": 5,
+      "id": 204,
       "options": {
         "colorMode": "background",
         "graphMode": "none",
@@ -361,7 +361,7 @@
         "x": 20,
         "y": 1
       },
-      "id": 6,
+      "id": 205,
       "options": {
         "colorMode": "background",
         "graphMode": "none",
@@ -374,12 +374,12 @@
       },
       "targets": [
         {
-          "expr": "sum by(rabbitmq_cluster) (irate(rabbitmq_stream_s3_fragments_created[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_cluster) (irate(rabbitmq_stream_s3_transfers_completed[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "",
           "refId": "A"
         }
       ],
-      "title": "Fragments uploaded / s",
+      "title": "Transfers / s",
       "type": "stat"
     },
     {
@@ -413,7 +413,7 @@
         "x": 0,
         "y": 5
       },
-      "id": 113,
+      "id": 206,
       "options": {
         "colorMode": "background",
         "graphMode": "none",
@@ -465,7 +465,7 @@
         "x": 6,
         "y": 5
       },
-      "id": 114,
+      "id": 207,
       "options": {
         "colorMode": "background",
         "graphMode": "none",
@@ -540,7 +540,7 @@
         "x": 12,
         "y": 5
       },
-      "id": 115,
+      "id": 208,
       "options": {
         "colorMode": "background",
         "graphMode": "none",
@@ -553,7 +553,7 @@
       },
       "targets": [
         {
-          "expr": "min((rabbitmq_stream_s3_remote_oldest_timestamp > 0) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "min((rabbitmq_stream_s3_manifest_first_timestamp_ms > 0) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "",
           "refId": "A"
         }
@@ -615,7 +615,7 @@
         "x": 18,
         "y": 5
       },
-      "id": 116,
+      "id": 209,
       "options": {
         "colorMode": "background",
         "graphMode": "none",
@@ -628,7 +628,7 @@
       },
       "targets": [
         {
-          "expr": "min((rabbitmq_stream_s3_remote_oldest_timestamp > 0) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "min((rabbitmq_stream_s3_manifest_first_timestamp_ms > 0) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "",
           "refId": "A"
         }
@@ -644,238 +644,9 @@
         "x": 0,
         "y": 9
       },
-      "id": 102,
+      "id": 215,
       "title": "Uploads",
       "type": "row"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "drawStyle": "line",
-            "fillOpacity": 20,
-            "gradientMode": "opacity",
-            "lineInterpolation": "smooth",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "decimals": 0,
-          "min": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "ops"
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "/^rabbit@[a-zA-Z\\.\\-]*?0(\\b|\\.)/"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "rgba(86, 166, 75, 1)",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "/^rabbit@[a-zA-Z\\.\\-]*?1(\\b|\\.)/"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "rgba(242, 204, 12, 1)",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "/^rabbit@[a-zA-Z\\.\\-]*?2(\\b|\\.)/"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "rgba(50, 116, 217, 1)",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "/^rabbit@[a-zA-Z\\.\\-]*?3(\\b|\\.)/"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "rgba(163, 82, 204, 1)",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "/^rabbit@[a-zA-Z\\.\\-]*?4(\\b|\\.)/"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "rgba(255, 120, 10, 1)",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "/^rabbit@[a-zA-Z\\.\\-]*?5(\\b|\\.)/"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "rgba(150, 217, 141, 1)",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "/^rabbit@[a-zA-Z\\.\\-]*?6(\\b|\\.)/"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "rgba(255, 238, 82, 1)",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "/^rabbit@[a-zA-Z\\.\\-]*?7(\\b|\\.)/"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "rgba(138, 184, 255, 1)",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "/^rabbit@[a-zA-Z\\.\\-]*?8(\\b|\\.)/"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "rgba(202, 149, 229, 1)",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "/^rabbit@[a-zA-Z\\.\\-]*?9(\\b|\\.)/"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "rgba(255, 179, 87, 1)",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          }
-        ]
-      },
-      "gridPos": {
-        "h": 9,
-        "w": 12,
-        "x": 0,
-        "y": 19
-      },
-      "id": 20,
-      "options": {
-        "legend": {
-          "calcs": [
-            "mean",
-            "max",
-            "min",
-            "last"
-          ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "targets": [
-        {
-          "expr": "sum by(rabbitmq_node) (irate(rabbitmq_stream_s3_fragments_created[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
-          "legendFormat": "{{rabbitmq_node}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Fragments uploaded / s",
-      "type": "timeseries"
     },
     {
       "datasource": {
@@ -1076,9 +847,9 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 37
+        "y": 10
       },
-      "id": 22,
+      "id": 216,
       "options": {
         "legend": {
           "calcs": [
@@ -1098,12 +869,241 @@
       },
       "targets": [
         {
-          "expr": "sum by(rabbitmq_node) (rabbitmq_stream_s3_active_tasks * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_node) (rabbitmq_stream_s3_remote_messages * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "{{rabbitmq_node}}",
           "refId": "A"
         }
       ],
-      "title": "Active tasks",
+      "title": "Remote tier messages",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "gradientMode": "opacity",
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 0,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "bytes"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?0(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(86, 166, 75, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?1(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(242, 204, 12, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?2(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(50, 116, 217, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?3(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(163, 82, 204, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?4(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(255, 120, 10, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?5(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(150, 217, 141, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?6(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(255, 238, 82, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?7(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(138, 184, 255, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?8(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(202, 149, 229, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?9(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(255, 179, 87, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 10
+      },
+      "id": 217,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "min",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by(rabbitmq_node) (rabbitmq_stream_s3_remote_bytes * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "{{rabbitmq_node}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Remote tier size",
       "type": "timeseries"
     },
     {
@@ -1304,10 +1304,10 @@
       "gridPos": {
         "h": 9,
         "w": 12,
-        "x": 12,
-        "y": 37
+        "x": 0,
+        "y": 19
       },
-      "id": 23,
+      "id": 218,
       "options": {
         "legend": {
           "calcs": [
@@ -1327,12 +1327,12 @@
       },
       "targets": [
         {
-          "expr": "sum by(rabbitmq_node) (irate(rabbitmq_stream_s3_task_failures[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(rabbitmq_node) (irate(rabbitmq_stream_s3_transfers_completed[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "legendFormat": "{{rabbitmq_node}}",
           "refId": "A"
         }
       ],
-      "title": "Task failures / s",
+      "title": "Transfers completed / s",
       "type": "timeseries"
     },
     {
@@ -1536,7 +1536,7 @@
         "x": 12,
         "y": 19
       },
-      "id": 119,
+      "id": 219,
       "options": {
         "legend": {
           "calcs": [
@@ -1619,7 +1619,7 @@
               }
             ]
           },
-          "unit": "ops"
+          "unit": "short"
         },
         "overrides": [
           {
@@ -1780,7 +1780,465 @@
         "x": 0,
         "y": 28
       },
-      "id": 120,
+      "id": 220,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "min",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by(rabbitmq_node) (rabbitmq_stream_s3_transfers_in_flight * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "{{rabbitmq_node}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Transfers in-flight",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "gradientMode": "opacity",
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 0,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?0(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(86, 166, 75, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?1(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(242, 204, 12, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?2(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(50, 116, 217, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?3(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(163, 82, 204, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?4(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(255, 120, 10, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?5(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(150, 217, 141, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?6(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(255, 238, 82, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?7(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(138, 184, 255, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?8(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(202, 149, 229, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?9(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(255, 179, 87, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 28
+      },
+      "id": 221,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "min",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by(rabbitmq_node) (irate(rabbitmq_stream_s3_transfers_failed[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "{{rabbitmq_node}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Transfer failures / s",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "gradientMode": "opacity",
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 0,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?0(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(86, 166, 75, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?1(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(242, 204, 12, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?2(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(50, 116, 217, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?3(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(163, 82, 204, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?4(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(255, 120, 10, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?5(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(150, 217, 141, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?6(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(255, 238, 82, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?7(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(138, 184, 255, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?8(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(202, 149, 229, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?9(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(255, 179, 87, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 37
+      },
+      "id": 222,
       "options": {
         "legend": {
           "calcs": [
@@ -1814,6 +2272,18 @@
       "type": "timeseries"
     },
     {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 46
+      },
+      "id": 210,
+      "title": "Upload Pipeline",
+      "type": "row"
+    },
+    {
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
@@ -1836,7 +2306,7 @@
             "showPoints": "never",
             "spanNulls": false,
             "stacking": {
-              "mode": "none"
+              "mode": "normal"
             },
             "thresholdsStyle": {
               "mode": "off"
@@ -2011,10 +2481,10 @@
       "gridPos": {
         "h": 9,
         "w": 12,
-        "x": 12,
-        "y": 10
+        "x": 0,
+        "y": 47
       },
-      "id": 125,
+      "id": 211,
       "options": {
         "legend": {
           "calcs": [
@@ -2034,12 +2504,22 @@
       },
       "targets": [
         {
-          "expr": "sum by(rabbitmq_node) (rabbitmq_stream_s3_remote_bytes * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
-          "legendFormat": "{{rabbitmq_node}}",
+          "expr": "sum by(rabbitmq_node) (rabbitmq_stream_s3_bytes_in_assembly * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "{{rabbitmq_node}} assembly",
           "refId": "A"
+        },
+        {
+          "expr": "sum by(rabbitmq_node) (rabbitmq_stream_s3_bytes_in_transfer * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "{{rabbitmq_node}} transfer",
+          "refId": "B"
+        },
+        {
+          "expr": "sum by(rabbitmq_node) (rabbitmq_stream_s3_bytes_in_persist * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "{{rabbitmq_node}} persist",
+          "refId": "C"
         }
       ],
-      "title": "Remote tier size",
+      "title": "Pipeline bytes by stage",
       "type": "timeseries"
     },
     {
@@ -2082,7 +2562,241 @@
               }
             ]
           },
-          "unit": "short"
+          "unit": "Bps"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?0(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(86, 166, 75, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?1(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(242, 204, 12, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?2(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(50, 116, 217, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?3(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(163, 82, 204, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?4(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(255, 120, 10, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?5(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(150, 217, 141, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?6(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(255, 238, 82, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?7(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(138, 184, 255, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?8(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(202, 149, 229, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rabbit@[a-zA-Z\\.\\-]*?9(\\b|\\.)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "rgba(255, 179, 87, 1)",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 47
+      },
+      "id": 212,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "min",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by(rabbitmq_node) (irate(rabbitmq_stream_s3_bytes_drained_total[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "{{rabbitmq_node}} drained",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by(rabbitmq_node) (irate(rabbitmq_stream_s3_bytes_persisted_total[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "{{rabbitmq_node}} persisted",
+          "refId": "B"
+        }
+      ],
+      "title": "Pipeline throughput",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "gradientMode": "opacity",
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 0,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops"
         },
         "overrides": [
           {
@@ -2241,9 +2955,9 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 10
+        "y": 56
       },
-      "id": 126,
+      "id": 213,
       "options": {
         "legend": {
           "calcs": [
@@ -2263,12 +2977,22 @@
       },
       "targets": [
         {
-          "expr": "sum by(rabbitmq_node) (rabbitmq_stream_s3_remote_messages * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
-          "legendFormat": "{{rabbitmq_node}}",
+          "expr": "sum by(rabbitmq_node) (irate(rabbitmq_stream_s3_persists_completed[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "{{rabbitmq_node}} completed",
           "refId": "A"
+        },
+        {
+          "expr": "sum by(rabbitmq_node) (irate(rabbitmq_stream_s3_persists_failed[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "{{rabbitmq_node}} failed",
+          "refId": "B"
+        },
+        {
+          "expr": "sum by(rabbitmq_node) (irate(rabbitmq_stream_s3_persist_conflicts[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "{{rabbitmq_node}} conflicts",
+          "refId": "C"
         }
       ],
-      "title": "Remote tier messages",
+      "title": "Persists / s",
       "type": "timeseries"
     },
     {
@@ -2280,7 +3004,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 46
+        "y": 65
       },
       "id": 121,
       "title": "Retention",
@@ -2485,7 +3209,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 47
+        "y": 66
       },
       "id": 122,
       "options": {
@@ -2714,7 +3438,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 47
+        "y": 66
       },
       "id": 123,
       "options": {
@@ -2948,7 +3672,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 56
+        "y": 75
       },
       "id": 124,
       "options": {
@@ -2999,7 +3723,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 65
+        "y": 84
       },
       "id": 103,
       "title": "S3 API",
@@ -3025,7 +3749,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 66
+        "y": 85
       },
       "id": 10,
       "options": {
@@ -3093,7 +3817,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 66
+        "y": 85
       },
       "id": 11,
       "options": {
@@ -3168,7 +3892,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 75
+        "y": 94
       },
       "id": 117,
       "options": {
@@ -3233,7 +3957,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 75
+        "y": 94
       },
       "id": 118,
       "options": {
@@ -3470,7 +4194,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 84
+        "y": 103
       },
       "id": 30,
       "options": {
@@ -3699,7 +4423,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 84
+        "y": 103
       },
       "id": 31,
       "options": {
@@ -3923,7 +4647,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 93
+        "y": 112
       },
       "id": 32,
       "options": {
@@ -4141,7 +4865,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 93
+        "y": 112
       },
       "id": 33,
       "options": {
@@ -4176,7 +4900,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 102
+        "y": 121
       },
       "id": 105,
       "title": "Log Reader",
@@ -4211,7 +4935,7 @@
         "h": 4,
         "w": 12,
         "x": 0,
-        "y": 103
+        "y": 122
       },
       "id": 106,
       "options": {
@@ -4264,7 +4988,7 @@
         "h": 4,
         "w": 12,
         "x": 12,
-        "y": 103
+        "y": 122
       },
       "id": 107,
       "options": {
@@ -4477,7 +5201,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 107
+        "y": 126
       },
       "id": 108,
       "options": {
@@ -4700,7 +5424,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 107
+        "y": 126
       },
       "id": 109,
       "options": {
@@ -4923,7 +5647,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 116
+        "y": 135
       },
       "id": 110,
       "options": {
@@ -5146,7 +5870,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 116
+        "y": 135
       },
       "id": 111,
       "options": {
@@ -5384,7 +6108,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 125
+        "y": 144
       },
       "id": 112,
       "options": {
@@ -5419,7 +6143,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 134
+        "y": 153
       },
       "id": 104,
       "title": "Remote Reader",
@@ -5467,7 +6191,7 @@
         "h": 4,
         "w": 12,
         "x": 0,
-        "y": 135
+        "y": 154
       },
       "id": 40,
       "options": {
@@ -5520,7 +6244,7 @@
         "h": 4,
         "w": 12,
         "x": 12,
-        "y": 135
+        "y": 154
       },
       "id": 41,
       "options": {
@@ -5535,7 +6259,7 @@
       },
       "targets": [
         {
-          "expr": "sum by(rabbitmq_cluster) (rabbitmq_stream_s3_request_in_flight * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"}) or vector(0)",
+          "expr": "sum by(rabbitmq_cluster) (rabbitmq_stream_s3_requests_in_flight * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"}) or vector(0)",
           "legendFormat": "",
           "refId": "A"
         }
@@ -5733,7 +6457,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 139
+        "y": 158
       },
       "id": 127,
       "options": {
@@ -5782,7 +6506,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 139
+        "y": 158
       },
       "id": 132,
       "options": {
@@ -6019,7 +6743,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 148
+        "y": 167
       },
       "id": 44,
       "options": {
@@ -6237,7 +6961,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 148
+        "y": 167
       },
       "id": 42,
       "options": {
@@ -6455,7 +7179,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 157
+        "y": 176
       },
       "id": 43,
       "options": {
@@ -6673,7 +7397,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 157
+        "y": 176
       },
       "id": 45,
       "options": {
@@ -6711,7 +7435,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 166
+        "y": 185
       },
       "id": 128,
       "title": "HTTP Connection Pools",
@@ -6916,7 +7640,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 167
+        "y": 186
       },
       "id": 129,
       "options": {
@@ -7150,7 +7874,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 167
+        "y": 186
       },
       "id": 130,
       "options": {
@@ -7379,7 +8103,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 176
+        "y": 195
       },
       "id": 131,
       "options": {
