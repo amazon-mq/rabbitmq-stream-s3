@@ -15,6 +15,9 @@ tier.
 -include_lib("kernel/include/logger.hrl").
 
 -include("include/rabbitmq_stream_s3.hrl").
+-include("include/logging.hrl").
+
+-define(DOMAIN, #{domain => ?RMQLOG_DOMAIN_STREAM_S3}).
 
 -behaviour(osiris_log_reader).
 
@@ -179,7 +182,8 @@ resolve_remote_location(first, #{name := StreamId, shared := Shared}) ->
         #manifest{first_offset = RemoteFirstOffset} when RemoteFirstOffset < LocalFirstOffset ->
             ?LOG_DEBUG(
                 "Attaching remote reader at first offset ~b for spec 'first'",
-                [RemoteFirstOffset]
+                [RemoteFirstOffset],
+                ?DOMAIN
             ),
             resolve_first(StreamId, RemoteFirstOffset);
         _ ->
@@ -188,23 +192,27 @@ resolve_remote_location(first, #{name := StreamId, shared := Shared}) ->
 resolve_remote_location(Offset, #{name := StreamId, shared := Shared}) when
     is_integer(Offset)
 ->
-    ?LOG_DEBUG(?MODULE_STRING ":~ts/2 finding offset ~b for stream '~ts'", [
-        ?FUNCTION_NAME, Offset, StreamId
-    ]),
+    ?LOG_DEBUG(
+        ?MODULE_STRING ":~ts/2 finding offset ~b for stream '~ts'",
+        [?FUNCTION_NAME, Offset, StreamId],
+        ?DOMAIN
+    ),
     FirstChunkId = osiris_log_shared:first_chunk_id(Shared),
     case Offset >= FirstChunkId of
         true ->
             ?LOG_DEBUG(
-                "Offset ~b is in the local tier of stream '~ts' (start ~b), using a local reader", [
-                    Offset, StreamId, FirstChunkId
-                ]
+                "Offset ~b is in the local tier of stream '~ts' (start ~b), using a local reader",
+                [Offset, StreamId, FirstChunkId],
+                ?DOMAIN
             ),
             {local, Offset};
         false ->
             ?LOG_DEBUG(
-                "Offset ~b of stream '~ts' is not local (start ~b), trying the remote tier", [
+                "Offset ~b of stream '~ts' is not local (start ~b), trying the remote tier",
+                [
                     Offset, StreamId, FirstChunkId
-                ]
+                ],
+                ?DOMAIN
             ),
             case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
                 undefined ->
@@ -218,9 +226,11 @@ resolve_remote_location(Offset, #{name := StreamId, shared := Shared}) when
             end
     end;
 resolve_remote_location({timestamp, Ts} = Spec, #{name := StreamId}) ->
-    ?LOG_DEBUG(?MODULE_STRING ":~ts/2 finding timestamp ~b for stream '~ts'", [
-        ?FUNCTION_NAME, Ts, StreamId
-    ]),
+    ?LOG_DEBUG(
+        ?MODULE_STRING ":~ts/2 finding timestamp ~b for stream '~ts'",
+        [?FUNCTION_NAME, Ts, StreamId],
+        ?DOMAIN
+    ),
     %% We can't cheaply query the first timestamp from `osiris_log_shared`.
     %% Instead try the remote tier first.
     case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
@@ -725,9 +735,11 @@ find_fragment(Entries, Spec, GetGroup) ->
             #fragment_ref{offset = EntryOffset, uid = Uid, size = Size};
         ?ENTRY(GroupOffset, _FTs, _LTs, Kind, _Sz, Uid, _) ->
             %% Download the group and search recursively within that.
-            ?LOG_DEBUG("Entry is not a fragment. Searching within group ~b kind ~b", [
-                GroupOffset, Kind
-            ]),
+            ?LOG_DEBUG(
+                "Entry is not a fragment. Searching within group ~b kind ~b",
+                [GroupOffset, Kind],
+                ?DOMAIN
+            ),
             GroupRef = #group_ref{uid = Uid, kind = Kind, offset = GroupOffset},
             {ok, GroupEntries} = GetGroup(GroupRef),
             find_fragment(GroupEntries, Spec, GetGroup)
@@ -772,7 +784,7 @@ saturating_decr(N) -> N - 1.
 
 index_data(StreamId, FragmentOffset, Uid, IdxStartPos) ->
     Key = rabbitmq_stream_s3:fragment_key(StreamId, FragmentOffset, Uid),
-    ?LOG_DEBUG("Looking up key ~ts (~ts)", [Key, ?FUNCTION_NAME]),
+    ?LOG_DEBUG("Looking up key ~ts (~ts)", [Key, ?FUNCTION_NAME], ?DOMAIN),
     {ok, Data} = rabbitmq_stream_s3_api:get_range(
         Key,
         {IdxStartPos, undefined},
@@ -825,7 +837,9 @@ read(RemoteReader, Offset, Bytes, Hint) ->
     ),
     case Ms > ?SLOW_READ_THRESHOLD_MS of
         true ->
-            ?LOG_WARNING("Slow remote tier read: ~bms (~b bytes at offset ~b)", [Ms, Bytes, Offset]),
+            ?LOG_WARNING(
+                "Slow remote tier read: ~bms (~b bytes at offset ~b)", [Ms, Bytes, Offset], ?DOMAIN
+            ),
             ok;
         false ->
             ok

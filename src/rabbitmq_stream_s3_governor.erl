@@ -26,6 +26,8 @@ with no pacing.
 
 -export([init_counters/0]).
 
+-include("include/logging.hrl").
+
 -define(REFILL_INTERVAL_MS, 100).
 
 %% Per-node counters.
@@ -177,6 +179,7 @@ drain_pending(#state{pending = Pending0, bucket = Bucket0} = State) ->
 spawn_task({Fun, _Size, ReplyTo, Ref}) ->
     inc(?C_TASKS_IN_FLIGHT, 1),
     spawn(fun() ->
+        logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
         Result =
             try
                 Fun()

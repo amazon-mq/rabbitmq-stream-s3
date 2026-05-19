@@ -497,6 +497,7 @@ register_replica(
 
 delete_manifest_objects(StreamId, Manifest) ->
     spawn(fun() ->
+        logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
         GetGroupFun = fun(GroupRef) ->
             Key = rabbitmq_stream_s3:group_key(StreamId, GroupRef),
             case rabbitmq_stream_s3_api:get(Key) of
@@ -652,6 +653,7 @@ execute_effect(
 ) ->
     Self = self(),
     spawn_link(fun() ->
+        logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
         Result =
             try
                 do_upload_group(StreamId, Kind, Entries)
@@ -671,6 +673,7 @@ execute_effect(
 ) ->
     Self = self(),
     {CommitPid, MonRef} = spawn_monitor(fun() ->
+        logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
         Result = do_commit(StreamId, Manifest, Epoch, Reference, ExpectedRevision),
         Self ! {persist_result, Result}
     end),

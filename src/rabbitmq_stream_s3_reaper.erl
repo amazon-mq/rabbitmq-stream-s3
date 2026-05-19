@@ -17,6 +17,7 @@ for batched deletion. The task exits when the listing is exhausted.
 -behaviour(gen_batch_server).
 
 -include("include/rabbitmq_stream_s3.hrl").
+-include("include/logging.hrl").
 -include_lib("kernel/include/logger.hrl").
 
 -export([start_link/0]).
@@ -54,6 +55,7 @@ delete_stream(StreamId) ->
     gen_batch_server:cast(?MODULE, {delete_stream, StreamId}).
 
 init([]) ->
+    logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
     {ok, #state{}}.
 
 handle_batch(Ops, State) ->
@@ -95,7 +97,10 @@ delete_batched(Keys) ->
     delete_batched(Rest).
 
 spawn_list_task(StreamId) ->
-    spawn_link(fun() -> list_and_delete(StreamId) end).
+    spawn_link(fun() ->
+        logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
+        list_and_delete(StreamId)
+    end).
 
 list_and_delete(StreamId) ->
     Prefix = rabbitmq_stream_s3:stream_prefix(StreamId),
