@@ -644,9 +644,10 @@ execute_effect({resubmit_transfer, Ref, _StreamId, Dir, Meta}, #state{cfg = Cfg}
         end
     end,
     rabbitmq_stream_s3_governor:submit(Fun, Size, Self, Ref),
-    %% Resubmissions don't bump transfers_in_flight again (already counted
-    %% on the first submit) and don't add to transfer_sizes (already there).
-    State0;
+    %% on_transfer_result already decremented the gauges and removed Ref
+    %% from transfer_sizes. Restore them so the eventual completion is
+    %% accounted for correctly.
+    on_transfer_submitted(Ref, Size, State0);
 execute_effect(
     {upload_group, StreamId, Kind, Entries, _Pos, _Len},
     State0
@@ -1171,13 +1172,6 @@ on_transfer_result(Ref, Outcome, #state{transfer_sizes = Sizes} = State0) ->
     case maps:take(Ref, Sizes) of
         {Size, Sizes1} ->
             dec(State0, ?C_TRANSFERS_IN_FLIGHT, 1),
-            %% Pipeline stage 2 -> 3 (on success) or 2 -> dropped (on
-            %% error). On retriable errors the existing flow does not
-            %% re-add the ref on resubmit, so transfers_in_flight and
-            %% bytes_in_transfer under-report by one fragment until the
-            %% retry completes. This is consistent with pre-existing
-            %% transfers_in_flight accounting; fixing it requires a
-            %% restructure of the retry path.
             dec(State0, ?C_BYTES_IN_TRANSFER, Size),
             case Outcome of
                 ok ->
