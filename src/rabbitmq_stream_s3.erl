@@ -119,10 +119,12 @@ pad_zeroes(Offset) ->
             Num
     end.
 
--doc "Creates the key for the given stream and UID".
--spec manifest_key(stream_id(), uid()) -> key().
-manifest_key(StreamId, Uid) when is_binary(StreamId) andalso is_integer(Uid) ->
-    manifest_key(StreamId, <<"root">>, Uid, <<"manifest">>).
+-doc "Creates the key for the given stream and manifest ref".
+-spec manifest_key(stream_id(), #manifest_ref{}) -> key().
+manifest_key(StreamId, #manifest_ref{epoch = Epoch, uid = Uid}) when is_binary(StreamId) ->
+    EpochBin = integer_to_binary(Epoch),
+    <<"rabbitmq/stream/", StreamId/binary, "/metadata/root.", EpochBin/binary, $.,
+        (format_uid(Uid))/binary, ".manifest">>.
 
 -spec manifest_key(stream_id(), binary(), uid(), binary()) -> key().
 manifest_key(StreamId, Prefix, Uid, Suffix) when

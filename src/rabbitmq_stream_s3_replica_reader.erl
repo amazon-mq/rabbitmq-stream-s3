@@ -557,12 +557,13 @@ group_magic(?MANIFEST_KIND_MEGA_GROUP) ->
 do_commit(StreamId, Manifest, Epoch, Reference, ExpectedRevision) ->
     Uid = rabbitmq_stream_s3:uid(),
     Data = serialize_manifest(Manifest),
-    Key = rabbitmq_stream_s3:manifest_key(StreamId, Uid),
+    Ref = #manifest_ref{epoch = Epoch, uid = Uid},
+    Key = rabbitmq_stream_s3:manifest_key(StreamId, Ref),
     case rabbitmq_stream_s3_api:put(Key, Data) of
         ok ->
             case commit_khepri(StreamId, Epoch, Reference, ExpectedRevision, Uid) of
-                {ok, OldUidEpoch, NewRevision} ->
-                    delete_old_manifest(StreamId, OldUidEpoch),
+                {ok, OldRef, NewRevision} ->
+                    delete_old_manifest(StreamId, OldRef),
                     {ok, NewRevision};
                 {error, _} = Err ->
                     Err
@@ -578,23 +579,25 @@ do_commit(StreamId, Manifest, Epoch, Reference, ExpectedRevision) ->
     rabbitmq_stream_s3_db:revision(),
     rabbitmq_stream_s3:uid()
 ) ->
-    {ok, {rabbitmq_stream_s3:uid(), osiris:epoch()} | undefined, rabbitmq_stream_s3_db:revision()}
+    {ok, #manifest_ref{} | undefined, rabbitmq_stream_s3_db:revision()}
     | {error, term()}.
 commit_khepri(_StreamId, _Epoch, undefined, ExpectedRevision, _Uid) ->
     %% No Khepri reference (test mode). Synthesize a revision.
     {ok, undefined, ExpectedRevision + 1};
 commit_khepri(StreamId, Epoch, Reference, ExpectedRevision, Uid) ->
     case rabbitmq_stream_s3_db:put(StreamId, Reference, Epoch, ExpectedRevision, Uid) of
-        {ok, Old, NewRevision} ->
-            {ok, Old, NewRevision};
+        {ok, {OldUid, OldEpoch}, NewRevision} ->
+            {ok, #manifest_ref{epoch = OldEpoch, uid = OldUid}, NewRevision};
+        {ok, undefined, NewRevision} ->
+            {ok, undefined, NewRevision};
         {error, _} = Err ->
             Err
     end.
 
 delete_old_manifest(_StreamId, undefined) ->
     ok;
-delete_old_manifest(StreamId, {OldUid, _Epoch}) ->
-    Key = rabbitmq_stream_s3:manifest_key(StreamId, OldUid),
+delete_old_manifest(StreamId, #manifest_ref{} = Ref) ->
+    Key = rabbitmq_stream_s3:manifest_key(StreamId, Ref),
     rabbitmq_stream_s3_reaper:delete_objects(StreamId, [Key]).
 
 -spec serialize_manifest(#manifest{}) -> binary().
@@ -817,8 +820,9 @@ resolve_manifest(StreamId) ->
             end;
         undefined ->
             case catch rabbitmq_stream_s3_db:get(StreamId) of
-                {ok, #{uid := Uid, revision := Rev}} ->
-                    Key = rabbitmq_stream_s3:manifest_key(StreamId, Uid),
+                {ok, #{uid := Uid, epoch := Epoch, revision := Rev}} ->
+                    Ref = #manifest_ref{epoch = Epoch, uid = Uid},
+                    Key = rabbitmq_stream_s3:manifest_key(StreamId, Ref),
                     case rabbitmq_stream_s3_api:get(Key, #{}) of
                         {ok, Data} ->
                             (parse_manifest_root(Data))#manifest{revision = Rev};

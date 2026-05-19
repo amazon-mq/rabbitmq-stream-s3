@@ -57,6 +57,12 @@
     size :: non_neg_integer()
 }).
 
+%% A pointer to a manifest root object.
+-record(manifest_ref, {
+    epoch :: osiris:epoch(),
+    uid :: rabbitmq_stream_s3:uid()
+}).
+
 -define(FRAGMENT_VERSION, 1).
 
 -record(remote_location, {
