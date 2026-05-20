@@ -51,7 +51,8 @@ all() ->
         find_index_position_timestamp,
         %% Replica reader core: rebalancing
         broadcast_edits_reproduce_manifest,
-        broadcast_edits_complete_across_persist_cycles
+        broadcast_edits_complete_across_persist_cycles,
+        broadcast_edits_with_retention
     ].
 
 init_per_suite(Config) -> Config.
@@ -381,6 +382,145 @@ drain_persists(State0, Rev, Acc) ->
             drain_persists(State1, Rev + 1, Acc ++ BroadcastEdits);
         [] ->
             {State1, Rev + 1, Acc ++ BroadcastEdits}
+    end.
+
+%% =========================================================================
+%% Replica reader core: retention interleaved with appends and rebalancing
+%% =========================================================================
+
+broadcast_edits_with_retention(_Config) ->
+    rabbit_ct_proper_helpers:run_proper(
+        fun prop_broadcast_edits_with_retention/0, [], 500
+    ).
+
+%% Property: for any interleaving of fragment appends and retention edits
+%% (possibly triggering rebalancing), the concatenation of all broadcast
+%% edits across all persist cycles reproduces the final persisted manifest.
+prop_broadcast_edits_with_retention() ->
+    ?FORALL(
+        {RebalanceThreshold, Ops},
+        {integer(3, 6), gen_ops_with_retention()},
+        begin
+            Opts = #{
+                stream => <<"stream">>,
+                dir => <<"/dir">>,
+                epoch => 1,
+                reference => test_ref,
+                persist_threshold => 3,
+                persist_interval_ms => 999999,
+                rebalance_threshold => RebalanceThreshold
+            },
+            {S0, _} = rabbitmq_stream_s3_replica_reader_core:init(#manifest{}, Opts),
+            {FinalState, AllEdits} = run_ops_with_retention(
+                Ops, S0, 0, 1, RebalanceThreshold, []
+            ),
+            FinalPersisted = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(
+                FinalState
+            ),
+            Replicated = lists:foldl(
+                fun(Edit, M) ->
+                    rabbitmq_stream_s3_manifest:apply_edit(Edit, M)
+                end,
+                #manifest{},
+                AllEdits
+            ),
+            Replicated#manifest.entries =:= FinalPersisted#manifest.entries andalso
+                Replicated#manifest.first_offset =:= FinalPersisted#manifest.first_offset andalso
+                Replicated#manifest.next_offset =:= FinalPersisted#manifest.next_offset andalso
+                Replicated#manifest.total_size =:= FinalPersisted#manifest.total_size
+        end
+    ).
+
+%% Generate a sequence of operations weighted toward fragments.
+gen_ops_with_retention() ->
+    ?LET(
+        N,
+        integer(4, 20),
+        [frequency([{4, fragment}, {1, retention}]) || _ <- lists:seq(1, N)]
+    ).
+
+%% Execute operations, draining persists as they trigger.
+run_ops_with_retention([], State0, _Offset, Rev, _Threshold, Edits) ->
+    %% Final persist to flush remaining edits.
+    Now = erlang:system_time(millisecond) + 999999,
+    case rabbitmq_stream_s3_replica_reader_core:tick(Now, State0) of
+        {S1, [{start_persist, _, _, _, _, _}]} ->
+            {S2, FinalEdits} = drain_all_persists(S1, Rev),
+            {S2, Edits ++ FinalEdits};
+        {S1, []} ->
+            {S1, Edits}
+    end;
+run_ops_with_retention([fragment | Rest], State0, Offset, Rev, Threshold, Edits) ->
+    Meta = #{
+        first_offset => Offset,
+        first_timestamp => Offset * 1000,
+        last_timestamp => (Offset + 99) * 1000,
+        next_offset => Offset + 100,
+        size => 64_000_000,
+        num_chunks => 100,
+        spans => [{0, 8, 64_000_008}]
+    },
+    {S1, Ref, _} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(Meta, State0),
+    {S2, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_complete(
+        Ref, erlang:unique_integer([positive]), S1
+    ),
+    %% Complete any rebalance that triggered.
+    S3 = complete_pending_rebalances(Effects, S2, Threshold),
+    %% Drain any persist that triggered.
+    {S4, NewRev, NewEdits} = maybe_drain_persist(S3, Effects, Rev),
+    run_ops_with_retention(Rest, S4, Offset + 100, NewRev, Threshold, Edits ++ NewEdits);
+run_ops_with_retention([retention | Rest], State0, Offset, Rev, Threshold, Edits) ->
+    %% Only apply retention if the manifest has more than one entry.
+    Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(State0),
+    case byte_size(Manifest#manifest.entries) > ?ENTRY_B of
+        true ->
+            %% Remove the first entry.
+            <<_:64, _:64/signed, _:64/signed, _:8, Size:40, _:32, _/binary>> =
+                Manifest#manifest.entries,
+            <<_:?ENTRY_B/binary, NewFirst/binary>> = Manifest#manifest.entries,
+            <<NewFirstOff:64, NewFirstTs:64/signed, NewFirstLTs:64/signed, _/binary>> = NewFirst,
+            RetEdit = #edit{
+                first_offset = NewFirstOff,
+                first_timestamp = NewFirstTs,
+                first_last_timestamp = NewFirstLTs,
+                next_offset = undefined,
+                size = -Size,
+                entries = <<>>,
+                pos = 0,
+                len = ?ENTRY_B
+            },
+            {S1, Effects} = rabbitmq_stream_s3_replica_reader_core:retention_complete(
+                RetEdit, State0
+            ),
+            %% Drain any persist that triggered.
+            {S2, NewRev, NewEdits} = maybe_drain_persist(S1, Effects, Rev),
+            run_ops_with_retention(Rest, S2, Offset, NewRev, Threshold, Edits ++ NewEdits);
+        false ->
+            %% Skip retention if only one entry (must keep at least one).
+            run_ops_with_retention(Rest, State0, Offset, Rev, Threshold, Edits)
+    end.
+
+%% If a persist was triggered in the effects, drain it (and any cascading persists).
+maybe_drain_persist(State, Effects, Rev) ->
+    case [E || {start_persist, _, _, _, _, _} = E <- Effects] of
+        [_ | _] ->
+            {S1, NewEdits} = drain_all_persists(State, Rev),
+            {S1, Rev + 1, NewEdits};
+        [] ->
+            {State, Rev, []}
+    end.
+
+drain_all_persists(State0, Rev) ->
+    drain_all_persists(State0, Rev, []).
+
+drain_all_persists(State0, Rev, Acc) ->
+    {State1, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_complete(Rev, State0),
+    BroadcastEdits = lists:append([Es || {broadcast, _, Es} <- Effects]),
+    case [E || {start_persist, _, _, _, _, _} = E <- Effects] of
+        [_ | _] ->
+            drain_all_persists(State1, Rev + 1, Acc ++ BroadcastEdits);
+        [] ->
+            {State1, Acc ++ BroadcastEdits}
     end.
 
 %% =========================================================================

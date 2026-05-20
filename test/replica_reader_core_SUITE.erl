@@ -56,7 +56,13 @@ all() ->
         recursive_rebalance_groups_to_kilo_group,
         rebalance_tick_defers_while_in_flight,
         group_upload_failed_retriable_retries,
-        group_upload_failed_fatal_abandons
+        group_upload_failed_fatal_abandons,
+        %% Retention
+        retention_complete_applies_edit,
+        retention_complete_triggers_persist,
+        retention_defers_persist,
+        retention_edit_broadcast_on_persist_complete,
+        retention_failed_clears_flag
     ].
 
 init_per_suite(Config) -> Config.
@@ -405,10 +411,11 @@ multiple_transfers_during_persist_all_broadcast(_Config) ->
     {S9, E1} = rabbitmq_stream_s3_replica_reader_core:persist_complete(1, S8),
     [Edits1] = [Edits || {broadcast, _, Edits} <- E1],
     ?assertMatch([#edit{next_offset = 100}], Edits1),
-    %% Second persist completes (must cover B+C+D).
+    %% Second persist completes (must cover B+C+D as individual edits).
     {_S10, E2} = rabbitmq_stream_s3_replica_reader_core:persist_complete(2, S9),
     [Edits2] = [Edits || {broadcast, _, Edits} <- E2],
-    ?assertMatch([#edit{next_offset = 400}], Edits2),
+    ?assertEqual(3, length(Edits2)),
+    ?assertMatch(#edit{next_offset = 400}, lists:last(Edits2)),
     %% Full chain reproduces the manifest.
     FinalManifest = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(_S10),
     assert_edits_reproduce_manifest(#manifest{}, FinalManifest, Edits1 ++ Edits2).
@@ -607,13 +614,19 @@ rebalance_edits_in_broadcast(_Config) ->
     From = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(S2),
     {S3, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_complete(2, S2),
     To = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(S3),
-    %% Broadcast should contain the append edit then the rebalance edit.
+    %% Broadcast should contain Threshold append edits then the rebalance edit.
     [Edits] = [Es || {broadcast, _, Es} <- Effects],
-    ?assertMatch([_, _], Edits),
-    [AppendEdit, RebalanceEdit] = Edits,
-    %% Append edit: len=0, entries = fragment entries.
-    ?assertEqual(0, AppendEdit#edit.len),
-    ?assert(byte_size(AppendEdit#edit.entries) > 0),
+    ?assertEqual(Threshold + 1, length(Edits)),
+    AppendEdits = lists:sublist(Edits, Threshold),
+    [RebalanceEdit] = lists:nthtail(Threshold, Edits),
+    %% Append edits: len=0, each has one entry.
+    lists:foreach(
+        fun(E) ->
+            ?assertEqual(0, E#edit.len),
+            ?assertEqual(?ENTRY_B, byte_size(E#edit.entries))
+        end,
+        AppendEdits
+    ),
     %% Rebalance edit: len > 0, entries = one group entry.
     ?assert(RebalanceEdit#edit.len > 0),
     ?assertEqual(?ENTRY_B, byte_size(RebalanceEdit#edit.entries)),
@@ -757,6 +770,131 @@ group_upload_failed_fatal_abandons(_Config) ->
     UploadGroups = [E || {upload_group, _, _, _, _, _} = E <- Effects],
     Persists = [E || {start_persist, _, _, _, _, _} = E <- Effects],
     ?assertEqual([], UploadGroups),
+    ?assertMatch([_], Persists).
+
+%% ------------------------------------------------------------------
+%% Retention tests
+%% ------------------------------------------------------------------
+
+retention_complete_applies_edit(_Config) ->
+    %% A retention edit removes the first fragment from the manifest.
+    {S0, _} = init_core(#{persist_threshold => 100}),
+    S1 = cut_and_complete(S0, 0, 100, 1001),
+    S2 = cut_and_complete(S1, 100, 200, 1002),
+    S3 = cut_and_complete(S2, 200, 300, 1003),
+    %% Remove the first entry.
+    RetEdit = #edit{
+        first_offset = 100,
+        first_timestamp = 100 * 1000,
+        first_last_timestamp = 199 * 1000,
+        next_offset = undefined,
+        size = -64_000_000,
+        entries = <<>>,
+        pos = 0,
+        len = ?ENTRY_B
+    },
+    {S4, _Effects} = rabbitmq_stream_s3_replica_reader_core:retention_complete(RetEdit, S3),
+    Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(S4),
+    ?assertEqual(100, Manifest#manifest.first_offset),
+    ?assertEqual(300, Manifest#manifest.next_offset),
+    ?assertEqual(2 * ?ENTRY_B, byte_size(Manifest#manifest.entries)).
+
+retention_complete_triggers_persist(_Config) ->
+    %% retention_complete increments since_persist. With threshold=1 it
+    %% should trigger a persist.
+    {S0, _} = init_core(#{persist_threshold => 3}),
+    S1 = cut_and_complete(S0, 0, 100, 1001),
+    S2 = cut_and_complete(S1, 100, 200, 1002),
+    S3 = cut_and_complete(S2, 200, 300, 1003),
+    %% Persist fires (threshold=3). Complete it.
+    {S4, _} = rabbitmq_stream_s3_replica_reader_core:persist_complete(1, S3),
+    %% Now apply retention. since_persist goes to 1. Use tick to trigger.
+    RetEdit = #edit{
+        first_offset = 100,
+        first_timestamp = 100 * 1000,
+        first_last_timestamp = 199 * 1000,
+        next_offset = undefined,
+        size = -64_000_000,
+        entries = <<>>,
+        pos = 0,
+        len = ?ENTRY_B
+    },
+    {S5, _} = rabbitmq_stream_s3_replica_reader_core:retention_complete(RetEdit, S4),
+    %% Tick with enough time elapsed should trigger persist.
+    Now = erlang:system_time(millisecond) + 10000,
+    {_S6, Effects} = rabbitmq_stream_s3_replica_reader_core:tick(Now, S5),
+    Persists = [E || {start_persist, _, _, _, _, _} = E <- Effects],
+    ?assertMatch([_], Persists).
+
+retention_defers_persist(_Config) ->
+    %% While retention_in_flight is true, persist must not start.
+    {S0, _} = init_core(#{persist_threshold => 1}),
+    S1 = cut_and_complete(S0, 0, 100, 1001),
+    %% Persist fires (threshold=1). Complete it.
+    {S2, _} = rabbitmq_stream_s3_replica_reader_core:persist_complete(1, S1),
+    %% Mark retention as started.
+    S3 = rabbitmq_stream_s3_replica_reader_core:retention_started(S2),
+    %% Apply another fragment. Persist should be deferred.
+    {S4, Effects} = cut_and_complete_effects(S3, 100, 200, 1002),
+    Persists = [E || {start_persist, _, _, _, _, _} = E <- Effects],
+    ?assertEqual([], Persists),
+    %% Tick should also not trigger persist.
+    Now = erlang:system_time(millisecond) + 10000,
+    {_S5, TickEffects} = rabbitmq_stream_s3_replica_reader_core:tick(Now, S4),
+    ?assertEqual([], TickEffects).
+
+retention_edit_broadcast_on_persist_complete(_Config) ->
+    %% The retention edit must appear in the broadcast only after persist.
+    {S0, _} = init_core(#{persist_threshold => 3}),
+    S1 = cut_and_complete(S0, 0, 100, 1001),
+    S2 = cut_and_complete(S1, 100, 200, 1002),
+    S3 = cut_and_complete(S2, 200, 300, 1003),
+    %% Persist fires (threshold=3). Complete it to establish baseline.
+    {S4, _} = rabbitmq_stream_s3_replica_reader_core:persist_complete(1, S3),
+    %% Apply retention (removes first entry).
+    RetEdit = #edit{
+        first_offset = 100,
+        first_timestamp = 100 * 1000,
+        first_last_timestamp = 199 * 1000,
+        next_offset = undefined,
+        size = -64_000_000,
+        entries = <<>>,
+        pos = 0,
+        len = ?ENTRY_B
+    },
+    {S5, RetEffects} = rabbitmq_stream_s3_replica_reader_core:retention_complete(RetEdit, S4),
+    %% retention_complete must NOT emit broadcast or update_range.
+    ?assertEqual([], [E || {broadcast, _, _} = E <- RetEffects]),
+    ?assertEqual([], [E || {update_range, _, _} = E <- RetEffects]),
+    %% Force persist via tick.
+    Now = erlang:system_time(millisecond) + 10000,
+    {S6, PersistEffects} = rabbitmq_stream_s3_replica_reader_core:tick(Now, S5),
+    ?assertMatch([{start_persist, _, _, _, _, _}], PersistEffects),
+    %% Complete persist. NOW the retention edit should be broadcast.
+    From = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(S6),
+    {S7, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_complete(2, S6),
+    To = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(S7),
+    [Edits] = [Es || {broadcast, _, Es} <- Effects],
+    %% The retention edit should be in the broadcast.
+    RetEdits = [E || #edit{len = L} = E <- Edits, L > 0],
+    ?assertMatch([_], RetEdits),
+    %% The invariant must hold.
+    assert_edits_reproduce_manifest(From, To, Edits).
+
+retention_failed_clears_flag(_Config) ->
+    %% After retention_failed, persist should be unblocked.
+    {S0, _} = init_core(#{persist_threshold => 1}),
+    S1 = cut_and_complete(S0, 0, 100, 1001),
+    {S2, _} = rabbitmq_stream_s3_replica_reader_core:persist_complete(1, S1),
+    %% Mark retention started, then apply a fragment.
+    S3 = rabbitmq_stream_s3_replica_reader_core:retention_started(S2),
+    S4 = cut_and_complete(S3, 100, 200, 1002),
+    %% Retention fails. Persist should now be possible.
+    {S5, _} = rabbitmq_stream_s3_replica_reader_core:retention_failed(timeout, S4),
+    %% Tick should trigger persist (since_persist > 0, interval elapsed).
+    Now = erlang:system_time(millisecond) + 10000,
+    {_S6, Effects} = rabbitmq_stream_s3_replica_reader_core:tick(Now, S5),
+    Persists = [E || {start_persist, _, _, _, _, _} = E <- Effects],
     ?assertMatch([_], Persists).
 
 %% ------------------------------------------------------------------

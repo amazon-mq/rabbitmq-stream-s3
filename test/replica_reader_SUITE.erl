@@ -497,9 +497,8 @@ remote_retention_deletes_fragments(Config) ->
         2000
     ),
 
-    %% Manifest reflects the deletion.
-    {FirstOffset, NextOffset} = get_range(Config),
-    ?assertEqual(10, FirstOffset).
+    %% Manifest reflects the deletion (after the retention persist completes).
+    ?awaitMatch({10, NextOffset}, get_range(Config), 2000).
 
 uploads_rebalance_into_group(Config) ->
     %% 5 segments, each producing a fragment (600 bytes > 500 target).
