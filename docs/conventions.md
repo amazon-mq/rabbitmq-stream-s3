@@ -40,6 +40,24 @@ The manifest stores entries as a flat binary (34 bytes per entry) rather than a 
 
 Use binary arrays for any fixed-size record collection that needs binary search or sequential access. Do not convert to lists of records for processing.
 
+## List accumulation
+
+Do not use `List ++ [Element]` to build lists incrementally. Tail-append copies the entire list on every call, making N appends O(N²).
+
+Use the prepend-and-reverse idiom instead: accumulate with `[Element | Acc]` (O(1) per element), then call `lists:reverse/1` once when the final order is needed (O(N) total).
+
+```erlang
+%% Bad: O(N²) over the accumulation cycle.
+Edits ++ [Edit]
+
+%% Good: O(1) prepend, O(N) reverse at consumption time.
+[Edit | Edits]
+...
+lists:reverse(Edits)
+```
+
+More generally, avoid `++/2` in loops or recursive accumulation. It is fine for one-off concatenation of short, bounded lists (e.g. merging effect lists from two calls).
+
 ## Storage backend abstraction
 
 The `rabbitmq_stream_s3_api` behaviour abstracts the remote tier. Production uses `rabbitmq_stream_s3_api_aws` (real S3). Tests use `rabbitmq_stream_s3_api_fs` (local filesystem).

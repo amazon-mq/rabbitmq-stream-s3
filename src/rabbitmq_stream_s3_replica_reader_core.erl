@@ -224,10 +224,11 @@ persist_complete(
     } = State0
 ) ->
     Manifest = CommittingManifest#manifest{revision = Revision},
-    %% Only discard the edits that were captured in the persisting batch.
-    %% Edits that arrived during the in-flight persist were appended after
-    %% start_persist captured its snapshot; those must be preserved.
-    RemainingEdits = lists:nthtail(Committed, State0#state.edits_since_persist),
+    %% edits_since_persist is stored reversed (newest first). The first
+    %% (N - Committed) elements are edits that arrived *after* start_persist
+    %% captured its snapshot; those must be preserved.
+    Remaining = N - Committed,
+    RemainingEdits = lists:sublist(State0#state.edits_since_persist, Remaining),
     State1 = State0#state{
         persist_in_flight = false,
         last_persisted_manifest = Manifest,
@@ -334,7 +335,7 @@ group_upload_complete(
         manifest = Manifest,
         rebalance_in_flight = false,
         since_persist = State0#state.since_persist + 1,
-        edits_since_persist = State0#state.edits_since_persist ++ [Edit]
+        edits_since_persist = [Edit | State0#state.edits_since_persist]
     },
     %% Check for recursive rebalancing (e.g. too many groups → kilo-group).
     {State2, RebalanceEffects} = maybe_start_rebalance(State1),
@@ -382,7 +383,7 @@ retention_complete(Edit, #state{manifest = Manifest0} = State0) ->
         manifest = Manifest,
         retention_in_flight = false,
         since_persist = State0#state.since_persist + 1,
-        edits_since_persist = State0#state.edits_since_persist ++ [Edit]
+        edits_since_persist = [Edit | State0#state.edits_since_persist]
     },
     {State2, PersistEffects} = maybe_start_persist(State1),
     {State2, PersistEffects}.
@@ -474,7 +475,7 @@ apply_fragment(
     State#state{
         manifest = Manifest,
         since_persist = N + 1,
-        edits_since_persist = Edits ++ [Edit1]
+        edits_since_persist = [Edit1 | Edits]
     }.
 
 -spec maybe_start_persist(state()) -> {state(), [core_effect()]}.
@@ -504,10 +505,13 @@ start_persist(
         manifest = Manifest,
         last_persisted_manifest = LastManifest,
         since_persist = N,
-        edits_since_persist = Edits
+        edits_since_persist = EditsRev
     } =
         State
 ) ->
+    %% edits_since_persist is stored in reverse (newest first) for O(1) prepend.
+    %% Reverse to temporal order for broadcast and persist.
+    Edits = lists:reverse(EditsRev),
     Effect =
         {start_persist, Manifest, Cfg#cfg.epoch, Cfg#cfg.reference, LastManifest#manifest.revision,
             Edits},
