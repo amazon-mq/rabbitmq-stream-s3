@@ -91,6 +91,21 @@ stream_s3.persist_interval_ms = 2000
 stream_s3.max_transfer_bytes_per_sec = unlimited
 ```
 
+### Read-path integrity
+
+```ini
+# Whether to validate CRC32 checksums when reading chunk data from the
+# remote tier (S3). When enabled, each chunk read by a consumer from S3
+# is verified against the CRC in its header before delivery. This catches
+# corruption introduced after upload (bit rot in S3, HTTP response
+# corruption not caught by TCP checksums). The cost is one erlang:crc32/1
+# call per chunk on the consumer read path.
+# Type: boolean. Default: false.
+stream_s3.verify_crc_on_read = false
+```
+
+Osiris does not validate CRC when sending chunk data to consumers via `send_file` or the chunk iterator. The CRC in each chunk header is validated on the write path (when replicas accept chunks) and during `read_chunk/1`, but not on the streaming read paths used for consumer delivery. This setting adds validation on the remote read path where data has traversed an additional network hop (S3) beyond the original replication.
+
 ## Monitoring
 
 The plugin exposes its metrics via Prometheus through the existing `rabbitmq_prometheus` plugin. Enabling `rabbitmq_stream_s3` implicitly enables `rabbitmq_prometheus`, which opens the Prometheus metrics endpoint on port 15692 (TCP) or 15691 (TLS).

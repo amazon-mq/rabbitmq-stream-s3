@@ -40,7 +40,8 @@ lives here. Callers use these functions instead of calling
     segment_upload_timeout/0,
     tick_timeout_milliseconds/0,
     max_transfer_bytes_per_sec/0,
-    max_transfer_burst_bytes/0
+    max_transfer_burst_bytes/0,
+    verify_crc_on_read/0
 ]).
 
 -define(APP, rabbitmq_stream_s3).
@@ -179,6 +180,10 @@ max_transfer_bytes_per_sec() ->
 max_transfer_burst_bytes() ->
     application:get_env(?APP, max_transfer_burst_bytes, undefined).
 
+-spec verify_crc_on_read() -> boolean().
+verify_crc_on_read() ->
+    application:get_env(?APP, verify_crc_on_read, false).
+
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
@@ -210,7 +215,8 @@ defaults_test_() ->
         ?_assertEqual(2, task_retry_delay_exponent()),
         ?_assertEqual(false, verbose_logging()),
         ?_assertEqual(45_000, segment_upload_timeout()),
-        ?_assertEqual(5000, tick_timeout_milliseconds())
+        ?_assertEqual(5000, tick_timeout_milliseconds()),
+        ?_assertEqual(false, verify_crc_on_read())
     ].
 
 configured_test_() ->

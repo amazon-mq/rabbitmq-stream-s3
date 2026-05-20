@@ -194,3 +194,11 @@ fun(Conf) ->
         Value     -> Value
     end
 end}.
+
+%%
+%% Read-path integrity
+%%
+
+{mapping, "stream_s3.verify_crc_on_read", "rabbitmq_stream_s3.verify_crc_on_read", [
+    {datatype, {enum, [true, false]}}
+]}.

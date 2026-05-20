@@ -85,7 +85,8 @@ tier.
 
 -record(?MODULE, {
     config :: osiris_log_reader:config(),
-    mode :: #remote{} | osiris_log:state()
+    mode :: #remote{} | osiris_log:state(),
+    verify_crc :: boolean()
 }).
 
 -record(remote_iterator, {
@@ -296,7 +297,7 @@ close(#?MODULE{mode = Local}) ->
 
 send_file(
     Socket,
-    #?MODULE{config = Config, mode = #remote{} = Remote0} = State0,
+    #?MODULE{config = Config, mode = #remote{} = Remote0, verify_crc = VerifyCrc} = State0,
     Callback
 ) ->
     case read_header(Remote0) of
@@ -306,7 +307,9 @@ send_file(
                 num_records := NumRecords,
                 position := Position,
                 next_position := NextPosition,
-                header_data := HeaderData
+                header_data := HeaderData,
+                crc := Crc,
+                data_size := DataSize
             } = Header,
             #remote{
                 pid = Pid,
@@ -317,6 +320,7 @@ send_file(
             DataPos = Position + ?CHUNK_HEADER_B + ToSkip,
             case read(Pid, DataPos, ToSend, within_chunk) of
                 {ok, Data} ->
+                    ok = maybe_validate_crc(ChId, Crc, Data, DataSize, VerifyCrc),
                     PrefixData = Callback(Header, ToSend + byte_size(HeaderData)),
                     case send(Transport, Socket, [PrefixData, HeaderData, Data]) of
                         ok ->
@@ -382,7 +386,7 @@ send_file(Socket, #?MODULE{mode = Local0} = State0, Callback) ->
     end.
 
 chunk_iterator(
-    #?MODULE{config = Config, mode = #remote{} = Remote0} = State0,
+    #?MODULE{config = Config, mode = #remote{} = Remote0, verify_crc = VerifyCrc} = State0,
     Credit,
     _PrevIter
 ) ->
@@ -394,12 +398,14 @@ chunk_iterator(
                 position := Position,
                 next_position := NextPosition,
                 filter_size := FilterSize,
-                data_size := DataSize
+                data_size := DataSize,
+                crc := Crc
             } = Header,
             #remote{pid = Pid} = Remote1} ->
             DataPos = Position + ?CHUNK_HEADER_B + FilterSize,
             case read(Pid, DataPos, DataSize, within_chunk) of
                 {ok, Data} ->
+                    ok = maybe_validate_crc(ChId, Crc, Data, DataSize, VerifyCrc),
                     Iter = #remote_iterator{
                         next_offset = ChId,
                         data = Data
@@ -606,11 +612,34 @@ select_amount_to_send(_ChunkSelector, #{
 }) ->
     {FilterSize, DataSize + TrailerSize}.
 
+%% Validates the CRC32 of chunk record data read from the remote tier.
+%% In send_file, Data may include the trailer (DataSize + TrailerSize bytes);
+%% the CRC only covers the first DataSize bytes.
+maybe_validate_crc(_ChunkId, _Crc, _Data, _DataSize, false) ->
+    ok;
+maybe_validate_crc(ChunkId, Crc, Data, DataSize, true) ->
+    RecordData = binary:part(Data, 0, DataSize),
+    case erlang:crc32(RecordData) of
+        Crc ->
+            ok;
+        Actual ->
+            ?LOG_ERROR(
+                "CRC validation failure reading chunk ~b from remote tier"
+                " (expected=~b, actual=~b, size=~b)",
+                [ChunkId, Crc, Actual, DataSize]
+            ),
+            exit({crc_validation_failure, {chunk_id, ChunkId}})
+    end.
+
 init_local_reader(OffsetSpec, Config) ->
     case osiris_log:init_offset_reader(OffsetSpec, Config) of
         {ok, Local} ->
             counters:add(counter(), ?C_LOCAL_INIT, 1),
-            {ok, #?MODULE{config = Config, mode = Local}};
+            {ok, #?MODULE{
+                config = Config,
+                mode = Local,
+                verify_crc = rabbitmq_stream_s3_config:verify_crc_on_read()
+            }};
         {error, _} = Err ->
             Err
     end.
@@ -640,6 +669,7 @@ init_remote_reader(
             counters:add(counter(), ?C_REMOTE_INIT, 1),
             Reader = #?MODULE{
                 config = Config,
+                verify_crc = rabbitmq_stream_s3_config:verify_crc_on_read(),
                 mode = #remote{
                     pid = Pid,
                     stream = StreamId,
