@@ -62,7 +62,12 @@ all() ->
         retention_complete_triggers_persist,
         retention_defers_persist,
         retention_edit_broadcast_on_persist_complete,
-        retention_failed_clears_flag
+        retention_failed_clears_flag,
+        %% Edge cases
+        fatal_front_drains_buffered_completions,
+        await_offset_satisfied_during_cascading_persist,
+        tick_fires_at_exact_interval_boundary,
+        retention_and_rebalance_same_persist_cycle
     ].
 
 init_per_suite(Config) -> Config.
@@ -896,6 +901,105 @@ retention_failed_clears_flag(_Config) ->
     {_S6, Effects} = rabbitmq_stream_s3_replica_reader_core:tick(Now, S5),
     Persists = [E || {start_persist, _, _, _, _, _} = E <- Effects],
     ?assertMatch([_], Persists).
+
+%% ------------------------------------------------------------------
+%% Edge case tests
+%% ------------------------------------------------------------------
+
+fatal_front_drains_buffered_completions(_Config) ->
+    %% Cut 3 fragments. Complete 2 and 3 (out of order). Then fragment 1
+    %% fails fatally. Fragments 2 and 3 should drain immediately since
+    %% they were already buffered in pending_completions.
+    {S0, _} = init_core(#{persist_threshold => 10}),
+    {S1, Ref1, _} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(0, 100), S0),
+    {S2, Ref2, _} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(100, 200), S1),
+    {S3, Ref3, _} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(200, 300), S2),
+    %% Complete 2 and 3 (not 1). Nothing should apply yet.
+    {S4, _} = rabbitmq_stream_s3_replica_reader_core:transfer_complete(Ref2, 2002, S3),
+    {S5, _} = rabbitmq_stream_s3_replica_reader_core:transfer_complete(Ref3, 3003, S4),
+    ?assertEqual(0, manifest_next_offset(S5)),
+    %% Fragment 1 fails fatally. 2 and 3 should drain.
+    {S6, _} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(Ref1, enoent, S5),
+    ?assertEqual(300, manifest_next_offset(S6)).
+
+await_offset_satisfied_during_cascading_persist(_Config) ->
+    %% Waiter at 150 (satisfied by first persist covering 0..200).
+    %% Waiter at 350 (needs second persist covering 200..400).
+    %% Persist threshold=2. Apply 2 → triggers persist, then 2 more during it.
+    {S0, _} = init_core(#{persist_threshold => 2}),
+    {S1, []} = rabbitmq_stream_s3_replica_reader_core:await_offset(150, from1, S0),
+    {S2, []} = rabbitmq_stream_s3_replica_reader_core:await_offset(350, from2, S1),
+    %% Apply 2 fragments → triggers persist.
+    S3 = cut_and_complete(S2, 0, 100, 1001),
+    S4 = cut_and_complete(S3, 100, 200, 1002),
+    %% Apply 2 more during the in-flight persist.
+    S5 = cut_and_complete(S4, 200, 300, 1003),
+    S6 = cut_and_complete(S5, 300, 400, 1004),
+    %% First persist completes. from1 should be notified, cascading persist starts.
+    {S7, E1} = rabbitmq_stream_s3_replica_reader_core:persist_complete(1, S6),
+    Replies1 = lists:flatten([Rs || {reply_waiters, Rs} <- E1]),
+    ?assertMatch([{from1, ok}], Replies1),
+    ?assertMatch([_], [E || {start_persist, _, _, _, _, _} = E <- E1]),
+    %% Second persist completes. from2 should be notified.
+    {_S8, E2} = rabbitmq_stream_s3_replica_reader_core:persist_complete(2, S7),
+    Replies2 = lists:flatten([Rs || {reply_waiters, Rs} <- E2]),
+    ?assertMatch([{from2, ok}], Replies2).
+
+tick_fires_at_exact_interval_boundary(_Config) ->
+    %% Tick should fire when (Now - LastTs) == Interval exactly.
+    {S0, _} = init_core(#{persist_threshold => 100, persist_interval_ms => 5000}),
+    S1 = cut_and_complete(S0, 0, 100, 1001),
+    %% Tick at exactly the interval boundary.
+    Now = erlang:system_time(millisecond) + 5000,
+    {_S2, Effects} = rabbitmq_stream_s3_replica_reader_core:tick(Now, S1),
+    Persists = [E || {start_persist, _, _, _, _, _} = E <- Effects],
+    ?assertMatch([_], Persists).
+
+retention_and_rebalance_same_persist_cycle(_Config) ->
+    %% Scenario: apply enough fragments to trigger rebalance, complete the
+    %% group upload, then apply a retention edit removing the group entry.
+    %% All in one persist cycle. The broadcast must reproduce the manifest.
+    Threshold = 4,
+    {S0, _} = init_core(#{rebalance_threshold => Threshold, persist_threshold => 100}),
+    %% Apply Threshold fragments → triggers rebalance.
+    S1 = lists:foldl(
+        fun(I, Acc) ->
+            cut_and_complete(Acc, I * 100, (I + 1) * 100, 1000 + I)
+        end,
+        S0,
+        lists:seq(0, Threshold - 1)
+    ),
+    %% Complete the group upload. Now manifest has 1 group entry.
+    {S2, _} = rabbitmq_stream_s3_replica_reader_core:group_upload_complete(9999, S1),
+    %% Apply more fragments so there's something after the group.
+    S3 = cut_and_complete(S2, Threshold * 100, (Threshold + 1) * 100, 2001),
+    S4 = cut_and_complete(S3, (Threshold + 1) * 100, (Threshold + 2) * 100, 2002),
+    %% Now apply retention that removes the group entry (pos=0, len=ENTRY_B).
+    Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(S4),
+    <<_:64, _:64/signed, _:64/signed, _:8, _:40, _:32, Rest/binary>> =
+        Manifest#manifest.entries,
+    <<NewFirstOff:64, NewFirstTs:64/signed, NewFirstLTs:64/signed, _/binary>> = Rest,
+    RetEdit = #edit{
+        first_offset = NewFirstOff,
+        first_timestamp = NewFirstTs,
+        first_last_timestamp = NewFirstLTs,
+        next_offset = undefined,
+        size = 0,
+        entries = <<>>,
+        pos = 0,
+        len = ?ENTRY_B
+    },
+    {S5, _} = rabbitmq_stream_s3_replica_reader_core:retention_complete(RetEdit, S4),
+    %% Force persist via tick.
+    Now = erlang:system_time(millisecond) + 999999,
+    {S6, PersistEffects} = rabbitmq_stream_s3_replica_reader_core:tick(Now, S5),
+    ?assertMatch([{start_persist, _, _, _, _, _}], PersistEffects),
+    %% Complete persist and verify the invariant.
+    From = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(S6),
+    {S7, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_complete(2, S6),
+    To = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(S7),
+    [Edits] = [Es || {broadcast, _, Es} <- Effects],
+    assert_edits_reproduce_manifest(From, To, Edits).
 
 %% ------------------------------------------------------------------
 %% Helpers
