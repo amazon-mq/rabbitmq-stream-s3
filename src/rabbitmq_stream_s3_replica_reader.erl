@@ -223,6 +223,8 @@ returned by the functional core module.
     %% persist_pending_bytes at start_persist; cleared on persist_result.
     %% bytes_in_persist gauge = persist_pending_bytes + persisting_bytes.
     persisting_bytes = 0 :: non_neg_integer(),
+    %% Monitor ref for the in-flight group upload task.
+    group_mon :: reference() | undefined,
     %% Kind of the group upload currently in flight. Cleared when the
     %% group_upload_result message arrives. Only one rebalance is in
     %% flight at a time so a single slot suffices.
@@ -348,17 +350,22 @@ handle_info({transfer_result, Ref, {error, Reason}}, #state{core = Core0} = Stat
     State1 = on_transfer_result(Ref, {error, Reason}, State0),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(Ref, Reason, Core0),
     {noreply, execute_effects(Effects, State1#state{core = Core})};
-handle_info({group_upload_result, {ok, Uid}}, #state{core = Core0} = State0) ->
+handle_info({group_upload_result, {ok, Uid}}, #state{core = Core0, group_mon = Mon} = State0) ->
+    demonitor(Mon, [flush]),
     State1 = on_group_upload_completed(State0),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:group_upload_complete(Uid, Core0),
-    {noreply, execute_effects(Effects, State1#state{core = Core})};
+    {noreply, execute_effects(Effects, State1#state{core = Core, group_mon = undefined})};
 handle_info(
     {group_upload_result, {error, Reason}},
-    #state{core = Core0, cfg = #cfg{stream = StreamId}} = State0
+    #state{core = Core0, group_mon = Mon, cfg = #cfg{stream = StreamId}} = State0
 ) ->
+    demonitor(Mon, [flush]),
     ?LOG_WARNING("~ts group upload failed: ~p", [StreamId, Reason]),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:group_upload_failed(Reason, Core0),
-    {noreply, execute_effects(Effects, State0#state{core = Core, pending_group_kind = undefined})};
+    {noreply,
+        execute_effects(Effects, State0#state{
+            core = Core, group_mon = undefined, pending_group_kind = undefined
+        })};
 handle_info(persist_timer, #state{core = Core0} = State0) ->
     Now = erlang:system_time(millisecond),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:tick(Now, Core0),
@@ -412,6 +419,16 @@ handle_info(
     {noreply,
         execute_effects(Effects, State1#state{
             core = Core, persist_mon = undefined, persist_pid = undefined
+        })};
+handle_info(
+    {'DOWN', Mon, process, _, Reason},
+    #state{group_mon = Mon, core = Core0, cfg = #cfg{stream = StreamId}} = State0
+) ->
+    ?LOG_WARNING("~ts group upload task crashed: ~p", [StreamId, Reason]),
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:group_upload_failed(Reason, Core0),
+    {noreply,
+        execute_effects(Effects, State0#state{
+            core = Core, group_mon = undefined, pending_group_kind = undefined
         })};
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -656,7 +673,7 @@ execute_effect(
     State0
 ) ->
     Self = self(),
-    spawn_link(fun() ->
+    {_Pid, MonRef} = spawn_monitor(fun() ->
         logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
         Result =
             try
@@ -670,7 +687,7 @@ execute_effect(
             end,
         Self ! {group_upload_result, Result}
     end),
-    State0#state{pending_group_kind = Kind};
+    State0#state{group_mon = MonRef, pending_group_kind = Kind};
 execute_effect(
     {start_persist, Manifest, Epoch, Reference, ExpectedRevision, _Edits},
     #state{cfg = #cfg{stream = StreamId}} = State
