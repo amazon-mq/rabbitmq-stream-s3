@@ -377,7 +377,7 @@ list(Prefix, Continuation, Opts) ->
             _ ->
                 [{<<"continuation-token">>, ContinuationToken} | Params0]
         end,
-    Params = uri_string:compose_query(Params1),
+    Params = uri_string:compose_query(lists:keysort(1, Params1)),
     case request(<<"GET">>, <<"/?", Params/binary>>, #{}, <<>>, Opts) of
         {ok, #{status := 200, body := Body}} ->
             {Keys, _TotalSize, NextToken} = decode_list_bucket_result(Body),
