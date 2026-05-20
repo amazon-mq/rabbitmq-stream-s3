@@ -398,7 +398,7 @@ list(Prefix, Continuation, Opts) ->
     {[key()], TotalSize :: non_neg_integer(), continuation_token() | undefined}.
 decode_list_bucket_result(Data) ->
     {#xmlElement{name = 'ListBucketResult', content = Result}, []} = xmerl_scan:string(
-        binary_to_list(Data)
+        binary_to_list(Data), [{allow_entities, false}]
     ),
     lists:foldl(
         fun
