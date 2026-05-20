@@ -1,5 +1,7 @@
 # Manifest
 
+This doc is for developers who need to understand how the plugin tracks data in S3. After reading it you will know: the tree structure, the binary entry format, how rebalancing works, and how concurrent writers are handled safely.
+
 The _manifest_ is a tree structure represented by objects in S3. A small number of these objects are also cached in memory by all stream members to enable fast access and modifications. Each stream has its own manifest. The manifest is tracked for two purposes:
 
 * **Resolving offset specs**: consumers may start reading a stream from a requested offset or timestamp. The manifest must provide cheap lookup to find the fragment which contains a requested offset or timestamp.
@@ -27,7 +29,7 @@ _JSON is just for display - the actual manifest uses a compact binary representa
 
 As new objects are uploaded, they are appended to the array in ascending order. This array can be quickly binary searched to find a given offset or timestamp. And we can quickly check the head of the array to see if max-age retention should delete the first fragment. We could also track the total size of the stream alongside this array to make max-bytes retention quick. The offset metadata about a fragment acts as a kind of pointer - the offset plus stream ID gives us enough information to create the fragment object's key.
 
-The problem with a single array is how it grows in size as the stream gets longer. If each entry cost 30 bytes (say 8 byte offset, two 8 byte timestamps, 6 bytes for size), a 50 TB stream would have an array size around 25 MB. While this doesn't sound like much for a very large stream, this array must be kept in memory for access and modifications. Megabyte size objects become expensive in terms of memory and network bandwidth footprint.
+The problem with a single array is how it grows in size as the stream gets longer. If each entry cost 34 bytes (8 byte offset, two 8 byte timestamps, 1 byte kind, 5 bytes size, 4 bytes UID), a 50 TB stream would have an array size around 28 MB. While this doesn't sound like much for a very large stream, this array must be kept in memory for access and modifications. Megabyte size objects become expensive in terms of memory and network bandwidth footprint.
 
 ### Factoring out groups
 
@@ -66,7 +68,7 @@ To support practically infinitely long streams, we can factor out `m` groups int
 
 ### Choosing `m`
 
-An `m` which is too small increases the number of requests to the remote tier during factoring and search, but reduces memory footprint. And vice versa for an `m` which is too large. We're using `1024` as a nice round power of two, though this could be tuned in the future. With `m=1024` and 30 bytes for each array entry, each (kilo-/mega-)group object only takes 30 kiB, which is small enough to fit into memory comfortably even when there are many streams. The root can grow beyond this, but remains small anyways. Small streams (less than 1024 fragments) do not need any groups at all and can store all metadata in the root. If `m=1024` and mega-groups are the largest kind of group, a 'fully loaded' root of 1024 mega-groups points to 1024^4 fragments. At an average fragment size of 64 MiB this covers 70 EiB of data in a single stream, which is a large enough amount that publishing it is very difficult in the first place.
+An `m` which is too small increases the number of requests to the remote tier during factoring and search, but reduces memory footprint. And vice versa for an `m` which is too large. We're using `1024` as a nice round power of two, though this could be tuned in the future. With `m=1024` and 34 bytes for each array entry, each (kilo-/mega-)group object only takes ~34 kiB, which is small enough to fit into memory comfortably even when there are many streams. The root can grow beyond this, but remains small anyways. Small streams (less than 1024 fragments) do not need any groups at all and can store all metadata in the root. If `m=1024` and mega-groups are the largest kind of group, a 'fully loaded' root of 1024 mega-groups points to 1024^4 fragments. At an average fragment size of 64 MiB this covers 70 EiB of data in a single stream, which is a large enough amount that publishing it is very difficult in the first place.
 
 A large `m` makes lookup fast. With mega-groups being the largest kind of group, lookup within even EiB of data would make 3 round-trips to the remote tier to determine the fragment for a given offset or timestamp. The root is cached, then one round trip gets the mega-group, another gets the right kilo-group, another gets the right group and then search within that group finds the right fragment. If the remote tier has reasonably low latency (10-100ms) then lookup is always sub-second.
 
@@ -125,7 +127,7 @@ Manifest objects are serialized in a custom binary format to minimize memory and
 
 <details><summary>Array entries...</summary>
 
-Fragment entry:
+Fragment and group entries share the same 34-byte layout, differentiated by the `Kind` field:
 
 ```
 |0              |1              |2              |3              | Bytes
@@ -139,30 +141,24 @@ Fragment entry:
 +---------------------------------------------------------------+
 | Last timestamp (i64)                                          |
 |                                                               |
-+----+-+--------------------------------------------------------+
-+  0 +i+ Size (u45)                                             |
-+----+-+--------------------------------------------------------+
-i: boolean, 1 = is sequence zero of source segment, 0 otherwise
++---------------+-----------------------------------------------+
+| Kind (u8)     | Size (u40)                                    |
++---------------+                                               |
+|               +-----------------------------------------------+
++---------------+-----------------------------------------------+
+| UID (u32)                                                     |
++---------------------------------------------------------------+
 ```
 
-Group entry:
+**Kind** (1 byte): identifies the entry type.
+- `0x00` = fragment
+- `0x01` = group
+- `0x02` = kilo-group
+- `0x03` = mega-group
 
-```
-|0              |1              |2              |3              | Bytes
-|0 1 2 3 4 5 6 7|0 1 2 3 4 5 6 7|0 1 2 3 4 5 6 7|0 1 2 3 4 5 6 7| Bits
-+---------------+---------------+---------------+---------------+
-| First offset (u64)                                            |
-|                                                               |
-+---------------------------------------------------------------+
-| First timestamp (i64)                                         |
-|                                                               |
-+---------------------------------------------------------------+
-| Last timestamp (i64)                                          |
-|                                                               |
-+------+--------------------------------------------------------+
-+ Kind + UID (u46)                                              |
-+------+--------------------------------------------------------+
-```
+**Size** (5 bytes, u40): total byte size of the fragment's data. Supports up to 1 TiB per fragment. Zero for group/kilo-group/mega-group entries.
+
+**UID** (4 bytes, u32): random identifier included in the S3 object key. Prevents overwrites when competing writers upload to the same offset range. Formatted as 8 lowercase hex characters in keys.
 
 ---
 
@@ -201,15 +197,44 @@ Group entry:
 
 ## Operations
 
-When the next fragment of stream data has been successfully uploaded, the coordination server `rabbitmq_stream_s3_server` appends the fragment's metadata to its in-memory copy of the root and evaluates whether the root has grown too large. The server debounces uploads of the updated root to the remote tier to keep requests-per-second low. Once the root is too large, the server uploads a new group object and once that has been successfully uploaded, the server replaces the fragments in its cached copy of the root with the new group's metadata.
+When the next fragment of stream data has been successfully uploaded, the remote replica reader appends the fragment's metadata to its in-memory copy of the root and evaluates whether the root has grown too large. The remote replica reader debounces uploads of the updated root to the remote tier to keep requests-per-second low. Once the root is too large, it uploads a new group object and once that has been successfully uploaded, replaces the fragments in its cached copy of the root with the new group's metadata.
 
-Periodically the server evaluates whether the stream's retention rules should delete fragments. If the root has no groups, the server decides which fragments to delete, removes them from the root array, and deletes them in the background. If there are groups, the server downloads the first group object and evaluates retention against the fragments within. Once that process completes, the server updates the total-size and oldest-last-timestamp metadata in the root. Group objects are never updated after being written, but once all fragments pointed to by a group (or all groups pointed to by a kilo-group, etc.) are deleted, the group object is deleted and removed from the root.
+Periodically the remote replica reader evaluates whether the stream's retention rules should delete fragments. If the root has no groups, it decides which fragments to delete, removes them from the root array, and deletes them in the background. If there are groups, it downloads the first group object and evaluates retention against the fragments within. Once that process completes, it updates the total-size and oldest-last-timestamp metadata in the root. Group objects are never updated after being written, but once all fragments pointed to by a group (or all groups pointed to by a kilo-group, etc.) are deleted, the group object is deleted and removed from the root.
 
-Changes to the manifest are made only by the server on the stream writer's node. Nodes with replica copies receive metadata about changes to each manifest through a generic edit type which can express the three kinds of changes: 1/ appending new fragments, 2/ factoring out groups and 3/ changes caused by retention. Since all stream members know information about the data in the remote tier, all members can perform local retention to evict fully uploaded segments aggressively.
+Changes to the manifest are made only by the remote replica reader on the stream writer's node. Nodes with replica copies receive metadata about changes to each manifest through a generic edit type which can express the three kinds of changes: 1/ appending new fragments, 2/ factoring out groups and 3/ changes caused by retention. Since all stream members know information about the data in the remote tier, all members can perform local retention to evict fully uploaded segments aggressively.
+
+### Rebalancing
+
+When the root's entries array accumulates `rebalance_threshold` (default 1024) entries of the same kind, the oldest entries are factored into a group object of the next-higher kind (fragments into a group, groups into a kilo-group, kilo-groups into a mega-group).
+
+The rebalance lifecycle:
+
+1. After fragment completions are applied to the in-memory manifest, the core scans the entries array for runs of entries exceeding the threshold.
+2. If detected, the core emits an `{upload_group, ...}` effect and sets `rebalance_in_flight = true`. Persist is deferred while a rebalance is in flight.
+3. The shell spawns a task that PUTs the group object to S3. Group uploads bypass the governor (they are small, ~34 KiB, and on the critical path for the persist).
+4. On completion, the core applies the rebalance edit: replaces the factored-out entries with a single group entry in the root.
+5. The core checks recursively: if the replacement created enough group entries to exceed the threshold at the next level, another rebalance is triggered (group into kilo-group, etc.).
+6. Once no more rebalancing is needed, persist proceeds normally.
+
+If the group upload fails with a retriable error (500, 503, timeout), the effect is re-emitted immediately. If it fails with a fatal error, the rebalance is abandoned: `rebalance_in_flight` is cleared and persist proceeds with the oversized root. The next fragment completion cycle re-detects the threshold and tries again. Abandoning a rebalance is always safe because the manifest is correct either way.
+
+### Retention within groups
+
+Group objects are immutable. Retention does not rewrite them. Instead, retention deletes fragment objects referenced by the group and updates the root's metadata to reflect what data is actually available.
+
+When the first entry in the root is a group:
+
+1. Download the group object to inspect its fragment entries.
+2. Evaluate the retention policy (max-bytes, max-age) against those entries.
+3. Delete expired fragment objects via the reaper.
+4. If all fragments in the group are expired: remove the group entry from the root and delete the group object.
+5. If partially expired: leave the group entry in place but update the root's `first_offset`, `first_timestamp`, and `total_size` to reflect the oldest surviving fragment.
+
+The manifest's `first_offset` is the authoritative marker for "oldest available data." Readers (via the fragment iterator) use this to skip deleted entries when descending into groups. The iterator positions itself at the first entry whose offset is at or above `first_offset`, avoiding 404s on fragments that retention has already cleaned up. This works recursively through kilo-groups and mega-groups.
 
 ### Resolving the manifest
 
-When a writer or replica starts up for a stream, `rabbitmq_stream_s3_server` must download the manifest root from the remote tier to determine what local data needs to be uploaded and what is redundant. Since uploads of the manifest are debounced, the last writer may have shut down before it uploaded an updated copy. _Resolving_ the manifest is downloading the current root from the remote tier and then attempting to find any fragments which were uploaded by the last writer. The _resolving_ process reads the header of the last fragment in the root to find the next fragment's offset, and then repeats that process to discover any fragments which were successfully uploaded but not yet applied to the manifest. These fragments are appended to the end of the in-memory copy of the root.
+When a writer starts up for a stream, the remote replica reader downloads the manifest root from the remote tier to determine what local data needs to be uploaded. It compares the manifest's `next_offset` against the local log to determine where to begin uploading. If the remote tier is ahead of the local log (due to an epoch change or data directory reset), the remote replica reader truncates the manifest to match the local log.
 
 ## Concurrency control
 
@@ -222,12 +247,12 @@ rabbitmq/
 │   │   ├── data/
 │   │   │   └── ...
 │   │   └── metadata/
-│   │       ├── 00000000000000000000.f619c0873d14edeb.kgroup
-│   │       ├── 00000000000000000000.d078ceab40232eff.group
-│   │       ├── 00000000000012345678.79425118e949e556.group
-│   │       ├── 00000000000091234567.edabc41fac4c6979.group
+│   │       ├── 00000000000000000000.f619c087.kgroup
+│   │       ├── 00000000000000000000.d078ceab.group
+│   │       ├── 00000000000012345678.79425118.group
+│   │       ├── 00000000000091234567.edabc41f.group
 │   │       ├── ...
-│   │       └── root.db868505ef4bc57a.manifest     // the root
+│   │       └── root.db868505.manifest     // the root
 ```
 
 The UID of the manifest root is stored in [Khepri](https://github.com/rabbitmq/khepri) (RabbitMQ's metadata store) associated with the stream name. The Khepri tree looks like this:
@@ -236,7 +261,7 @@ The UID of the manifest root is stored in [Khepri](https://github.com/rabbitmq/k
 rabbitmq
 ├── rabbitmq_stream_s3
 │   └── <<"__stream-01_1745252105682952932">>
-│       Data: {Uid: db868505ef4bc57a, Epoch: 5}. Version: 10
+│       Data: {Uid: db868505, Epoch: 5}. Version: 10
 ├── vhosts
 │   └── <<"/">>
 │       ├── queues
@@ -246,6 +271,53 @@ rabbitmq
 └── ...
 ```
 
-When updating the manifest, the writer node first creates the manifest object in the remote tier. Because of the randomness in the UID, the new object can be written without without conflict without any coordination. Then the writer updates the UID in Khepri with a conditional write: it sets a precondition that the current version of the Khepri tree node is the version it read. Khepri rejects the write if another writer has updated the tree node. When the precondition fails, the writer abandons the change, re-downloads the manifest and retries.
+When updating the manifest, the remote replica reader first creates the manifest object in the remote tier. Because of the randomness in the UID, the new object can be written without conflict without any coordination. Then it updates the UID in Khepri with a conditional write: it sets a precondition that the current version of the Khepri tree node is the version it read. Khepri rejects the write if another writer has updated the tree node. When the precondition fails, the remote replica reader abandons the change, re-downloads the manifest and retries.
 
-In the precondition, the writer node also checks that the stored epoch is less than or equal to the its epoch. Because epoch numbers are monotonically increasing and incremented for each new writer, this extra check causes a deposed writer's updates to fail once the newer writer has completed at least one update. The epoch check reduces the chance of a deposed writer interrupting a newer writer.
+In the precondition, the remote replica reader also checks that the stored epoch is less than or equal to its epoch. Because epoch numbers are monotonically increasing and incremented for each new writer, this extra check causes a deposed writer's updates to fail once the newer writer has completed at least one update. The epoch check reduces the chance of a deposed writer interrupting a newer writer.
+
+## Manifest edit replication
+
+Replica nodes maintain a cached copy of the manifest so that consumers on any node can resolve offsets into the remote tier without contacting the writer. The writer propagates manifest changes to replicas via _edits_ rather than sending the full manifest on every change (manifests can be megabytes for large streams).
+
+### Correctness invariant
+
+**A replica's manifest must always be a contiguous prefix of the writer's edit history.** Edits must be applied in strict sequential order. Applying an edit out of order or skipping an edit would corrupt the replica's manifest (wrong entry positions, incorrect total_size, broken offset resolution).
+
+This invariant is non-negotiable. Correctness takes absolute priority over the cost savings of incremental edits. If the invariant cannot be maintained (due to message loss, reordering, or crash), the replica must discard its cached manifest and re-sync the full manifest from the writer.
+
+### Edit structure
+
+An edit describes a modification to the manifest's entries array using three fields: `pos` (byte offset into the array), `len` (bytes to remove), and `entries` (bytes to insert). This single structure handles all manifest mutations:
+
+- **Append** (new fragment uploaded): `pos = byte_size(entries_array)`, `len = 0`, `entries = <new entry>`. Appends to the end.
+- **Truncate** (retention deletes oldest fragments): `pos = 0`, `len = N`, `entries = <<>>`. Removes a prefix.
+- **Replace** (rebalancing factors fragments into a group): `pos = P`, `len = L`, `entries = <group entry>`. Splices a group pointer in place of the factored-out fragment entries.
+
+An edit also carries updated top-level metadata (`first_offset`, `next_offset`, `first_timestamp`, `size`) so the replica can update its manifest root without recomputing from the entries array.
+
+### Edit ordering when rebalancing
+
+A single persist may produce multiple edits: an append edit (new fragments) and a rebalance edit (replacing entries with a group pointer). These must be ordered correctly for replicas to apply them.
+
+The append edit must come before the rebalance edit. A rebalance edit replaces entries at a byte position. Those entries must already exist in the replica's array for the replacement to be valid. The append edit creates them. If the rebalance came first, the replica would attempt to replace bytes that don't exist yet.
+
+This ordering is non-obvious because the rebalance logically happened "before" the persist (the group was uploaded and the in-memory manifest was rewritten before persist started). But from the replica's perspective, it needs the entries to exist before they can be replaced.
+
+### Sequence numbers
+
+Each edit carries a monotonically increasing sequence number. The writer increments the sequence on every edit. Each replica tracks the last applied sequence number. On receiving an edit:
+
+1. If `edit.seq == replica.seq + 1`: apply the edit, advance `replica.seq`.
+2. Otherwise: the edit is out of sequence. Discard the local manifest and request a full re-sync from the writer.
+
+There is no attempt to buffer or reorder edits. A single gap triggers a full re-sync. This is deliberate: the re-sync path is simple, correct, and bounded in cost (one manifest download). Attempting to recover from gaps with buffering adds complexity and failure modes.
+
+### Why messages can be lost
+
+Erlang distribution does not guarantee delivery. Messages between connected nodes are ordered but can be silently lost when the distribution connection drops (net split, node crash) because messages in the kernel send buffer are discarded without notification to the sender. The distribution buffer can also overflow under sustained load.
+
+The sequence number mechanism detects these losses and triggers re-sync. Node monitors detect disconnections and remove the node from the broadcast set. When the node reconnects and re-registers, it receives the full current manifest (equivalent to a re-sync).
+
+### Formal modeling
+
+This protocol is formally verified in [`tla/manifest-replication/`](../tla/manifest-replication/). See [`tla/README.md`](../tla/README.md) for details and how to run the model checker.

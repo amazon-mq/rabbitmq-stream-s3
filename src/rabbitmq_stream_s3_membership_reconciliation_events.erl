@@ -12,9 +12,9 @@ This gen_event subscribes to:
 * `rabbit_event` for queue creation and policy change notifications
 
 The `rabbit_event` subscription is not really necessary at the moment since
-the plugin does not subscribe check for policies and
-`rabbitmq_stream_s3_log_manifest` triggers an evaluation upon writer spawn,
-but it is left here to match membership reconciliation for quorum queues.
+the plugin does not check for policies and the hooks trigger an evaluation
+upon writer spawn, but it is left here to match membership reconciliation
+for quorum queues.
 """.
 
 -behaviour(gen_event).

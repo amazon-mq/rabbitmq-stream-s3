@@ -124,7 +124,8 @@ end_per_group(_Group, Config) ->
 
 init_per_testcase(_Testcase, Config) ->
     application:ensure_all_started(gun),
-    ok = rabbitmq_stream_s3:setup(),
+    application:ensure_all_started(seshat),
+    _ = seshat:new_group(rabbitmq_stream_s3),
     ok = rabbitmq_stream_s3_api_aws:init(),
     Config.
 
@@ -187,26 +188,22 @@ kick_the_tires(_Config) ->
                 (nonce())/binary>>
          || N <- lists:seq(1, 10)
         ],
-        NKeys = length(Keys1),
         Payload = <<"Object data">>,
         [ok = rabbitmq_stream_s3_api_aws:put(K, Payload, #{}) || K <- Keys1],
-        {ok, {ListKeys, TotalSize, undefined}} = rabbitmq_stream_s3_api_aws:list(
+        {ok, ListKeys, done} = rabbitmq_stream_s3_api_aws:list(
             <<"prefix">>,
-            undefined,
+            start,
             #{}
         ),
         ?assertEqual(lists:sort(Keys1), lists:sort(ListKeys)),
-        ?assertEqual(byte_size(Payload) * length(Keys1), TotalSize),
-        {ok, #{pages := 1, objects := NKeys, total_size := TotalSize}} = rabbitmq_stream_s3_api_aws:delete_prefix(
-            <<"prefix">>,
-            #{}
-        ),
-        {ok, {[], 0, undefined}} = rabbitmq_stream_s3_api_aws:list(<<"prefix">>, undefined, #{}),
+        ok = rabbitmq_stream_s3_api_aws:delete(ListKeys, #{}),
+        {ok, [], done} = rabbitmq_stream_s3_api_aws:list(<<"prefix">>, start, #{}),
 
         ok
     after
         _ = rabbitmq_stream_s3_api_aws:delete(Keys, #{}),
-        _ = rabbitmq_stream_s3_api_aws:delete_prefix(<<"prefix">>, #{}),
+        {ok, PrefixKeys, _} = rabbitmq_stream_s3_api_aws:list(<<"prefix">>, start, #{}),
+        _ = rabbitmq_stream_s3_api_aws:delete(PrefixKeys, #{}),
         ok
     end.
 

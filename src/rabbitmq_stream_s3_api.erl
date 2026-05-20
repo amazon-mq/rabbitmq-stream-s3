@@ -28,8 +28,8 @@ file-system operations. Use that in non-unit tests.
     stream_finish/2,
     delete/1,
     delete/2,
-    delete_prefix/1,
-    delete_prefix/2,
+    list/1,
+    list/2,
     match_async/3,
     handle_async/3,
     cancel_async/2,
@@ -50,12 +50,14 @@ file-system operations. Use that in non-unit tests.
 }.
 -type async_state() :: term().
 -type async_req() :: reference().
+-type list_continuation() :: start | done | term().
 
 -export_type([
     range_spec/0,
     request_opts/0,
     async_state/0,
-    async_req/0
+    async_req/0,
+    list_continuation/0
 ]).
 
 -callback init() -> ok.
@@ -78,7 +80,8 @@ atomic in a file system and S3 only supports deleting 1000 keys at a time, for
 examples.
 """.
 -callback delete(key() | [key()], request_opts()) -> ok | {error, any()}.
--callback delete_prefix(key(), request_opts()) -> {ok, map()} | {error, any()}.
+-callback list(key(), list_continuation(), request_opts()) ->
+    {ok, [key()], list_continuation()} | {error, any()}.
 -callback match_async(
     Msg :: term(),
     Reqs :: #{async_req() := async_state()},
@@ -129,6 +132,9 @@ init() ->
     persistent_term:put(?COUNTER_KEY, Cnt),
     ok = rabbitmq_stream_s3_remote_reader:init_counters(),
     ok = rabbitmq_stream_s3_log_reader:init_counters(),
+    ok = rabbitmq_stream_s3_governor:init_counters(),
+    ok = rabbitmq_stream_s3_reaper:init_counters(),
+    ok = rabbitmq_stream_s3_replica_reader:init_counters(),
     lists:foreach(
         fun(Kind) ->
             rabbitmq_stream_s3_histogram:new(
@@ -238,14 +244,17 @@ delete(Key, Opts) when is_binary(Key) andalso is_map(Opts) ->
     counters:add(counter(), ?C_DELETE_ONE, 1),
     observe(write, fun() -> (backend()):delete(Key, Opts) end).
 
--spec delete_prefix(key()) -> {ok, map()} | {error, any()}.
-delete_prefix(Prefix) ->
-    delete_prefix(Prefix, #{}).
+-doc #{equiv => list(Prefix, start)}.
+-spec list(key()) -> {ok, [key()], list_continuation()} | {error, any()}.
+list(Prefix) ->
+    list(Prefix, start).
 
--spec delete_prefix(key(), request_opts()) -> {ok, map()} | {error, any()}.
-delete_prefix(Prefix, Opts) when is_binary(Prefix) andalso is_map(Opts) ->
+-doc "List keys under Prefix. Pass the returned continuation to get the next page.".
+-spec list(key(), list_continuation()) ->
+    {ok, [key()], list_continuation()} | {error, any()}.
+list(Prefix, Continuation) when is_binary(Prefix) ->
     counters:add(counter(), ?C_LIST, 1),
-    observe(write, fun() -> (backend()):delete_prefix(Prefix, Opts) end).
+    (backend()):list(Prefix, Continuation, #{}).
 
 -spec match_async(
     Msg :: term(),

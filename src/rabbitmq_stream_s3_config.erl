@@ -12,7 +12,6 @@ lives here. Callers use these functions instead of calling
 
 -export([
     api_backend/0,
-    manifest_server_backend/0,
     aws_access_key/0,
     aws_secret_key/0,
     aws_security_token/0,
@@ -39,7 +38,9 @@ lives here. Callers use these functions instead of calling
     task_retry_delay_exponent/0,
     verbose_logging/0,
     segment_upload_timeout/0,
-    tick_timeout_milliseconds/0
+    tick_timeout_milliseconds/0,
+    max_transfer_bytes_per_sec/0,
+    max_transfer_burst_bytes/0
 ]).
 
 -define(APP, rabbitmq_stream_s3).
@@ -48,10 +49,6 @@ lives here. Callers use these functions instead of calling
 -spec api_backend() -> module().
 api_backend() ->
     application:get_env(?APP, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_aws).
-
--spec manifest_server_backend() -> module().
-manifest_server_backend() ->
-    application:get_env(?APP, rabbitmq_stream_s3_server, rabbitmq_stream_s3_server).
 
 %% AWS credentials. Return `undefined` when not configured (instance role is used).
 -spec aws_access_key() -> binary() | undefined.
@@ -173,6 +170,14 @@ segment_upload_timeout() ->
 -spec tick_timeout_milliseconds() -> non_neg_integer().
 tick_timeout_milliseconds() ->
     application:get_env(?APP, tick_timeout_milliseconds, 5000).
+
+-spec max_transfer_bytes_per_sec() -> pos_integer() | unlimited.
+max_transfer_bytes_per_sec() ->
+    application:get_env(?APP, max_transfer_bytes_per_sec, unlimited).
+
+-spec max_transfer_burst_bytes() -> pos_integer() | undefined.
+max_transfer_burst_bytes() ->
+    application:get_env(?APP, max_transfer_burst_bytes, undefined).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").

@@ -15,6 +15,9 @@ tier.
 -include_lib("kernel/include/logger.hrl").
 
 -include("include/rabbitmq_stream_s3.hrl").
+-include("include/logging.hrl").
+
+-define(DOMAIN, #{domain => ?RMQLOG_DOMAIN_STREAM_S3}).
 
 -behaviour(osiris_log_reader).
 
@@ -107,7 +110,7 @@ tier.
 -export([mode/1]).
 
 -ifdef(TEST).
--export([find_fragment/3, find_index_position/2]).
+-export([find_fragment/3, find_index_position/2, resolve_remote_location/2]).
 -endif.
 
 %%%===================================================================
@@ -175,61 +178,68 @@ resolve_remote_location(Spec, _Config) when Spec =:= last orelse Spec =:= next -
     {local, Spec};
 resolve_remote_location(first, #{name := StreamId, shared := Shared}) ->
     LocalFirstOffset = osiris_log_shared:first_chunk_id(Shared),
-    case (rabbitmq_stream_s3_server:backend()):get_manifest(StreamId) of
+    case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
         #manifest{first_offset = RemoteFirstOffset} when RemoteFirstOffset < LocalFirstOffset ->
             ?LOG_DEBUG(
                 "Attaching remote reader at first offset ~b for spec 'first'",
-                [RemoteFirstOffset]
+                [RemoteFirstOffset],
+                ?DOMAIN
             ),
-            {ok, remote_location_first(RemoteFirstOffset)};
+            resolve_first(StreamId, RemoteFirstOffset);
         _ ->
             {local, first}
     end;
 resolve_remote_location(Offset, #{name := StreamId, shared := Shared}) when
     is_integer(Offset)
 ->
-    ?LOG_DEBUG(?MODULE_STRING ":~ts/2 finding offset ~b for stream '~ts'", [
-        ?FUNCTION_NAME, Offset, StreamId
-    ]),
+    ?LOG_DEBUG(
+        ?MODULE_STRING ":~ts/2 finding offset ~b for stream '~ts'",
+        [?FUNCTION_NAME, Offset, StreamId],
+        ?DOMAIN
+    ),
     FirstChunkId = osiris_log_shared:first_chunk_id(Shared),
     case Offset >= FirstChunkId of
         true ->
             ?LOG_DEBUG(
-                "Offset ~b is in the local tier of stream '~ts' (start ~b), using a local reader", [
-                    Offset, StreamId, FirstChunkId
-                ]
+                "Offset ~b is in the local tier of stream '~ts' (start ~b), using a local reader",
+                [Offset, StreamId, FirstChunkId],
+                ?DOMAIN
             ),
             {local, Offset};
         false ->
             ?LOG_DEBUG(
-                "Offset ~b of stream '~ts' is not local (start ~b), trying the remote tier", [
+                "Offset ~b of stream '~ts' is not local (start ~b), trying the remote tier",
+                [
                     Offset, StreamId, FirstChunkId
-                ]
+                ],
+                ?DOMAIN
             ),
-            case (rabbitmq_stream_s3_server:backend()):get_manifest(StreamId) of
+            case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
                 undefined ->
                     {local, next};
                 #manifest{first_offset = FirstOffset} when Offset < FirstOffset ->
                     %% Emulate osiris_log's behavior: attach at the beginning
                     %% of the stream.
-                    {ok, remote_location_first(FirstOffset)};
-                #manifest{entries = Entries} ->
-                    find_position({offset, Offset}, Entries, StreamId)
+                    resolve_first(StreamId, FirstOffset);
+                #manifest{} = Manifest ->
+                    find_position({offset, Offset}, Manifest, StreamId)
             end
     end;
 resolve_remote_location({timestamp, Ts} = Spec, #{name := StreamId}) ->
-    ?LOG_DEBUG(?MODULE_STRING ":~ts/2 finding timestamp ~b for stream '~ts'", [
-        ?FUNCTION_NAME, Ts, StreamId
-    ]),
+    ?LOG_DEBUG(
+        ?MODULE_STRING ":~ts/2 finding timestamp ~b for stream '~ts'",
+        [?FUNCTION_NAME, Ts, StreamId],
+        ?DOMAIN
+    ),
     %% We can't cheaply query the first timestamp from `osiris_log_shared`.
     %% Instead try the remote tier first.
-    case (rabbitmq_stream_s3_server:backend()):get_manifest(StreamId) of
+    case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
         #manifest{first_offset = FirstOffset, first_timestamp = FirstTs} when Ts < FirstTs ->
-            {ok, remote_location_first(FirstOffset)};
-        #manifest{entries = Entries} ->
+            resolve_first(StreamId, FirstOffset);
+        #manifest{entries = Entries} = Manifest ->
             case rabbitmq_stream_s3_array:last(?ENTRY_B, Entries) of
-                ?ENTRY(_O, _FTs, LTs, _, _) when LTs >= Ts ->
-                    find_position({timestamp, Ts}, Entries, StreamId);
+                ?ENTRY(_O, _FTs, LTs, _, _, _) when LTs >= Ts ->
+                    find_position({timestamp, Ts}, Manifest, StreamId);
                 _ ->
                     {local, Spec}
             end;
@@ -252,19 +262,11 @@ total_range(#{name := StreamId, shared := Shared}) ->
             empty;
         LocalFirst ->
             LocalLast = osiris_log_shared:committed_offset(Shared),
-            case (rabbitmq_stream_s3_server:backend()):get_range(StreamId) of
-                {RemoteFirst, RemoteLast} when RemoteFirst =/= -1 ->
-                    {min(LocalFirst, RemoteFirst), max(LocalLast, RemoteLast)};
-                _ ->
-                    %% The stream might be starting up and not have a range
-                    %% yet. Request the manifest so we can check the values
-                    %% ourselves.
-                    case (rabbitmq_stream_s3_server:backend()):get_manifest(StreamId) of
-                        #manifest{first_offset = RemoteFirst, next_offset = RemoteNext} ->
-                            {min(LocalFirst, RemoteFirst), max(LocalLast, RemoteNext - 1)};
-                        undefined ->
-                            {LocalFirst, LocalLast}
-                    end
+            case rabbitmq_stream_s3_manifest_replica:get_range(StreamId) of
+                {RemoteFirst, RemoteNext} ->
+                    {min(LocalFirst, RemoteFirst), max(LocalLast, RemoteNext - 1)};
+                empty ->
+                    {LocalFirst, LocalLast}
             end
     end.
 
@@ -330,13 +332,13 @@ send_file(
                     State = State0#?MODULE{
                         mode = Remote1#remote{
                             next_offset = Offset,
-                            position = ?FRAGMENT_HEADER_B
+                            position = ?SEGMENT_HEADER_B
                         }
                     },
                     send_file(Socket, State, Callback);
-                {become_local, Offset} ->
+                {become_local, _} ->
                     counters:add(counter(), ?C_REMOTE_CLOSE, 1),
-                    case init_local_reader(Offset, Config) of
+                    case init_local_reader(Remote1#remote.next_offset, Config) of
                         {ok, State} ->
                             send_file(Socket, State, Callback);
                         {error, _} = Err ->
@@ -345,9 +347,9 @@ send_file(
                 end_of_stream ->
                     {end_of_stream, State0#?MODULE{mode = Remote1}}
             end;
-        {become_local, Offset} ->
+        {become_local, _} ->
             counters:add(counter(), ?C_REMOTE_CLOSE, 1),
-            case init_local_reader(Offset, Config) of
+            case init_local_reader(Remote0#remote.next_offset, Config) of
                 {ok, State} ->
                     send_file(Socket, State, Callback);
                 {error, _} = Err ->
@@ -412,13 +414,13 @@ chunk_iterator(
                     State = State0#?MODULE{
                         mode = Remote1#remote{
                             next_offset = Offset,
-                            position = ?FRAGMENT_HEADER_B
+                            position = ?SEGMENT_HEADER_B
                         }
                     },
                     chunk_iterator(State, Credit, undefined);
-                {become_local, Offset} ->
+                {become_local, _} ->
                     counters:add(counter(), ?C_REMOTE_CLOSE, 1),
-                    case init_local_reader(Offset, Config) of
+                    case init_local_reader(Remote1#remote.next_offset, Config) of
                         {ok, State} ->
                             chunk_iterator(State, Credit, undefined);
                         {error, _} = Err ->
@@ -427,9 +429,9 @@ chunk_iterator(
                 end_of_stream ->
                     {end_of_stream, State0#?MODULE{mode = Remote1}}
             end;
-        {become_local, Offset} ->
+        {become_local, _} ->
             counters:add(counter(), ?C_REMOTE_CLOSE, 1),
-            case init_local_reader(Offset, Config) of
+            case init_local_reader(Remote0#remote.next_offset, Config) of
                 {ok, State} ->
                     chunk_iterator(State, Credit, undefined);
                 {error, _} = Err ->
@@ -525,7 +527,7 @@ read_header1(
         {ok, Header} ->
             read_header2(Remote0, Header);
         {next_fragment, Offset} ->
-            Remote = Remote0#remote{next_offset = Offset, position = ?FRAGMENT_HEADER_B},
+            Remote = Remote0#remote{next_offset = Offset, position = ?SEGMENT_HEADER_B},
             read_header(Remote);
         {become_local, Offset} ->
             {become_local, Offset};
@@ -614,7 +616,11 @@ init_local_reader(OffsetSpec, Config) ->
     end.
 
 init_remote_reader(
-    #remote_location{fragment = Fragment, position = Position, chunk_id = Offset} = Location,
+    #remote_location{
+        position = Position,
+        chunk_id = Offset,
+        fragment_ref = FragRef
+    } = Location,
     #{name := StreamId, options := Options, shared := Shared} = Config
 ) ->
     Filter =
@@ -629,7 +635,7 @@ init_remote_reader(
         stream => StreamId,
         location => Location
     },
-    case rabbitmq_stream_s3_remote_reader_sup:add_child(Conf) of
+    case gen_server:start_link(rabbitmq_stream_s3_remote_reader, Conf, []) of
         {ok, Pid} ->
             counters:add(counter(), ?C_REMOTE_INIT, 1),
             Reader = #?MODULE{
@@ -640,7 +646,7 @@ init_remote_reader(
                     transport = maps:get(transport, Options, tcp),
                     next_offset = Offset,
                     shared = Shared,
-                    fragment = Fragment,
+                    fragment = FragRef#fragment_ref.offset,
                     position = Position,
                     filter = Filter,
                     chunk_selector = maps:get(chunk_selector, Options, user_data)
@@ -668,17 +674,33 @@ maybe_become_remote(Offset, #?MODULE{config = Config, mode = Local}) ->
 
 -spec find_position(
     {offset, osiris:offset()} | {timestamp, osiris:timestamp()},
-    rabbitmq_stream_s3:entries(),
+    #manifest{},
     stream_id()
 ) -> {ok, #remote_location{}} | {error, any()}.
-find_position(Spec, Entries, StreamId) ->
-    GetGroupFun = rabbitmq_stream_s3_server:get_group_fun(StreamId, resolve_offset_spec),
-    Fragment = find_fragment(Entries, Spec, GetGroupFun),
-    find_position0(Spec, Fragment, StreamId).
+find_position(Spec, #manifest{} = Manifest, StreamId) ->
+    GetGroupFun = rabbitmq_stream_s3_manifest:get_group_fun(StreamId),
+    #fragment_ref{offset = FragmentOffset, uid = Uid, size = Size} =
+        FragRef =
+        find_fragment(Manifest#manifest.entries, Spec, GetGroupFun),
+    %% Download the index from the fragment to find the exact chunk position.
+    IdxStartPos = ?SEGMENT_HEADER_B + Size,
+    IndexData = index_data(StreamId, FragmentOffset, Uid, IdxStartPos),
+    {ChunkId, _, FragPos} = find_index_position(IndexData, Spec),
+    %% Position within the fragment object (after the 8-byte header).
+    Position = ?SEGMENT_HEADER_B + FragPos,
+    %% Create an iterator positioned at this fragment for forward navigation.
+    Iterator = rabbitmq_stream_s3_fragment_iterator:init(Manifest, FragmentOffset, GetGroupFun),
+    %% Advance past the current entry so the iterator is ready for `next`.
+    Iterator1 = advance_past_current(Iterator),
+    {ok, #remote_location{
+        chunk_id = ChunkId,
+        position = Position,
+        fragment_ref = FragRef,
+        iterator = Iterator1
+    }}.
 
 -doc """
-Finds the offset of the manifest which contains the requested offset or
-timestamp.
+Finds the manifest entry which contains the requested offset or timestamp.
 
 This scans the entries array in logarithmic time. If the offset/timestamp
 being searched for is within a group, the group will be fetched with `GetGroup`
@@ -688,14 +710,14 @@ and then searched recursively.
     rabbitmq_stream_s3:entries(),
     {offset, osiris:offset()} | {timestamp, osiris:timestamp()},
     fun((#group_ref{}) -> {ok, rabbitmq_stream_s3:entries()} | {error, any()})
-) -> Fragment :: osiris:offset().
+) -> #fragment_ref{}.
 find_fragment(Entries, Spec, GetGroup) ->
     PartitionPredicate =
         case Spec of
             {offset, Offset} ->
-                fun(?ENTRY(O, _FTs, _LTs, _K, _)) -> Offset >= O end;
+                fun(?ENTRY(O, _FTs, _LTs, _K, _Sz, _Uid, _)) -> Offset >= O end;
             {timestamp, Ts} ->
-                fun(?ENTRY(_O, _FTs, LTs, _K, _)) -> Ts >= LTs end
+                fun(?ENTRY(_O, _FTs, LTs, _K, _Sz, _Uid, _)) -> Ts >= LTs end
         end,
     Idx0 = rabbitmq_stream_s3_array:partition_point(
         PartitionPredicate,
@@ -709,37 +731,18 @@ find_fragment(Entries, Spec, GetGroup) ->
             {timestamp, _} -> min(Idx0, NumEntries - 1)
         end,
     case rabbitmq_stream_s3_array:at(Idx, ?ENTRY_B, Entries) of
-        ?FRAGMENT(EntryOffset, _FTs, _LTs, _Sq, _Sz, _) ->
-            EntryOffset;
-        ?GROUP(GroupOffset, _FTs, _LTs, Kind, Uid, _) ->
+        ?ENTRY(EntryOffset, _FTs, _LTs, ?MANIFEST_KIND_FRAGMENT, Size, Uid, _) ->
+            #fragment_ref{offset = EntryOffset, uid = Uid, size = Size};
+        ?ENTRY(GroupOffset, _FTs, _LTs, Kind, _Sz, Uid, _) ->
             %% Download the group and search recursively within that.
-            ?LOG_DEBUG("Entry is not a fragment. Searching within group ~b kind ~b", [
-                GroupOffset, Kind
-            ]),
+            ?LOG_DEBUG(
+                "Entry is not a fragment. Searching within group ~b kind ~b",
+                [GroupOffset, Kind],
+                ?DOMAIN
+            ),
             GroupRef = #group_ref{uid = Uid, kind = Kind, offset = GroupOffset},
             {ok, GroupEntries} = GetGroup(GroupRef),
             find_fragment(GroupEntries, Spec, GetGroup)
-    end.
-
--spec find_position0(
-    {offset, osiris:offset()} | {timestamp, osiris:timestamp()},
-    osiris:offset(),
-    stream_id()
-) -> {ok, #remote_location{}} | {error, any()}.
-find_position0(Spec, Fragment, StreamId) ->
-    case rabbitmq_stream_s3_server:get_fragment_info(StreamId, Fragment) of
-        {ok, Info} ->
-            #fragment_info{index_start_pos = IdxStartPos} = Info,
-            IndexData = index_data(StreamId, Fragment, IdxStartPos),
-            {ChunkId, _, Pos} = find_index_position(IndexData, Spec),
-            {ok, #remote_location{
-                chunk_id = ChunkId,
-                position = Pos,
-                fragment = Fragment,
-                fragment_info = Info
-            }};
-        {error, _} = Err ->
-            Err
     end.
 
 find_index_position(IndexData, Spec) ->
@@ -779,15 +782,46 @@ find_index_position(IndexData, Spec) ->
 saturating_decr(0) -> 0;
 saturating_decr(N) -> N - 1.
 
-index_data(StreamId, FragmentOffset, StartPos) ->
-    Key = rabbitmq_stream_s3:fragment_key(StreamId, FragmentOffset),
-    ?LOG_DEBUG("Looking up key ~ts (~ts)", [Key, ?FUNCTION_NAME]),
+index_data(StreamId, FragmentOffset, Uid, IdxStartPos) ->
+    Key = rabbitmq_stream_s3:fragment_key(StreamId, FragmentOffset, Uid),
+    ?LOG_DEBUG("Looking up key ~ts (~ts)", [Key, ?FUNCTION_NAME], ?DOMAIN),
     {ok, Data} = rabbitmq_stream_s3_api:get_range(
         Key,
-        {StartPos + ?IDX_HEADER_B, undefined},
+        {IdxStartPos, undefined},
         #{timeout => ?READ_TIMEOUT}
     ),
     Data.
+
+%% Advance the iterator past the current entry (so next/1 returns the
+%% entry *after* the one we resolved to).
+advance_past_current(Iterator) ->
+    case rabbitmq_stream_s3_fragment_iterator:next(Iterator) of
+        {ok, _, Iterator1} -> Iterator1;
+        end_of_manifest -> Iterator;
+        {error, _} -> Iterator
+    end.
+
+resolve_first(StreamId, FirstOffset) ->
+    case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
+        #manifest{entries = Entries} = Manifest when byte_size(Entries) >= ?ENTRY_B ->
+            GetGroupFun = rabbitmq_stream_s3_manifest:get_group_fun(StreamId),
+            Iterator = rabbitmq_stream_s3_fragment_iterator:init(
+                Manifest, FirstOffset, GetGroupFun
+            ),
+            case rabbitmq_stream_s3_fragment_iterator:next(Iterator) of
+                {ok, FragRef, Iterator1} ->
+                    {ok, #remote_location{
+                        chunk_id = FragRef#fragment_ref.offset,
+                        position = ?SEGMENT_HEADER_B,
+                        fragment_ref = FragRef,
+                        iterator = Iterator1
+                    }};
+                _ ->
+                    {local, first}
+            end;
+        _ ->
+            {local, first}
+    end.
 
 -spec read(pid(), byte_offset(), pos_integer(), rabbitmq_stream_s3_remote_reader:hint()) ->
     {ok, binary()}
@@ -803,19 +837,14 @@ read(RemoteReader, Offset, Bytes, Hint) ->
     ),
     case Ms > ?SLOW_READ_THRESHOLD_MS of
         true ->
-            ?LOG_WARNING("Slow remote tier read: ~bms (~b bytes at offset ~b)", [Ms, Bytes, Offset]),
+            ?LOG_WARNING(
+                "Slow remote tier read: ~bms (~b bytes at offset ~b)", [Ms, Bytes, Offset], ?DOMAIN
+            ),
             ok;
         false ->
             ok
     end,
     Result.
-
-remote_location_first(Offset) ->
-    #remote_location{
-        fragment = Offset,
-        position = ?FRAGMENT_HEADER_B,
-        chunk_id = Offset
-    }.
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
@@ -824,26 +853,35 @@ find_fragment_test() ->
     Ts = erlang:system_time(millisecond),
     Size = 200,
     FragmentEntries = <<
-        ?FRAGMENT(
+        ?ENTRY(
             (N * 20),
             (Ts - 2000 + N * 20),
             (Ts - 2000 + (N + 1) * 20),
-            0,
-            Size
+            ?MANIFEST_KIND_FRAGMENT,
+            Size,
+            N
         )
      || N <- lists:seq(0, 100)
     >>,
     %% Factor out those fragments into a group.
     NextFragmentEntries = <<
-        ?FRAGMENT((N * 20), (Ts - 2000 + N * 20), (Ts - 2000 + (N + 1) * 20), 0, Size)
+        ?ENTRY(
+            (N * 20),
+            (Ts - 2000 + N * 20),
+            (Ts - 2000 + (N + 1) * 20),
+            ?MANIFEST_KIND_FRAGMENT,
+            Size,
+            N
+        )
      || N <- lists:seq(101, 150)
     >>,
     GroupUid = rabbitmq_stream_s3:uid(),
-    Entries = ?GROUP(
+    Entries = ?ENTRY(
         0,
         (Ts - 2000),
         Ts,
         ?MANIFEST_KIND_GROUP,
+        0,
         GroupUid,
         NextFragmentEntries
     ),
@@ -854,7 +892,8 @@ find_fragment_test() ->
         {ok, FragmentEntries}
     end,
     FindFragment2 = fun(Spec) ->
-        find_fragment(Entries, Spec, GetGroup)
+        #fragment_ref{offset = FoundOffset} = find_fragment(Entries, Spec, GetGroup),
+        FoundOffset
     end,
     %% The new fragments can be found normally.
     ?assertEqual(2040, FindFragment2({offset, 2050})),

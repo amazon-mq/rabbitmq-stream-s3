@@ -3,326 +3,301 @@
 
 -module(log_reader_SUITE).
 -moduledoc """
-Low-level tests for `rabbitmq_stream_s3_log_reader`.
+Integration tests for the consumer-side remote reader.
 
-These tests bypass the full broker stack. They use:
-- `rabbitmq_stream_s3_api_fs` as the storage backend
-- `rabbitmq_stream_s3_server_ets` as the manifest server backend
-- `osiris_log` directly to create local segment data
-- Seed helpers to upload fragments synchronously
+Uses the same infrastructure as `replica_reader_SUITE`: real upload path,
+barrier techniques, no mocks. Tests that data uploaded to the remote tier
+can be read back correctly by consumers.
 
-This allows precise control over the layout of the local and remote tiers.
+The key barrier technique: after writing, we wait for local retention to
+reclaim uploaded segments. This is the natural state where the remote tier
+is the only source for old data.
 """.
 
--compile([nowarn_export_all, export_all]).
+-compile([export_all, nowarn_export_all]).
 
 -include_lib("common_test/include/ct.hrl").
--include_lib("eunit/include/eunit.hrl").
--include("include/rabbitmq_stream_s3.hrl").
+-include_lib("stdlib/include/assert.hrl").
+-include_lib("rabbitmq_ct_helpers/include/rabbit_assert.hrl").
+-include_lib("rabbitmq_stream_s3/include/rabbitmq_stream_s3.hrl").
 
-%%%===================================================================
-%%% Common Test callbacks
-%%%===================================================================
+-import(rabbitmq_stream_s3_test_helpers, [
+    start_writer/2,
+    start_writer/3,
+    start_cluster/3,
+    start_cluster/4,
+    flush_writer/1,
+    seed_log/2,
+    write_sequential/3,
+    reader_config/2,
+    read_all/1,
+    read_all/2,
+    await_offset/2,
+    list_segment_offsets/1,
+    list_segment_offsets/2,
+    list_fragment_offsets/1,
+    get_range/1,
+    get_range/2,
+    assert_sequential/2,
+    assert_sequential/3
+]).
+
+suite() ->
+    [{ct_hooks, [rabbitmq_stream_s3_cth]}].
 
 all() ->
     [
-        {group, parallel}
+        {group, single_node},
+        {group, with_replica}
     ].
 
 groups() ->
     [
-        {parallel, [parallel], [
-            read_from_first_with_remote_tier,
-            read_last_chunk_at_index_boundary
+        {single_node, [], [
+            read_from_remote_first,
+            read_from_remote_first_large_filter,
+            read_across_fragment_boundaries,
+            read_from_remote_offset,
+            read_repositions_on_fragment_not_found,
+            read_through_group
+        ]},
+        {with_replica, [], [
+            read_from_replica_node
         ]}
     ].
 
 init_per_suite(Config) ->
-    _ = application:ensure_all_started(logger),
-    %% Suppress non-error logs sent to stdout. CommonTest is already capturing
-    %% logs independently.
-    logger:set_handler_config(default, level, error),
-    {ok, _} = application:ensure_all_started(seshat),
-    _ = seshat:new_group(rabbitmq_stream_s3),
-    osiris:configure_logger(logger),
-    application:set_env(rabbitmq_stream_s3, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_fs),
-    application:set_env(
-        rabbitmq_stream_s3,
-        rabbitmq_stream_s3_server,
-        rabbitmq_stream_s3_server_ets
-    ),
-    application:set_env(osiris, max_segment_size_chunks, 10),
-    PrivDir = ?config(priv_dir, Config),
-    DataDir = filename:join(PrivDir, "shared"),
-    ok = filelib:ensure_path(DataDir),
-    rabbitmq_stream_s3_api_fs:set_data_dir(DataDir),
-    ok = rabbitmq_stream_s3_api:init(),
-    ok = rabbitmq_stream_s3_server:init_counters(),
-    ok = rabbitmq_stream_s3_log_reader:init_counters(),
-    {ok, SupPid} = rabbitmq_stream_s3_remote_reader_sup:start_link(),
-    unlink(SupPid),
-    %% Use a long-living process to create the ETS tables.
-    %% Transfer ETS table ownership to a long-lived process so parallel
-    %% test cases can access them after init_per_suite exits.
-    Holder = spawn(fun() ->
-        ok = rabbitmq_stream_s3_server_ets:setup(),
-        receive
-            stop -> ok
-        end
-    end),
-    [{fs_data_dir, DataDir}, {sup_pid, SupPid}, {ets_holder, Holder} | Config].
-
-end_per_suite(Config) ->
-    ?config(ets_holder, Config) ! stop,
-    Pid = ?config(sup_pid, Config),
-    MRef = erlang:monitor(process, Pid),
-    exit(Pid, shutdown),
-    receive
-        {'DOWN', MRef, process, Pid, _} ->
+    case node() of
+        nonode@nohost ->
+            {ok, _} = net_kernel:start([ct_remote_reader, shortnames]);
+        _ ->
             ok
-    after 100 ->
-        ok
-    end.
-
-init_per_group(_Group, Config) ->
+    end,
     Config.
 
-end_per_group(_Group, Config) ->
+end_per_suite(Config) ->
+    Config.
+
+init_per_group(single_node, Config) ->
+    Config;
+init_per_group(with_replica, Config) ->
+    {Peer, ReplicaNode} = rabbitmq_stream_s3_cth:setup_peer(Config),
+    [{peer, Peer}, {replica_node, ReplicaNode} | Config].
+
+end_per_group(single_node, Config) ->
+    Config;
+end_per_group(with_replica, Config) ->
+    peer:stop(?config(peer, Config)),
     Config.
 
 init_per_testcase(TestCase, Config) ->
-    %% Unique stream ID per test so parallel tests don't share remote storage.
-    StreamId = iolist_to_binary(["__", atom_to_list(TestCase), "_1"]),
-    Shared = osiris_log_shared:new(),
-    OsirisCfg = #{
-        dir => filename:join([?config(fs_data_dir, Config), atom_to_list(TestCase), "osiris"]),
+    StreamId = <<"__", (atom_to_binary(TestCase))/binary, "_1">>,
+    WriterCfg = #{
         name => binary_to_list(StreamId),
         epoch => 1,
-        readers_counter_fun => fun(_) -> ok end,
-        shared => Shared,
+        replica_nodes => [],
+        leader_node => node(),
+        reference => StreamId,
         options => #{},
-        max_segment_size_bytes => 10_000
+        max_segment_size_bytes => 5_000
     },
-    ok = filelib:ensure_path(maps:get(dir, OsirisCfg)),
-    [{stream_id, StreamId}, {osiris_cfg, OsirisCfg}, {shared, Shared} | Config].
+    [{stream_id, StreamId}, {writer_cfg, WriterCfg} | Config].
 
 end_per_testcase(_TestCase, Config) ->
+    WriterCfg = ?config(writer_cfg, Config),
+    catch osiris_writer:stop(WriterCfg),
     Config.
 
-%%%===================================================================
-%%% Test cases
-%%%===================================================================
+%% ------------------------------------------------------------------
+%% Tests
+%% ------------------------------------------------------------------
 
-read_from_first_with_remote_tier(Config) ->
-    Messages = messages(20, 500),
+read_from_remote_first(Config) ->
+    Writer = start_writer(Config, #{fragment_target_size => 1000}),
 
-    %% Write messages to the local tier and upload to the remote tier.
-    ok = seed_local_tier(Messages, Config),
-    Manifest = upload_to_remote_tier(#manifest{}, Config),
-    publish_manifest(Manifest, Config),
+    N = 200,
+    write_sequential(Writer, N, 5),
 
-    %% Local tier: 2 segments starting at offsets 0 and 10.
-    %% Remote tier: 2 fragments starting at offsets 0 and 10.
-    ?assertEqual([0, 10], local_segments(Config)),
-    ?assertEqual([0, 10], remote_fragments(Config)),
+    ReaderCfg = reader_config(Writer, Config),
+    #{shared := Shared} = ReaderCfg,
+    ?awaitMatch([S] when S > 0, list_segment_offsets(Config), 1000),
+    ?awaitMatch(F when F > 0, osiris_log_shared:first_chunk_id(Shared), 1000),
 
-    %% After local retention, only the active segment (offset 10) remains.
-    Manifest = execute_local_retention(Manifest, Config),
-    ?assertEqual([10], local_segments(Config)),
-
-    ReaderCfg = reader_config(Config),
     {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg),
     ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),
 
     Records = read_all(Reader0),
-    ?assertEqual(Messages, Records).
+    assert_sequential(Records, N).
 
--doc """
-The log reader might attempt to read into the index section of a fragment
-since it over-reads the chunk header to get the full bloom filter. The remote
-reader must cap the read at the index boundary.
-""".
-read_last_chunk_at_index_boundary(Config) ->
-    %% Small messages produce small chunks, making it likely that the last
-    %% chunk header in a fragment falls within ?MAX_FILTER_SIZE bytes of the
-    %% index boundary.
-    Messages = messages(20, 1),
-
-    ok = seed_local_tier(Messages, Config),
-    Manifest = upload_to_remote_tier(#manifest{}, Config),
-    publish_manifest(Manifest, Config),
-    Manifest = execute_local_retention(Manifest, Config),
-
-    ReaderCfg = reader_config(Config),
-    {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg),
-    ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),
-
-    Records = read_all(Reader0),
-    ?assertEqual(Messages, Records).
-
-%%%===================================================================
-%%% Helpers
-%%%===================================================================
-
--doc "Generate N messages each padded to the given byte size.".
-messages(N, Size) ->
-    [
-        begin
-            Prefix = <<"msg-", (integer_to_binary(I))/binary, "-">>,
-            Pad = max(0, Size - byte_size(Prefix)),
-            <<Prefix/binary, (binary:copy(<<"x">>, Pad))/binary>>
-        end
-     || I <- lists:seq(1, N)
-    ].
-
--doc "Write messages to the local osiris log and return the updated manifest placeholder.".
-seed_local_tier(Messages, Config) ->
-    OsirisCfg = ?config(osiris_cfg, Config),
-    Shared = ?config(shared, Config),
-    Log0 = osiris_log:init(OsirisCfg),
-    Log1 = lists:foldl(fun(Msg, L) -> osiris_log:write([Msg], L) end, Log0, Messages),
-    LastOffset = osiris_log:next_offset(Log1) - 1,
-    osiris_log_shared:set_committed_chunk_id(Shared, LastOffset),
-    ok = osiris_log:close(Log1).
-
--doc "Upload all new local segments to the remote tier and return the updated manifest.".
-upload_to_remote_tier(Manifest0, Config) ->
-    Dir = maps:get(dir, ?config(osiris_cfg, Config)),
-    upload_all_fragments(Dir, Manifest0, Config).
-
--doc "First offsets of segment files currently in the local osiris log directory.".
-local_segments(Config) ->
-    Dir = maps:get(dir, ?config(osiris_cfg, Config)),
-    {ok, Files} = file:list_dir(Dir),
-    lists:sort([
-        binary_to_integer(list_to_binary(filename:basename(F, ".segment")))
-     || F <- Files, filename:extension(F) =:= ".segment"
-    ]).
-
--doc "First offsets of fragment files currently stored in the remote tier.".
-remote_fragments(Config) ->
-    rabbitmq_stream_s3_api_fs:list_fragments(?config(stream_id, Config)).
-
--doc "Upload all segments in the osiris log directory and return the updated manifest".
-upload_all_fragments(Dir, Manifest0, Config) ->
-    StreamId = ?config(stream_id, Config),
-    {ok, Files} = file:list_dir(Dir),
-    IdxFiles = lists:sort([filename:join(Dir, F) || F <- Files, filename:extension(F) =:= ".index"]),
-    NewIdxFiles = [
-        F
-     || F <- IdxFiles,
-        rabbitmq_stream_s3:index_file_offset(F) >= Manifest0#manifest.next_offset
-    ],
-    lists:foldl(
-        fun(IdxFile, ManifestAcc) ->
-            {Fragment, _} = rabbitmq_stream_s3_log_manifest:recover_fragments(IdxFile),
-            Effect = #upload_fragment{stream = StreamId, dir = Dir, fragment = Fragment},
-            #fragment_uploaded{info = Info} = rabbitmq_stream_s3_server:execute_task(Effect),
-            {ok, Edit} = rabbitmq_stream_s3_manifest:apply_infos([Info], ManifestAcc),
-            rabbitmq_stream_s3_manifest:apply_edit(Edit, ManifestAcc)
-        end,
-        Manifest0,
-        NewIdxFiles
-    ).
-
--doc """
-Evaluate local-tier retention, deleting segments whose data is fully in the
-remote tier and updating the shared ref. Equivalent to the server's
-`#trigger_retention` effect.
-""".
-execute_local_retention(Manifest, Config) ->
-    StreamId = ?config(stream_id, Config),
-    OsirisCfg = ?config(osiris_cfg, Config),
-    Shared = ?config(shared, Config),
-    Dir = maps:get(dir, OsirisCfg),
-    Spec = [{'fun', rabbitmq_stream_s3_server:local_retention_fun(StreamId)}],
-    case osiris_log:evaluate_retention(Dir, Spec) of
-        {{FstOff, _}, _FstTs, _NumSeg} when is_integer(FstOff) ->
-            osiris_log_shared:set_first_chunk_id(Shared, FstOff);
-        _ ->
-            ok
-    end,
-    Manifest.
-
--doc """
-Evaluate remote-tier retention against the manifest with the given spec,
-deleting fragment objects and updating the ETS manifest and range.
-Equivalent to the server's `#evaluate_retention` task.
-""".
-execute_remote_retention(Spec, Manifest, Config) ->
-    StreamId = ?config(stream_id, Config),
-    Now = erlang:system_time(millisecond),
-    GetGroupFun = rabbitmq_stream_s3_server:get_group_fun(StreamId, retention),
-    {Edit, Deletions} = rabbitmq_stream_s3_machine:execute_retention(
-        Manifest, Now, Spec, GetGroupFun
+read_from_remote_first_large_filter(Config) ->
+    %% filter_size => 255 makes each chunk 239 bytes larger than default.
+    %% Exercises the index boundary calculation with variable-size chunks.
+    N = 200,
+    Writer = start_writer(
+        Config, #{filter_size => 255}, #{fragment_target_size => 1000}
     ),
-    case Deletions of
-        [] ->
-            ok;
-        _ ->
-            Effect = #delete_objects{stream = StreamId, objects = Deletions},
-            rabbitmq_stream_s3_server:execute_task(Effect)
-    end,
-    NewManifest = rabbitmq_stream_s3_manifest:apply_edit(Edit, Manifest),
-    publish_manifest(NewManifest, Config),
-    NewManifest.
 
-publish_manifest(Manifest, Config) ->
+    write_sequential(Writer, N, 5),
+
+    ReaderCfg = reader_config(Writer, Config),
+    #{shared := Shared} = ReaderCfg,
+    ?awaitMatch([S] when S > 0, list_segment_offsets(Config), 1000),
+    ?awaitMatch(F when F > 0, osiris_log_shared:first_chunk_id(Shared), 1000),
+
+    {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg),
+    ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),
+
+    Records = read_all(Reader0),
+    assert_sequential(Records, N).
+
+read_across_fragment_boundaries(Config) ->
+    %% 3 segments, one chunk each, 600 bytes payload, fragment target 500.
+    %% Each chunk exceeds the target so each becomes its own fragment.
+    %% Exactly 3 fragments at offsets [0, 10, 20].
+    %% Multiple segments allow retention to reclaim uploaded data.
+    #{next_offset := NextOffset} = seed_log(Config, [
+        {segment, [{chunk, #{records => 10, size => 600}}]},
+        {segment, [{chunk, #{records => 10, size => 600}}]},
+        {segment, [{chunk, #{records => 10, size => 600}}]}
+    ]),
+
+    Writer = start_writer(Config, #{}, #{fragment_target_size => 500}),
+    flush_writer(Writer),
+    await_offset(Config, NextOffset),
+
+    ?assertEqual([0, 10, 20], list_fragment_offsets(Config)),
+
+    ReaderCfg = reader_config(Writer, Config),
+    #{shared := Shared} = ReaderCfg,
+    ?awaitMatch(F when F > 0, osiris_log_shared:first_chunk_id(Shared), 1000),
+
+    {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg),
+    ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),
+
+    Records = read_all(Reader0),
+    assert_sequential(Records, NextOffset).
+
+read_from_remote_offset(Config) ->
+    Writer = start_writer(Config, #{fragment_target_size => 500}),
+
+    N = 200,
+    write_sequential(Writer, N, 5),
+
+    ReaderCfg = reader_config(Writer, Config),
+    #{shared := Shared} = ReaderCfg,
+    ?awaitMatch([S] when S > 0, list_segment_offsets(Config), 1000),
+    ?awaitMatch(F when F > 0, osiris_log_shared:first_chunk_id(Shared), 1000),
+
+    %% Request a random offset in the remote tier (below first_chunk_id).
+    FirstChunkId = osiris_log_shared:first_chunk_id(Shared),
+    TargetOffset = rand:uniform(FirstChunkId) - 1,
+    ct:pal("Attaching at target offset ~b, first local offset is ~b", [TargetOffset, FirstChunkId]),
+
+    {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(TargetOffset, ReaderCfg),
+    ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),
+
+    Records = read_all(Reader0, TargetOffset),
+    assert_sequential(Records, TargetOffset, N - 1).
+
+read_repositions_on_fragment_not_found(Config) ->
+    %% 3 fragments (600 bytes each, target 500). Remote retention with
+    %% max_bytes=1000 deletes the first two, leaving only offset 10.
+    %% A reader requesting offset 0 gets 404 and repositions at 10.
+    #{next_offset := NextOffset} = seed_log(Config, [
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]}
+    ]),
+    Writer = start_writer(
+        Config,
+        #{retention => [{max_bytes, 1000}]},
+        #{fragment_target_size => 500}
+    ),
+    flush_writer(Writer),
+    await_offset(Config, NextOffset),
+
+    %% Wait for remote retention to delete the first two fragments.
+    ?awaitMatch([10], list_fragment_offsets(Config), 2000),
+
+    %% Wait for local retention to reclaim uploaded segments.
+    ReaderCfg = reader_config(Writer, Config),
+    #{shared := Shared} = ReaderCfg,
+    ?awaitMatch(F when F > 0, osiris_log_shared:first_chunk_id(Shared), 1000),
+
+    %% Open a reader at offset 0. The fragment is gone (retention deleted it).
+    %% The reader should reposition at the oldest available offset (10).
+    {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(0, ReaderCfg),
+    ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),
+
+    Records = read_all(Reader0, 10),
+    assert_sequential(Records, 10, NextOffset - 1).
+
+read_through_group(Config) ->
+    %% 5 segments, each producing a fragment (600 bytes > 500 target).
+    %% Rebalance threshold = 4: after 4 fragments, the oldest 4 are factored
+    %% into a group. Final manifest: 1 group entry + 1 fragment entry.
+    %% A consumer reading from offset 0 must descend into the group to find
+    %% the first fragment, then continue through all 5 fragments.
+    #{next_offset := NextOffset} = seed_log(Config, [
+        {segment, [{chunk, #{records => 10, size => 600}}]},
+        {segment, [{chunk, #{records => 10, size => 600}}]},
+        {segment, [{chunk, #{records => 10, size => 600}}]},
+        {segment, [{chunk, #{records => 10, size => 600}}]},
+        {segment, [{chunk, #{records => 10, size => 600}}]}
+    ]),
+    Writer = start_writer(
+        Config, #{}, #{fragment_target_size => 500, rebalance_threshold => 4}
+    ),
+    flush_writer(Writer),
+    await_offset(Config, NextOffset),
+
+    %% Wait for local retention to reclaim uploaded segments.
+    ReaderCfg = reader_config(Writer, Config),
+    #{shared := Shared} = ReaderCfg,
+    ?awaitMatch(F when F > 0, osiris_log_shared:first_chunk_id(Shared), 1000),
+
+    %% Read from offset 0. The iterator must descend into the group.
+    {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg),
+    ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),
+
+    Records = read_all(Reader0),
+    assert_sequential(Records, NextOffset).
+
+read_from_replica_node(Config) ->
     StreamId = ?config(stream_id, Config),
-    rabbitmq_stream_s3_server_ets:set_manifest(StreamId, Manifest),
-    publish_range(Manifest#manifest.first_offset, Manifest#manifest.next_offset - 1, Config).
+    ReplicaNode = ?config(replica_node, Config),
 
--doc "Update only the range in the ETS server, without changing the manifest.".
-publish_range(First, Last, Config) ->
-    rabbitmq_stream_s3_server_ets:set_range(?config(stream_id, Config), First, Last).
+    {Writer, [ReplicaPid]} = start_cluster(
+        Config, [ReplicaNode], #{max_segment_size_bytes => 5000}, #{fragment_target_size => 1000}
+    ),
 
--doc "Delete a fragment from remote storage, simulating remote-tier retention.".
-delete_remote_fragment(FirstOffset, Config) ->
-    Key = rabbitmq_stream_s3:fragment_key(?config(stream_id, Config), FirstOffset),
-    case rabbitmq_stream_s3_api:delete(Key) of
-        ok -> ok;
-        {error, [{Key, {error, enoent}}]} -> ok
-    end.
+    N = 200,
+    write_sequential(Writer, N, 5),
 
--doc """
-Re-open the local osiris log to update the shared ref from the actual segment
-files on disk. Use this after remote-tier changes to ensure the local first
-offset reflects reality.
-""".
-refresh_local_tier(Config) ->
-    OsirisCfg = ?config(osiris_cfg, Config),
-    Log = osiris_log:init(OsirisCfg),
-    ok = osiris_log:close(Log).
+    %% Wait for the full upload to reach the replica's manifest cache.
+    %% Retention can only reclaim segments fully below next_offset, so we
+    %% must wait for all data to be uploaded before expecting reclamation.
+    ?awaitMatch(
+        {_, NextOffset} when NextOffset >= N,
+        get_range(Config, ReplicaNode),
+        5000
+    ),
 
-reader_config(Config) ->
-    #{
-        name => ?config(stream_id, Config),
-        dir => maps:get(dir, ?config(osiris_cfg, Config)),
-        epoch => 1,
-        shared => ?config(shared, Config),
-        options => #{transport => tcp},
-        readers_counter_fun => fun(_) -> ok end
-    }.
+    %% Wait for retention on the replica to reclaim uploaded segments.
+    ?awaitMatch([S] when S > 0, list_segment_offsets(Config, ReplicaNode), 1000),
 
--doc "Drain all records from a reader via chunk_iterator + iterator_next".
-read_all(Reader0) ->
-    read_all(Reader0, []).
-
-read_all(Reader0, Acc) ->
-    case rabbitmq_stream_s3_log_reader:chunk_iterator(Reader0, 1, undefined) of
-        {ok, _Header, Iter, Reader1} ->
-            Records = drain_iter(Iter, []),
-            read_all(Reader1, Acc ++ Records);
-        {end_of_stream, _Reader} ->
-            Acc;
-        {error, Reason} ->
-            error({read_error, Reason})
-    end.
-
-drain_iter(Iter, Acc) ->
-    case rabbitmq_stream_s3_log_reader:iterator_next(Iter) of
-        {{_Offset, Record}, Iter1} ->
-            drain_iter(Iter1, [Record | Acc]);
-        end_of_chunk ->
-            lists:reverse(Acc)
-    end.
+    %% Read from the replica node. Everything must run in one call since
+    %% the remote reader is linked to the caller.
+    Records = erpc:call(ReplicaNode, fun() ->
+        Ctx = osiris_util:get_reader_context(ReplicaPid),
+        RCfg = Ctx#{
+            name => StreamId,
+            epoch => 1,
+            options => #{transport => tcp},
+            readers_counter_fun => fun(_) -> ok end
+        },
+        {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, RCfg),
+        remote = rabbitmq_stream_s3_log_reader:mode(Reader0),
+        rabbitmq_stream_s3_test_helpers:read_all(Reader0)
+    end),
+    assert_sequential(Records, N).

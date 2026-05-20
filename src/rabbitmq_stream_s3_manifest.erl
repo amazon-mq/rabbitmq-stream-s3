@@ -16,14 +16,16 @@ fragments (via tree-branch-like "group" objects, for large enough streams).
 
 -type t() :: #manifest{}.
 -type edit() :: #edit{}.
+-type get_group_fun() :: rabbitmq_stream_s3_fragment_iterator:get_group_fun().
 
 -export_type([t/0, edit/0]).
 
 -export([
     new_edit/1,
-    rebalance_edit/2,
-    apply_infos/2,
-    apply_edit/2
+    apply_edit/2,
+    get_group_fun/1,
+    evaluate_remote_retention/3,
+    evaluate_remote_retention/4
 ]).
 
 %% ---------------------------------------------------------------------------
@@ -42,71 +44,6 @@ new_edit(#manifest{
         first_last_timestamp = FirstLastTs,
         next_offset = NextOffset
     }.
-
--doc "Create an edit which describes a rebalance from a group being uploaded".
--spec rebalance_edit(#group_uploaded{}, t()) -> edit().
-rebalance_edit(#group_uploaded{entry = Entry, pos = Pos, len = Len}, #manifest{} = Manifest) ->
-    %% TODO: I'm pretty sure we need to clear next_offset here. Add a test
-    %% case for the machine where rebalancing starts, a fragment is uploaded
-    %% and applied, and then the rebalancing completes.
-    (new_edit(Manifest))#edit{entries = Entry, pos = Pos, len = Len}.
-
--doc """
-Create an edit that adds successfully uploaded fragments to their manifest
-entries array.
-
-`Infos` is expected to be sorted by offset ascending.
-""".
--spec apply_infos([#fragment_info{}], t()) -> {ok, edit() | undefined} | {error, #fragment_info{}}.
-apply_infos(Infos, #manifest{entries = Entries} = Manifest) ->
-    Edit0 = (new_edit(Manifest))#edit{pos = byte_size(Entries)},
-    apply_infos0(Infos, Edit0).
-
-apply_infos0([], Edit) ->
-    {ok, Edit};
-apply_infos0(
-    [
-        #fragment_info{
-            first_offset = Offset,
-            next_offset = NextOffset,
-            first_timestamp = FirstTs,
-            last_timestamp = LastTs,
-            seq_no = SeqNo,
-            size = Size
-        }
-        | Rest
-    ],
-    #edit{
-        next_offset = Offset,
-        size = Size0,
-        entries = Entries0
-    } = Edit0
-) ->
-    Edit1 =
-        case Offset of
-            0 ->
-                %% For the very first fragment, also set the offset and timestamps.
-                Edit0#edit{
-                    first_offset = Offset,
-                    first_timestamp = FirstTs,
-                    first_last_timestamp = LastTs
-                };
-            _ ->
-                Edit0
-        end,
-    IsSeqZero =
-        case SeqNo of
-            0 -> 1;
-            _ -> 0
-        end,
-    Edit = Edit1#edit{
-        next_offset = NextOffset,
-        size = Size0 + Size,
-        entries = <<Entries0/binary, ?FRAGMENT(Offset, FirstTs, LastTs, IsSeqZero, Size)/binary>>
-    },
-    apply_infos0(Rest, Edit);
-apply_infos0([Info | _], #edit{}) ->
-    {error, Info}.
 
 -doc """
 Apply an edit to a manifest.
@@ -174,3 +111,266 @@ apply_edit(
         total_size = TotalSize0 + Size,
         entries = Entries
     }.
+
+-doc """
+Returns a function that downloads group objects from S3 and returns their
+entries array. Used by the fragment iterator and offset resolution.
+""".
+-spec get_group_fun(stream_id()) -> rabbitmq_stream_s3_fragment_iterator:get_group_fun().
+get_group_fun(StreamId) ->
+    fun(#group_ref{kind = Kind} = GroupRef) ->
+        Key = rabbitmq_stream_s3:group_key(StreamId, GroupRef),
+        case rabbitmq_stream_s3_api:get(Key, #{}) of
+            {ok, Data} ->
+                HeaderSize = group_header_size(Kind),
+                <<_Header:HeaderSize/binary, Entries/binary>> = Data,
+                {ok, Entries};
+            {error, _} = Err ->
+                Err
+        end
+    end.
+
+-doc """
+Evaluate remote tier retention against the manifest.
+
+Returns `unchanged` if no entries need to be removed, or
+`{edit(), [#fragment_ref{} | #group_ref{}]}` with the edit to apply and the
+references to delete from S3.
+
+Evaluates fragment entries at the head of the root. If the root starts with
+a group entry, downloads the group object via GetGroupFun and evaluates
+retention against the fragments within. Fragments inside the group are
+deleted individually. When all fragments in a group are expired, the group
+entry is removed from the root and the group object is deleted.
+""".
+-spec evaluate_remote_retention(t(), [osiris:retention_spec()], integer()) ->
+    unchanged | {edit(), [#fragment_ref{} | #group_ref{}]}.
+evaluate_remote_retention(Manifest, Specs, Now) ->
+    evaluate_remote_retention(Manifest, Specs, Now, undefined).
+
+-spec evaluate_remote_retention(
+    t(), [osiris:retention_spec()], integer(), get_group_fun() | undefined
+) ->
+    unchanged | {edit(), [#fragment_ref{} | #group_ref{}]}.
+evaluate_remote_retention(#manifest{entries = <<>>}, _Specs, _Now, _GetGroupFun) ->
+    unchanged;
+evaluate_remote_retention(#manifest{}, [], _Now, _GetGroupFun) ->
+    unchanged;
+evaluate_remote_retention(#manifest{} = Manifest, Specs, Now, GetGroupFun) ->
+    case eval_retention_specs(Manifest, Specs, Now) of
+        0 ->
+            %% No leading fragments to remove. Check if the first entry is a group.
+            maybe_eval_group_retention(Manifest, Specs, Now, GetGroupFun);
+        NumEntries ->
+            build_retention_result(Manifest, NumEntries)
+    end.
+
+%% Returns the number of leading fragment entries to remove.
+eval_retention_specs(Manifest, Specs, Now) ->
+    lists:foldl(
+        fun(Spec, Acc) ->
+            max(Acc, entries_to_remove(Manifest, Spec, Now))
+        end,
+        0,
+        Specs
+    ).
+
+entries_to_remove(
+    #manifest{total_size = TotalSize, entries = Entries}, {max_bytes, MaxBytes}, _Now
+) ->
+    remove_for_max_bytes(Entries, TotalSize, MaxBytes, 0);
+entries_to_remove(#manifest{entries = Entries}, {max_age, MaxAgeMs}, Now) ->
+    Cutoff = Now - MaxAgeMs,
+    remove_for_max_age(Entries, Cutoff, 0);
+entries_to_remove(_, _, _) ->
+    0.
+
+remove_for_max_bytes(_Entries, TotalSize, MaxBytes, N) when TotalSize =< MaxBytes ->
+    N;
+remove_for_max_bytes(<<>>, _TotalSize, _MaxBytes, N) ->
+    N;
+remove_for_max_bytes(Entries, TotalSize, MaxBytes, N) ->
+    <<_Offset:64, _FirstTs:64, _LastTs:64, Kind:8, Size:40, _Uid:32, Rest/binary>> = Entries,
+    case Kind of
+        ?MANIFEST_KIND_FRAGMENT when Rest =/= <<>> ->
+            remove_for_max_bytes(Rest, TotalSize - Size, MaxBytes, N + 1);
+        _ ->
+            %% Hit a group entry or last entry. Stop here.
+            N
+    end.
+
+remove_for_max_age(<<>>, _Cutoff, N) ->
+    N;
+remove_for_max_age(Entries, Cutoff, N) ->
+    <<_Offset:64, _FirstTs:64/signed, LastTs:64/signed, Kind:8, _Size:40, _Uid:32, Rest/binary>> =
+        Entries,
+    case Kind of
+        ?MANIFEST_KIND_FRAGMENT when LastTs < Cutoff andalso Rest =/= <<>> ->
+            remove_for_max_age(Rest, Cutoff, N + 1);
+        _ ->
+            N
+    end.
+
+build_retention_result(#manifest{entries = Entries} = Manifest, NumEntries) ->
+    BytesToRemove = NumEntries * ?ENTRY_B,
+    {Removed, Remaining} = {
+        binary:part(Entries, 0, BytesToRemove),
+        binary:part(Entries, BytesToRemove, byte_size(Entries) - BytesToRemove)
+    },
+    %% Collect fragment refs for deletion.
+    Refs = collect_fragment_refs(Removed, []),
+    %% Compute the size delta.
+    SizeDelta = lists:foldl(fun(#fragment_ref{size = S}, Acc) -> Acc - S end, 0, Refs),
+    %% Determine new first_offset and timestamps from the remaining entries.
+    {NewFirstOffset, NewFirstTs, NewFirstLastTs} =
+        case Remaining of
+            <<>> ->
+                {Manifest#manifest.next_offset, -1, -1};
+            ?ENTRY(Offset, FirstTs, LastTs, _, _, _, _) ->
+                {Offset, FirstTs, LastTs}
+        end,
+    Edit = #edit{
+        first_offset = NewFirstOffset,
+        first_timestamp = NewFirstTs,
+        first_last_timestamp = NewFirstLastTs,
+        next_offset = undefined,
+        size = SizeDelta,
+        entries = <<>>,
+        pos = 0,
+        len = BytesToRemove
+    },
+    {Edit, Refs}.
+
+%% Evaluate retention within the first group entry, if present.
+maybe_eval_group_retention(_Manifest, _Specs, _Now, undefined) ->
+    unchanged;
+maybe_eval_group_retention(#manifest{entries = Entries} = Manifest, Specs, Now, GetGroupFun) ->
+    case Entries of
+        <<Offset:64/unsigned, _FTs:64/signed, _LTs:64/signed, Kind:8/unsigned, _Size:40/unsigned,
+            Uid:32/unsigned,
+            _Rest/binary>> when Kind =/= ?MANIFEST_KIND_FRAGMENT ->
+            GroupRef = #group_ref{offset = Offset, kind = Kind, uid = Uid},
+            case GetGroupFun(GroupRef) of
+                {ok, GroupEntries} ->
+                    eval_group_entries(Manifest, GroupEntries, GroupRef, Specs, Now);
+                {error, _} ->
+                    unchanged
+            end;
+        _ ->
+            unchanged
+    end.
+
+%% Evaluate retention on fragment entries within a group.
+eval_group_entries(Manifest, GroupEntries, GroupRef, Specs, Now) ->
+    NumToRemove = eval_group_retention_specs(
+        GroupEntries, Manifest#manifest.total_size, Specs, Now
+    ),
+    case NumToRemove of
+        0 ->
+            unchanged;
+        _ ->
+            NumGroupEntries = byte_size(GroupEntries) div ?ENTRY_B,
+            build_group_retention_result(
+                Manifest, GroupEntries, GroupRef, NumToRemove, NumGroupEntries
+            )
+    end.
+
+eval_group_retention_specs(GroupEntries, ManifestTotalSize, Specs, Now) ->
+    lists:foldl(
+        fun(Spec, Acc) ->
+            max(Acc, group_entries_to_remove(GroupEntries, ManifestTotalSize, Spec, Now))
+        end,
+        0,
+        Specs
+    ).
+
+group_entries_to_remove(Entries, ManifestTotalSize, {max_bytes, MaxBytes}, _Now) ->
+    remove_for_max_bytes_in_group(Entries, ManifestTotalSize, MaxBytes, 0);
+group_entries_to_remove(Entries, _ManifestTotalSize, {max_age, MaxAgeMs}, Now) ->
+    Cutoff = Now - MaxAgeMs,
+    remove_for_max_age_in_group(Entries, Cutoff, 0);
+group_entries_to_remove(_, _, _, _) ->
+    0.
+
+%% Like remove_for_max_bytes but allows removing all entries (groups can be
+%% fully consumed).
+remove_for_max_bytes_in_group(_Entries, TotalSize, MaxBytes, N) when TotalSize =< MaxBytes ->
+    N;
+remove_for_max_bytes_in_group(<<>>, _TotalSize, _MaxBytes, N) ->
+    N;
+remove_for_max_bytes_in_group(Entries, TotalSize, MaxBytes, N) ->
+    <<_:64, _:64, _:64, _:8, Size:40, _:32, Rest/binary>> = Entries,
+    remove_for_max_bytes_in_group(Rest, TotalSize - Size, MaxBytes, N + 1).
+
+%% Like remove_for_max_age but doesn't stop at the last entry (groups can be
+%% fully consumed).
+remove_for_max_age_in_group(<<>>, _Cutoff, N) ->
+    N;
+remove_for_max_age_in_group(Entries, Cutoff, N) ->
+    <<_Offset:64, _FirstTs:64/signed, LastTs:64/signed, _Kind:8, _Size:40, _Uid:32, Rest/binary>> =
+        Entries,
+    case LastTs < Cutoff of
+        true -> remove_for_max_age_in_group(Rest, Cutoff, N + 1);
+        false -> N
+    end.
+
+build_group_retention_result(Manifest, GroupEntries, GroupRef, NumToRemove, NumGroupEntries) ->
+    BytesToRemove = NumToRemove * ?ENTRY_B,
+    Removed = binary:part(GroupEntries, 0, BytesToRemove),
+    FragRefs = collect_fragment_refs(Removed, []),
+    SizeDelta = lists:foldl(fun(#fragment_ref{size = S}, Acc) -> Acc - S end, 0, FragRefs),
+    case NumToRemove >= NumGroupEntries of
+        true ->
+            %% Entire group consumed. Remove the group entry from the root.
+            Remaining = binary:part(
+                Manifest#manifest.entries, ?ENTRY_B, byte_size(Manifest#manifest.entries) - ?ENTRY_B
+            ),
+            {NewFirstOffset, NewFirstTs, NewFirstLastTs} =
+                case Remaining of
+                    <<>> ->
+                        {Manifest#manifest.next_offset, -1, -1};
+                    ?ENTRY(Off, FTs, LTs, _, _, _, _) ->
+                        {Off, FTs, LTs}
+                end,
+            Edit = #edit{
+                first_offset = NewFirstOffset,
+                first_timestamp = NewFirstTs,
+                first_last_timestamp = NewFirstLastTs,
+                next_offset = undefined,
+                size = SizeDelta,
+                entries = <<>>,
+                pos = 0,
+                len = ?ENTRY_B
+            },
+            {Edit, [GroupRef | FragRefs]};
+        false ->
+            %% Partial group consumption. Update root metadata only.
+            %% The group entry stays. Determine new first_offset from the
+            %% first surviving entry in the group.
+            SurvivingStart = binary:part(GroupEntries, BytesToRemove, ?ENTRY_B),
+            <<NewFirstOffset:64/unsigned, NewFirstTs:64/signed, NewFirstLastTs:64/signed, _:8, _:40,
+                _:32>> = SurvivingStart,
+            Edit = #edit{
+                first_offset = NewFirstOffset,
+                first_timestamp = NewFirstTs,
+                first_last_timestamp = NewFirstLastTs,
+                next_offset = undefined,
+                size = SizeDelta,
+                entries = <<>>,
+                pos = 0,
+                len = 0
+            },
+            {Edit, FragRefs}
+    end.
+
+collect_fragment_refs(<<>>, Acc) ->
+    lists:reverse(Acc);
+collect_fragment_refs(Entries, Acc) ->
+    <<Offset:64/unsigned, _FirstTs:64/signed, _LastTs:64/signed, ?MANIFEST_KIND_FRAGMENT:8/unsigned,
+        Size:40/unsigned, Uid:32/unsigned, Rest/binary>> = Entries,
+    Ref = #fragment_ref{offset = Offset, uid = Uid, size = Size},
+    collect_fragment_refs(Rest, [Ref | Acc]).
+
+group_header_size(?MANIFEST_KIND_GROUP) -> ?MANIFEST_HEADER_SIZE;
+group_header_size(?MANIFEST_KIND_KILO_GROUP) -> ?MANIFEST_HEADER_SIZE;
+group_header_size(?MANIFEST_KIND_MEGA_GROUP) -> ?MANIFEST_HEADER_SIZE.

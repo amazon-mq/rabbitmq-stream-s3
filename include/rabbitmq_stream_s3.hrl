@@ -1,12 +1,6 @@
 %% Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 %% SPDX-License-Identifier: Apache-2.0
 
-%% A logical identifier for a stream. This is set to be the stream queue's
-%% resource name by RabbitMQ. This term is used for the `{osiris_offset,
-%% stream_reference(), osiris:offset()}' message sent by Osiris and to trigger
-%% deletion based on the queue name from the metadata store.
--type stream_reference() :: rabbit_amqqueue:name().
-
 %% Prefer binaries for filenames. This is a subtype of file:filename_all().
 %% Binaries represent ASCII in a much more compact fashion than lists.
 -type filename() :: binary().
@@ -54,80 +48,28 @@
 -define(C_OSIRIS_LOG_CHUNKS, 4).
 -define(C_OSIRIS_LOG_SEGMENTS, 5).
 
-%% * "OSIF" (4)
-%% * version (4)
-%% * first offset (8)
-%% * next offset (8)
-%% * first timestamp (8)
-%% * last timestamp (8)
-%% * seq no (2)
-%% * segment offset (8)
-%% * segment start pos (4)
-%% * index start pos (4)
-%% = 58.
--define(FRAGMENT_HEADER_B, 58).
--define(FRAGMENT_VERSION, 1).
--define(FRAGMENT_HEADER(
-    FirstOffset,
-    NextOffset,
-    FirstTs,
-    LastTs,
-    SeqNo,
-    SegmentOffset,
-    SegmentStartPos,
-    IdxStartPos,
-    Rem
-),
-    <<
-        "OSIF",
-        ?FRAGMENT_VERSION:32/unsigned,
-        FirstOffset:64/unsigned,
-        NextOffset:64/unsigned,
-        FirstTs:64/signed,
-        LastTs:64/signed,
-        SeqNo:16/unsigned,
-        SegmentOffset:64/unsigned,
-        SegmentStartPos:32/unsigned,
-        IdxStartPos:32/unsigned,
-        Rem/binary
-    >>
-).
-%% Info stored in a fragment's header. This record is a more convenient way to
-%% work with the above macro's data.
--record(fragment_info, {
-    %% Offset of the first chunk in the fragment.
-    first_offset :: osiris:offset(),
-    %% Offset of the first chunk in the subsequent fragment.
-    next_offset :: osiris:offset(),
-    %% Timestamp of the first chunk in the fragment.
-    first_timestamp :: osiris:timestamp(),
-    %% Timestamp of the last chunk in the fragment.
-    last_timestamp :: osiris:timestamp(),
-    %% Zero-based sequence number within the segment.
-    seq_no :: non_neg_integer(),
-    %% TODO: these next two fields could be used to convert a remote reader
-    %% into a local reader cheaply.
-    %% The offset of the segment file from which this fragment was extracted.
-    segment_offset :: osiris:offset(),
-    %% The position into the segment file where this fragment data started.
-    segment_start_pos :: byte_offset(),
-    %% Size of the fragment data. Doesn't including headers or index data.
-    size :: pos_integer(),
-    %% Position into the fragment object where the index header starts.
-    index_start_pos :: byte_offset(),
-    %% Copied from `#fragment.roll_reason`. Only defined when the info record
-    %% is created by an upload task. Not defined when the info record comes
-    %% from reading an existing fragment's header.
-    roll_reason :: size | segment_roll | undefined
+%% A pointer to a fragment object. Together with the stream ID this has all
+%% the necessary info to construct the fragment's S3 key and locate the index
+%% boundary within the object.
+-record(fragment_ref, {
+    offset :: osiris:offset(),
+    uid :: rabbitmq_stream_s3:uid(),
+    size :: non_neg_integer()
 }).
 
+%% A pointer to a manifest root object.
+-record(manifest_ref, {
+    epoch :: osiris:epoch(),
+    uid :: rabbitmq_stream_s3:uid()
+}).
+
+-define(FRAGMENT_VERSION, 1).
+
 -record(remote_location, {
-    fragment :: osiris:offset(),
     position :: byte_offset(),
     chunk_id :: osiris:offset(),
-    %% This may be undefined if we are starting at the first offset in a
-    %% fragment and didn't download any of its data.
-    fragment_info :: #fragment_info{} | undefined
+    fragment_ref :: #fragment_ref{},
+    iterator :: rabbitmq_stream_s3_fragment_iterator:iterator()
 }).
 
 -define(INDEX_RECORD(Offset, Timestamp, FragmentFilePos), <<
@@ -186,50 +128,30 @@
 %% but share the same amount of space - to make the entries arrays compact even
 %% when there are thousands of fragments.
 %%
-%% So an entry is a sort of union type between fragment and group. Both groups
-%% and fragments store the first offset and last timestamp in their range. This
-%% is used for readers to resolve offset specs. Fragments also store the
-%% segment data size. This is used for retention. Groups instead store the UID
-%% of the object.
--define(ENTRY_B, 30).
--define(ENTRY(Offset, FirstTs, LastTs, Kind), ?ENTRY(Offset, FirstTs, LastTs, Kind, <<>>)).
--define(ENTRY(Offset, FirstTs, LastTs, Kind, Rest), <<
+%% Fragment and group entries share the same 34-byte layout, differentiated by
+%% the Kind field. Both store the first offset, first timestamp, last
+%% timestamp, size, and UID. For groups, Size is zero and UID identifies the
+%% group object. For fragments, Size is the segment data size and UID
+%% identifies the fragment object.
+-define(ENTRY_B, 34).
+-define(ENTRY(Offset, FirstTs, LastTs, Kind, Size, Uid), <<
     Offset:64/unsigned,
     FirstTs:64/signed,
     LastTs:64/signed,
-    Kind:2/unsigned,
-    _:46,
-    %% Other entries:
-    Rest/binary
+    Kind:8/unsigned,
+    Size:40/unsigned,
+    Uid:32/unsigned
 >>).
--define(FRAGMENT(Offset, FirstTs, LastTs, IsSeqZero, Size),
-    ?FRAGMENT(Offset, FirstTs, LastTs, IsSeqZero, Size, <<>>)
-).
--define(FRAGMENT(Offset, FirstTs, LastTs, IsSeqZero, Size, Rest), <<
+-define(ENTRY(Offset, FirstTs, LastTs, Kind, Size, Uid, Rest), <<
     Offset:64/unsigned,
     FirstTs:64/signed,
     LastTs:64/signed,
-    ?MANIFEST_KIND_FRAGMENT:2/unsigned,
-    %% Whether the fragment was the first in the segment. This can be used to
-    %% search for a tracking snapshot.
-    IsSeqZero:1/unsigned,
-    %% 45 bits can describe segment data of up to 32 TiB.
-    %% 2^45 == 32 * 1024^4
-    Size:45/unsigned,
-    Rest/binary
->>).
-%% NOTE: ?GROUP will match fragments. Always attempt to match ?FRAGMENT first
-%% or guard on the Kind argument.
--define(GROUP(Offset, FirstTs, LastTs, Kind, Uid),
-    ?GROUP(Offset, FirstTs, LastTs, Kind, Uid, <<>>)
-).
--define(GROUP(Offset, FirstTs, LastTs, Kind, Uid, Rest), <<
-    Offset:64/unsigned,
-    FirstTs:64/signed,
-    LastTs:64/signed,
-    Kind:2/unsigned,
-    %% 46 bits of entropy. See the uid() type.
-    Uid:46/unsigned,
+    Kind:8/unsigned,
+    %% 40 bits can describe segment data of up to 1 TiB.
+    %% 2^40 == 1024^4
+    Size:40/unsigned,
+    %% 32 bits of entropy. See the uid() type.
+    Uid:32/unsigned,
     Rest/binary
 >>).
 
@@ -281,41 +203,12 @@
 -endif.
 
 -type byte_offset() :: non_neg_integer().
--type checksum() :: non_neg_integer().
-
-%% rabbitmq_stream_s3_log_manifest_machine types:
 
 %% The name of a stream. This is a unique identifier for an incarnation of a
 %% stream, meaning that it will not be identical if you delete a stream queue
 %% and recreate it. RabbitMQ sets these to be the vhost name, stream name and
 %% creation timestamp, concatenated with "_".
 -type stream_id() :: binary().
-
-%% Same as erlang:crc32(<<>>).
--define(EMPTY_CRC32, 0).
-
--record(fragment, {
-    first_offset :: osiris:offset() | undefined,
-    last_offset :: osiris:offset() | undefined,
-    next_offset :: osiris:offset() | undefined,
-    segment_offset :: osiris:offset(),
-    segment_pos = ?SEGMENT_HEADER_B :: pos_integer(),
-    first_timestamp :: osiris:timestamp() | undefined,
-    last_timestamp :: osiris:timestamp() | undefined,
-    %% Number of chunks in prior fragments and number in current fragment.
-    num_chunks = {0, 0} :: {non_neg_integer(), non_neg_integer()},
-    %% Zero-based increasing integer for sequence number within the segment.
-    seq_no = 0 :: non_neg_integer(),
-    %% NOTE: `#fragment.size` is the bytes of segment data, not headers or
-    %% index data.
-    size = 0 :: non_neg_integer(),
-    checksum = ?EMPTY_CRC32 :: checksum() | undefined,
-    %% The reason that the fragment was considered complete / "rolled" (like a
-    %% segment file). Fragments are capped by max size or rolled over with a
-    %% segment. Tracking the roll reason lets us delete local tier data
-    %% aggressively in retention.
-    roll_reason = size :: size | segment_roll
-}).
 
 %% An edit to the manifest entries array. This type generically covers
 %% insertions, deletions and replacements. Edits are passed from the writer
@@ -346,195 +239,3 @@
     kind :: rabbitmq_stream_s3:kind(),
     uid :: rabbitmq_stream_s3:uid()
 }).
-
-%% Events.
-
-%% The writer has written enough data and the given fragment is ready to be
-%% handed off to the manifest. This is also emitted when a writer starts up
-%% as it scans through the current segment and finds existing fragments - the
-%% manifest server applies these idempotently.
--record(fragment_available, {
-    stream :: stream_id(),
-    fragment :: #fragment{}
-}).
-%% The writer notified the manifest that the commit offset has moved forward.
--record(commit_offset_increased, {
-    stream :: stream_id(),
-    offset :: osiris:offset()
-}).
--record(fragment_uploaded, {
-    stream :: stream_id(),
-    info :: #fragment_info{}
-}).
--record(manifest_uploaded, {
-    stream :: stream_id(),
-    entry :: rabbitmq_stream_s3_db:entry()
-}).
--record(group_uploaded, {
-    stream :: stream_id(),
-    entry :: rabbitmq_stream_s3:entry(),
-    pos :: non_neg_integer(),
-    len :: pos_integer()
-}).
--record(manifest_requested, {
-    stream :: stream_id(),
-    requester :: gen_server:from() | pid()
-}).
--record(manifest_resolved, {
-    stream :: stream_id(),
-    manifest :: #manifest{},
-    seq :: non_neg_integer() | undefined
-}).
--record(writer_spawned, {
-    stream :: stream_id(),
-    pid :: pid(),
-    config :: osiris_log:config(),
-    %% Fragments available in the active segment. This list must be sorted
-    %% descending by first offset.
-    available_fragments = [] :: [#fragment{}]
-}).
--record(acceptor_spawned, {
-    stream :: stream_id(),
-    config :: osiris_log:config()
-}).
-%% Sent from the writer to replicas to notify them of changes to the in-memory
-%% copy of the manifest.
-%%
-%% This is somewhat similar to the append-entries RPC in raft.
--record(manifest_edited, {
-    stream :: stream_id(),
-    edits :: nonempty_list(#edit{}),
-    seq :: non_neg_integer(),
-    %% Suggest that the replica triggers local retention. This is set to true
-    %% when the writer finishes uploading a fragment which was taken because
-    %% of segment rollover.
-    trigger_retention = false :: boolean()
-}).
--record(tick, {}).
--record(retention_updated, {
-    stream :: stream_id(),
-    retention :: [osiris:retention_spec()]
-}).
--record(manifest_upload_rejected, {
-    stream :: stream_id(),
-    conflict :: rabbitmq_stream_s3_db:entry()
-}).
--record(stream_deleted, {stream :: stream_id()}).
--record(retention_executed, {
-    stream :: stream_id(),
-    edit :: #edit{}
-}).
--record(member_stopped, {stream :: stream_id()}).
-
--type event() ::
-    #acceptor_spawned{}
-    | #commit_offset_increased{}
-    | #fragment_available{}
-    | #fragment_uploaded{}
-    | #group_uploaded{}
-    | #manifest_edited{}
-    | #manifest_requested{}
-    | #manifest_resolved{}
-    | #manifest_upload_rejected{}
-    | #manifest_uploaded{}
-    | #member_stopped{}
-    | #retention_executed{}
-    | #retention_updated{}
-    | #stream_deleted{}
-    | #tick{}
-    | #writer_spawned{}.
-
-%% Effects.
-
--record(register_offset_listener, {
-    writer_pid :: pid(),
-    offset :: osiris:offset() | -1
-}).
--record(upload_fragment, {
-    stream :: stream_id(),
-    dir :: directory(),
-    fragment :: #fragment{}
-}).
--record(upload_manifest, {
-    stream :: stream_id(),
-    epoch :: osiris:epoch(),
-    reference :: stream_reference(),
-    manifest :: #manifest{}
-}).
--record(upload_group, {
-    stream :: stream_id(),
-    kind :: rabbitmq_stream_s3:kind(),
-    entries :: rabbitmq_stream_s3:entries(),
-    pos :: non_neg_integer(),
-    len :: pos_integer()
-}).
-%% Download the manifest from the remote tier and also check the tail of the
-%% last fragment to see if fragments have been uploaded but not yet applied.
--record(resolve_manifest, {stream :: stream_id()}).
--record(reply, {to :: gen_server:from(), response :: term()}).
-%% Set the range of the remote tier stream.
--record(set_range, {
-    stream :: stream_id(),
-    counter :: counters:counters_ref(),
-    first_offset :: osiris:offset() | -1,
-    first_timestamp :: osiris:timestamp(),
-    %% The exclusive end of the stream - an offset which may not exist yet.
-    next_offset :: osiris:offset()
-}).
--record(send, {
-    to :: pid() | {atom(), node()},
-    message :: term(),
-    %% See `erlang:send/3`.
-    options = [] :: [nosuspend | noconnect | priority]
-}).
--record(delete_objects, {
-    stream :: stream_id(),
-    %% Assumed to be sorted increasing by offset.
-    objects :: nonempty_list(osiris:offset() | #group_ref{})
-}).
-%% Read through the local stream data and find available fragments.
-%% This is done for the active segment when a writer spawns. This effect is
-%% used to perform the same recovery for older fragments when the manifest
-%% server recognizes a hole between the tail of the resolved manifest and the
-%% first available fragment recovered during writer spawn.
--record(find_fragments, {
-    stream :: stream_id(),
-    dir :: directory(),
-    from :: osiris:offset(),
-    %% **Exclusive** end: if a fragment starts at this offset it does not need
-    %% to be sent to the manifest server.
-    to :: osiris:offset()
-}).
--record(delete_stream, {stream :: stream_id()}).
-%% Trigger evaluation of retention in the local tier.
--record(trigger_retention, {
-    stream :: stream_id(),
-    dir :: directory(),
-    shared :: atomics:atomics_ref(),
-    counter :: counters:counters_ref()
-}).
-%% Evaluate retention in the remote tier within group files. This effect is
-%% emitted when a manifest has group entries. (If there are only fragment
-%% entries then remote tier retention is evaluated in-place.)
--record(evaluate_retention, {
-    stream :: stream_id(),
-    manifest :: #manifest{},
-    retention_spec :: rabbitmq_stream_s3:retention_spec(),
-    now :: osiris:timestamp()
-}).
-
--type effect() ::
-    #delete_objects{}
-    | #delete_stream{}
-    | #evaluate_retention{}
-    | #find_fragments{}
-    | #group_uploaded{}
-    | #register_offset_listener{}
-    | #reply{}
-    | #resolve_manifest{}
-    | #send{}
-    | #set_range{}
-    | #trigger_retention{}
-    | #upload_fragment{}
-    | #upload_group{}
-    | #upload_manifest{}.

@@ -4,52 +4,82 @@
 -module(rabbitmq_stream_s3_sup).
 -behaviour(supervisor).
 
--export([start_link/0, start_pools/0]).
+-export([start_link/0]).
 -export([init/1]).
-
--rabbit_boot_step(
-    {rabbitmq_stream_s3_http_pools, [
-        {description, "S3 HTTP connection pools"},
-        {mfa, {?MODULE, start_pools, []}},
-        {requires, rabbitmq_stream_s3},
-        {enables, rabbitmq_stream_s3_server}
-    ]}
-).
 
 start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
-start_pools() ->
-    UploadPoolId = rabbitmq_stream_s3_upload_pool,
-    ok = rabbit_sup:start_child(UploadPoolId, rabbitmq_stream_s3_api_aws_pool, [
-        UploadPoolId,
-        #{
-            name => UploadPoolId,
-            min_size => rabbitmq_stream_s3_config:upload_pool_min_size(),
-            max_size => rabbitmq_stream_s3_config:upload_pool_max_size()
-        }
-    ]),
-    GeneralPoolId = rabbitmq_stream_s3_general_pool,
-    ok = rabbit_sup:start_child(GeneralPoolId, rabbitmq_stream_s3_api_aws_pool, [
-        GeneralPoolId,
-        #{
-            name => GeneralPoolId,
-            min_size => rabbitmq_stream_s3_config:general_pool_min_size(),
-            max_size => rabbitmq_stream_s3_config:general_pool_max_size()
-        }
-    ]).
-
 init([]) ->
+    _ = seshat:new_group(rabbitmq_stream_s3),
+    ok = rabbitmq_stream_s3_api:init(),
+    application:set_env(osiris, log_hooks, rabbitmq_stream_s3_hooks),
+    application:set_env(osiris, log_reader, rabbitmq_stream_s3_log_reader),
+    catch rabbitmq_stream_s3_prometheus_collector:register(),
+    catch rabbitmq_stream_s3_db:setup(),
+    rabbitmq_stream_s3_registry:init(),
     SupFlags = #{strategy => one_for_one, intensity => 3, period => 5},
-    RemoteReaderSup = #{
-        id => rabbitmq_stream_s3_remote_reader_sup,
+    UploadPool = pool_child(rabbitmq_stream_s3_upload_pool, #{
+        name => rabbitmq_stream_s3_upload_pool,
+        min_size => rabbitmq_stream_s3_config:upload_pool_min_size(),
+        max_size => rabbitmq_stream_s3_config:upload_pool_max_size()
+    }),
+    GeneralPool = pool_child(rabbitmq_stream_s3_general_pool, #{
+        name => rabbitmq_stream_s3_general_pool,
+        min_size => rabbitmq_stream_s3_config:general_pool_min_size(),
+        max_size => rabbitmq_stream_s3_config:general_pool_max_size()
+    }),
+    Reaper = #{
+        id => rabbitmq_stream_s3_reaper,
+        type => worker,
+        start => {rabbitmq_stream_s3_reaper, start_link, []}
+    },
+    ManifestCache = #{
+        id => rabbitmq_stream_s3_manifest_replica,
+        type => worker,
+        start => {rabbitmq_stream_s3_manifest_replica, start_link, []}
+    },
+    ReplicaReaderSup = #{
+        id => rabbitmq_stream_s3_replica_reader_sup,
         type => supervisor,
-        start => {rabbitmq_stream_s3_remote_reader_sup, start_link, []}
+        start => {rabbitmq_stream_s3_replica_reader_sup, start_link, []}
+    },
+    Governor = #{
+        id => rabbitmq_stream_s3_governor,
+        type => worker,
+        start => {rabbitmq_stream_s3_governor, start_link, [governor_opts()]}
     },
     MembershipReconciliation = #{
         id => rabbitmq_stream_s3_membership_reconciliation,
         type => worker,
         start => {rabbitmq_stream_s3_membership_reconciliation, start_link, []}
     },
-    Procs = [RemoteReaderSup, MembershipReconciliation],
+    Procs = [
+        ManifestCache,
+        Reaper,
+        MembershipReconciliation,
+        UploadPool,
+        GeneralPool,
+        Governor,
+        ReplicaReaderSup
+    ],
     {ok, {SupFlags, Procs}}.
+
+governor_opts() ->
+    case rabbitmq_stream_s3_config:max_transfer_bytes_per_sec() of
+        unlimited ->
+            #{rate => unlimited};
+        Rate ->
+            Opts = #{rate => Rate},
+            case rabbitmq_stream_s3_config:max_transfer_burst_bytes() of
+                undefined -> Opts;
+                Burst -> Opts#{burst => Burst}
+            end
+    end.
+
+pool_child(Id, Config) ->
+    #{
+        id => Id,
+        type => worker,
+        start => {rabbitmq_stream_s3_api_aws_pool, start_link, [Id, Config]}
+    }.

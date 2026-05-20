@@ -23,7 +23,7 @@ associated file in that folder.
     stream_data/2,
     stream_finish/2,
     delete/2,
-    delete_prefix/2,
+    list/3,
     match_async/3,
     handle_async/3,
     cancel_async/2
@@ -165,19 +165,14 @@ delete(Keys, Opts) when is_list(Keys) andalso is_map(Opts) ->
         end
     end).
 
--spec delete_prefix(key(), rabbitmq_stream_s3_api:request_opts()) ->
-    {ok, map()} | {error, any()}.
-delete_prefix(Prefix, Opts) when is_binary(Prefix) andalso is_map(Opts) ->
-    Timeout = maps:get(timeout, Opts, 5000),
-    with_timeout(Timeout, fun() ->
-        Path = key_to_path(Prefix),
-        case file:del_dir_r(Path) of
-            ok ->
-                {ok, #{}};
-            {error, _} = Err ->
-                Err
-        end
-    end).
+list(Prefix, _Continuation, _Opts) when is_binary(Prefix) ->
+    Path = key_to_path(Prefix),
+    Keys = [
+        path_to_key(list_to_binary(F))
+     || F <- filelib:wildcard(binary_to_list(filename:join(Path, "**/*"))),
+        not filelib:is_dir(F)
+    ],
+    {ok, Keys, done}.
 
 -spec match_async(
     Msg :: term(),
@@ -231,7 +226,7 @@ when
     Manifest :: file:filename() | undefined,
     FragmentFile :: file:filename().
 get_stream_data(StreamName0) ->
-    DataDir = data_dir(),
+    DataDir = binary_to_list(data_dir()),
     StreamNameWildcard = binary_to_list(<<"*", StreamName0/binary, "*">>),
     case filelib:wildcard(filename:join([DataDir, "**", StreamNameWildcard])) of
         [] ->
@@ -261,7 +256,10 @@ get_stream_data(StreamName0) ->
 list_fragments(StreamName) ->
     case get_stream_data(StreamName) of
         {ok, _Manifest, Fragments} ->
-            lists:sort([binary_to_integer(filename:basename(F, <<".fragment">>)) || F <- Fragments]);
+            lists:sort([
+                list_to_integer(filename:basename(F, ".fragment"))
+             || F <- Fragments
+            ]);
         _ ->
             []
     end.
@@ -274,15 +272,25 @@ clear() ->
 set_data_dir(DataDir) ->
     application:set_env(rabbitmq_stream_s3, api_fs_data_dir, DataDir).
 
+-doc """
+Returns the data directory as a binary. `filelib:wildcard/1` only accepts
+strings, so callers that list files must convert with `binary_to_list/1`.
+`path_to_key/1` expects binary input.
+""".
 -spec data_dir() -> file:filename_all().
 data_dir() ->
     Dir = rabbitmq_stream_s3_config:api_fs_data_dir(),
     ?assertNotEqual(undefined, Dir),
-    Dir.
+    iolist_to_binary(Dir).
 
 -spec key_to_path(rabbitmq_stream_s3_api:key()) -> binary().
 key_to_path(Key) ->
     filename:join(data_dir(), Key).
+
+path_to_key(Path) ->
+    DataDir = data_dir(),
+    Len = byte_size(DataDir) + 1,
+    binary:part(iolist_to_binary(Path), Len, byte_size(iolist_to_binary(Path)) - Len).
 
 with_timeout(Timeout, Fun) ->
     Self = self(),
