@@ -13,6 +13,7 @@ retention is updated.
 -behaviour(osiris_log_hooks).
 
 -include("include/rabbitmq_stream_s3.hrl").
+-include_lib("kernel/include/logger.hrl").
 
 -export([
     on_init/3,
@@ -38,6 +39,10 @@ on_init(writer, Pid, #{name := Name, dir := Dir, shared := Shared, counter := Co
     %% Pass user retention specs (max_bytes, max_age) for remote tier evaluation.
     %% Filter out the {'fun', ...} specs we add — those are for local retention only.
     UserRetention = [S || S <- maps:get(retention, Config, []), element(1, S) =/= 'fun'],
+    ?LOG_INFO(
+        "on_init writer stream=~ts epoch=~b writer_pid=~p node=~p",
+        [StreamId, Epoch, Pid, node()]
+    ),
     {ok, _} = rabbitmq_stream_s3_replica_reader_sup:start_child(
         RemoteConfig#{
             stream => StreamId,

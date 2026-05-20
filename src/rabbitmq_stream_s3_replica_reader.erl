@@ -285,7 +285,12 @@ init(
         },
         {continue, resolve_manifest}}.
 
-handle_call({await_offset, Offset}, From, #state{core = Core0} = State) ->
+handle_call({await_offset, Offset}, From, #state{cfg = #cfg{stream = StreamId}, core = Core0} = State) ->
+    CoreState = rabbitmq_stream_s3_replica_reader_core:format_state(Core0),
+    ?LOG_INFO(
+        "~ts await_offset=~b from=~p core_state=~p",
+        [StreamId, Offset, From, CoreState]
+    ),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:await_offset(Offset, From, Core0),
     {noreply, execute_effects(Effects, State#state{core = Core})};
 handle_call(_Request, _From, State) ->
@@ -327,13 +332,27 @@ handle_cast(_Msg, State) ->
     {noreply, State}.
 
 handle_continue(resolve_manifest, #state{cfg = #cfg{stream = StreamId}} = State0) ->
+    ?LOG_INFO("~ts handle_continue resolve_manifest starting", [StreamId]),
     Manifest = resolve_manifest(StreamId),
+    ?LOG_INFO(
+        "~ts handle_continue resolved manifest next_offset=~b",
+        [StreamId, Manifest#manifest.next_offset]
+    ),
     State1 = on_manifest_resolved(Manifest, State0),
     {Core, _Effects} = rabbitmq_stream_s3_replica_reader_core:init(Manifest, State1#state.config),
     State = start_reading(State1#state{core = Core}),
+    ?LOG_INFO(
+        "~ts handle_continue complete log=~p assembly=~p",
+        [
+            StreamId,
+            State#state.log =/= undefined,
+            State#state.assembly =/= undefined
+        ]
+    ),
     {noreply, State}.
 
-handle_info({osiris_offset, _Ref, _Offset}, State0) ->
+handle_info({osiris_offset, _Ref, Offset}, #state{cfg = #cfg{stream = StreamId}} = State0) ->
+    ?LOG_DEBUG("~ts osiris_offset notification offset=~b", [StreamId, Offset]),
     State = drain(State0),
     {noreply, State};
 handle_info(retry_resolve, #state{cfg = #cfg{stream = StreamId}} = State0) ->
@@ -342,13 +361,19 @@ handle_info(retry_resolve, #state{cfg = #cfg{stream = StreamId}} = State0) ->
     {Core, _} = rabbitmq_stream_s3_replica_reader_core:init(Manifest, State1#state.config),
     State = start_reading(State1#state{core = Core}),
     {noreply, State};
-handle_info({transfer_result, Ref, {ok, Uid}}, #state{core = Core0} = State0) ->
+handle_info({transfer_result, Ref, {ok, Uid}}, #state{cfg = #cfg{stream = StreamId}, core = Core0} = State0) ->
+    ?LOG_INFO("~ts transfer_result ok ref=~p uid=~b", [StreamId, Ref, Uid]),
     State1 = on_transfer_result(Ref, ok, State0),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_complete(Ref, Uid, Core0),
     State2 = State1#state{core = Core},
     State3 = execute_effects(Effects, State2),
+    ?LOG_INFO(
+        "~ts after transfer_complete core_state=~p",
+        [StreamId, rabbitmq_stream_s3_replica_reader_core:format_state(Core)]
+    ),
     {noreply, State3};
-handle_info({transfer_result, Ref, {error, Reason}}, #state{core = Core0} = State0) ->
+handle_info({transfer_result, Ref, {error, Reason}}, #state{cfg = #cfg{stream = StreamId}, core = Core0} = State0) ->
+    ?LOG_WARNING("~ts transfer_result error ref=~p reason=~p", [StreamId, Ref, Reason]),
     State1 = on_transfer_result(Ref, {error, Reason}, State0),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(Ref, Reason, Core0),
     {noreply, execute_effects(Effects, State1#state{core = Core})};
@@ -379,8 +404,9 @@ handle_info(
     demonitor(Mon, [flush]),
     State = on_remote_retention(Edit, Refs, StreamId, Core0, State0#state{retention_mon = undefined}),
     {noreply, State};
-handle_info(persist_timer, #state{core = Core0} = State0) ->
+handle_info(persist_timer, #state{cfg = #cfg{stream = StreamId}, core = Core0} = State0) ->
     Now = erlang:system_time(millisecond),
+    ?LOG_DEBUG("~ts persist_timer fired", [StreamId]),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:tick(Now, Core0),
     {noreply, execute_effects(Effects, State0#state{core = Core, persist_timer = undefined})};
 handle_info(
@@ -397,9 +423,14 @@ handle_info(
         MonRef -> {noreply, State#state{replicas = maps:remove(Node, Replicas)}};
         _ -> {noreply, State}
     end;
-handle_info({persist_result, {ok, Revision}}, #state{core = Core0, persist_mon = Mon} = State0) ->
+handle_info({persist_result, {ok, Revision}}, #state{cfg = #cfg{stream = StreamId}, core = Core0, persist_mon = Mon} = State0) ->
     demonitor(Mon, [flush]),
+    ?LOG_INFO("~ts persist_result ok revision=~p", [StreamId, Revision]),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_complete(Revision, Core0),
+    ?LOG_INFO(
+        "~ts after persist_complete core_state=~p",
+        [StreamId, rabbitmq_stream_s3_replica_reader_core:format_state(Core)]
+    ),
     {noreply,
         execute_effects(Effects, State0#state{
             core = Core, persist_mon = undefined, persist_pid = undefined
@@ -453,12 +484,21 @@ handle_info(
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(_Reason, #state{
+terminate(Reason, #state{
     cfg = #cfg{stream = StreamId},
+    core = Core,
     persist_mon = Mon,
     persist_pid = CommitPid,
     metrics_id = MetricsId
 }) ->
+    CoreInfo = case Core of
+        undefined -> undefined;
+        _ -> rabbitmq_stream_s3_replica_reader_core:format_state(Core)
+    end,
+    ?LOG_INFO(
+        "~ts terminate reason=~p core_state=~p",
+        [StreamId, Reason, CoreInfo]
+    ),
     %% Kill any in-flight commit task to prevent orphaned Khepri writes.
     %% An orphaned write advances the revision, causing conflicts for the
     %% next incarnation of this replica reader.
@@ -592,20 +632,37 @@ group_magic(?MANIFEST_KIND_MEGA_GROUP) ->
 ) ->
     {ok, rabbitmq_stream_s3_db:revision()} | {error, term()}.
 do_commit(StreamId, Manifest, Epoch, Reference, ExpectedRevision) ->
+    T0 = erlang:monotonic_time(millisecond),
     Uid = rabbitmq_stream_s3:uid(),
     Data = serialize_manifest(Manifest),
     Ref = #manifest_ref{epoch = Epoch, uid = Uid},
     Key = rabbitmq_stream_s3:manifest_key(StreamId, Ref),
     case rabbitmq_stream_s3_api:put(Key, Data) of
         ok ->
+            T1 = erlang:monotonic_time(millisecond),
             case commit_khepri(StreamId, Epoch, Reference, ExpectedRevision, Uid) of
                 {ok, OldRef, NewRevision} ->
+                    T2 = erlang:monotonic_time(millisecond),
+                    ?LOG_INFO(
+                        "~ts do_commit ok s3_ms=~b khepri_ms=~b revision=~p",
+                        [StreamId, T1 - T0, T2 - T1, NewRevision]
+                    ),
                     delete_old_manifest(StreamId, OldRef),
                     {ok, NewRevision};
                 {error, _} = Err ->
+                    T2 = erlang:monotonic_time(millisecond),
+                    ?LOG_WARNING(
+                        "~ts do_commit khepri_error s3_ms=~b khepri_ms=~b err=~p",
+                        [StreamId, T1 - T0, T2 - T1, Err]
+                    ),
                     Err
             end;
         {error, _} = Err ->
+            T1 = erlang:monotonic_time(millisecond),
+            ?LOG_WARNING(
+                "~ts do_commit s3_put_error ms=~b err=~p",
+                [StreamId, T1 - T0, Err]
+            ),
             Err
     end.
 
@@ -664,6 +721,10 @@ execute_effects([Effect | Rest], State0) ->
 execute_effect({submit_transfer, Ref, _StreamId, Dir, Meta}, #state{cfg = Cfg} = State0) ->
     StreamId = Cfg#cfg.stream,
     Size = maps:get(size, Meta),
+    ?LOG_INFO(
+        "~ts submit_transfer ref=~p size=~b first_offset=~b next_offset=~b",
+        [StreamId, Ref, Size, maps:get(first_offset, Meta), maps:get(next_offset, Meta)]
+    ),
     Self = self(),
     Fun = fun() ->
         case upload_fragment(Dir, StreamId, Meta) of
@@ -712,6 +773,10 @@ execute_effect(
     {start_persist, Manifest, Epoch, Reference, ExpectedRevision, _Edits},
     #state{cfg = #cfg{stream = StreamId}} = State
 ) ->
+    ?LOG_INFO(
+        "~ts start_persist next_offset=~b epoch=~b expected_rev=~p",
+        [StreamId, Manifest#manifest.next_offset, Epoch, ExpectedRevision]
+    ),
     Self = self(),
     {CommitPid, MonRef} = spawn_monitor(fun() ->
         logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
@@ -753,10 +818,12 @@ execute_effect(
     Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(Core),
     maybe_evaluate_retention(Manifest, State),
     maybe_evaluate_remote_retention(Manifest, Retention, Cfg#cfg.stream, State);
-execute_effect({reply_waiters, Replies}, State) ->
+execute_effect({reply_waiters, Replies}, #state{cfg = #cfg{stream = StreamId}} = State) ->
+    ?LOG_INFO("~ts reply_waiters count=~b", [StreamId, length(Replies)]),
     [gen_server:reply(From, Reply) || {From, Reply} <- Replies],
     State;
-execute_effect({start_persist_timer, Ms}, #state{persist_timer = OldRef} = State) ->
+execute_effect({start_persist_timer, Ms}, #state{cfg = #cfg{stream = StreamId}, persist_timer = OldRef} = State) ->
+    ?LOG_DEBUG("~ts start_persist_timer ms=~b (old_ref=~p)", [StreamId, Ms, OldRef]),
     _ = cancel_timer(OldRef),
     Ref = erlang:send_after(Ms, self(), persist_timer),
     State#state{persist_timer = Ref};
@@ -766,6 +833,10 @@ execute_effect(cancel_persist_timer, #state{persist_timer = Ref} = State) ->
 execute_effect(reinitialize, #state{cfg = #cfg{stream = StreamId}} = State0) ->
     ?LOG_INFO("~ts reinitializing after commit conflict", [StreamId]),
     Manifest = resolve_manifest(StreamId),
+    ?LOG_INFO(
+        "~ts reinitialize resolved manifest next_offset=~b",
+        [StreamId, Manifest#manifest.next_offset]
+    ),
     State = on_manifest_resolved(Manifest, State0),
     {Core, _} = rabbitmq_stream_s3_replica_reader_core:init(Manifest, State#state.config),
     start_reading(State#state{
@@ -923,12 +994,17 @@ parse_manifest_root(?MANIFEST(FirstOffset, NextOffset, FirstTs, FirstLastTs, Tot
 start_reading(
     #state{
         cfg = #cfg{
-            writer_pid = WriterPid
+            writer_pid = WriterPid,
+            stream = StreamId
         }
     } = State
 ) ->
     case is_process_alive(WriterPid) of
         false ->
+            ?LOG_WARNING(
+                "~ts start_reading: writer ~p is dead, not starting",
+                [StreamId, WriterPid]
+            ),
             State;
         true ->
             start_reading0(State)
@@ -1018,11 +1094,18 @@ drain(
             Pos = maps:get(position, Header),
             NextPos = maps:get(next_position, Header),
             ChunkSize = NextPos - Pos,
+            ChunkId = maps:get(chunk_id, Header),
+            NumRecords = maps:get(num_records, Header),
+            DataSize = maps:get(data_size, Header),
+            ?LOG_DEBUG(
+                "~ts drain read chunk_id=~b num_records=~b data_size=~b chunk_size=~b",
+                [StreamId, ChunkId, NumRecords, DataSize, ChunkSize]
+            ),
             Chunk = #{
-                chunk_id => maps:get(chunk_id, Header),
+                chunk_id => ChunkId,
                 timestamp => maps:get(timestamp, Header),
-                num_records => maps:get(num_records, Header),
-                data_size => maps:get(data_size, Header),
+                num_records => NumRecords,
+                data_size => DataSize,
                 position => Pos,
                 next_position => NextPos,
                 segment_offset => SegOffset,
@@ -1039,6 +1122,10 @@ drain(
                 true ->
                     Meta = rabbitmq_stream_s3_fragment_assembly:metadata(Assembly1),
                     FragmentSize = maps:get(size, Meta),
+                    ?LOG_INFO(
+                        "~ts drain fragment_cut first_offset=~b next_offset=~b size=~b",
+                        [StreamId, maps:get(first_offset, Meta), maps:get(next_offset, Meta), FragmentSize]
+                    ),
                     %% Pipeline stage 1 -> 2: the fragment leaves the
                     %% assembly. Bytes are removed from the in-assembly
                     %% gauge; the in-transfer gauge is incremented in
@@ -1060,6 +1147,10 @@ drain(
             end;
         {end_of_stream, Log1} ->
             NextOffset = osiris_log:next_offset(Log1),
+            ?LOG_DEBUG(
+                "~ts drain end_of_stream next_offset=~b",
+                [StreamId, NextOffset]
+            ),
             osiris:register_offset_listener(WriterPid, NextOffset, ?OFFSET_FORMATTER),
             State#state{log = Log1, assembly = Assembly0};
         {error, Reason} ->

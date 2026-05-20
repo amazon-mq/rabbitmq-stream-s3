@@ -27,6 +27,7 @@ with no pacing.
 -export([init_counters/0]).
 
 -include("include/logging.hrl").
+-include_lib("kernel/include/logger.hrl").
 
 -define(REFILL_INTERVAL_MS, 100).
 
@@ -180,12 +181,15 @@ spawn_task({Fun, _Size, ReplyTo, Ref}) ->
     inc(?C_TASKS_IN_FLIGHT, 1),
     spawn(fun() ->
         logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
+        T0 = erlang:monotonic_time(millisecond),
         Result =
             try
                 Fun()
             catch
                 Class:Reason -> {error, {Class, Reason}}
             end,
+        Elapsed = erlang:monotonic_time(millisecond) - T0,
+        ?LOG_DEBUG("governor task completed in ~bms result=~p", [Elapsed, element(1, Result)]),
         dec(?C_TASKS_IN_FLIGHT, 1),
         ReplyTo ! {transfer_result, Ref, Result}
     end).

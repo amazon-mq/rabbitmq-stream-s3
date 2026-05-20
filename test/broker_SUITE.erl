@@ -451,17 +451,41 @@ get_stream_info(Config, QName) ->
     }.
 
 await_offset(Config, WriterNode, StreamId, Offset) ->
-    rabbit_ct_broker_helpers:rpc(
-        Config,
-        WriterNode,
-        gen_server,
-        call,
-        [
+    ct:pal("await_offset: node=~p stream=~ts offset=~b", [WriterNode, StreamId, Offset]),
+    Result = rabbit_ct_broker_helpers:rpc(
+        Config, WriterNode, ?MODULE, do_await_offset, [StreamId, WriterNode, Offset]
+    ),
+    case Result of
+        ok ->
+            ct:pal("await_offset: ok"),
+            ok;
+        {timeout, State} ->
+            ct:pal("await_offset TIMEOUT: replica_reader state=~p", [State]),
+            error({await_offset_timeout, #{
+                stream => StreamId, node => WriterNode,
+                offset => Offset, state => State
+            }})
+    end.
+
+%% Exported for RPC from await_offset/4.
+do_await_offset(StreamId, WriterNode, Offset) ->
+    try
+        gen_server:call(
             {via, rabbitmq_stream_s3_registry, {StreamId, WriterNode}},
             {await_offset, Offset},
             10000
-        ]
-    ).
+        )
+    catch
+        exit:{timeout, _} ->
+            State = try
+                sys:get_state(
+                    {via, rabbitmq_stream_s3_registry, {StreamId, WriterNode}},
+                    5000
+                )
+            catch _:_ -> unavailable
+            end,
+            {timeout, State}
+    end.
 
 list_fragment_keys(Config, Node, StreamId) ->
     Prefix = rabbitmq_stream_s3:stream_prefix(StreamId),
