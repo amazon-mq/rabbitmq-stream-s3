@@ -59,7 +59,8 @@ groups() ->
             read_across_fragment_boundaries,
             read_from_remote_offset,
             read_repositions_on_fragment_not_found,
-            read_through_group
+            read_through_group,
+            read_detects_crc_corruption
         ]},
         {with_replica, [], [
             read_from_replica_node
@@ -263,6 +264,30 @@ read_through_group(Config) ->
     Records = read_all(Reader0),
     assert_sequential(Records, NextOffset).
 
+read_detects_crc_corruption(Config) ->
+    %% When verify_crc_on_read is enabled, reading a corrupted fragment
+    %% must exit with {crc_validation_failure, _}.
+    Writer = start_writer(Config, #{fragment_target_size => 1000}),
+    N = 50,
+    write_sequential(Writer, N, 5),
+
+    ReaderCfg0 = reader_config(Writer, Config),
+    ReaderCfg = ReaderCfg0#{verify_crc_on_read => true},
+    #{shared := Shared} = ReaderCfg,
+    ?awaitMatch([S] when S > 0, list_segment_offsets(Config), 1000),
+    ?awaitMatch(F when F > 0, osiris_log_shared:first_chunk_id(Shared), 1000),
+
+    %% Corrupt the first fragment file on disk.
+    corrupt_first_fragment(Config),
+
+    %% Reading should fail with CRC validation error.
+    {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg),
+    ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),
+    ?assertExit(
+        {crc_validation_failure, _},
+        read_all(Reader0)
+    ).
+
 read_from_replica_node(Config) ->
     StreamId = ?config(stream_id, Config),
     ReplicaNode = ?config(replica_node, Config),
@@ -301,3 +326,27 @@ read_from_replica_node(Config) ->
         rabbitmq_stream_s3_test_helpers:read_all(Reader0)
     end),
     assert_sequential(Records, N).
+
+%% ------------------------------------------------------------------
+%% Internal helpers
+%% ------------------------------------------------------------------
+
+corrupt_first_fragment(Config) ->
+    RemoteDir = ?config(remote_dir, Config),
+    StreamId = ?config(stream_id, Config),
+    Pattern = filename:join([
+        RemoteDir,
+        "rabbitmq",
+        "stream",
+        binary_to_list(StreamId),
+        "data",
+        "*.fragment"
+    ]),
+    [First | _] = lists:sort(filelib:wildcard(binary_to_list(iolist_to_binary(Pattern)))),
+    {ok, Bin} = file:read_file(First),
+    %% Flip a byte in the record data region (past 8-byte fragment header +
+    %% 48-byte chunk header). This ensures the CRC will not match.
+    Pos = 8 + 48 + 16,
+    <<Pre:Pos/binary, Byte:8, Post/binary>> = Bin,
+    Corrupted = <<Pre/binary, (Byte bxor 16#FF):8, Post/binary>>,
+    ok = file:write_file(First, Corrupted).
