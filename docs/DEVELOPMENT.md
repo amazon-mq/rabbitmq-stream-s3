@@ -95,10 +95,16 @@ All Erlang source is formatted with `erlfmt`:
 
 ```bash
 # Check formatting (fails if anything needs reformatting)
-erlfmt -c src/*.erl test/*.erl
+gmake fmt-check
 
 # Apply formatting
-erlfmt -w src/*.erl test/*.erl
+gmake fmt
+```
+
+If `erlfmt` is not on your PATH, set the `ERLFMT` variable:
+
+```bash
+gmake fmt ERLFMT=/path/to/erlfmt
 ```
 
 Format after finishing a change, not during debugging.
