@@ -18,6 +18,16 @@ include ../../erlang.mk
 
 CT_QUICK_SUITES = api_fs db replica_reader_core replica_reader log_reader fragment_iterator fragment_assembly prop manifest_replica
 
+ERLFMT ?= erlfmt
+ERLFMT_FILES = src/*.erl test/*.erl
+
+.PHONY: fmt fmt-check
+fmt:
+	$(verbose) $(ERLFMT) -w $(ERLFMT_FILES)
+
+fmt-check:
+	$(verbose) $(ERLFMT) -c $(ERLFMT_FILES)
+
 .PHONY: ct-quick
 ct-quick: test-build
 	$(verbose) mkdir -p $(CT_LOGS_DIR)

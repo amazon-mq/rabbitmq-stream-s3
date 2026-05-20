@@ -612,6 +612,9 @@ select_amount_to_send(_ChunkSelector, #{
 }) ->
     {FilterSize, DataSize + TrailerSize}.
 
+verify_crc(Config) ->
+    maps:get(verify_crc_on_read, Config, rabbitmq_stream_s3_config:verify_crc_on_read()).
+
 %% Validates the CRC32 of chunk record data read from the remote tier.
 %% In send_file, Data may include the trailer (DataSize + TrailerSize bytes);
 %% the CRC only covers the first DataSize bytes.
@@ -638,7 +641,7 @@ init_local_reader(OffsetSpec, Config) ->
             {ok, #?MODULE{
                 config = Config,
                 mode = Local,
-                verify_crc = rabbitmq_stream_s3_config:verify_crc_on_read()
+                verify_crc = verify_crc(Config)
             }};
         {error, _} = Err ->
             Err
@@ -669,7 +672,7 @@ init_remote_reader(
             counters:add(counter(), ?C_REMOTE_INIT, 1),
             Reader = #?MODULE{
                 config = Config,
-                verify_crc = rabbitmq_stream_s3_config:verify_crc_on_read(),
+                verify_crc = verify_crc(Config),
                 mode = #remote{
                     pid = Pid,
                     stream = StreamId,

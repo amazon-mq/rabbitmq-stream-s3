@@ -225,6 +225,8 @@ returned by the functional core module.
     persisting_bytes = 0 :: non_neg_integer(),
     %% Monitor ref for the in-flight group upload task.
     group_mon :: reference() | undefined,
+    %% Monitor ref for the in-flight retention evaluation task.
+    retention_mon :: reference() | undefined,
     %% Kind of the group upload currently in flight. Cleared when the
     %% group_upload_result message arrives. Only one rebalance is in
     %% flight at a time so a single slot suffices.
@@ -366,6 +368,17 @@ handle_info(
         execute_effects(Effects, State0#state{
             core = Core, group_mon = undefined, pending_group_kind = undefined
         })};
+handle_info({retention_result, unchanged}, #state{core = Core0, retention_mon = Mon} = State0) ->
+    demonitor(Mon, [flush]),
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:retention_failed(unchanged, Core0),
+    {noreply, execute_effects(Effects, State0#state{core = Core, retention_mon = undefined})};
+handle_info(
+    {retention_result, {Edit, Refs}},
+    #state{core = Core0, retention_mon = Mon, cfg = #cfg{stream = StreamId}} = State0
+) ->
+    demonitor(Mon, [flush]),
+    State = on_remote_retention(Edit, Refs, StreamId, Core0, State0#state{retention_mon = undefined}),
+    {noreply, State};
 handle_info(persist_timer, #state{core = Core0} = State0) ->
     Now = erlang:system_time(millisecond),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:tick(Now, Core0),
@@ -430,6 +443,13 @@ handle_info(
         execute_effects(Effects, State0#state{
             core = Core, group_mon = undefined, pending_group_kind = undefined
         })};
+handle_info(
+    {'DOWN', Mon, process, _, Reason},
+    #state{retention_mon = Mon, core = Core0, cfg = #cfg{stream = StreamId}} = State0
+) ->
+    ?LOG_WARNING("~ts retention evaluation task crashed: ~p", [StreamId, Reason]),
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:retention_failed(Reason, Core0),
+    {noreply, execute_effects(Effects, State0#state{core = Core, retention_mon = undefined})};
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -730,7 +750,7 @@ execute_effect(
     {evaluate_retention, _StreamId, _Dir},
     #state{core = Core, retention = Retention, cfg = Cfg} = State
 ) ->
-    Manifest = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(Core),
+    Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(Core),
     maybe_evaluate_retention(Manifest, State),
     maybe_evaluate_remote_retention(Manifest, Retention, Cfg#cfg.stream, State);
 execute_effect({reply_waiters, Replies}, State) ->
@@ -796,31 +816,68 @@ maybe_evaluate_remote_retention(_Manifest, [], _StreamId, State) ->
 maybe_evaluate_remote_retention(Manifest, Retention, StreamId, #state{core = Core0} = State) ->
     inc(State, ?C_REMOTE_TIER_RETENTION_EVALUATIONS, 1),
     Now = erlang:system_time(millisecond),
-    GetGroupFun = rabbitmq_stream_s3_manifest:get_group_fun(StreamId),
-    case
-        rabbitmq_stream_s3_manifest:evaluate_remote_retention(Manifest, Retention, Now, GetGroupFun)
-    of
+    %% First try without group download (handles fragments-only case synchronously).
+    case rabbitmq_stream_s3_manifest:evaluate_remote_retention(Manifest, Retention, Now) of
         unchanged ->
-            State;
+            %% No leading fragments to remove. If the first entry is a group,
+            %% spawn an async task to download it and evaluate retention within.
+            maybe_spawn_group_retention(Manifest, Retention, Now, StreamId, State);
         {Edit, Refs} ->
-            on_remote_retention_deleted(Refs, State),
-            %% Delete the objects in the background.
-            Keys = lists:map(
-                fun
-                    (#fragment_ref{} = FRef) ->
-                        rabbitmq_stream_s3:fragment_key(StreamId, FRef);
-                    (#group_ref{} = GRef) ->
-                        rabbitmq_stream_s3:group_key(StreamId, GRef)
-                end,
-                Refs
-            ),
-            rabbitmq_stream_s3_reaper:delete_objects(StreamId, Keys),
-            %% Apply the edit to the core's manifest and execute effects.
-            {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:apply_retention_edit(
-                Edit, Core0
-            ),
-            execute_effects(Effects, State#state{core = Core})
+            on_remote_retention(Edit, Refs, StreamId, Core0, State)
     end.
+
+%% Handle a retention result (synchronous fragments-only case or async completion).
+-spec on_remote_retention(#edit{}, [#fragment_ref{} | #group_ref{}], stream_id(), term(), #state{}) ->
+    #state{}.
+on_remote_retention(Edit, Refs, StreamId, Core0, State) ->
+    on_remote_retention_deleted(Refs, State),
+    Keys = lists:map(
+        fun
+            (#fragment_ref{} = FRef) ->
+                rabbitmq_stream_s3:fragment_key(StreamId, FRef);
+            (#group_ref{} = GRef) ->
+                rabbitmq_stream_s3:group_key(StreamId, GRef)
+        end,
+        Refs
+    ),
+    rabbitmq_stream_s3_reaper:delete_objects(StreamId, Keys),
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:retention_complete(Edit, Core0),
+    execute_effects(Effects, State#state{core = Core}).
+
+%% Spawn an async task to evaluate retention within a group object.
+-spec maybe_spawn_group_retention(
+    #manifest{}, [osiris:retention_spec()], integer(), stream_id(), #state{}
+) -> #state{}.
+maybe_spawn_group_retention(
+    #manifest{entries = <<_:64, _:64/signed, _:64/signed, Kind:8, _:40, _:32, _/binary>>} =
+        Manifest,
+    Retention,
+    Now,
+    StreamId,
+    State
+) when Kind =/= ?MANIFEST_KIND_FRAGMENT ->
+    Self = self(),
+    GetGroupFun = rabbitmq_stream_s3_manifest:get_group_fun(StreamId),
+    {_Pid, MonRef} = spawn_monitor(fun() ->
+        logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
+        Result =
+            try
+                rabbitmq_stream_s3_manifest:evaluate_remote_retention(
+                    Manifest, Retention, Now, GetGroupFun
+                )
+            catch
+                Class:Reason:Stack ->
+                    ?LOG_WARNING(
+                        "Retention evaluation crashed: ~p:~p~n~p", [Class, Reason, Stack]
+                    ),
+                    unchanged
+            end,
+        Self ! {retention_result, Result}
+    end),
+    Core = rabbitmq_stream_s3_replica_reader_core:retention_started(State#state.core),
+    State#state{core = Core, retention_mon = MonRef};
+maybe_spawn_group_retention(_Manifest, _Retention, _Now, _StreamId, State) ->
+    State.
 
 %% ------------------------------------------------------------------
 %% Reading

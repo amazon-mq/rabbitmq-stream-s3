@@ -74,6 +74,7 @@ groups() ->
             stream_deletion_cleans_remote_tier,
             discover_attaches_to_existing_writer,
             remote_retention_deletes_fragments,
+            remote_retention_survives_multiple_persist_cycles,
             uploads_rebalance_into_group,
             remote_retention_deletes_within_group,
             old_manifest_roots_deleted
@@ -497,9 +498,39 @@ remote_retention_deletes_fragments(Config) ->
         2000
     ),
 
-    %% Manifest reflects the deletion.
-    {FirstOffset, NextOffset} = get_range(Config),
-    ?assertEqual(10, FirstOffset).
+    %% Manifest reflects the deletion (after the retention persist completes).
+    ?awaitMatch({10, NextOffset}, get_range(Config), 2000).
+
+remote_retention_survives_multiple_persist_cycles(Config) ->
+    %% Exercises the scenario where multiple persist_complete cycles fire
+    %% before the retention edit is persisted. With persist_threshold=1,
+    %% every fragment triggers a persist. Retention must not produce
+    %% duplicate edits (which would crash the replica reader).
+    #{next_offset := NextOffset} = seed_log(Config, [
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]}
+    ]),
+    _Writer = start_writer(
+        Config,
+        #{retention => [{max_bytes, 1000}]},
+        #{fragment_target_size => 500, persist_threshold => 1}
+    ),
+    await_offset(Config, NextOffset),
+
+    %% Remote retention should delete fragments until <= 1000 bytes remain.
+    %% Each fragment is ~600 bytes, so only the last one should survive.
+    ?awaitMatch(
+        [20],
+        list_fragment_offsets(Config),
+        2000
+    ),
+
+    %% The replica reader must still be alive (no crash from duplicate edits).
+    %% get_range advancing proves the retention persist completed successfully.
+    ?awaitMatch({20, NextOffset}, get_range(Config), 2000).
 
 uploads_rebalance_into_group(Config) ->
     %% 5 segments, each producing a fragment (600 bytes > 500 target).
