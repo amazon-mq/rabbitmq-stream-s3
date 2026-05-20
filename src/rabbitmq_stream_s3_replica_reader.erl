@@ -849,7 +849,8 @@ on_remote_retention(Edit, Refs, StreamId, Core0, State) ->
     #manifest{}, [osiris:retention_spec()], integer(), stream_id(), #state{}
 ) -> #state{}.
 maybe_spawn_group_retention(
-    #manifest{entries = <<_:64, _:64/signed, _:64/signed, Kind:8, _:40, _:32, _/binary>>} = Manifest,
+    #manifest{entries = <<_:64, _:64/signed, _:64/signed, Kind:8, _:40, _:32, _/binary>>} =
+        Manifest,
     Retention,
     Now,
     StreamId,
