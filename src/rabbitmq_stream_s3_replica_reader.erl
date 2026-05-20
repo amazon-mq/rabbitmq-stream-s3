@@ -750,7 +750,7 @@ execute_effect(
     {evaluate_retention, _StreamId, _Dir},
     #state{core = Core, retention = Retention, cfg = Cfg} = State
 ) ->
-    Manifest = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(Core),
+    Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(Core),
     maybe_evaluate_retention(Manifest, State),
     maybe_evaluate_remote_retention(Manifest, Retention, Cfg#cfg.stream, State);
 execute_effect({reply_waiters, Replies}, State) ->
