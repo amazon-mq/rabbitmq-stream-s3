@@ -849,7 +849,7 @@ on_remote_retention(Edit, Refs, StreamId, Core0, State) ->
     #manifest{}, [osiris:retention_spec()], integer(), stream_id(), #state{}
 ) -> #state{}.
 maybe_spawn_group_retention(
-    #manifest{entries = <<_:64, _:64/signed, _:64/signed, Kind:8, _:40, _:32, _/binary>>},
+    #manifest{entries = <<_:64, _:64/signed, _:64/signed, Kind:8, _:40, _:32, _/binary>>} = Manifest,
     Retention,
     Now,
     StreamId,
@@ -857,7 +857,6 @@ maybe_spawn_group_retention(
 ) when Kind =/= ?MANIFEST_KIND_FRAGMENT ->
     Self = self(),
     GetGroupFun = rabbitmq_stream_s3_manifest:get_group_fun(StreamId),
-    Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(State#state.core),
     {_Pid, MonRef} = spawn_monitor(fun() ->
         logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
         Result =
