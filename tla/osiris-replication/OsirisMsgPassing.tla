@@ -253,7 +253,7 @@ CoordinatorRestoresVisibilityOfReplica ==
         /\ coord_state[r] = "offline"
         /\ CoordinatorResetsReplica(r)
         /\ start_stop_ctr' = start_stop_ctr + 1
-    /\ UNCHANGED << rep_log, rep_ler, rep_first_offset, rep_max_ler_of_rep, rep_listener,
+    /\ UNCHANGED << rep_log, rep_ler, rep_first_offset,
                     coord_leader, coord_epoch, coord_election, coord_election_ler,
                     confirmed, confirmed_replicas, requests, responses_processed , RemoteVars >>
 

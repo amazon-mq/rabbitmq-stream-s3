@@ -15,13 +15,34 @@ permissions:
   contents: read
 
 jobs:
-  osiris-replication:
+  changes:
     runs-on: ubuntu-latest
-    if: >-
-      github.event_name == 'schedule' ||
-      contains(github.event.head_commit.modified, 'tla/osiris-replication/') ||
-      contains(github.event.head_commit.added, 'tla/osiris-replication/') ||
-      contains(github.event.head_commit.modified, '.github/workflows/tla-model-check.yaml')
+    outputs:
+      osiris: ${{ steps.filter.outputs.osiris }}
+      manifest: ${{ steps.filter.outputs.manifest }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Detect changed paths
+        id: filter
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE=${{ github.event.pull_request.base.sha }}
+          else
+            BASE=${{ github.event.before }}
+          fi
+          CHANGED=$(git diff --name-only "$BASE" HEAD)
+          echo "osiris=false" >> "$GITHUB_OUTPUT"
+          echo "manifest=false" >> "$GITHUB_OUTPUT"
+          echo "$CHANGED" | grep -q '^tla/osiris-replication/' && echo "osiris=true" >> "$GITHUB_OUTPUT" || true
+          echo "$CHANGED" | grep -q '^tla/manifest-replication/' && echo "manifest=true" >> "$GITHUB_OUTPUT" || true
+          echo "$CHANGED" | grep -q '^\.github/workflows/tla-model-check\.yaml' && { echo "osiris=true" >> "$GITHUB_OUTPUT"; echo "manifest=true" >> "$GITHUB_OUTPUT"; } || true
+
+  osiris-replication:
+    needs: changes
+    if: needs.changes.outputs.osiris == 'true' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-java@v5
@@ -36,12 +57,9 @@ jobs:
           timeout 300 java -XX:+UseParallelGC -jar ../../tla2tools.jar -simulate -depth 500 -workers auto -deadlock MC.tla || [ $? -eq 124 ]
 
   manifest-replication:
+    needs: changes
+    if: needs.changes.outputs.manifest == 'true' || github.event_name == 'schedule'
     runs-on: ubuntu-latest
-    if: >-
-      github.event_name == 'schedule' ||
-      contains(github.event.head_commit.modified, 'tla/manifest-replication/') ||
-      contains(github.event.head_commit.added, 'tla/manifest-replication/') ||
-      contains(github.event.head_commit.modified, '.github/workflows/tla-model-check.yaml')
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-java@v5

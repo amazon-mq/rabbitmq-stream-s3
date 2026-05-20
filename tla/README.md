@@ -36,18 +36,22 @@ Files:
 - `SeqBounded` - no replica's sequence exceeds the writer's
 - `ReplicaConsistent` - any replica in "ok" state holds a valid prefix of the writer's history
 
-**Results:** 2 replicas, 4 edits, channel depth 3. TLC explores 2.2M states (229K distinct) in ~6 seconds with no invariant violations.
+**Results:** The state space with the current parameters (2 replicas, 3 edits, 3 epochs, channel depth 2) is too large for exhaustive model checking. Use simulation mode.
 
 ## Running
 
 Requires [TLA+ tools](https://github.com/tlaplus/tlaplus/releases) (TLC).
 
-```bash
-# Manifest replication model (exhaustive, ~6 seconds)
-cd manifest-replication/
-tlc ManifestReplicationMC -config ManifestReplication.cfg
+Both models are too large for exhaustive checking with their current parameters. Use simulation mode:
 
-# Osiris replication model (simulation mode, bounded time)
+```bash
+# Manifest replication model (simulation)
+cd manifest-replication/
+timeout 3600 tlc -simulate -depth 5000 -workers auto ManifestReplicationMC -config ManifestReplication.cfg
+
+# Osiris replication model (simulation)
 cd osiris-replication/
-tlc -simulate -depth 500 -workers auto MC
+timeout 3600 tlc -simulate -depth 5000 -workers auto MC
 ```
+
+Simulation mode explores random traces and reports invariant violations immediately when found. Increase the timeout for longer runs. Increase `-depth` for longer traces.
