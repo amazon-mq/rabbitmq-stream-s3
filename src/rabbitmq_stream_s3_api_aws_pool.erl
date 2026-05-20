@@ -392,6 +392,11 @@ open() ->
         %% AWS S3 only supports HTTP/1.1.
         protocols => [http],
         tls_opts => [
+            {verify, verify_peer},
+            {cacerts, public_key:cacerts_get()},
+            {customize_hostname_check, [
+                {match_fun, public_key:pkix_verify_hostname_match_fun(https)}
+            ]},
             %% Connections are mostly data pipes for large refc binaries.
             %% Full sweeps are nearly free since the process's heap doesn't
             %% contain much, and the immediate cleanup of dead refc binary
