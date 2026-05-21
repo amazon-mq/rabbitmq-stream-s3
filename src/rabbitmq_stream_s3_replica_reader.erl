@@ -227,6 +227,10 @@ returned by the functional core module.
     group_mon :: reference() | undefined,
     %% Monitor ref for the in-flight retention evaluation task.
     retention_mon :: reference() | undefined,
+    %% PID of the in-flight retention evaluation task.
+    retention_pid :: pid() | undefined,
+    %% Timer ref for the retention task timeout.
+    retention_timer :: reference() | undefined,
     %% Kind of the group upload currently in flight. Cleared when the
     %% group_upload_result message arrives. Only one rebalance is in
     %% flight at a time so a single slot suffices.
@@ -368,16 +372,49 @@ handle_info(
         execute_effects(Effects, State0#state{
             core = Core, group_mon = undefined, pending_group_kind = undefined
         })};
-handle_info({retention_result, unchanged}, #state{core = Core0, retention_mon = Mon} = State0) ->
-    demonitor(Mon, [flush]),
-    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:retention_failed(unchanged, Core0),
-    {noreply, execute_effects(Effects, State0#state{core = Core, retention_mon = undefined})};
 handle_info(
-    {retention_result, {Edit, Refs}},
-    #state{core = Core0, retention_mon = Mon, cfg = #cfg{stream = StreamId}} = State0
+    {retention_result, unchanged},
+    #state{core = Core0, retention_mon = Mon, retention_timer = TRef} = State0
 ) ->
     demonitor(Mon, [flush]),
-    State = on_remote_retention(Edit, Refs, StreamId, Core0, State0#state{retention_mon = undefined}),
+    _ = cancel_timer(TRef),
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:retention_failed(unchanged, Core0),
+    {noreply,
+        execute_effects(Effects, State0#state{
+            core = Core,
+            retention_mon = undefined,
+            retention_pid = undefined,
+            retention_timer = undefined
+        })};
+handle_info(
+    {retention_result, {Edit, Refs}},
+    #state{core = Core0, retention_mon = Mon, retention_timer = TRef, cfg = #cfg{stream = StreamId}} =
+        State0
+) ->
+    demonitor(Mon, [flush]),
+    _ = cancel_timer(TRef),
+    State = on_remote_retention(Edit, Refs, StreamId, Core0, State0#state{
+        retention_mon = undefined, retention_pid = undefined, retention_timer = undefined
+    }),
+    {noreply, State};
+handle_info(
+    retention_timeout,
+    #state{retention_mon = Mon, retention_pid = Pid, core = Core0, cfg = #cfg{stream = StreamId}} =
+        State0
+) when Mon =/= undefined ->
+    ?LOG_WARNING("~ts retention evaluation task timed out, killing", [StreamId]),
+    exit(Pid, kill),
+    demonitor(Mon, [flush]),
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:retention_failed(timeout, Core0),
+    {noreply,
+        execute_effects(Effects, State0#state{
+            core = Core,
+            retention_mon = undefined,
+            retention_pid = undefined,
+            retention_timer = undefined
+        })};
+handle_info(retention_timeout, State) ->
+    %% Stale timeout after normal completion; ignore.
     {noreply, State};
 handle_info(persist_timer, #state{core = Core0} = State0) ->
     Now = erlang:system_time(millisecond),
@@ -445,11 +482,19 @@ handle_info(
         })};
 handle_info(
     {'DOWN', Mon, process, _, Reason},
-    #state{retention_mon = Mon, core = Core0, cfg = #cfg{stream = StreamId}} = State0
+    #state{retention_mon = Mon, retention_timer = TRef, core = Core0, cfg = #cfg{stream = StreamId}} =
+        State0
 ) ->
     ?LOG_WARNING("~ts retention evaluation task crashed: ~p", [StreamId, Reason]),
+    _ = cancel_timer(TRef),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:retention_failed(Reason, Core0),
-    {noreply, execute_effects(Effects, State0#state{core = Core, retention_mon = undefined})};
+    {noreply,
+        execute_effects(Effects, State0#state{
+            core = Core,
+            retention_mon = undefined,
+            retention_pid = undefined,
+            retention_timer = undefined
+        })};
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -858,7 +903,7 @@ maybe_spawn_group_retention(
 ) when Kind =/= ?MANIFEST_KIND_FRAGMENT ->
     Self = self(),
     GetGroupFun = rabbitmq_stream_s3_manifest:get_group_fun(StreamId),
-    {_Pid, MonRef} = spawn_monitor(fun() ->
+    {Pid, MonRef} = spawn_monitor(fun() ->
         logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
         Result =
             try
@@ -875,7 +920,9 @@ maybe_spawn_group_retention(
         Self ! {retention_result, Result}
     end),
     Core = rabbitmq_stream_s3_replica_reader_core:retention_started(State#state.core),
-    State#state{core = Core, retention_mon = MonRef};
+    Timeout = rabbitmq_stream_s3_config:retention_task_timeout(),
+    TRef = erlang:send_after(Timeout, Self, retention_timeout),
+    State#state{core = Core, retention_mon = MonRef, retention_pid = Pid, retention_timer = TRef};
 maybe_spawn_group_retention(_Manifest, _Retention, _Now, _StreamId, State) ->
     State.
 
