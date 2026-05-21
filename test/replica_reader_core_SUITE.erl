@@ -63,6 +63,8 @@ all() ->
         retention_defers_persist,
         retention_edit_broadcast_on_persist_complete,
         retention_failed_clears_flag,
+        persist_failed_during_rebalance_retries_after,
+        recursive_rebalance_three_levels_deep,
         %% Edge cases
         fatal_front_drains_buffered_completions,
         await_offset_satisfied_during_cascading_persist,
@@ -776,6 +778,107 @@ group_upload_failed_fatal_abandons(_Config) ->
     Persists = [E || {start_persist, _, _, _, _, _} = E <- Effects],
     ?assertEqual([], UploadGroups),
     ?assertMatch([_], Persists).
+
+persist_failed_during_rebalance_retries_after(_Config) ->
+    %% Persist fires (threshold=2), then rebalance triggers (threshold=4).
+    %% Persist fails with a transient error while rebalance_in_flight = true.
+    %% The retry is blocked. After group_upload_complete, persist fires.
+    Threshold = 4,
+    {S0, _} = init_core(#{persist_threshold => 2, rebalance_threshold => Threshold}),
+    %% Apply 2 fragments → persist fires.
+    S1 = cut_and_complete(S0, 0, 100, 1001),
+    S2 = cut_and_complete(S1, 100, 200, 1002),
+    %% Persist is now in flight. Apply 2 more → rebalance triggers.
+    S3 = cut_and_complete(S2, 200, 300, 1003),
+    {S4, Ref4, _} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(300, 400), S3),
+    {S5, Effects5} = rabbitmq_stream_s3_replica_reader_core:transfer_complete(Ref4, 1004, S4),
+    %% Rebalance should have triggered.
+    ?assertMatch([_], [E || {upload_group, _, _, _, _, _} = E <- Effects5]),
+    %% Persist fails with transient error. Retry is blocked by rebalance.
+    {S6, FailEffects} = rabbitmq_stream_s3_replica_reader_core:persist_failed(s3_error, S5),
+    %% Should get a timer (fallback) but no start_persist.
+    ?assertEqual([], [E || {start_persist, _, _, _, _, _} = E <- FailEffects]),
+    ?assertMatch([{start_persist_timer, _}], [E || {start_persist_timer, _} = E <- FailEffects]),
+    %% Tick is also blocked by rebalance_in_flight.
+    Now = erlang:system_time(millisecond) + 100000,
+    {S7, TickEffects} = rabbitmq_stream_s3_replica_reader_core:tick(Now, S6),
+    ?assertEqual([], TickEffects),
+    %% Group upload completes. Persist should now fire.
+    {_S8, CompleteEffects} = rabbitmq_stream_s3_replica_reader_core:group_upload_complete(
+        9999, S7
+    ),
+    ?assertMatch([_], [E || {start_persist, _, _, _, _, _} = E <- CompleteEffects]).
+
+recursive_rebalance_three_levels_deep(_Config) ->
+    %% Start with a manifest that has Threshold-1 kilo-group entries and
+    %% Threshold-1 group entries. Adding Threshold fragments triggers:
+    %% 1. fragments → group (brings group count to Threshold)
+    %% 2. groups → kilo-group (brings kilo-group count to Threshold)
+    %% 3. kilo-groups → mega-group
+    Threshold = 4,
+    %% Build Threshold-1 kilo-group entries.
+    KiloEntries = lists:foldl(
+        fun(I, Acc) ->
+            Offset = I * 1_000_000,
+            FTs = I * 100_000,
+            LTs = (I + 1) * 100_000,
+            Uid = 7000 + I,
+            E = ?ENTRY(Offset, FTs, LTs, ?MANIFEST_KIND_KILO_GROUP, 0, Uid),
+            <<Acc/binary, E/binary>>
+        end,
+        <<>>,
+        lists:seq(0, Threshold - 2)
+    ),
+    %% Then Threshold-1 group entries after the kilo-groups.
+    KiloEnd = (Threshold - 1) * 1_000_000,
+    GroupEntries = lists:foldl(
+        fun(I, Acc) ->
+            Offset = KiloEnd + I * 10_000,
+            FTs = (Threshold - 1) * 100_000 + I * 1000,
+            LTs = (Threshold - 1) * 100_000 + (I + 1) * 1000,
+            Uid = 8000 + I,
+            E = ?ENTRY(Offset, FTs, LTs, ?MANIFEST_KIND_GROUP, 0, Uid),
+            <<Acc/binary, E/binary>>
+        end,
+        <<>>,
+        lists:seq(0, Threshold - 2)
+    ),
+    AllEntries = <<KiloEntries/binary, GroupEntries/binary>>,
+    BaseOffset = KiloEnd + (Threshold - 1) * 10_000,
+    Manifest = #manifest{
+        first_offset = 0,
+        first_timestamp = 0,
+        first_last_timestamp = 100_000,
+        next_offset = BaseOffset,
+        total_size = 0,
+        entries = AllEntries
+    },
+    {S0, _} = init_core_with_manifest(Manifest, #{
+        rebalance_threshold => Threshold, persist_threshold => 100
+    }),
+    %% Apply Threshold fragments → triggers fragments→group.
+    S1 = lists:foldl(
+        fun(I, Acc) ->
+            Offset = BaseOffset + I * 100,
+            cut_and_complete(Acc, Offset, Offset + 100, 3000 + I)
+        end,
+        S0,
+        lists:seq(0, Threshold - 1)
+    ),
+    %% Complete group upload (fragments→group). Now Threshold groups exist → kilo-group.
+    {S2, E1} = rabbitmq_stream_s3_replica_reader_core:group_upload_complete(8888, S1),
+    ?assertMatch([_], [E || {upload_group, _, ?MANIFEST_KIND_KILO_GROUP, _, _, _} = E <- E1]),
+    %% Complete kilo-group upload. Now Threshold kilo-groups exist → mega-group.
+    {S3, E2} = rabbitmq_stream_s3_replica_reader_core:group_upload_complete(7777, S2),
+    ?assertMatch([_], [E || {upload_group, _, ?MANIFEST_KIND_MEGA_GROUP, _, _, _} = E <- E2]),
+    %% Complete mega-group upload. No further rebalancing needed.
+    {S4, E3} = rabbitmq_stream_s3_replica_reader_core:group_upload_complete(6666, S3),
+    ?assertEqual([], [E || {upload_group, _, _, _, _, _} = E <- E3]),
+    %% Final manifest should have 1 mega-group entry.
+    M = rabbitmq_stream_s3_replica_reader_core:manifest(S4),
+    ?assertEqual(?ENTRY_B, byte_size(M#manifest.entries)),
+    <<_:64, _:64/signed, _:64/signed, Kind:8, _:40, _:32>> = M#manifest.entries,
+    ?assertEqual(?MANIFEST_KIND_MEGA_GROUP, Kind).
 
 %% ------------------------------------------------------------------
 %% Retention tests
