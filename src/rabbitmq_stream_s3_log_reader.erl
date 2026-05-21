@@ -349,7 +349,9 @@ send_file(
                             Err
                     end;
                 end_of_stream ->
-                    {end_of_stream, State0#?MODULE{mode = Remote1}}
+                    {end_of_stream, State0#?MODULE{mode = Remote1}};
+                {error, timeout} = Err ->
+                    Err
             end;
         {become_local, _} ->
             counters:add(counter(), ?C_REMOTE_CLOSE, 1),
@@ -360,7 +362,9 @@ send_file(
                     Err
             end;
         {end_of_stream, Remote} ->
-            {end_of_stream, State0#?MODULE{mode = Remote}}
+            {end_of_stream, State0#?MODULE{mode = Remote}};
+        {error, timeout} = Err ->
+            Err
     end;
 send_file(Socket, #?MODULE{mode = Local0} = State0, Callback) ->
     case osiris_log:send_file(Socket, Local0, Callback) of
@@ -433,7 +437,9 @@ chunk_iterator(
                             Err
                     end;
                 end_of_stream ->
-                    {end_of_stream, State0#?MODULE{mode = Remote1}}
+                    {end_of_stream, State0#?MODULE{mode = Remote1}};
+                {error, timeout} = Err ->
+                    Err
             end;
         {become_local, _} ->
             counters:add(counter(), ?C_REMOTE_CLOSE, 1),
@@ -444,7 +450,9 @@ chunk_iterator(
                     Err
             end;
         {end_of_stream, Remote} ->
-            {end_of_stream, State0#?MODULE{mode = Remote}}
+            {end_of_stream, State0#?MODULE{mode = Remote}};
+        {error, timeout} = Err ->
+            Err
     end;
 chunk_iterator(#?MODULE{mode = Local0} = State0, Credit, PrevIter) ->
     case osiris_log:chunk_iterator(Local0, Credit, PrevIter) of
@@ -508,7 +516,8 @@ send(ssl, Socket, Data) ->
 -spec read_header(#remote{}) ->
     {ok, osiris_log:header_map(), #remote{}}
     | {become_local, osiris:offset()}
-    | {end_of_stream, #remote{}}.
+    | {end_of_stream, #remote{}}
+    | {error, timeout}.
 read_header(#remote{shared = Shared, next_offset = NextOffset} = Remote) ->
     CanReadNext =
         osiris_log_shared:last_chunk_id(Shared) >= NextOffset andalso
@@ -538,7 +547,9 @@ read_header1(
         {become_local, Offset} ->
             {become_local, Offset};
         end_of_stream ->
-            {end_of_stream, Remote0}
+            {end_of_stream, Remote0};
+        {error, timeout} = Err ->
+            Err
     end.
 
 read_header2(
@@ -860,7 +871,8 @@ resolve_first(StreamId, FirstOffset) ->
     {ok, binary()}
     | {next_fragment, osiris:offset()}
     | {become_local, osiris:offset()}
-    | end_of_stream.
+    | end_of_stream
+    | {error, timeout}.
 read(RemoteReader, Offset, Bytes, Hint) ->
     {Ms, Result} = timer:tc(
         rabbitmq_stream_s3_remote_reader,
