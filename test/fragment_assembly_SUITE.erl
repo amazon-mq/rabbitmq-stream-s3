@@ -19,7 +19,10 @@ all() ->
         multi_segment_spans,
         metadata_correct,
         index_records_single_span,
-        index_records_multi_span
+        index_records_multi_span,
+        cut_at_segment_boundary,
+        single_chunk_exceeds_target,
+        zero_size_chunk_no_cut
     ].
 
 init_per_suite(Config) -> Config.
@@ -136,6 +139,40 @@ index_records_multi_span(_Config) ->
             500:32/unsigned>>,
         Idx
     ).
+
+cut_at_segment_boundary(_Config) ->
+    %% First chunk in segment 0, second chunk in segment 512000.
+    %% The second chunk also causes the cut (exceeds target).
+    %% Both spans must be recorded in metadata.
+    S0 = rabbitmq_stream_s3_fragment_assembly:new(1000),
+    S1 = rabbitmq_stream_s3_fragment_assembly:add_chunk(
+        chunk(0, 100, 500, 0, 8, 508), S0
+    ),
+    ?assertNot(rabbitmq_stream_s3_fragment_assembly:is_cut(S1)),
+    S2 = rabbitmq_stream_s3_fragment_assembly:add_chunk(
+        chunk(50, 200, 600, 512000, 8, 608), S1
+    ),
+    ?assert(rabbitmq_stream_s3_fragment_assembly:is_cut(S2)),
+    Meta = rabbitmq_stream_s3_fragment_assembly:metadata(S2),
+    ?assertEqual([{0, 8, 508}, {512000, 8, 608}], maps:get(spans, Meta)).
+
+single_chunk_exceeds_target(_Config) ->
+    %% A single chunk whose data_size exceeds the target cuts immediately.
+    S0 = rabbitmq_stream_s3_fragment_assembly:new(1000),
+    S1 = rabbitmq_stream_s3_fragment_assembly:add_chunk(chunk(0, 100, 5000), S0),
+    ?assert(rabbitmq_stream_s3_fragment_assembly:is_cut(S1)),
+    Meta = rabbitmq_stream_s3_fragment_assembly:metadata(S1),
+    ?assertEqual(1, maps:get(num_chunks, Meta)),
+    ?assertEqual(5000, maps:get(size, Meta)).
+
+zero_size_chunk_no_cut(_Config) ->
+    %% A chunk with data_size = 0 (e.g. tracking chunk) must not trigger a cut.
+    S0 = rabbitmq_stream_s3_fragment_assembly:new(1000),
+    S1 = rabbitmq_stream_s3_fragment_assembly:add_chunk(chunk(0, 100, 0), S0),
+    ?assertNot(rabbitmq_stream_s3_fragment_assembly:is_cut(S1)),
+    %% Multiple zero-size chunks still don't cut.
+    S2 = rabbitmq_stream_s3_fragment_assembly:add_chunk(chunk(50, 200, 0), S1),
+    ?assertNot(rabbitmq_stream_s3_fragment_assembly:is_cut(S2)).
 
 %% ------------------------------------------------------------------
 %% Helpers
