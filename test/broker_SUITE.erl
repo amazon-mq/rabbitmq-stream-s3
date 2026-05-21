@@ -47,7 +47,7 @@ init_per_group(cluster_size_3, Config) ->
     Config2 = rabbit_ct_helpers:merge_app_env(Config1, [
         {rabbitmq_stream_s3, [
             {rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_fs},
-            {fragment_target_size, 1000},
+            {fragment_target_size, 1},
             {persist_threshold, 1},
             {api_fs_data_dir, DataDir}
         ]}
