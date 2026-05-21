@@ -65,6 +65,7 @@ all() ->
         retention_failed_clears_flag,
         persist_failed_during_rebalance_retries_after,
         recursive_rebalance_three_levels_deep,
+        multiple_persist_conflicts_reinitialize,
         %% Edge cases
         fatal_front_drains_buffered_completions,
         await_offset_satisfied_during_cascading_persist,
@@ -1006,6 +1007,70 @@ retention_failed_clears_flag(_Config) ->
     {_S6, Effects} = rabbitmq_stream_s3_replica_reader_core:tick(Now, S5),
     Persists = [E || {start_persist, _, _, _, _, _} = E <- Effects],
     ?assertMatch([_], Persists).
+
+multiple_persist_conflicts_reinitialize(_Config) ->
+    %% 3 consecutive persist conflicts. Each triggers reinitialize.
+    %% After each reinit, the core is re-initialized with the "resolved"
+    %% manifest and continues operating normally. No leaked state.
+    Opts = #{persist_threshold => 1},
+    %% Cycle 1: cut, complete, persist fires, conflict.
+    {S0, _} = init_core(Opts),
+    S1 = cut_and_complete(S0, 0, 100, 1001),
+    {_S2, E1} = rabbitmq_stream_s3_replica_reader_core:persist_failed(conflict, S1),
+    ?assertEqual([reinitialize], E1),
+    %% Reinit with manifest at next_offset=100 (simulating resolved manifest).
+    Manifest1 = #manifest{
+        first_offset = 0,
+        first_timestamp = 0,
+        first_last_timestamp = 99000,
+        next_offset = 100,
+        total_size = 64_000_000,
+        entries = ?ENTRY(0, 0, 99000, ?MANIFEST_KIND_FRAGMENT, 64_000_000, 1001)
+    },
+    {S3, _} = init_core_with_manifest(Manifest1, Opts),
+    %% Cycle 2: cut, complete, persist fires, conflict.
+    S4 = cut_and_complete(S3, 100, 200, 1002),
+    {_S5, E2} = rabbitmq_stream_s3_replica_reader_core:persist_failed(conflict, S4),
+    ?assertEqual([reinitialize], E2),
+    %% Reinit with manifest at next_offset=200.
+    Manifest2 = #manifest{
+        first_offset = 0,
+        first_timestamp = 0,
+        first_last_timestamp = 199000,
+        next_offset = 200,
+        total_size = 128_000_000,
+        entries = <<
+            (Manifest1#manifest.entries)/binary,
+            (?ENTRY(100, 100000, 199000, ?MANIFEST_KIND_FRAGMENT, 64_000_000, 1002))/binary
+        >>
+    },
+    {S6, _} = init_core_with_manifest(Manifest2, Opts),
+    %% Cycle 3: same pattern.
+    S7 = cut_and_complete(S6, 200, 300, 1003),
+    {_S8, E3} = rabbitmq_stream_s3_replica_reader_core:persist_failed(conflict, S7),
+    ?assertEqual([reinitialize], E3),
+    %% Reinit and verify normal operation resumes.
+    Manifest3 = #manifest{
+        first_offset = 0,
+        first_timestamp = 0,
+        first_last_timestamp = 299000,
+        next_offset = 300,
+        total_size = 192_000_000,
+        entries = <<
+            (Manifest2#manifest.entries)/binary,
+            (?ENTRY(200, 200000, 299000, ?MANIFEST_KIND_FRAGMENT, 64_000_000, 1003))/binary
+        >>
+    },
+    {S9, _} = init_core_with_manifest(Manifest3, Opts),
+    %% After 3 conflicts, the core operates normally.
+    S10 = cut_and_complete(S9, 300, 400, 1004),
+    %% Persist fires (threshold=1). Complete it successfully this time.
+    {S11, PEffects} = rabbitmq_stream_s3_replica_reader_core:persist_complete(1, S10),
+    ?assertMatch([_ | _], [E || {update_range, _, _} = E <- PEffects]),
+    ?assertMatch([_ | _], [E || {broadcast, _, _} = E <- PEffects]),
+    ?assertEqual(
+        400, (rabbitmq_stream_s3_replica_reader_core:persisted_manifest(S11))#manifest.next_offset
+    ).
 
 %% ------------------------------------------------------------------
 %% Edge case tests
