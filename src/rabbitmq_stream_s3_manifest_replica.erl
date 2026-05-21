@@ -90,6 +90,7 @@ get_manifest(StreamId) ->
 -spec get_range(stream_id()) -> rabbitmq_stream_s3:range().
 get_range(StreamId) ->
     case ets:lookup(?TABLE, StreamId) of
+        [{_, #manifest{entries = <<>>}}] -> empty;
         [{_, #manifest{first_offset = First, next_offset = Next}}] -> {First, Next};
         [] -> empty
     end.

@@ -69,7 +69,9 @@ all() ->
         fatal_front_drains_buffered_completions,
         await_offset_satisfied_during_cascading_persist,
         tick_fires_at_exact_interval_boundary,
-        retention_and_rebalance_same_persist_cycle
+        retention_and_rebalance_same_persist_cycle,
+        retention_deletes_all_entries,
+        new_fragment_after_empty_manifest
     ].
 
 init_per_suite(Config) -> Config.
@@ -1103,6 +1105,54 @@ retention_and_rebalance_same_persist_cycle(_Config) ->
     To = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(S7),
     [Edits] = [Es || {broadcast, _, Es} <- Effects],
     assert_edits_reproduce_manifest(From, To, Edits).
+
+retention_deletes_all_entries(_Config) ->
+    %% Retention removes all entries. Manifest becomes empty.
+    {S0, _} = init_core(#{persist_threshold => 100}),
+    S1 = cut_and_complete(S0, 0, 100, 1001),
+    S2 = cut_and_complete(S1, 100, 200, 1002),
+    %% Remove both entries.
+    RetEdit = #edit{
+        first_offset = 200,
+        first_timestamp = -1,
+        first_last_timestamp = -1,
+        next_offset = undefined,
+        size = -128_000_000,
+        entries = <<>>,
+        pos = 0,
+        len = 2 * ?ENTRY_B
+    },
+    {S3, _Effects} = rabbitmq_stream_s3_replica_reader_core:retention_complete(RetEdit, S2),
+    Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(S3),
+    ?assertEqual(<<>>, Manifest#manifest.entries),
+    ?assertEqual(200, Manifest#manifest.first_offset),
+    ?assertEqual(200, Manifest#manifest.next_offset).
+
+new_fragment_after_empty_manifest(_Config) ->
+    %% After retention empties the manifest, new fragments append correctly.
+    %% The first fragment sets first_offset (same as a fresh manifest).
+    {S0, _} = init_core(#{persist_threshold => 100}),
+    S1 = cut_and_complete(S0, 0, 100, 1001),
+    RetEdit = #edit{
+        first_offset = 100,
+        first_timestamp = -1,
+        first_last_timestamp = -1,
+        next_offset = undefined,
+        size = -64_000_000,
+        entries = <<>>,
+        pos = 0,
+        len = ?ENTRY_B
+    },
+    {S2, _} = rabbitmq_stream_s3_replica_reader_core:retention_complete(RetEdit, S1),
+    %% Manifest is empty.
+    M1 = rabbitmq_stream_s3_replica_reader_core:manifest(S2),
+    ?assertEqual(<<>>, M1#manifest.entries),
+    %% New fragment appends successfully and sets first_offset.
+    S3 = cut_and_complete(S2, 200, 300, 1002),
+    M2 = rabbitmq_stream_s3_replica_reader_core:manifest(S3),
+    ?assertEqual(?ENTRY_B, byte_size(M2#manifest.entries)),
+    ?assertEqual(200, M2#manifest.first_offset),
+    ?assertEqual(300, M2#manifest.next_offset).
 
 %% ------------------------------------------------------------------
 %% Helpers

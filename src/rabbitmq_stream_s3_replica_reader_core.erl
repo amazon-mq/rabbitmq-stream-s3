@@ -461,8 +461,10 @@ apply_fragment(
         len = 0
     },
     Edit1 =
-        case Manifest0#manifest.next_offset of
-            0 ->
+        case Manifest0#manifest.entries of
+            <<>> ->
+                %% Empty manifest (fresh stream or fully retained). The first
+                %% fragment sets the manifest's position metadata.
                 Edit#edit{
                     first_offset = FirstOffset,
                     first_timestamp = FirstTs,

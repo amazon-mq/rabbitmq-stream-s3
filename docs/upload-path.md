@@ -158,7 +158,7 @@ After local retention, the shell evaluates the user's retention policy (max-byte
 3. Send the fragment keys to the reaper for deletion.
 4. Broadcast the edit to replica nodes.
 
-Remote retention keeps at least one entry in the manifest to preserve position metadata.
+Remote retention can delete all entries from the manifest. When the manifest is empty, the remote tier is invisible to consumers and `get_range` returns `empty`.
 
 When the first entry in the root is a group, retention downloads the group object and evaluates the policy against its fragment entries. Fragments are deleted individually. If the entire group is consumed, the group entry is removed from the root and the group object is deleted. If partially consumed, the root's metadata (first_offset, first_timestamp, total_size) is updated to reflect the oldest surviving fragment. See [manifest.md](./manifest.md) "Retention within groups" for details.
 

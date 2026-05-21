@@ -78,6 +78,7 @@ groups() ->
             remote_retention_survives_multiple_persist_cycles,
             uploads_rebalance_into_group,
             remote_retention_deletes_within_group,
+            remote_retention_deletes_all_fragments,
             old_manifest_roots_deleted
         ]},
         {with_replica, [], [
@@ -657,6 +658,38 @@ remote_retention_deletes_within_group(Config) ->
     %% Range reflects the deletion.
     {FirstOffset, NextOffset} = get_range(Config),
     ?assertEqual(20, FirstOffset).
+
+remote_retention_deletes_all_fragments(Config) ->
+    %% 4 segments, each producing a fragment (600 bytes > 500 target).
+    %% Rebalance threshold = 4: all 4 fragments factored into a group.
+    %% The root then has exactly 1 group entry and 0 trailing fragments.
+    %% max_bytes = 1 forces retention to delete all fragments in the group,
+    %% removing the group entry and leaving the manifest empty.
+    %% The system must handle this gracefully: no crash, range becomes empty,
+    %% and the replica reader continues operating.
+    StreamId = ?config(stream_id, Config),
+    #{next_offset := NextOffset} = seed_log(Config, [
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]}
+    ]),
+    _Writer = start_writer(
+        Config,
+        #{retention => [{max_bytes, 1}]},
+        #{fragment_target_size => 500, rebalance_threshold => 4}
+    ),
+    await_offset(Config, NextOffset),
+
+    %% Remote retention should delete all fragments and the group.
+    %% The range becomes empty (no remote data).
+    ?awaitMatch(empty, get_range(Config), 2000),
+
+    %% No fragment objects remain.
+    ?awaitMatch([], list_fragment_offsets(Config), 2000),
+
+    %% The replica reader is still alive.
+    ?assert(is_pid(rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}))).
 
 old_manifest_roots_deleted(Config) ->
     StreamId = ?config(stream_id, Config),

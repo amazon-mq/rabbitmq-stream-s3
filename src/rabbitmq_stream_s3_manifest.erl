@@ -192,10 +192,10 @@ remove_for_max_bytes(<<>>, _TotalSize, _MaxBytes, N) ->
 remove_for_max_bytes(Entries, TotalSize, MaxBytes, N) ->
     <<_Offset:64, _FirstTs:64, _LastTs:64, Kind:8, Size:40, _Uid:32, Rest/binary>> = Entries,
     case Kind of
-        ?MANIFEST_KIND_FRAGMENT when Rest =/= <<>> ->
+        ?MANIFEST_KIND_FRAGMENT ->
             remove_for_max_bytes(Rest, TotalSize - Size, MaxBytes, N + 1);
         _ ->
-            %% Hit a group entry or last entry. Stop here.
+            %% Hit a group entry. Stop here (group retention handles it).
             N
     end.
 
@@ -205,7 +205,7 @@ remove_for_max_age(Entries, Cutoff, N) ->
     <<_Offset:64, _FirstTs:64/signed, LastTs:64/signed, Kind:8, _Size:40, _Uid:32, Rest/binary>> =
         Entries,
     case Kind of
-        ?MANIFEST_KIND_FRAGMENT when LastTs < Cutoff andalso Rest =/= <<>> ->
+        ?MANIFEST_KIND_FRAGMENT when LastTs < Cutoff ->
             remove_for_max_age(Rest, Cutoff, N + 1);
         _ ->
             N

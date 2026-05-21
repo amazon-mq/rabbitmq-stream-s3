@@ -205,7 +205,7 @@ After each durable commit, the replica reader evaluates the user's retention pol
 
 Remote retention only evaluates fragment entries at the head of the root. If the root starts with a group entry, retention downloads the group object and evaluates the policy against its fragment entries. Fragments are deleted individually. When all fragments in a group are expired, the group entry is removed from the root and the group object is deleted. See [manifest.md](./manifest.md) for details.
 
-At least one entry is always kept in the manifest to preserve the stream's position metadata.
+Retention can delete all entries from the manifest. An empty manifest (`entries = <<>>`) signals "no remote data available" and the remote tier becomes invisible to consumers. The `next_offset` is preserved in the manifest root so the replica reader knows where to resume uploading.
 
 ## Offset listener and event formatter
 
