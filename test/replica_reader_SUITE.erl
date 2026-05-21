@@ -79,7 +79,8 @@ groups() ->
             uploads_rebalance_into_group,
             remote_retention_deletes_within_group,
             remote_retention_deletes_all_fragments,
-            old_manifest_roots_deleted
+            old_manifest_roots_deleted,
+            attach_to_stream_with_prior_retention
         ]},
         {with_replica, [], [
             replication_happy_path
@@ -716,6 +717,52 @@ old_manifest_roots_deleted(Config) ->
         end,
         2000
     ).
+
+attach_to_stream_with_prior_retention(Config) ->
+    %% Simulates enabling the plugin on a stream that has already undergone
+    %% local retention. Start a writer without hooks, write enough to trigger
+    %% retention, then restart with hooks enabled.
+    WriterCfg0 = ?config(writer_cfg, Config),
+
+    %% Phase 1: writer without plugin hooks, small segments, tight retention.
+    WriterCfg1 = maps:merge(WriterCfg0, #{
+        max_segment_size_bytes => 500,
+        retention => [{max_bytes, 1000}],
+        log_hooks => undefined
+    }),
+    {ok, Writer1} = osiris_writer:start(WriterCfg1),
+    Record = binary:copy(<<"R">>, 300),
+    lists:foreach(
+        fun(_) ->
+            osiris_writer:write(Writer1, Record),
+            flush_writer(Writer1)
+        end,
+        lists:seq(1, 20)
+    ),
+    %% Wait for retention to delete old segments.
+    ?awaitMatch(
+        [First | _] when First > 0,
+        list_segment_offsets(Config),
+        1000
+    ),
+    ok = osiris_writer:stop(WriterCfg1),
+
+    %% Phase 2: restart with plugin hooks. The replica reader discovers the
+    %% log starts at a non-zero offset and uploads from there.
+    _Writer2 = start_writer(
+        Config,
+        #{max_segment_size_bytes => 500},
+        #{fragment_target_size => 500}
+    ),
+    %% await_offset(20) ensures the replica reader has uploaded ALL remaining
+    %% data (20 records were written in phase 1).
+    await_offset(Config, 20),
+
+    %% The manifest's first_offset must be > 0, proving the plugin started
+    %% at the local log's non-zero first offset rather than offset 0.
+    {FirstOffset, NextOffset} = get_range(Config),
+    ?assert(FirstOffset > 0),
+    ?assertEqual(20, NextOffset).
 
 replication_happy_path(Config) ->
     StreamId = ?config(stream_id, Config),
