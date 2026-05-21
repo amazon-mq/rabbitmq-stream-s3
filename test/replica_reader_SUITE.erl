@@ -72,12 +72,15 @@ groups() ->
             seed_log_uploads_deterministic,
             local_ahead_discards_manifest,
             stream_deletion_cleans_remote_tier,
+            stream_deletion_during_active_upload,
             discover_attaches_to_existing_writer,
             remote_retention_deletes_fragments,
             remote_retention_survives_multiple_persist_cycles,
             uploads_rebalance_into_group,
             remote_retention_deletes_within_group,
-            old_manifest_roots_deleted
+            remote_retention_deletes_all_fragments,
+            old_manifest_roots_deleted,
+            attach_to_stream_with_prior_retention
         ]},
         {with_replica, [], [
             replication_happy_path
@@ -430,6 +433,44 @@ stream_deletion_cleans_remote_tier(Config) ->
     osiris_log:delete_directory(WriterCfg),
     ?assertNot(filelib:is_dir(Dir)).
 
+stream_deletion_during_active_upload(Config) ->
+    StreamId = ?config(stream_id, Config),
+    WriterCfg = ?config(writer_cfg, Config),
+
+    %% Use a large fragment target so the replica reader accumulates data
+    %% but hasn't finished uploading when we kill the writer.
+    Writer = start_writer(Config, #{}, #{fragment_target_size => 100_000}),
+
+    %% Write enough data to trigger at least one fragment cut and have
+    %% the governor task in flight.
+    Record = binary:copy(<<"D">>, 500),
+    lists:foreach(
+        fun(_) ->
+            osiris_writer:write(Writer, Record),
+            flush_writer(Writer)
+        end,
+        lists:seq(1, 300)
+    ),
+
+    %% Verify the replica reader is alive and has work in progress.
+    ReaderPid = rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}),
+    ?assert(is_pid(ReaderPid)),
+    ReaderMon = monitor(process, ReaderPid),
+
+    %% Stop the writer while uploads may be in flight.
+    ok = osiris_writer:stop(WriterCfg),
+
+    %% The replica reader should terminate cleanly (normal exit).
+    receive
+        {'DOWN', ReaderMon, process, ReaderPid, Reason} ->
+            ?assertEqual(normal, Reason)
+    after 5000 ->
+        ct:fail("replica reader did not stop after writer down")
+    end,
+
+    %% Registry is cleaned up.
+    ?assertEqual(undefined, rabbitmq_stream_s3_registry:whereis_name({StreamId, node()})).
+
 discover_attaches_to_existing_writer(Config) ->
     StreamId = ?config(stream_id, Config),
 
@@ -619,6 +660,38 @@ remote_retention_deletes_within_group(Config) ->
     {FirstOffset, NextOffset} = get_range(Config),
     ?assertEqual(20, FirstOffset).
 
+remote_retention_deletes_all_fragments(Config) ->
+    %% 4 segments, each producing a fragment (600 bytes > 500 target).
+    %% Rebalance threshold = 4: all 4 fragments factored into a group.
+    %% The root then has exactly 1 group entry and 0 trailing fragments.
+    %% max_bytes = 1 forces retention to delete all fragments in the group,
+    %% removing the group entry and leaving the manifest empty.
+    %% The system must handle this gracefully: no crash, range becomes empty,
+    %% and the replica reader continues operating.
+    StreamId = ?config(stream_id, Config),
+    #{next_offset := NextOffset} = seed_log(Config, [
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]}
+    ]),
+    _Writer = start_writer(
+        Config,
+        #{retention => [{max_bytes, 1}]},
+        #{fragment_target_size => 500, rebalance_threshold => 4}
+    ),
+    await_offset(Config, NextOffset),
+
+    %% Remote retention should delete all fragments and the group.
+    %% The range becomes empty (no remote data).
+    ?awaitMatch(empty, get_range(Config), 2000),
+
+    %% No fragment objects remain.
+    ?awaitMatch([], list_fragment_offsets(Config), 2000),
+
+    %% The replica reader is still alive.
+    ?assert(is_pid(rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}))).
+
 old_manifest_roots_deleted(Config) ->
     StreamId = ?config(stream_id, Config),
 
@@ -644,6 +717,52 @@ old_manifest_roots_deleted(Config) ->
         end,
         2000
     ).
+
+attach_to_stream_with_prior_retention(Config) ->
+    %% Simulates enabling the plugin on a stream that has already undergone
+    %% local retention. Start a writer without hooks, write enough to trigger
+    %% retention, then restart with hooks enabled.
+    WriterCfg0 = ?config(writer_cfg, Config),
+
+    %% Phase 1: writer without plugin hooks, small segments, tight retention.
+    WriterCfg1 = maps:merge(WriterCfg0, #{
+        max_segment_size_bytes => 500,
+        retention => [{max_bytes, 1000}],
+        log_hooks => undefined
+    }),
+    {ok, Writer1} = osiris_writer:start(WriterCfg1),
+    Record = binary:copy(<<"R">>, 300),
+    lists:foreach(
+        fun(_) ->
+            osiris_writer:write(Writer1, Record),
+            flush_writer(Writer1)
+        end,
+        lists:seq(1, 20)
+    ),
+    %% Wait for retention to delete old segments.
+    ?awaitMatch(
+        [First | _] when First > 0,
+        list_segment_offsets(Config),
+        1000
+    ),
+    ok = osiris_writer:stop(WriterCfg1),
+
+    %% Phase 2: restart with plugin hooks. The replica reader discovers the
+    %% log starts at a non-zero offset and uploads from there.
+    _Writer2 = start_writer(
+        Config,
+        #{max_segment_size_bytes => 500},
+        #{fragment_target_size => 500}
+    ),
+    %% await_offset(20) ensures the replica reader has uploaded ALL remaining
+    %% data (20 records were written in phase 1).
+    await_offset(Config, 20),
+
+    %% The manifest's first_offset must be > 0, proving the plugin started
+    %% at the local log's non-zero first offset rather than offset 0.
+    {FirstOffset, NextOffset} = get_range(Config),
+    ?assert(FirstOffset > 0),
+    ?assertEqual(20, NextOffset).
 
 replication_happy_path(Config) ->
     StreamId = ?config(stream_id, Config),

@@ -63,11 +63,16 @@ all() ->
         retention_defers_persist,
         retention_edit_broadcast_on_persist_complete,
         retention_failed_clears_flag,
+        persist_failed_during_rebalance_retries_after,
+        recursive_rebalance_three_levels_deep,
+        multiple_persist_conflicts_reinitialize,
         %% Edge cases
         fatal_front_drains_buffered_completions,
         await_offset_satisfied_during_cascading_persist,
         tick_fires_at_exact_interval_boundary,
-        retention_and_rebalance_same_persist_cycle
+        retention_and_rebalance_same_persist_cycle,
+        retention_deletes_all_entries,
+        new_fragment_after_empty_manifest
     ].
 
 init_per_suite(Config) -> Config.
@@ -777,6 +782,107 @@ group_upload_failed_fatal_abandons(_Config) ->
     ?assertEqual([], UploadGroups),
     ?assertMatch([_], Persists).
 
+persist_failed_during_rebalance_retries_after(_Config) ->
+    %% Persist fires (threshold=2), then rebalance triggers (threshold=4).
+    %% Persist fails with a transient error while rebalance_in_flight = true.
+    %% The retry is blocked. After group_upload_complete, persist fires.
+    Threshold = 4,
+    {S0, _} = init_core(#{persist_threshold => 2, rebalance_threshold => Threshold}),
+    %% Apply 2 fragments → persist fires.
+    S1 = cut_and_complete(S0, 0, 100, 1001),
+    S2 = cut_and_complete(S1, 100, 200, 1002),
+    %% Persist is now in flight. Apply 2 more → rebalance triggers.
+    S3 = cut_and_complete(S2, 200, 300, 1003),
+    {S4, Ref4, _} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(300, 400), S3),
+    {S5, Effects5} = rabbitmq_stream_s3_replica_reader_core:transfer_complete(Ref4, 1004, S4),
+    %% Rebalance should have triggered.
+    ?assertMatch([_], [E || {upload_group, _, _, _, _, _} = E <- Effects5]),
+    %% Persist fails with transient error. Retry is blocked by rebalance.
+    {S6, FailEffects} = rabbitmq_stream_s3_replica_reader_core:persist_failed(s3_error, S5),
+    %% Should get a timer (fallback) but no start_persist.
+    ?assertEqual([], [E || {start_persist, _, _, _, _, _} = E <- FailEffects]),
+    ?assertMatch([{start_persist_timer, _}], [E || {start_persist_timer, _} = E <- FailEffects]),
+    %% Tick is also blocked by rebalance_in_flight.
+    Now = erlang:system_time(millisecond) + 100000,
+    {S7, TickEffects} = rabbitmq_stream_s3_replica_reader_core:tick(Now, S6),
+    ?assertEqual([], TickEffects),
+    %% Group upload completes. Persist should now fire.
+    {_S8, CompleteEffects} = rabbitmq_stream_s3_replica_reader_core:group_upload_complete(
+        9999, S7
+    ),
+    ?assertMatch([_], [E || {start_persist, _, _, _, _, _} = E <- CompleteEffects]).
+
+recursive_rebalance_three_levels_deep(_Config) ->
+    %% Start with a manifest that has Threshold-1 kilo-group entries and
+    %% Threshold-1 group entries. Adding Threshold fragments triggers:
+    %% 1. fragments → group (brings group count to Threshold)
+    %% 2. groups → kilo-group (brings kilo-group count to Threshold)
+    %% 3. kilo-groups → mega-group
+    Threshold = 4,
+    %% Build Threshold-1 kilo-group entries.
+    KiloEntries = lists:foldl(
+        fun(I, Acc) ->
+            Offset = I * 1_000_000,
+            FTs = I * 100_000,
+            LTs = (I + 1) * 100_000,
+            Uid = 7000 + I,
+            E = ?ENTRY(Offset, FTs, LTs, ?MANIFEST_KIND_KILO_GROUP, 0, Uid),
+            <<Acc/binary, E/binary>>
+        end,
+        <<>>,
+        lists:seq(0, Threshold - 2)
+    ),
+    %% Then Threshold-1 group entries after the kilo-groups.
+    KiloEnd = (Threshold - 1) * 1_000_000,
+    GroupEntries = lists:foldl(
+        fun(I, Acc) ->
+            Offset = KiloEnd + I * 10_000,
+            FTs = (Threshold - 1) * 100_000 + I * 1000,
+            LTs = (Threshold - 1) * 100_000 + (I + 1) * 1000,
+            Uid = 8000 + I,
+            E = ?ENTRY(Offset, FTs, LTs, ?MANIFEST_KIND_GROUP, 0, Uid),
+            <<Acc/binary, E/binary>>
+        end,
+        <<>>,
+        lists:seq(0, Threshold - 2)
+    ),
+    AllEntries = <<KiloEntries/binary, GroupEntries/binary>>,
+    BaseOffset = KiloEnd + (Threshold - 1) * 10_000,
+    Manifest = #manifest{
+        first_offset = 0,
+        first_timestamp = 0,
+        first_last_timestamp = 100_000,
+        next_offset = BaseOffset,
+        total_size = 0,
+        entries = AllEntries
+    },
+    {S0, _} = init_core_with_manifest(Manifest, #{
+        rebalance_threshold => Threshold, persist_threshold => 100
+    }),
+    %% Apply Threshold fragments → triggers fragments→group.
+    S1 = lists:foldl(
+        fun(I, Acc) ->
+            Offset = BaseOffset + I * 100,
+            cut_and_complete(Acc, Offset, Offset + 100, 3000 + I)
+        end,
+        S0,
+        lists:seq(0, Threshold - 1)
+    ),
+    %% Complete group upload (fragments→group). Now Threshold groups exist → kilo-group.
+    {S2, E1} = rabbitmq_stream_s3_replica_reader_core:group_upload_complete(8888, S1),
+    ?assertMatch([_], [E || {upload_group, _, ?MANIFEST_KIND_KILO_GROUP, _, _, _} = E <- E1]),
+    %% Complete kilo-group upload. Now Threshold kilo-groups exist → mega-group.
+    {S3, E2} = rabbitmq_stream_s3_replica_reader_core:group_upload_complete(7777, S2),
+    ?assertMatch([_], [E || {upload_group, _, ?MANIFEST_KIND_MEGA_GROUP, _, _, _} = E <- E2]),
+    %% Complete mega-group upload. No further rebalancing needed.
+    {S4, E3} = rabbitmq_stream_s3_replica_reader_core:group_upload_complete(6666, S3),
+    ?assertEqual([], [E || {upload_group, _, _, _, _, _} = E <- E3]),
+    %% Final manifest should have 1 mega-group entry.
+    M = rabbitmq_stream_s3_replica_reader_core:manifest(S4),
+    ?assertEqual(?ENTRY_B, byte_size(M#manifest.entries)),
+    <<_:64, _:64/signed, _:64/signed, Kind:8, _:40, _:32>> = M#manifest.entries,
+    ?assertEqual(?MANIFEST_KIND_MEGA_GROUP, Kind).
+
 %% ------------------------------------------------------------------
 %% Retention tests
 %% ------------------------------------------------------------------
@@ -902,6 +1008,70 @@ retention_failed_clears_flag(_Config) ->
     Persists = [E || {start_persist, _, _, _, _, _} = E <- Effects],
     ?assertMatch([_], Persists).
 
+multiple_persist_conflicts_reinitialize(_Config) ->
+    %% 3 consecutive persist conflicts. Each triggers reinitialize.
+    %% After each reinit, the core is re-initialized with the "resolved"
+    %% manifest and continues operating normally. No leaked state.
+    Opts = #{persist_threshold => 1},
+    %% Cycle 1: cut, complete, persist fires, conflict.
+    {S0, _} = init_core(Opts),
+    S1 = cut_and_complete(S0, 0, 100, 1001),
+    {_S2, E1} = rabbitmq_stream_s3_replica_reader_core:persist_failed(conflict, S1),
+    ?assertEqual([reinitialize], E1),
+    %% Reinit with manifest at next_offset=100 (simulating resolved manifest).
+    Manifest1 = #manifest{
+        first_offset = 0,
+        first_timestamp = 0,
+        first_last_timestamp = 99000,
+        next_offset = 100,
+        total_size = 64_000_000,
+        entries = ?ENTRY(0, 0, 99000, ?MANIFEST_KIND_FRAGMENT, 64_000_000, 1001)
+    },
+    {S3, _} = init_core_with_manifest(Manifest1, Opts),
+    %% Cycle 2: cut, complete, persist fires, conflict.
+    S4 = cut_and_complete(S3, 100, 200, 1002),
+    {_S5, E2} = rabbitmq_stream_s3_replica_reader_core:persist_failed(conflict, S4),
+    ?assertEqual([reinitialize], E2),
+    %% Reinit with manifest at next_offset=200.
+    Manifest2 = #manifest{
+        first_offset = 0,
+        first_timestamp = 0,
+        first_last_timestamp = 199000,
+        next_offset = 200,
+        total_size = 128_000_000,
+        entries = <<
+            (Manifest1#manifest.entries)/binary,
+            (?ENTRY(100, 100000, 199000, ?MANIFEST_KIND_FRAGMENT, 64_000_000, 1002))/binary
+        >>
+    },
+    {S6, _} = init_core_with_manifest(Manifest2, Opts),
+    %% Cycle 3: same pattern.
+    S7 = cut_and_complete(S6, 200, 300, 1003),
+    {_S8, E3} = rabbitmq_stream_s3_replica_reader_core:persist_failed(conflict, S7),
+    ?assertEqual([reinitialize], E3),
+    %% Reinit and verify normal operation resumes.
+    Manifest3 = #manifest{
+        first_offset = 0,
+        first_timestamp = 0,
+        first_last_timestamp = 299000,
+        next_offset = 300,
+        total_size = 192_000_000,
+        entries = <<
+            (Manifest2#manifest.entries)/binary,
+            (?ENTRY(200, 200000, 299000, ?MANIFEST_KIND_FRAGMENT, 64_000_000, 1003))/binary
+        >>
+    },
+    {S9, _} = init_core_with_manifest(Manifest3, Opts),
+    %% After 3 conflicts, the core operates normally.
+    S10 = cut_and_complete(S9, 300, 400, 1004),
+    %% Persist fires (threshold=1). Complete it successfully this time.
+    {S11, PEffects} = rabbitmq_stream_s3_replica_reader_core:persist_complete(1, S10),
+    ?assertMatch([_ | _], [E || {update_range, _, _} = E <- PEffects]),
+    ?assertMatch([_ | _], [E || {broadcast, _, _} = E <- PEffects]),
+    ?assertEqual(
+        400, (rabbitmq_stream_s3_replica_reader_core:persisted_manifest(S11))#manifest.next_offset
+    ).
+
 %% ------------------------------------------------------------------
 %% Edge case tests
 %% ------------------------------------------------------------------
@@ -1000,6 +1170,54 @@ retention_and_rebalance_same_persist_cycle(_Config) ->
     To = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(S7),
     [Edits] = [Es || {broadcast, _, Es} <- Effects],
     assert_edits_reproduce_manifest(From, To, Edits).
+
+retention_deletes_all_entries(_Config) ->
+    %% Retention removes all entries. Manifest becomes empty.
+    {S0, _} = init_core(#{persist_threshold => 100}),
+    S1 = cut_and_complete(S0, 0, 100, 1001),
+    S2 = cut_and_complete(S1, 100, 200, 1002),
+    %% Remove both entries.
+    RetEdit = #edit{
+        first_offset = 200,
+        first_timestamp = -1,
+        first_last_timestamp = -1,
+        next_offset = undefined,
+        size = -128_000_000,
+        entries = <<>>,
+        pos = 0,
+        len = 2 * ?ENTRY_B
+    },
+    {S3, _Effects} = rabbitmq_stream_s3_replica_reader_core:retention_complete(RetEdit, S2),
+    Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(S3),
+    ?assertEqual(<<>>, Manifest#manifest.entries),
+    ?assertEqual(200, Manifest#manifest.first_offset),
+    ?assertEqual(200, Manifest#manifest.next_offset).
+
+new_fragment_after_empty_manifest(_Config) ->
+    %% After retention empties the manifest, new fragments append correctly.
+    %% The first fragment sets first_offset (same as a fresh manifest).
+    {S0, _} = init_core(#{persist_threshold => 100}),
+    S1 = cut_and_complete(S0, 0, 100, 1001),
+    RetEdit = #edit{
+        first_offset = 100,
+        first_timestamp = -1,
+        first_last_timestamp = -1,
+        next_offset = undefined,
+        size = -64_000_000,
+        entries = <<>>,
+        pos = 0,
+        len = ?ENTRY_B
+    },
+    {S2, _} = rabbitmq_stream_s3_replica_reader_core:retention_complete(RetEdit, S1),
+    %% Manifest is empty.
+    M1 = rabbitmq_stream_s3_replica_reader_core:manifest(S2),
+    ?assertEqual(<<>>, M1#manifest.entries),
+    %% New fragment appends successfully and sets first_offset.
+    S3 = cut_and_complete(S2, 200, 300, 1002),
+    M2 = rabbitmq_stream_s3_replica_reader_core:manifest(S3),
+    ?assertEqual(?ENTRY_B, byte_size(M2#manifest.entries)),
+    ?assertEqual(200, M2#manifest.first_offset),
+    ?assertEqual(300, M2#manifest.next_offset).
 
 %% ------------------------------------------------------------------
 %% Helpers
