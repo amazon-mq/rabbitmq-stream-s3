@@ -19,7 +19,10 @@ all() ->
         apply_retention_edit,
         range_updates_on_edit,
         sequenced_edits_applied_in_order,
-        gap_triggers_resync
+        gap_triggers_resync,
+        rapid_edits_with_gap_then_resync,
+        stale_edit_after_resync_ignored,
+        retention_and_append_in_same_broadcast
     ].
 
 init_per_suite(Config) ->
@@ -215,8 +218,171 @@ gap_triggers_resync(_Config) ->
     unlink(WriterPid),
     exit(WriterPid, kill).
 
+rapid_edits_with_gap_then_resync(_Config) ->
+    StreamId = <<"stream-rapid">>,
+    {Manifest0, _} = build_manifest([
+        {fragment, #{offset => 0, size => 1000}}
+    ]),
+
+    rabbitmq_stream_s3_registry:init(),
+    Self = self(),
+    WriterPid = spawn_link(fun() -> fake_writer_loop(Self) end),
+    yes = rabbitmq_stream_s3_registry:register_name({StreamId, node()}, WriterPid),
+
+    %% Sync at seq=0, epoch=1.
+    ok = rabbitmq_stream_s3_manifest_replica:sync(StreamId, 0, 1, Manifest0),
+
+    %% Edit seq=1 applies.
+    Edit1 = append_edit(Manifest0, 50, 1000, 51, 2000, 42),
+    ok = rabbitmq_stream_s3_manifest_replica:apply_edits(StreamId, [Edit1], 1, 1),
+    M1 = rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId),
+    ?assertEqual(51, M1#manifest.next_offset),
+
+    %% Edit seq=2 applies.
+    Edit2 = append_edit(M1, 100, 1000, 101, 3000, 43),
+    ok = rabbitmq_stream_s3_manifest_replica:apply_edits(StreamId, [Edit2], 2, 1),
+    M2 = rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId),
+    ?assertEqual(101, M2#manifest.next_offset),
+
+    %% Edit seq=4 (gap: expected 3). Triggers resync.
+    Edit4 = append_edit(M2, 200, 1000, 201, 4000, 44),
+    {error, gap} = rabbitmq_stream_s3_manifest_replica:apply_edits(StreamId, [Edit4], 4, 1),
+    receive
+        {resync_received, _} -> ok
+    after 1000 -> ct:fail("no resync")
+    end,
+
+    %% Re-sync with a fresh manifest at seq=5.
+    {ManifestNew, _} = build_manifest([
+        {fragment, #{offset => 0, size => 1000}},
+        {fragment, #{offset => 50, size => 2000}},
+        {fragment, #{offset => 100, size => 3000}},
+        {fragment, #{offset => 150, size => 4000}},
+        {fragment, #{offset => 200, size => 5000}}
+    ]),
+    ok = rabbitmq_stream_s3_manifest_replica:sync(StreamId, 5, 1, ManifestNew),
+
+    %% Subsequent edit at seq=6 applies normally.
+    Edit6 = append_edit(ManifestNew, 300, 1000, 301, 6000, 45),
+    ok = rabbitmq_stream_s3_manifest_replica:apply_edits(StreamId, [Edit6], 6, 1),
+    M3 = rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId),
+    ?assertEqual(301, M3#manifest.next_offset),
+
+    rabbitmq_stream_s3_registry:unregister_name({StreamId, node()}),
+    unlink(WriterPid),
+    exit(WriterPid, kill).
+
+stale_edit_after_resync_ignored(_Config) ->
+    StreamId = <<"stream-stale">>,
+    {Manifest0, _} = build_manifest([
+        {fragment, #{offset => 0, size => 1000}}
+    ]),
+
+    rabbitmq_stream_s3_registry:init(),
+    Self = self(),
+    WriterPid = spawn_link(fun() -> fake_writer_loop(Self) end),
+    yes = rabbitmq_stream_s3_registry:register_name({StreamId, node()}, WriterPid),
+
+    %% Sync at seq=0, epoch=1.
+    ok = rabbitmq_stream_s3_manifest_replica:sync(StreamId, 0, 1, Manifest0),
+
+    %% Edit seq=1 applies.
+    Edit1 = append_edit(Manifest0, 50, 1000, 51, 2000, 42),
+    ok = rabbitmq_stream_s3_manifest_replica:apply_edits(StreamId, [Edit1], 1, 1),
+
+    %% Re-sync at seq=10, epoch=2 (new writer after election).
+    {ManifestNew, _} = build_manifest([
+        {fragment, #{offset => 0, size => 5000}},
+        {fragment, #{offset => 100, size => 6000}}
+    ]),
+    ok = rabbitmq_stream_s3_manifest_replica:sync(StreamId, 10, 2, ManifestNew),
+
+    %% Stale edit from old epoch (seq=2, epoch=1) arrives after re-sync.
+    %% Should be rejected (gap/epoch mismatch).
+    StaleEdit = append_edit(Manifest0, 100, 1000, 101, 3000, 43),
+    {error, gap} = rabbitmq_stream_s3_manifest_replica:apply_edits(
+        StreamId, [StaleEdit], 2, 1
+    ),
+    receive
+        {resync_received, _} -> ok
+    after 1000 -> ct:fail("no resync")
+    end,
+
+    %% Manifest unchanged (stale edit was ignored).
+    ?assertEqual(ManifestNew, rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId)),
+
+    rabbitmq_stream_s3_registry:unregister_name({StreamId, node()}),
+    unlink(WriterPid),
+    exit(WriterPid, kill).
+
+retention_and_append_in_same_broadcast(_Config) ->
+    StreamId = <<"stream-mixed">>,
+    {Manifest0, _} = build_manifest([
+        {fragment, #{offset => 0, size => 1000, uid => 1}},
+        {fragment, #{offset => 50, size => 2000, uid => 2}},
+        {fragment, #{offset => 100, size => 3000, uid => 3}}
+    ]),
+    ok = rabbitmq_stream_s3_manifest_replica:sync(StreamId, 0, 1, Manifest0),
+
+    %% A single broadcast containing: append (new fragment) then retention (remove first).
+    AppendEdit = #edit{
+        first_offset = 0,
+        first_timestamp = Manifest0#manifest.first_timestamp,
+        first_last_timestamp = Manifest0#manifest.first_last_timestamp,
+        next_offset = 201,
+        size = 4000,
+        entries = ?ENTRY(200, 2000, 2100, ?MANIFEST_KIND_FRAGMENT, 4000, 99),
+        pos = byte_size(Manifest0#manifest.entries),
+        len = 0
+    },
+    RetentionEdit = #edit{
+        first_offset = 50,
+        first_timestamp = 500,
+        first_last_timestamp = 510,
+        next_offset = undefined,
+        size = -1000,
+        entries = <<>>,
+        pos = 0,
+        len = ?ENTRY_B
+    },
+    %% Apply both edits in one sequenced call (append first, then retention).
+    ok = rabbitmq_stream_s3_manifest_replica:apply_edits(
+        StreamId, [AppendEdit, RetentionEdit], 1, 1
+    ),
+
+    M = rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId),
+    %% First offset advanced (retention removed offset 0 entry).
+    ?assertEqual(50, M#manifest.first_offset),
+    %% Next offset advanced (append added offset 200 entry).
+    ?assertEqual(201, M#manifest.next_offset),
+    %% 3 entries remain: offsets 50, 100, 200.
+    ?assertEqual(3 * ?ENTRY_B, byte_size(M#manifest.entries)),
+    %% Total size: original 6000 + 4000 (append) - 1000 (retention) = 9000.
+    ?assertEqual(9000, M#manifest.total_size).
+
 fake_writer(TestPid) ->
     receive
         {'$gen_cast', {resync, Node}} ->
             TestPid ! {resync_received, Node}
     end.
+
+fake_writer_loop(TestPid) ->
+    receive
+        {'$gen_cast', {resync, Node}} ->
+            TestPid ! {resync_received, Node},
+            fake_writer_loop(TestPid)
+    end.
+
+%% Build an append edit for a new fragment at Offset with given Size.
+append_edit(Manifest, Offset, Ts, NextOffset, Size, Uid) ->
+    LastTs = Ts + 100,
+    #edit{
+        first_offset = Manifest#manifest.first_offset,
+        first_timestamp = Manifest#manifest.first_timestamp,
+        first_last_timestamp = Manifest#manifest.first_last_timestamp,
+        next_offset = NextOffset,
+        size = Size,
+        entries = ?ENTRY(Offset, Ts, LastTs, ?MANIFEST_KIND_FRAGMENT, Size, Uid),
+        pos = byte_size(Manifest#manifest.entries),
+        len = 0
+    }.
