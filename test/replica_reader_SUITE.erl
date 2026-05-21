@@ -72,6 +72,7 @@ groups() ->
             seed_log_uploads_deterministic,
             local_ahead_discards_manifest,
             stream_deletion_cleans_remote_tier,
+            stream_deletion_during_active_upload,
             discover_attaches_to_existing_writer,
             remote_retention_deletes_fragments,
             remote_retention_survives_multiple_persist_cycles,
@@ -429,6 +430,44 @@ stream_deletion_cleans_remote_tier(Config) ->
     ),
     osiris_log:delete_directory(WriterCfg),
     ?assertNot(filelib:is_dir(Dir)).
+
+stream_deletion_during_active_upload(Config) ->
+    StreamId = ?config(stream_id, Config),
+    WriterCfg = ?config(writer_cfg, Config),
+
+    %% Use a large fragment target so the replica reader accumulates data
+    %% but hasn't finished uploading when we kill the writer.
+    Writer = start_writer(Config, #{}, #{fragment_target_size => 100_000}),
+
+    %% Write enough data to trigger at least one fragment cut and have
+    %% the governor task in flight.
+    Record = binary:copy(<<"D">>, 500),
+    lists:foreach(
+        fun(_) ->
+            osiris_writer:write(Writer, Record),
+            flush_writer(Writer)
+        end,
+        lists:seq(1, 300)
+    ),
+
+    %% Verify the replica reader is alive and has work in progress.
+    ReaderPid = rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}),
+    ?assert(is_pid(ReaderPid)),
+    ReaderMon = monitor(process, ReaderPid),
+
+    %% Stop the writer while uploads may be in flight.
+    ok = osiris_writer:stop(WriterCfg),
+
+    %% The replica reader should terminate cleanly (normal exit).
+    receive
+        {'DOWN', ReaderMon, process, ReaderPid, Reason} ->
+            ?assertEqual(normal, Reason)
+    after 5000 ->
+        ct:fail("replica reader did not stop after writer down")
+    end,
+
+    %% Registry is cleaned up.
+    ?assertEqual(undefined, rabbitmq_stream_s3_registry:whereis_name({StreamId, node()})).
 
 discover_attaches_to_existing_writer(Config) ->
     StreamId = ?config(stream_id, Config),
