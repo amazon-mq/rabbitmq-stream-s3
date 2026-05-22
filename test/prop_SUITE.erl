@@ -52,7 +52,10 @@ all() ->
         %% Replica reader core: rebalancing
         broadcast_edits_reproduce_manifest,
         broadcast_edits_complete_across_persist_cycles,
-        broadcast_edits_with_retention
+        broadcast_edits_with_retention,
+        %% Remote reader core
+        remote_reader_core_no_crash,
+        remote_reader_core_reply_size_bounded
     ].
 
 init_per_suite(Config) -> Config.
@@ -1418,3 +1421,149 @@ chunks_to_index(Chunks) ->
         ?INDEX_RECORD(O, Ts, Pos)
      || {Pos, {O, Ts}} <- lists:zip(lists:seq(0, length(Chunks) - 1), Chunks)
     ]).
+
+%% =========================================================================
+%% Remote reader core properties
+%% =========================================================================
+
+remote_reader_core_no_crash(_Config) ->
+    rabbit_ct_proper_helpers:run_proper(fun prop_remote_reader_core_no_crash/0, [], 500).
+
+prop_remote_reader_core_no_crash() ->
+    ?FORALL(
+        Events,
+        gen_rrc_event_sequence(),
+        begin
+            FragRef = #fragment_ref{offset = 0, uid = 1, size = 1_000_000},
+            Manifest = #manifest{
+                first_offset = 0,
+                next_offset = 200,
+                entries = ?ENTRY(0, 0, 0, ?MANIFEST_KIND_FRAGMENT, 1_000_000, 1)
+            },
+            GetGroupFun = fun(_) -> {error, not_found} end,
+            Iterator0 = rabbitmq_stream_s3_fragment_iterator:init(Manifest, 0, GetGroupFun),
+            Iterator =
+                case rabbitmq_stream_s3_fragment_iterator:next(Iterator0) of
+                    {ok, _, It} -> It;
+                    _ -> Iterator0
+                end,
+            {State0, _} = rabbitmq_stream_s3_remote_reader_core:init(
+                <<"prop-stream">>, FragRef, 8, Iterator, #{}
+            ),
+            %% Run all events. Must not crash.
+            try
+                _ = run_rrc_events(Events, State0),
+                true
+            catch
+                C:R:St ->
+                    file:write_file(
+                        "/tmp/prop_crash.txt",
+                        io_lib:format("~p:~p~nEvents: ~w~nStack: ~p~n", [C, R, Events, St])
+                    ),
+                    false
+            end
+        end
+    ).
+
+remote_reader_core_reply_size_bounded(_Config) ->
+    rabbit_ct_proper_helpers:run_proper(fun prop_remote_reader_core_reply_size_bounded/0, [], 500).
+
+prop_remote_reader_core_reply_size_bounded() ->
+    ?FORALL(
+        {ReadOffset, ReadBytes, DataSize},
+        {range(8, 500), range(1, 1000), range(100, 5000)},
+        begin
+            FragSize = 1_000_000,
+            FragRef = #fragment_ref{offset = 0, uid = 1, size = FragSize},
+            Manifest = #manifest{
+                first_offset = 0,
+                next_offset = 200,
+                entries = ?ENTRY(0, 0, 0, ?MANIFEST_KIND_FRAGMENT, FragSize, 1)
+            },
+            GetGroupFun = fun(_) -> {error, not_found} end,
+            Iterator0 = rabbitmq_stream_s3_fragment_iterator:init(Manifest, 0, GetGroupFun),
+            Iterator =
+                case rabbitmq_stream_s3_fragment_iterator:next(Iterator0) of
+                    {ok, _, It} -> It;
+                    _ -> Iterator0
+                end,
+            {S0, _} = rabbitmq_stream_s3_remote_reader_core:init(
+                <<"prop-stream">>, FragRef, 8, Iterator, #{}
+            ),
+            %% Provide data.
+            Data = binary:copy(<<0>>, DataSize),
+            {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(
+                S0, {data, make_ref(), 0, Data, done}
+            ),
+            %% Issue a read.
+            {_S2, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
+                S1, {read, ReadOffset, ReadBytes, chunk_boundary}
+            ),
+            %% If a reply was produced, its data must be <= ReadBytes.
+            case [D || {reply, {ok, D}} <- Effects] of
+                [] -> true;
+                [ReplyData] -> byte_size(ReplyData) =< ReadBytes
+            end
+        end
+    ).
+
+%% ------------------------------------------------------------------
+%% Remote reader core generators
+%% ------------------------------------------------------------------
+
+gen_rrc_event_sequence() ->
+    ?LET(N, range(1, 20), gen_rrc_events(N, 8)).
+
+gen_rrc_events(0, _NextReadPos) ->
+    [];
+gen_rrc_events(N, NextReadPos) ->
+    ?LET(
+        {Event, NextPos},
+        gen_rrc_event(NextReadPos),
+        ?LET(Rest, gen_rrc_events(N - 1, NextPos), [Event | Rest])
+    ).
+
+gen_rrc_event(NextReadPos) ->
+    frequency([
+        {3, gen_rrc_read_event(NextReadPos)},
+        {3, ?LET(E, gen_rrc_data_event(), {E, NextReadPos})},
+        {2, ?LET(E, gen_rrc_error_event(), {E, NextReadPos})},
+        {1, {{retry}, NextReadPos}},
+        {1, ?LET(E, gen_rrc_manifest_range_event(), {E, NextReadPos})}
+    ]).
+
+gen_rrc_read_event(NextReadPos) ->
+    ?LET(
+        Bytes,
+        range(1, 5000),
+        {{read, NextReadPos, Bytes, chunk_boundary}, NextReadPos + Bytes}
+    ).
+
+gen_rrc_data_event() ->
+    ?LET(
+        Size,
+        range(1, 10000),
+        {data, make_ref(), 0, binary:copy(<<0>>, Size), oneof([done, continue])}
+    ).
+
+gen_rrc_error_event() ->
+    ?LET(
+        Reason,
+        oneof([timeout, slow_down, connection_error, stream_error, internal_error]),
+        {request_error, make_ref(), 0, Reason}
+    ).
+
+gen_rrc_manifest_range_event() ->
+    oneof([
+        {manifest_range, empty},
+        ?LET({F, E}, {range(0, 100), range(101, 500)}, {manifest_range, {F, E}})
+    ]).
+
+run_rrc_events([], State) ->
+    State;
+run_rrc_events([{retry} | Rest], State0) ->
+    {State1, _} = rabbitmq_stream_s3_remote_reader_core:step(State0, retry),
+    run_rrc_events(Rest, State1);
+run_rrc_events([Event | Rest], State0) ->
+    {State1, _} = rabbitmq_stream_s3_remote_reader_core:step(State0, Event),
+    run_rrc_events(Rest, State1).

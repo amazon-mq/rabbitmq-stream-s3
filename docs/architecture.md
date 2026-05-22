@@ -163,8 +163,8 @@ If the task crashes or S3 is unavailable, the orphan detection mechanism eventua
 When a consumer subscribes at an offset that no longer exists locally:
 
 1. `rabbitmq_stream_s3_log_reader` checks the manifest cache. If the offset is below the local range and within the manifest's range, it resolves the starting fragment.
-2. A `rabbitmq_stream_s3_remote_reader` process is spawned for the consumer. It prefetches fragment data from S3 using HTTP range requests.
-3. The remote reader uses the fragment iterator to navigate forward through the manifest tree without knowing its internal structure (groups, kilo-groups, etc.).
+2. A `rabbitmq_stream_s3_remote_reader` process is spawned for the consumer. It delegates all decisions (buffering, retry, fragment transitions) to `rabbitmq_stream_s3_remote_reader_core` and executes the resulting effects (S3 requests, timers, replies).
+3. The remote reader core uses the fragment iterator to navigate forward through the manifest tree without knowing its internal structure (groups, kilo-groups, etc.).
 4. When the consumer catches up to the local tier, the log reader transitions to local reads. The remote reader exits.
 
 If the remote reader encounters a 404 (fragment deleted by retention between iterator creation and fetch), it refreshes the iterator from the manifest cache and repositions at the oldest available offset.
