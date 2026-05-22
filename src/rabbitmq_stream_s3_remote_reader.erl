@@ -28,7 +28,8 @@ synchronous feedback is generated.
 -behaviour(gen_server).
 
 -record(cfg, {
-    request_timeout_ms :: pos_integer()
+    request_timeout_ms :: pos_integer(),
+    pending_read_deadline_ms :: pos_integer()
 }).
 
 -define(C_BUFFER_HIT, 1).
@@ -76,6 +77,8 @@ synchronous feedback is generated.
     %% Pending caller (at most one).
     from :: gen_server:from() | undefined,
     since :: integer() | undefined,
+    %% Timer that fires deadline_expired if the pending read is not served in time.
+    deadline_timer :: reference() | undefined,
     %% Maps fragment_offset -> {async_req, async_state}
     requests = #{} :: #{
         osiris:offset() => {
@@ -176,16 +179,20 @@ init(
     {ok, State}.
 
 handle_call(
-    #read{offset = Offset, bytes = Bytes, hint = Hint}, From, #state{core = Core0} = State0
+    #read{offset = Offset, bytes = Bytes, hint = Hint},
+    From,
+    #state{cfg = #cfg{pending_read_deadline_ms = Deadline}, core = Core0} = State0
 ) ->
     ?assertEqual(undefined, State0#state.from),
     {Core1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
         Core0, {read, Offset, Bytes, Hint}
     ),
+    Timer = erlang:send_after(Deadline, self(), deadline_expired),
     State1 = State0#state{
         core = Core1,
         from = From,
-        since = erlang:monotonic_time()
+        since = erlang:monotonic_time(),
+        deadline_timer = Timer
     },
     State = execute_effects(Effects, State1),
     maybe_stop(State);
@@ -200,6 +207,27 @@ handle_info({'DOWN', MRef, process, _Pid, _Reason}, #state{reader_ref = MRef} = 
 handle_info(retry_requests, #state{core = Core0} = State0) ->
     {Core1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(Core0, retry),
     State = execute_effects(Effects, State0#state{core = Core1}),
+    maybe_stop(State);
+handle_info(deadline_expired, #state{from = undefined} = State) ->
+    %% Timer fired after the read was already served. Ignore.
+    {noreply, State};
+handle_info(
+    deadline_expired, #state{core = Core0, requests = Requests, cancelled = Cancelled0} = State0
+) ->
+    %% Cancel in-flight S3 requests so they don't feed stale data into the
+    %% reset buffer after the core clears it.
+    maps:foreach(
+        fun(_FragOff, {ReqId, AsyncState}) ->
+            rabbitmq_stream_s3_api:cancel_async(ReqId, AsyncState)
+        end,
+        Requests
+    ),
+    counters:sub(counter(), ?C_REQUESTS_IN_FLIGHT, map_size(Requests)),
+    NewCancelled = maps:merge(Cancelled0, #{ReqId => ok || _ := {ReqId, _} <- Requests}),
+    {Core1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(Core0, deadline_expired),
+    State = execute_effects(Effects, State0#state{
+        core = Core1, requests = #{}, cancelled = NewCancelled, deadline_timer = undefined
+    }),
     maybe_stop(State);
 handle_info(Msg, #state{requests = Requests0, cancelled = Cancelled0} = State0) ->
     AsyncStates = #{Req => AsyncState || _ := {Req, AsyncState} <- Requests0},
@@ -317,14 +345,17 @@ execute_effects([Effect | Rest], State0) ->
     State = execute_effect(Effect, State0),
     execute_effects(Rest, State).
 
-execute_effect({reply, Result}, #state{from = From, since = Since} = State) when
+execute_effect(
+    {reply, Result}, #state{from = From, since = Since, deadline_timer = Timer} = State
+) when
     From =/= undefined
 ->
     Duration = rabbitmq_stream_s3_util:elapsed_ms(Since),
     counters:add(counter(), ?C_AWAIT_DURATION_MS, Duration),
     counters:add(counter(), ?C_AWAIT, 1),
+    cancel_deadline_timer(Timer),
     gen_server:reply(From, Result),
-    State#state{from = undefined, since = undefined};
+    State#state{from = undefined, since = undefined, deadline_timer = undefined};
 execute_effect({reply, _Result}, State) ->
     %% No pending caller (e.g. reply generated during init before any call).
     State;
@@ -438,8 +469,15 @@ maybe_stop(State) ->
 
 build_cfg(Opts) ->
     #cfg{
-        request_timeout_ms = maps:get(request_timeout_ms, Opts, 30_000)
+        request_timeout_ms = maps:get(request_timeout_ms, Opts, 30_000),
+        pending_read_deadline_ms = maps:get(pending_read_deadline_ms, Opts, 50_000)
     }.
+
+cancel_deadline_timer(undefined) ->
+    ok;
+cancel_deadline_timer(Timer) ->
+    _ = erlang:cancel_timer(Timer, [{async, true}, {info, false}]),
+    ok.
 
 counter() ->
     persistent_term:get(?COUNTER_KEY).

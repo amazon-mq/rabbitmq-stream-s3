@@ -39,7 +39,9 @@ all() ->
         retry_resets_delay_on_success,
         read_larger_than_buffer_awaits,
         header_overread_capped_at_index_boundary,
-        next_fragment_404_triggers_range_lookup
+        next_fragment_404_triggers_range_lookup,
+        deadline_expired_replies_error_timeout,
+        deadline_expired_resets_buffer_for_retry
     ].
 
 init_per_suite(Config) ->
@@ -532,3 +534,42 @@ next_fragment_404_triggers_range_lookup(_Config) ->
         S2, {read, 208, 50, chunk_boundary}
     ),
     ?assertMatch([{lookup_manifest_range}], Effects).
+
+deadline_expired_replies_error_timeout(_Config) ->
+    %% When the shell fires deadline_expired, the core replies {error, timeout}
+    %% and clears the pending read.
+    FragRef = frag_ref(0, 1_000_000, 42),
+    Iterator = mock_iterator([{0, 1_000_000, 42}]),
+    {S0, _} = init(stream_id(), FragRef, 64, Iterator),
+    %% Issue a read (pending, no data yet).
+    {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {read, 64, 100, chunk_boundary}),
+    ?assertMatch({64, 100}, rabbitmq_stream_s3_remote_reader_core:pending(S1)),
+    %% Deadline fires.
+    {S2, Effects} = rabbitmq_stream_s3_remote_reader_core:step(S1, deadline_expired),
+    ?assertMatch([{reply, {error, timeout}}], Effects),
+    %% Pending is cleared.
+    ?assertEqual(undefined, rabbitmq_stream_s3_remote_reader_core:pending(S2)).
+
+deadline_expired_resets_buffer_for_retry(_Config) ->
+    %% After deadline_expired, a subsequent read at any position (including one
+    %% behind the old current_pos) does not crash. It awaits data instead.
+    FragRef = frag_ref(0, 1_000_000, 42),
+    Iterator = mock_iterator([{0, 1_000_000, 42}]),
+    {S0, _} = init(stream_id(), FragRef, 64, Iterator),
+    %% Provide data and advance current_pos via a successful read.
+    Data = binary:copy(<<0>>, 5000),
+    {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {data, make_ref(), 0, Data, done}),
+    {S2, E1} = rabbitmq_stream_s3_remote_reader_core:step(S1, {read, 64, 100, chunk_boundary}),
+    ?assertMatch([{reply, {ok, _}} | _], E1),
+    %% Issue another read (pending), then deadline fires.
+    {S3, _} = rabbitmq_stream_s3_remote_reader_core:step(S2, {read, 3000, 100, chunk_boundary}),
+    {S4, _} = rabbitmq_stream_s3_remote_reader_core:step(S3, deadline_expired),
+    %% Retry at position 64 (behind old current_pos). Must not crash.
+    %% Buffer is empty so it awaits, and a new request is started.
+    {_S5, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
+        S4, {read, 64, 100, chunk_boundary}
+    ),
+    Replies = [E || {reply, _} = E <- Effects],
+    ?assertEqual([], Replies),
+    Requests = [F || {start_request, _, _, F} <- Effects],
+    ?assertMatch([0], Requests).

@@ -111,6 +111,7 @@ and transitions immediately if available, or signals that more data is needed.
     | {data, request_id(), fragment_offset(), binary(), done | continue}
     | {request_error, request_id(), fragment_offset(), term()}
     | retry
+    | deadline_expired
     | {manifest_range, {osiris:offset(), osiris:offset()} | empty}
     | {iterator_refreshed, rabbitmq_stream_s3_fragment_iterator:iterator() | end_of_manifest}
     | {jumped, #fragment_ref{}, rabbitmq_stream_s3_fragment_iterator:iterator()}.
@@ -126,6 +127,7 @@ and transitions immediately if available, or signals that more data is needed.
 
 -type read_result() ::
     {ok, binary()}
+    | {error, timeout}
     | {next_fragment, osiris:offset()}
     | {become_local, osiris:offset()}
     | end_of_stream.
@@ -239,6 +241,21 @@ step(State0, retry) ->
     {State1, Effects} = maybe_start_requests(State0),
     {State2, Effects2} = try_serve(State1),
     {State2, Effects ++ Effects2};
+step(#state{cfg = #cfg{min_retry_delay_ms = MinDelay}} = State0, deadline_expired) ->
+    %% The shell's pending-read deadline fired. Reply with an error and reset
+    %% buffer state so the next read at any position passes Offset >= StartPos.
+    %% See: https://github.com/amazon-mq/rabbitmq-stream-s3/issues/157
+    %% See: https://github.com/amazon-mq/rabbitmq-stream-s3/issues/161
+    State = State0#state{
+        buffer = <<>>,
+        start_pos = 0,
+        current_pos = 0,
+        end_pos = 0,
+        pending = undefined,
+        requests_in_flight = #{},
+        retry_delay = MinDelay
+    },
+    {State, [{reply, {error, timeout}}]};
 step(State0, {manifest_range, Range}) ->
     handle_manifest_range(Range, State0);
 step(State0, {iterator_refreshed, end_of_manifest}) ->
