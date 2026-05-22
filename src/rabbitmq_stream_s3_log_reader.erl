@@ -129,7 +129,7 @@ counter() ->
 
 record_resolve(T0, Tier, OffsetSpec) ->
     Cnt = counter(),
-    Duration = erlang:convert_time_unit(erlang:monotonic_time() - T0, native, millisecond),
+    Duration = rabbitmq_stream_s3_util:elapsed_ms(T0),
     counters:add(Cnt, ?C_RESOLVE_DURATION_MS, Duration),
     counters:add(Cnt, ?C_RESOLVE, 1),
     case Tier of

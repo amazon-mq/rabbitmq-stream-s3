@@ -1375,8 +1375,7 @@ start_timeout_window(_Timeout) ->
 end_timeout_window(infinity = Timeout, none) ->
     Timeout;
 end_timeout_window(Timeout, T0) ->
-    T1 = erlang:monotonic_time(),
-    TDiff = erlang:convert_time_unit(T1 - T0, native, millisecond),
+    TDiff = rabbitmq_stream_s3_util:elapsed_ms(T0),
     Remaining = Timeout - TDiff,
     erlang:max(Remaining, 0).
 

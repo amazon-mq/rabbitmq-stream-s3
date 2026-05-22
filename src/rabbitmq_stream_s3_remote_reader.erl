@@ -187,7 +187,7 @@ read(Server, Offset, Bytes, Hint) ->
 read(Server, Offset, Bytes, Hint, Timeout) ->
     T0 = erlang:monotonic_time(),
     Result = gen_server:call(Server, #read{offset = Offset, bytes = Bytes, hint = Hint}, Timeout),
-    Duration = erlang:convert_time_unit(erlang:monotonic_time() - T0, native, millisecond),
+    Duration = rabbitmq_stream_s3_util:elapsed_ms(T0),
     counters:add(counter(), ?C_READ_DURATION_MS, Duration),
     counters:add(counter(), ?C_READ, 1),
     Result.
@@ -531,11 +531,7 @@ maybe_reply_pending(
 ) ->
     case maybe_reply(Read, State0) of
         {reply, Reply, State1} ->
-            Duration = erlang:convert_time_unit(
-                erlang:monotonic_time() - Since,
-                native,
-                millisecond
-            ),
+            Duration = rabbitmq_stream_s3_util:elapsed_ms(Since),
             counters:add(counter(), ?C_AWAIT_DURATION_MS, Duration),
             counters:add(counter(), ?C_AWAIT, 1),
             gen_server:reply(From, Reply),
