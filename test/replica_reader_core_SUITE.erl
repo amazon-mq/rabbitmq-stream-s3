@@ -71,6 +71,7 @@ all() ->
         await_offset_satisfied_during_cascading_persist,
         tick_fires_at_exact_interval_boundary,
         retention_and_rebalance_same_persist_cycle,
+        persist_complete_defers_retention_during_rebalance,
         retention_deletes_all_entries,
         new_fragment_after_empty_manifest
     ].
@@ -1170,6 +1171,40 @@ retention_and_rebalance_same_persist_cycle(_Config) ->
     To = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(S7),
     [Edits] = [Es || {broadcast, _, Es} <- Effects],
     assert_edits_reproduce_manifest(From, To, Edits).
+
+persist_complete_defers_retention_during_rebalance(_Config) ->
+    %% Reproduces the flake: a persist completes while a rebalance is in
+    %% flight. persist_complete must NOT emit evaluate_retention, because
+    %% retention could delete the entries the rebalance is factoring,
+    %% causing group_upload_complete to crash with {badmatch, false}.
+    %% After the rebalance completes and the next persist fires, retention
+    %% is evaluated normally.
+    Threshold = 4,
+    {S0, _} = init_core(#{rebalance_threshold => Threshold, persist_threshold => 1}),
+    %% Apply one fragment and persist it (so we have a persist in flight
+    %% that will complete after the rebalance starts).
+    S1 = cut_and_complete(S0, 0, 100, 1001),
+    %% Persist is now in flight (threshold=1 triggered it). Apply 3 more
+    %% fragments to reach the rebalance threshold on the next drain.
+    S2 = cut_and_complete(S1, 100, 200, 1002),
+    S3 = cut_and_complete(S2, 200, 300, 1003),
+    S4 = cut_and_complete(S3, 300, 400, 1004),
+    %% Rebalance should now be in flight (4 fragments >= threshold).
+    #{rebalance_in_flight := true} =
+        rabbitmq_stream_s3_replica_reader_core:format_state(S4),
+    %% Now the earlier persist completes. It must NOT emit evaluate_retention.
+    {S5, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_complete(1, S4),
+    ?assertEqual([], [E || {evaluate_retention, _, _} = E <- Effects]),
+    %% Complete the rebalance. This clears rebalance_in_flight and triggers
+    %% a new persist (since_persist > 0).
+    {S6, RebalEffects} = rabbitmq_stream_s3_replica_reader_core:group_upload_complete(9999, S5),
+    #{rebalance_in_flight := false} =
+        rabbitmq_stream_s3_replica_reader_core:format_state(S6),
+    %% The rebalance triggers persist (since_persist incremented).
+    ?assertMatch([_ | _], [E || {start_persist, _, _, _, _, _} = E <- RebalEffects]),
+    %% Complete that persist. NOW retention should be emitted.
+    {_S7, FinalEffects} = rabbitmq_stream_s3_replica_reader_core:persist_complete(2, S6),
+    ?assertMatch([_ | _], [E || {evaluate_retention, _, _} = E <- FinalEffects]).
 
 retention_deletes_all_entries(_Config) ->
     %% Retention removes all entries. Manifest becomes empty.

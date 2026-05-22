@@ -238,12 +238,21 @@ persist_complete(
         last_persist_ts = erlang:system_time(millisecond),
         edits_since_persist = RemainingEdits
     },
-    Effects0 = [
-        {update_range, Manifest#manifest.first_offset, Manifest#manifest.next_offset},
-        {broadcast, Cfg#cfg.stream, State0#state.persisting_edits},
-        {evaluate_retention, Cfg#cfg.stream, Cfg#cfg.dir},
-        cancel_persist_timer
-    ],
+    %% Don't evaluate retention while a rebalance is in flight. Retention
+    %% could delete entries that the rebalance is factoring into a group,
+    %% causing group_upload_complete to crash. Retention will be triggered
+    %% by the next persist_complete after the rebalance finishes.
+    RetentionEffects =
+        case State0#state.rebalance_in_flight of
+            true -> [];
+            false -> [{evaluate_retention, Cfg#cfg.stream, Cfg#cfg.dir}]
+        end,
+    Effects0 =
+        [
+            {update_range, Manifest#manifest.first_offset, Manifest#manifest.next_offset},
+            {broadcast, Cfg#cfg.stream, State0#state.persisting_edits}
+            | RetentionEffects
+        ] ++ [cancel_persist_timer],
     {State2, WaiterEffects} = notify_waiters(State1),
     Effects1 = Effects0 ++ WaiterEffects,
     %% If more edits applied while persist was in flight, trigger another.
