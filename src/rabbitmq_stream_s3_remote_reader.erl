@@ -547,7 +547,22 @@ maybe_reply_pending(
             counters:add(counter(), ?C_AWAIT_DURATION_MS, Elapsed),
             counters:add(counter(), ?C_AWAIT, 1),
             gen_server:reply(From, {error, timeout}),
-            {noreply, State0#?MODULE{pending_read = undefined}};
+            %% Reset buffer to position 0 and cancel in-flight requests.
+            %% The caller may retry at any position (send_chunks reverts
+            %% the consumer to its pre-loop state on error), so the buffer
+            %% must not have a start_pos that would violate the
+            %% Offset >= StartPos assertion in try_read.
+            cancel_requests(State0#?MODULE.requests),
+            {noreply, State0#?MODULE{
+                pending_read = undefined,
+                buffer = <<>>,
+                start_pos = 0,
+                current_pos = 0,
+                end_pos = 0,
+                requests = #{},
+                cancelled_requests = #{},
+                retry_delay = ?MIN_RETRY_DELAY_MS
+            }};
         false ->
             case maybe_reply(Read, State0) of
                 {reply, Reply, State1} ->
