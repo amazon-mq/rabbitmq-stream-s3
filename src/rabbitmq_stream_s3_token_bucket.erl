@@ -46,7 +46,7 @@ request(Tokens, #bucket{available = Available} = Bucket) ->
 -spec refill(t()) -> t().
 refill(#bucket{rate = Rate, burst = Burst, available = Available, last_refill = Last} = Bucket) ->
     Now = erlang:monotonic_time(),
-    Elapsed = erlang:convert_time_unit(Now - Last, native, millisecond),
+    Elapsed = rabbitmq_stream_s3_util:elapsed_ms(Now, Last),
     Added = (Rate * Elapsed) div 1000,
     NewAvailable = min(Burst, Available + Added),
     Bucket#bucket{available = NewAvailable, last_refill = Now}.

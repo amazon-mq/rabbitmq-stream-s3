@@ -226,7 +226,7 @@ stream_data({StartTs, BackendState}, Data) ->
 -spec stream_finish(async_state(), non_neg_integer()) -> ok | {error, any()}.
 stream_finish({StartTs, BackendState}, Crc32) ->
     Result = (backend()):stream_finish(BackendState, Crc32),
-    Ms = erlang:convert_time_unit(erlang:monotonic_time() - StartTs, native, millisecond),
+    Ms = rabbitmq_stream_s3_util:elapsed_ms(StartTs),
     rabbitmq_stream_s3_histogram:observe({?MODULE, request_duration, write}, Ms),
     Result.
 
@@ -298,7 +298,7 @@ cancel_async(Req, {StartTs, BackendState}) ->
     ok = finish_async(StartTs).
 
 finish_async(StartTs) ->
-    Ms = erlang:convert_time_unit(erlang:monotonic_time() - StartTs, native, millisecond),
+    Ms = rabbitmq_stream_s3_util:elapsed_ms(StartTs),
     rabbitmq_stream_s3_histogram:observe({?MODULE, request_duration, read}, Ms),
     ok.
 
@@ -307,9 +307,7 @@ observe(Kind, Fun) ->
     try
         Fun()
     after
-        DurationMs = erlang:convert_time_unit(
-            erlang:monotonic_time() - T0, native, millisecond
-        ),
+        DurationMs = rabbitmq_stream_s3_util:elapsed_ms(T0),
         rabbitmq_stream_s3_histogram:observe({?MODULE, request_duration, Kind}, DurationMs)
     end.
 
