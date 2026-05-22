@@ -365,7 +365,6 @@ group_upload_failed(Reason, #state{cfg = Cfg, manifest = Manifest} = State) ->
     end.
 
 -doc """
--doc """
 Mark that an async retention evaluation has been spawned.
 """.
 -spec retention_started(state()) -> state().
