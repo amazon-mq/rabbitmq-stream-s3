@@ -34,9 +34,13 @@ multiplicative decrease ([AIMD]) algorithm.
 -define(MIN_RETRY_DELAY_MS, 1_000).
 -define(MAX_RETRY_DELAY_MS, 30_000).
 %% Cancel and retry an in-flight S3 request if no response arrives within
-%% this window. Must be less than ?GEN_SERVER_CALL_TIMEOUT (60s) to allow
-%% recovery before the caller times out.
--define(REQUEST_TIMEOUT_MS, 30_000).
+%% this window. Sized to allow multiple retries within
+%% ?PENDING_READ_DEADLINE_MS before giving up.
+-define(REQUEST_TIMEOUT_MS, 15_000).
+%% Maximum time a pending read can wait before the remote reader replies
+%% {error, timeout}. Must be less than ?GEN_SERVER_CALL_TIMEOUT (60s) to
+%% avoid crashing the caller.
+-define(PENDING_READ_DEADLINE_MS, 50_000).
 
 -define(C_BUFFER_HIT, 1).
 -define(C_BUFFER_MISS, 2).
@@ -175,7 +179,8 @@ init_counters() ->
     {ok, binary()}
     | {next_fragment, osiris:offset()}
     | {become_local, osiris:offset()}
-    | end_of_stream.
+    | end_of_stream
+    | {error, timeout}.
 read(Server, Offset, Bytes, Hint) ->
     read(Server, Offset, Bytes, Hint, ?GEN_SERVER_CALL_TIMEOUT).
 
@@ -183,7 +188,8 @@ read(Server, Offset, Bytes, Hint) ->
     {ok, binary()}
     | {next_fragment, osiris:offset()}
     | {become_local, osiris:offset()}
-    | end_of_stream.
+    | end_of_stream
+    | {error, timeout}.
 read(Server, Offset, Bytes, Hint, Timeout) ->
     T0 = erlang:monotonic_time(),
     Result = gen_server:call(Server, #read{offset = Offset, bytes = Bytes, hint = Hint}, Timeout),
@@ -364,7 +370,9 @@ handle_request_error(Reason, Req0, RetryDelay0, State) ->
             Transient =:= connection_error;
             Transient =:= timeout
         ->
-            maybe_reply_pending(State);
+            erlang:send_after(RetryDelay0, self(), retry_requests),
+            RetryDelay = min(RetryDelay0 * 2, ?MAX_RETRY_DELAY_MS),
+            maybe_reply_pending(State#?MODULE{retry_delay = RetryDelay});
         _ ->
             {stop, {shutdown, Reason}, State}
     end.
@@ -529,25 +537,53 @@ maybe_reply_pending(
         }
     } = State0
 ) ->
-    case maybe_reply(Read, State0) of
-        {reply, Reply, State1} ->
-            Duration = rabbitmq_stream_s3_util:elapsed_ms(Since),
-            counters:add(counter(), ?C_AWAIT_DURATION_MS, Duration),
+    Elapsed = rabbitmq_stream_s3_util:elapsed_ms(Since),
+    case Elapsed >= ?PENDING_READ_DEADLINE_MS of
+        true ->
+            ?LOG_WARNING(
+                "Remote read deadline exceeded (~bms), replying {error, timeout}",
+                [Elapsed]
+            ),
+            counters:add(counter(), ?C_AWAIT_DURATION_MS, Elapsed),
             counters:add(counter(), ?C_AWAIT, 1),
-            gen_server:reply(From, Reply),
-            State = State1#?MODULE{pending_read = undefined},
-            {noreply, State};
-        {stop, Reason, Reply, State1} ->
-            gen_server:reply(From, Reply),
-            State = State1#?MODULE{pending_read = undefined},
-            {stop, Reason, State};
-        {retry, State} ->
-            %% No in-flight requests - the pool was busy when maybe_start_request
-            %% was called. Schedule a retry so the read does not stall forever.
-            erlang:send_after(?MIN_RETRY_DELAY_MS, self(), retry_requests),
-            {noreply, State};
-        {noreply, _} = NoReply ->
-            NoReply
+            gen_server:reply(From, {error, timeout}),
+            %% Reset buffer to position 0 and cancel in-flight requests.
+            %% The caller may retry at any position (send_chunks reverts
+            %% the consumer to its pre-loop state on error), so the buffer
+            %% must not have a start_pos that would violate the
+            %% Offset >= StartPos assertion in try_read.
+            cancel_requests(State0#?MODULE.requests),
+            {noreply, State0#?MODULE{
+                pending_read = undefined,
+                buffer = <<>>,
+                start_pos = 0,
+                current_pos = 0,
+                end_pos = 0,
+                requests = #{},
+                cancelled_requests = #{},
+                retry_delay = ?MIN_RETRY_DELAY_MS
+            }};
+        false ->
+            case maybe_reply(Read, State0) of
+                {reply, Reply, State1} ->
+                    counters:add(counter(), ?C_AWAIT_DURATION_MS, Elapsed),
+                    counters:add(counter(), ?C_AWAIT, 1),
+                    gen_server:reply(From, Reply),
+                    State = State1#?MODULE{pending_read = undefined},
+                    {noreply, State};
+                {stop, Reason, Reply, State1} ->
+                    gen_server:reply(From, Reply),
+                    State = State1#?MODULE{pending_read = undefined},
+                    {stop, Reason, State};
+                {retry, State} ->
+                    %% No in-flight requests - the pool was busy when
+                    %% maybe_start_request was called. Schedule a retry so
+                    %% the read does not stall forever.
+                    erlang:send_after(?MIN_RETRY_DELAY_MS, self(), retry_requests),
+                    {noreply, State};
+                {noreply, _} = NoReply ->
+                    NoReply
+            end
     end.
 
 maybe_reply(#read{offset = Offset, bytes = Bytes, hint = _Hint}, #?MODULE{} = State0) ->
