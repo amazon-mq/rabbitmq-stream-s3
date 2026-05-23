@@ -41,7 +41,8 @@ all() ->
         header_overread_capped_at_index_boundary,
         next_fragment_404_triggers_range_lookup,
         deadline_expired_replies_error_timeout,
-        deadline_expired_resets_buffer_for_retry
+        deadline_expired_resets_buffer_for_retry,
+        jump_to_oldest_stale_manifest_becomes_local
     ].
 
 init_per_suite(Config) ->
@@ -573,3 +574,20 @@ deadline_expired_resets_buffer_for_retry(_Config) ->
     ?assertEqual([], Replies),
     Requests = [F || {start_request, _, _, F} <- Effects],
     ?assertMatch([0], Requests).
+
+jump_to_oldest_stale_manifest_becomes_local(_Config) ->
+    %% When manifest_range returns FirstOffset == current fragment offset,
+    %% the manifest is stale. The core must become_local instead of looping.
+    FragRef = frag_ref(0, 1_000_000, 42),
+    Iterator = mock_iterator([{0, 1_000_000, 42}]),
+    {S0, _} = init(stream_id(), FragRef, 64, Iterator),
+    %% Issue read, then 404 on current fragment.
+    {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {read, 64, 100, chunk_boundary}),
+    {S2, [{lookup_manifest_range}]} = rabbitmq_stream_s3_remote_reader_core:step(
+        S1, {request_error, make_ref(), 0, not_found}
+    ),
+    %% Manifest says first_offset = 0, same as our current fragment.
+    %% This means retention deleted it but the persist cycle hasn't updated yet.
+    {_S3, Effects} = rabbitmq_stream_s3_remote_reader_core:step(S2, {manifest_range, {0, 500}}),
+    %% Must become_local, NOT emit jump_to_oldest (which would loop).
+    ?assertMatch([{reply, {become_local, 0}}], Effects).

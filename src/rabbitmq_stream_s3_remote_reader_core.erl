@@ -416,7 +416,7 @@ handle_manifest_range(_Range, #state{pending = undefined} = State) ->
 handle_manifest_range(
     {FirstOffset, EndOffset},
     #state{
-        fragment_ref = #fragment_ref{size = FragSize},
+        fragment_ref = #fragment_ref{offset = CurrentOffset, size = FragSize},
         pending = #pending{offset = Offset}
     } = State
 ) ->
@@ -426,8 +426,7 @@ handle_manifest_range(
             %% Next fragment was 404. Check if retention evicted it.
             case rabbitmq_stream_s3_fragment_iterator:next(State#state.iterator) of
                 {ok, #fragment_ref{offset = NextFragment}, _} when FirstOffset >= NextFragment ->
-                    %% Retention evicted. Shell resolves the jump.
-                    {State, [{jump_to_oldest, FirstOffset}]};
+                    maybe_jump_to_oldest(FirstOffset, CurrentOffset, State);
                 {ok, #fragment_ref{offset = NextFragment}, _} when EndOffset =< NextFragment ->
                     FragOffset = (State#state.fragment_ref)#fragment_ref.offset,
                     State1 = goto_next_fragment(State#state{pending = undefined}),
@@ -439,12 +438,20 @@ handle_manifest_range(
                     ]}
             end;
         {false, _} ->
-            %% Current fragment 404. Shell resolves the jump.
-            {State, [{jump_to_oldest, FirstOffset}]};
+            maybe_jump_to_oldest(FirstOffset, CurrentOffset, State);
         _ ->
             State1 = goto_next_fragment(State#state{pending = undefined}),
             {State1, [{reply, {become_local, (State#state.fragment_ref)#fragment_ref.offset}}]}
     end.
+
+%% If the manifest's first_offset points to the fragment we already know is
+%% gone (404), the manifest is stale. Fall through to the local tier to avoid
+%% an infinite jump loop. See: https://github.com/amazon-mq/rabbitmq-stream-s3/issues/166
+maybe_jump_to_oldest(FirstOffset, CurrentOffset, State) when FirstOffset =:= CurrentOffset ->
+    State1 = goto_next_fragment(State#state{pending = undefined}),
+    {State1, [{reply, {become_local, CurrentOffset}}]};
+maybe_jump_to_oldest(FirstOffset, _CurrentOffset, State) ->
+    {State, [{jump_to_oldest, FirstOffset}]}.
 
 %% ------------------------------------------------------------------
 %% Internal: fragment navigation
