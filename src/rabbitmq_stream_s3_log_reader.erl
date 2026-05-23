@@ -349,7 +349,9 @@ send_file(
                             Err
                     end;
                 end_of_stream ->
-                    {end_of_stream, State0#?MODULE{mode = Remote1}}
+                    {end_of_stream, State0#?MODULE{mode = Remote1}};
+                {error, timeout} = Err ->
+                    Err
             end;
         {become_local, _} ->
             counters:add(counter(), ?C_REMOTE_CLOSE, 1),
@@ -360,7 +362,9 @@ send_file(
                     Err
             end;
         {end_of_stream, Remote} ->
-            {end_of_stream, State0#?MODULE{mode = Remote}}
+            {end_of_stream, State0#?MODULE{mode = Remote}};
+        {error, timeout} = Err ->
+            Err
     end;
 send_file(Socket, #?MODULE{mode = Local0} = State0, Callback) ->
     case osiris_log:send_file(Socket, Local0, Callback) of
@@ -433,7 +437,9 @@ chunk_iterator(
                             Err
                     end;
                 end_of_stream ->
-                    {end_of_stream, State0#?MODULE{mode = Remote1}}
+                    {end_of_stream, State0#?MODULE{mode = Remote1}};
+                {error, timeout} = Err ->
+                    Err
             end;
         {become_local, _} ->
             counters:add(counter(), ?C_REMOTE_CLOSE, 1),
@@ -444,7 +450,9 @@ chunk_iterator(
                     Err
             end;
         {end_of_stream, Remote} ->
-            {end_of_stream, State0#?MODULE{mode = Remote}}
+            {end_of_stream, State0#?MODULE{mode = Remote}};
+        {error, timeout} = Err ->
+            Err
     end;
 chunk_iterator(#?MODULE{mode = Local0} = State0, Credit, PrevIter) ->
     case osiris_log:chunk_iterator(Local0, Credit, PrevIter) of
@@ -508,7 +516,8 @@ send(ssl, Socket, Data) ->
 -spec read_header(#remote{}) ->
     {ok, osiris_log:header_map(), #remote{}}
     | {become_local, osiris:offset()}
-    | {end_of_stream, #remote{}}.
+    | {end_of_stream, #remote{}}
+    | {error, timeout}.
 read_header(#remote{shared = Shared, next_offset = NextOffset} = Remote) ->
     CanReadNext =
         osiris_log_shared:last_chunk_id(Shared) >= NextOffset andalso
@@ -538,7 +547,9 @@ read_header1(
         {become_local, Offset} ->
             {become_local, Offset};
         end_of_stream ->
-            {end_of_stream, Remote0}
+            {end_of_stream, Remote0};
+        {error, timeout} = Err ->
+            Err
     end.
 
 read_header2(
@@ -667,7 +678,7 @@ init_remote_reader(
         stream => StreamId,
         location => Location
     },
-    case gen_server:start_link(rabbitmq_stream_s3_remote_reader, Conf, []) of
+    case gen_server:start(rabbitmq_stream_s3_remote_reader, Conf, []) of
         {ok, Pid} ->
             counters:add(counter(), ?C_REMOTE_INIT, 1),
             Reader = #?MODULE{
@@ -717,20 +728,26 @@ find_position(Spec, #manifest{} = Manifest, StreamId) ->
         find_fragment(Manifest#manifest.entries, Spec, GetGroupFun),
     %% Download the index from the fragment to find the exact chunk position.
     IdxStartPos = ?SEGMENT_HEADER_B + Size,
-    IndexData = index_data(StreamId, FragmentOffset, Uid, IdxStartPos),
-    {ChunkId, _, FragPos} = find_index_position(IndexData, Spec),
-    %% Position within the fragment object (after the 8-byte header).
-    Position = ?SEGMENT_HEADER_B + FragPos,
-    %% Create an iterator positioned at this fragment for forward navigation.
-    Iterator = rabbitmq_stream_s3_fragment_iterator:init(Manifest, FragmentOffset, GetGroupFun),
-    %% Advance past the current entry so the iterator is ready for `next`.
-    Iterator1 = advance_past_current(Iterator),
-    {ok, #remote_location{
-        chunk_id = ChunkId,
-        position = Position,
-        fragment_ref = FragRef,
-        iterator = Iterator1
-    }}.
+    case index_data(StreamId, FragmentOffset, Uid, IdxStartPos) of
+        {ok, IndexData} ->
+            {ChunkId, _, FragPos} = find_index_position(IndexData, Spec),
+            %% Position within the fragment object (after the 8-byte header).
+            Position = ?SEGMENT_HEADER_B + FragPos,
+            %% Create an iterator positioned at this fragment for forward navigation.
+            Iterator = rabbitmq_stream_s3_fragment_iterator:init(
+                Manifest, FragmentOffset, GetGroupFun
+            ),
+            %% Advance past the current entry so the iterator is ready for `next`.
+            Iterator1 = advance_past_current(Iterator),
+            {ok, #remote_location{
+                chunk_id = ChunkId,
+                position = Position,
+                fragment_ref = FragRef,
+                iterator = Iterator1
+            }};
+        {error, _} = Err ->
+            Err
+    end.
 
 -doc """
 Finds the manifest entry which contains the requested offset or timestamp.
@@ -818,12 +835,11 @@ saturating_decr(N) -> N - 1.
 index_data(StreamId, FragmentOffset, Uid, IdxStartPos) ->
     Key = rabbitmq_stream_s3:fragment_key(StreamId, FragmentOffset, Uid),
     ?LOG_DEBUG("Looking up key ~ts (~ts)", [Key, ?FUNCTION_NAME], ?DOMAIN),
-    {ok, Data} = rabbitmq_stream_s3_api:get_range(
+    rabbitmq_stream_s3_api:get_range(
         Key,
         {IdxStartPos, undefined},
         #{timeout => ?READ_TIMEOUT}
-    ),
-    Data.
+    ).
 
 %% Advance the iterator past the current entry (so next/1 returns the
 %% entry *after* the one we resolved to).
@@ -860,7 +876,8 @@ resolve_first(StreamId, FirstOffset) ->
     {ok, binary()}
     | {next_fragment, osiris:offset()}
     | {become_local, osiris:offset()}
-    | end_of_stream.
+    | end_of_stream
+    | {error, timeout}.
 read(RemoteReader, Offset, Bytes, Hint) ->
     {Ms, Result} = timer:tc(
         rabbitmq_stream_s3_remote_reader,

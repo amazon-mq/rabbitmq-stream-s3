@@ -746,6 +746,12 @@ attach_to_stream_with_prior_retention(Config) ->
         1000
     ),
     ok = osiris_writer:stop(WriterCfg1),
+    %% Barrier: wait for the osiris_retention process to finish all pending
+    %% evaluations. Retention is a cast to a separate gen_batch_server; the
+    %% writer may have sent retention evals that are still in flight. Without
+    %% this barrier, restarting the writer can race with retention deleting
+    %% segment files mid-init.
+    ok = gen_batch_server:call(osiris_retention, barrier, 5000),
 
     %% Phase 2: restart with plugin hooks. The replica reader discovers the
     %% log starts at a non-zero offset and uploads from there.

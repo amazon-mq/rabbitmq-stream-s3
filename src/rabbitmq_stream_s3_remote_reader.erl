@@ -93,7 +93,7 @@ synchronous feedback is generated.
 
 %% API
 -export([
-    start_link/1,
+    start/1,
     read/4,
     read/5,
     init_counters/0,
@@ -134,8 +134,8 @@ read_size_prometheus_format() ->
         }
     }.
 
-start_link(Config) ->
-    gen_server:start_link(?MODULE, Config, []).
+start(Config) ->
+    gen_server:start(?MODULE, Config, []).
 
 read(Server, Offset, Bytes, Hint) ->
     read(Server, Offset, Bytes, Hint, ?GEN_SERVER_CALL_TIMEOUT).
@@ -469,7 +469,7 @@ maybe_stop(State) ->
 
 build_cfg(Opts) ->
     #cfg{
-        request_timeout_ms = maps:get(request_timeout_ms, Opts, 30_000),
+        request_timeout_ms = maps:get(request_timeout_ms, Opts, 15_000),
         pending_read_deadline_ms = maps:get(pending_read_deadline_ms, Opts, 50_000)
     }.
 
