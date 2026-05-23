@@ -39,7 +39,7 @@ When resolution points to the remote tier, the log reader:
 
 1. Finds the fragment containing the target offset by binary-searching the manifest entries.
 2. Constructs a `#remote_location{}` containing the fragment ref, byte position within the fragment, and a fragment iterator positioned at the current entry.
-3. Spawns a `rabbitmq_stream_s3_remote_reader` gen_server linked to the caller.
+3. Spawns a `rabbitmq_stream_s3_remote_reader` gen_server (unlinked; the remote reader monitors the caller and stops when it exits).
 4. Returns the reader state in remote mode.
 
 Subsequent reads (`send_file/3`, `chunk_iterator/3`) are forwarded to the remote reader process.
