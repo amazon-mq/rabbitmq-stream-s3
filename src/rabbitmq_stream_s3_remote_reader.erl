@@ -830,6 +830,25 @@ cancel_requests(Requests) ->
     counters:put(counter(), ?C_REQUESTS_IN_FLIGHT, 0).
 
 jump_to_oldest(
+    #?MODULE{
+        fragment_ref = #fragment_ref{offset = CurrentOffset},
+        requests = Requests,
+        cancelled_requests = Cancelled0
+    } = State0,
+    FirstOffset
+) when FirstOffset =:= CurrentOffset ->
+    %% The manifest's first_offset points to the fragment we already know
+    %% is gone (404). The manifest is stale - retention deleted the
+    %% fragment but the persist cycle hasn't updated the manifest yet.
+    %% Fall through to the local tier to avoid an infinite loop.
+    cancel_requests(Requests),
+    Cancelled = maps:merge(Cancelled0, #{Req => ok || Req := _ <- Requests}),
+    State = goto_next_fragment(State0#?MODULE{
+        requests = #{},
+        cancelled_requests = Cancelled
+    }),
+    {become_local, State};
+jump_to_oldest(
     #?MODULE{stream = StreamId, requests = Requests, cancelled_requests = Cancelled0} = State0,
     FirstOffset
 ) ->
