@@ -1529,7 +1529,8 @@ gen_rrc_event(NextReadPos) ->
         {3, ?LET(E, gen_rrc_data_event(), {E, NextReadPos})},
         {2, ?LET(E, gen_rrc_error_event(), {E, NextReadPos})},
         {1, {{retry}, NextReadPos}},
-        {1, ?LET(E, gen_rrc_manifest_range_event(), {E, NextReadPos})}
+        {1, ?LET(E, gen_rrc_manifest_range_event(), {E, NextReadPos})},
+        {1, {deadline_expired, NextReadPos}}
     ]).
 
 gen_rrc_read_event(NextReadPos) ->
