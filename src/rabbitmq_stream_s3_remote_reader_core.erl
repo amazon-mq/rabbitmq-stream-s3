@@ -383,14 +383,11 @@ try_fragment_transition(
     %% Next fragment 404. Need manifest range to decide.
     {not_found_check_range, State};
 try_fragment_transition(
-    #state{next = undefined, iterator = Iterator, requests_in_flight = Requests} = State
+    #state{next = undefined, iterator = Iterator} = State
 ) ->
     case rabbitmq_stream_s3_fragment_iterator:next(Iterator) of
-        {ok, #fragment_ref{offset = NextOffset}, _} ->
-            case maps:is_key(NextOffset, Requests) of
-                true -> {await, State};
-                false -> {await, State}
-            end;
+        {ok, _FragRef, _} ->
+            {await, State};
         end_of_manifest ->
             {refresh_iterator, State};
         {error, _} ->
