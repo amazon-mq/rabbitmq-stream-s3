@@ -678,7 +678,7 @@ init_remote_reader(
         stream => StreamId,
         location => Location
     },
-    case gen_server:start_link(rabbitmq_stream_s3_remote_reader, Conf, []) of
+    case gen_server:start(rabbitmq_stream_s3_remote_reader, Conf, []) of
         {ok, Pid} ->
             counters:add(counter(), ?C_REMOTE_INIT, 1),
             Reader = #?MODULE{
