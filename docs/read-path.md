@@ -39,19 +39,20 @@ When resolution points to the remote tier, the log reader:
 
 1. Finds the fragment containing the target offset by binary-searching the manifest entries.
 2. Constructs a `#remote_location{}` containing the fragment ref, byte position within the fragment, and a fragment iterator positioned at the current entry.
-3. Spawns a `rabbitmq_stream_s3_remote_reader` gen_server linked to the caller.
+3. Spawns a `rabbitmq_stream_s3_remote_reader` gen_server (unlinked; the remote reader monitors the caller and stops when it exits).
 4. Returns the reader state in remote mode.
 
 Subsequent reads (`send_file/3`, `chunk_iterator/3`) are forwarded to the remote reader process.
 
 ## Remote reader
 
-The remote reader (`rabbitmq_stream_s3_remote_reader`) is a per-consumer gen_server that prefetches fragment data from S3. It manages:
+The remote reader is split into a functional core and a gen_server shell, following the same pattern as the upload path (`replica_reader` / `replica_reader_core`).
 
-- The current fragment (downloading via HTTP range requests).
-- The next fragment (prefetched in the background for seamless transitions).
-- A read buffer for the current position.
-- The fragment iterator for forward navigation.
+**`rabbitmq_stream_s3_remote_reader_core`** is a pure module containing all decision logic: buffer management, AIMD prefetch sizing, fragment transitions, retry/timeout decisions, and error classification. It receives events and returns a new state plus a list of effects. It never performs I/O.
+
+**`rabbitmq_stream_s3_remote_reader`** is the gen_server shell. It translates external events (gun HTTP messages, timer fires, gen_server calls from the log reader) into core events, feeds them to the core, and executes the resulting effects (start S3 requests, set timers, reply to callers, look up the manifest cache).
+
+Effects that require local data (manifest range lookups, iterator refreshes) are resolved synchronously in the shell's effect-execution loop and fed back to the core immediately. This avoids extra async round-trips for what are fast ETS lookups.
 
 ### Prefetch
 
