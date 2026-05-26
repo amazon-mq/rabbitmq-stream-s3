@@ -223,7 +223,7 @@ become_local_at_end_of_manifest(_Config) ->
 
     %% Read past end triggers refresh_iterator effect.
     {S2, E1} = rabbitmq_stream_s3_remote_reader_core:step(S1, {read, 164, 50, chunk_boundary}),
-    ?assertMatch([{refresh_iterator}], E1),
+    ?assertMatch([refresh_iterator], E1),
 
     %% Shell reports end_of_manifest.
     {_S3, E2} = rabbitmq_stream_s3_remote_reader_core:step(
@@ -244,7 +244,7 @@ not_found_triggers_range_lookup(_Config) ->
     {S2, E1} = rabbitmq_stream_s3_remote_reader_core:step(
         S1, {request_error, make_ref(), 0, not_found}
     ),
-    ?assertMatch([{lookup_manifest_range}], E1),
+    ?assertMatch([lookup_manifest_range], E1),
 
     %% Shell reports empty range → end_of_stream.
     {_S3, E2} = rabbitmq_stream_s3_remote_reader_core:step(S2, {manifest_range, empty}),
@@ -434,7 +434,7 @@ jump_to_oldest_full_cycle(_Config) ->
     {S0, _} = init(stream_id(), FragRef, 64, Iterator),
     %% Issue read, then 404.
     {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {read, 64, 100, chunk_boundary}),
-    {S2, [{lookup_manifest_range}]} = rabbitmq_stream_s3_remote_reader_core:step(
+    {S2, [lookup_manifest_range]} = rabbitmq_stream_s3_remote_reader_core:step(
         S1, {request_error, make_ref(), 0, not_found}
     ),
     %% Manifest says first available is at offset 500.
@@ -534,7 +534,7 @@ next_fragment_404_triggers_range_lookup(_Config) ->
     {_S3, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
         S2, {read, 208, 50, chunk_boundary}
     ),
-    ?assertMatch([{lookup_manifest_range}], Effects).
+    ?assertMatch([lookup_manifest_range], Effects).
 
 deadline_expired_replies_error_timeout(_Config) ->
     %% When the shell fires deadline_expired, the core replies {error, timeout}
@@ -583,7 +583,7 @@ jump_to_oldest_stale_manifest_becomes_local(_Config) ->
     {S0, _} = init(stream_id(), FragRef, 64, Iterator),
     %% Issue read, then 404 on current fragment.
     {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {read, 64, 100, chunk_boundary}),
-    {S2, [{lookup_manifest_range}]} = rabbitmq_stream_s3_remote_reader_core:step(
+    {S2, [lookup_manifest_range]} = rabbitmq_stream_s3_remote_reader_core:step(
         S1, {request_error, make_ref(), 0, not_found}
     ),
     %% Manifest says first_offset = 0, same as our current fragment.

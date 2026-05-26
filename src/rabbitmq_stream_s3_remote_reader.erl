@@ -376,12 +376,12 @@ execute_effect(
 execute_effect({set_timer, DelayMs}, State) ->
     erlang:send_after(DelayMs, self(), retry_requests),
     State;
-execute_effect({lookup_manifest_range}, #state{stream = StreamId, core = Core0} = State) ->
+execute_effect(lookup_manifest_range, #state{stream = StreamId, core = Core0} = State) ->
     %% Synchronous local lookup — feed result back to core immediately.
     Range = rabbitmq_stream_s3_manifest_replica:get_range(StreamId),
     {Core1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(Core0, {manifest_range, Range}),
     execute_effects(Effects, State#state{core = Core1});
-execute_effect({refresh_iterator}, #state{stream = StreamId, core = Core0} = State) ->
+execute_effect(refresh_iterator, #state{stream = StreamId, core = Core0} = State) ->
     %% Synchronous local lookup — feed result back to core immediately.
     Result = refresh_iterator(StreamId, Core0),
     {Core1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(

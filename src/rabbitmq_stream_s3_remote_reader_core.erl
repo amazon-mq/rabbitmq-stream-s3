@@ -120,8 +120,8 @@ and transitions immediately if available, or signals that more data is needed.
     {reply, read_result()}
     | {start_request, rabbitmq_stream_s3:key(), {byte_offset(), byte_offset()}, fragment_offset()}
     | {set_timer, pos_integer()}
-    | {lookup_manifest_range}
-    | {refresh_iterator}
+    | lookup_manifest_range
+    | refresh_iterator
     | {jump_to_oldest, osiris:offset()}
     | stop.
 
@@ -203,7 +203,7 @@ step(State0, {request_error, _RequestId, Fragment, not_found}) ->
             State = State0#state{current_not_found = true, requests_in_flight = #{}},
             case State#state.pending of
                 undefined -> {State, []};
-                _ -> {State, [{lookup_manifest_range}]}
+                _ -> {State, [lookup_manifest_range]}
             end;
         false ->
             %% Next fragment 404. Mark it and try to serve (may trigger range lookup
@@ -325,9 +325,9 @@ try_serve(#state{pending = #pending{offset = Offset, bytes = Bytes}} = State) ->
             {State3, Effects} = maybe_start_requests(State2),
             {State3, Effects};
         {not_found_check_range, State1} ->
-            {State1, [{lookup_manifest_range}]};
+            {State1, [lookup_manifest_range]};
         {refresh_iterator, State1} ->
-            {State1, [{refresh_iterator}]}
+            {State1, [refresh_iterator]}
     end.
 
 %% ------------------------------------------------------------------
