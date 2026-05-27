@@ -362,57 +362,34 @@ execute_effect(
 execute_effect({set_timer, DelayMs}, State) ->
     erlang:send_after(DelayMs, self(), retry_requests),
     State;
-execute_effect(lookup_manifest_range, #state{stream = StreamId, core = Core0} = State) ->
-    %% Synchronous local lookup — feed result back to core immediately.
-    Range = rabbitmq_stream_s3_manifest_replica:get_range(StreamId),
-    {Core1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(Core0, {manifest_range, Range}),
-    execute_effects(Effects, State#state{core = Core1});
-execute_effect(refresh_iterator, #state{stream = StreamId, core = Core0} = State) ->
-    %% Synchronous local lookup — feed result back to core immediately.
-    Result = refresh_iterator(StreamId, Core0),
+execute_effect(
+    {refresh_iterator, NotFoundOffset},
+    #state{stream = StreamId, core = Core0} = State0
+) ->
+    %% Cancel in-flight requests. The core will reinitialize at a new fragment.
+    State1 = cancel_all_requests(State0),
+    %% Synchronous local lookup. Rebuild iterator past the 404'd offset.
+    Result = refresh_iterator(StreamId, NotFoundOffset),
     {Core1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
         Core0, {iterator_refreshed, Result}
     ),
-    execute_effects(Effects, State#state{core = Core1});
-execute_effect(
-    {jump_to_oldest, FirstOffset},
-    #state{stream = StreamId, core = Core0} = State0
-) ->
-    %% Cancel in-flight requests, resolve the fragment from the manifest,
-    %% and feed back to the core.
-    State1 = cancel_all_requests(State0),
-    case resolve_fragment_at(StreamId, FirstOffset) of
-        {ok, FragRef, Iterator} ->
-            {Core1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
-                Core0, {jumped, FragRef, Iterator}
-            ),
-            execute_effects(Effects, State1#state{core = Core1});
-        not_found ->
-            %% Manifest doesn't have this offset. End of stream.
-            case State1#state.from of
-                undefined ->
-                    State1;
-                From ->
-                    gen_server:reply(From, end_of_stream),
-                    State1#state{from = undefined, since = undefined}
-            end
-    end;
+    execute_effects(Effects, State1#state{core = Core1});
 execute_effect(stop, State) ->
     State#state{stopping = true}.
 
-%% Rebuild the fragment iterator from the manifest cache.
-refresh_iterator(StreamId, Core) ->
-    FragOffset = rabbitmq_stream_s3_remote_reader_core:current_fragment_offset(Core),
+%% Rebuild the fragment iterator from the manifest cache, advancing past
+%% the given offset (the fragment known to be 404).
+refresh_iterator(StreamId, NotFoundOffset) ->
     case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
         #manifest{} = Manifest ->
             GetGroupFun = rabbitmq_stream_s3_manifest:get_group_fun(StreamId),
             Iterator0 = rabbitmq_stream_s3_fragment_iterator:init(
-                Manifest, FragOffset, GetGroupFun
+                Manifest, NotFoundOffset, GetGroupFun
             ),
-            %% Advance past the current fragment.
+            %% Advance past the 404'd fragment.
             Iterator =
                 case rabbitmq_stream_s3_fragment_iterator:next(Iterator0) of
-                    {ok, _, It} -> It;
+                    {ok, #fragment_ref{offset = O}, It} when O =< NotFoundOffset -> It;
                     _ -> Iterator0
                 end,
             %% Check if there's anything after.
@@ -422,22 +399,6 @@ refresh_iterator(StreamId, Core) ->
             end;
         _ ->
             end_of_manifest
-    end.
-
-%% Look up a fragment ref at the given offset from the manifest cache.
-resolve_fragment_at(StreamId, Offset) ->
-    case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
-        #manifest{} = Manifest ->
-            GetGroupFun = rabbitmq_stream_s3_manifest:get_group_fun(StreamId),
-            Iterator = rabbitmq_stream_s3_fragment_iterator:init(
-                Manifest, Offset, GetGroupFun
-            ),
-            case rabbitmq_stream_s3_fragment_iterator:next(Iterator) of
-                {ok, FragRef, _} -> {ok, FragRef, Iterator};
-                _ -> not_found
-            end;
-        _ ->
-            not_found
     end.
 
 maybe_stop(#state{stopping = true} = State) ->

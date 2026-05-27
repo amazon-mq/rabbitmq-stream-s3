@@ -24,7 +24,7 @@ all() ->
         two_timeouts_then_retry_succeeds,
         fragment_transition_with_prefetch,
         become_local_at_end_of_manifest,
-        not_found_triggers_range_lookup,
+        not_found_triggers_refresh_iterator,
         %% New tests
         aimd_growth_after_consecutive_hits,
         aimd_shrink_on_miss,
@@ -35,14 +35,14 @@ all() ->
         fragment_transition_without_prefetch_awaits,
         read_at_exact_fragment_boundary,
         mid_fragment_init_position,
-        jump_to_oldest_full_cycle,
+        fragment_404_advances_to_next_fragment,
         retry_resets_delay_on_success,
         read_larger_than_buffer_awaits,
         header_overread_capped_at_index_boundary,
-        next_fragment_404_triggers_range_lookup,
+        next_fragment_404_triggers_refresh_iterator,
         deadline_expired_replies_error_timeout,
         deadline_expired_resets_buffer_for_retry,
-        jump_to_oldest_stale_manifest_becomes_local
+        fragment_404_emits_refresh_iterator
     ].
 
 init_per_suite(Config) ->
@@ -223,7 +223,7 @@ become_local_at_end_of_manifest(_Config) ->
 
     %% Read past end triggers refresh_iterator effect.
     {S2, E1} = rabbitmq_stream_s3_remote_reader_core:step(S1, {read, 164, 50, chunk_boundary}),
-    ?assertMatch([refresh_iterator], E1),
+    ?assertMatch([{refresh_iterator, 0}], E1),
 
     %% Shell reports end_of_manifest.
     {_S3, E2} = rabbitmq_stream_s3_remote_reader_core:step(
@@ -231,8 +231,9 @@ become_local_at_end_of_manifest(_Config) ->
     ),
     ?assertMatch([{reply, {become_local, 0}}], E2).
 
-not_found_triggers_range_lookup(_Config) ->
-    %% A 404 on the current fragment triggers a manifest range lookup.
+not_found_triggers_refresh_iterator(_Config) ->
+    %% A 404 on the current fragment triggers a refresh_iterator effect.
+    %% If the refreshed iterator is exhausted, become_local.
     FragRef = frag_ref(0, 1_000_000, 42),
     Iterator = mock_iterator([{0, 1_000_000, 42}]),
     {S0, _} = init(stream_id(), FragRef, 64, Iterator),
@@ -244,11 +245,13 @@ not_found_triggers_range_lookup(_Config) ->
     {S2, E1} = rabbitmq_stream_s3_remote_reader_core:step(
         S1, {request_error, make_ref(), 0, not_found}
     ),
-    ?assertMatch([lookup_manifest_range], E1),
+    ?assertMatch([{refresh_iterator, 0}], E1),
 
-    %% Shell reports empty range → end_of_stream.
-    {_S3, E2} = rabbitmq_stream_s3_remote_reader_core:step(S2, {manifest_range, empty}),
-    ?assertMatch([{reply, end_of_stream}], E2).
+    %% Shell reports no more fragments → become_local.
+    {_S3, E2} = rabbitmq_stream_s3_remote_reader_core:step(
+        S2, {iterator_refreshed, end_of_manifest}
+    ),
+    ?assertMatch([{reply, {become_local, 0}}], E2).
 
 %% ------------------------------------------------------------------
 %% AIMD and retry tests
@@ -426,27 +429,26 @@ mid_fragment_init_position(_Config) ->
     {_S0, Effects} = init(stream_id(), FragRef, MidPos, Iterator),
     ?assertMatch([{start_request, _, {5000, _}, 0}], Effects).
 
-jump_to_oldest_full_cycle(_Config) ->
-    %% 404 on current fragment → manifest_range → jump_to_oldest effect →
-    %% jumped event → reply with next_fragment + new request started.
+fragment_404_advances_to_next_fragment(_Config) ->
+    %% 404 on current fragment → refresh_iterator → iterator_refreshed with
+    %% next fragment → reply with next_fragment + new request started.
     FragRef = frag_ref(0, 1_000_000, 42),
     Iterator = mock_iterator([{0, 1_000_000, 42}, {500, 2_000_000, 99}]),
     {S0, _} = init(stream_id(), FragRef, 64, Iterator),
     %% Issue read, then 404.
     {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {read, 64, 100, chunk_boundary}),
-    {S2, [lookup_manifest_range]} = rabbitmq_stream_s3_remote_reader_core:step(
+    {S2, [{refresh_iterator, 0}]} = rabbitmq_stream_s3_remote_reader_core:step(
         S1, {request_error, make_ref(), 0, not_found}
     ),
-    %% Manifest says first available is at offset 500.
-    {S3, E1} = rabbitmq_stream_s3_remote_reader_core:step(S2, {manifest_range, {500, 1000}}),
-    ?assertMatch([{jump_to_oldest, 500}], E1),
-    %% Shell resolves the jump and feeds back.
-    NewFragRef = frag_ref(500, 2_000_000, 99),
-    NewIterator = mock_iterator([{500, 2_000_000, 99}]),
-    {_S4, E2} = rabbitmq_stream_s3_remote_reader_core:step(S3, {jumped, NewFragRef, NewIterator}),
+    %% Shell refreshes iterator past offset 0. The iterator's next entry
+    %% is fragment 500. Build an iterator where next/1 returns fragment 500.
+    Manifest500 = build_manifest([{500, 2_000_000, 99}]),
+    GetGroupFun = fun(_) -> {error, not_found} end,
+    NewIterator = rabbitmq_stream_s3_fragment_iterator:init(Manifest500, 0, GetGroupFun),
+    {_S3, E1} = rabbitmq_stream_s3_remote_reader_core:step(S2, {iterator_refreshed, NewIterator}),
     %% Should reply with next_fragment and start a request for the new fragment.
-    ?assertMatch([{reply, {next_fragment, 500}} | _], E2),
-    Requests = [F || {start_request, _, _, F} <- E2],
+    ?assertMatch([{reply, {next_fragment, 500}} | _], E1),
+    Requests = [F || {start_request, _, _, F} <- E1],
     ?assertEqual([500], Requests).
 
 retry_resets_delay_on_success(_Config) ->
@@ -517,9 +519,10 @@ header_overread_capped_at_index_boundary(_Config) ->
     [{reply, {ok, ResultData}}] = Replies,
     ?assertEqual(108, byte_size(ResultData)).
 
-next_fragment_404_triggers_range_lookup(_Config) ->
+next_fragment_404_triggers_refresh_iterator(_Config) ->
     %% Prefetch of next fragment returns 404. When the consumer reads past
-    %% the current fragment, the core triggers a manifest range lookup.
+    %% the current fragment, the core triggers a refresh_iterator past the
+    %% 404'd fragment's offset.
     FragRef = frag_ref(0, 200, 42),
     Iterator = mock_iterator([{0, 200, 42}, {100, 500, 43}]),
     {S0, _} = init(stream_id(), FragRef, 8, Iterator),
@@ -530,11 +533,11 @@ next_fragment_404_triggers_range_lookup(_Config) ->
     {S2, _} = rabbitmq_stream_s3_remote_reader_core:step(
         S1, {request_error, make_ref(), 100, not_found}
     ),
-    %% Read past end of current fragment. Next is not_found → range lookup.
+    %% Read past end of current fragment. Next is not_found → refresh past offset 100.
     {_S3, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
         S2, {read, 208, 50, chunk_boundary}
     ),
-    ?assertMatch([lookup_manifest_range], Effects).
+    ?assertMatch([{refresh_iterator, 100}], Effects).
 
 deadline_expired_replies_error_timeout(_Config) ->
     %% When the shell fires deadline_expired, the core replies {error, timeout}
@@ -575,19 +578,15 @@ deadline_expired_resets_buffer_for_retry(_Config) ->
     Requests = [F || {start_request, _, _, F} <- Effects],
     ?assertMatch([0], Requests).
 
-jump_to_oldest_stale_manifest_becomes_local(_Config) ->
-    %% When manifest_range returns FirstOffset == current fragment offset,
-    %% the manifest is stale. The core must become_local instead of looping.
+fragment_404_emits_refresh_iterator(_Config) ->
+    %% When the current fragment returns 404, the core emits
+    %% {refresh_iterator, Offset} to advance past the dead fragment.
     FragRef = frag_ref(0, 1_000_000, 42),
     Iterator = mock_iterator([{0, 1_000_000, 42}]),
     {S0, _} = init(stream_id(), FragRef, 64, Iterator),
     %% Issue read, then 404 on current fragment.
     {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {read, 64, 100, chunk_boundary}),
-    {S2, [lookup_manifest_range]} = rabbitmq_stream_s3_remote_reader_core:step(
+    {_S2, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
         S1, {request_error, make_ref(), 0, not_found}
     ),
-    %% Manifest says first_offset = 0, same as our current fragment.
-    %% This means retention deleted it but the persist cycle hasn't updated yet.
-    {_S3, Effects} = rabbitmq_stream_s3_remote_reader_core:step(S2, {manifest_range, {0, 500}}),
-    %% Must become_local, NOT emit jump_to_oldest (which would loop).
-    ?assertMatch([{reply, {become_local, 0}}], Effects).
+    ?assertMatch([{refresh_iterator, 0}], Effects).
