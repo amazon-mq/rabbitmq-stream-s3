@@ -595,15 +595,7 @@ delete_manifest_objects(StreamId, Manifest) ->
             end
         end,
         Refs = rabbitmq_stream_s3_fragment_iterator:all_refs(Manifest, GetGroupFun),
-        Keys = lists:map(
-            fun
-                (#fragment_ref{} = FRef) ->
-                    rabbitmq_stream_s3:fragment_key(StreamId, FRef);
-                (#group_ref{} = GroupRef) ->
-                    rabbitmq_stream_s3:group_key(StreamId, GroupRef)
-            end,
-            Refs
-        ),
+        Keys = [rabbitmq_stream_s3:ref_key(StreamId, Ref) || Ref <- Refs],
         rabbitmq_stream_s3_reaper:delete_objects(StreamId, Keys)
     end),
     ok.
@@ -686,7 +678,7 @@ commit_khepri(StreamId, Epoch, Reference, ExpectedRevision, Uid) ->
 delete_old_manifest(_StreamId, undefined) ->
     ok;
 delete_old_manifest(StreamId, #manifest_ref{} = Ref) ->
-    Key = rabbitmq_stream_s3:manifest_key(StreamId, Ref),
+    Key = rabbitmq_stream_s3:ref_key(StreamId, Ref),
     rabbitmq_stream_s3_reaper:delete_objects(StreamId, [Key]).
 
 -spec serialize_manifest(#manifest{}) -> binary().
@@ -1369,15 +1361,7 @@ on_persist_completed(#manifest{} = Manifest, State) ->
 flush_deferred_deletions(#state{deferred_deletions = []}) ->
     ok;
 flush_deferred_deletions(#state{deferred_deletions = Refs, cfg = #cfg{stream = StreamId}}) ->
-    Keys = lists:map(
-        fun
-            (#fragment_ref{} = FRef) ->
-                rabbitmq_stream_s3:fragment_key(StreamId, FRef);
-            (#group_ref{} = GRef) ->
-                rabbitmq_stream_s3:group_key(StreamId, GRef)
-        end,
-        Refs
-    ),
+    Keys = [rabbitmq_stream_s3:ref_key(StreamId, Ref) || Ref <- Refs],
     rabbitmq_stream_s3_reaper:delete_objects(StreamId, Keys).
 
 update_manifest_gauges(
