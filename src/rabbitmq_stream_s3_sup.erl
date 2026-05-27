@@ -18,6 +18,7 @@ init([]) ->
     catch rabbitmq_stream_s3_prometheus_collector:register(),
     catch rabbitmq_stream_s3_db:setup(),
     rabbitmq_stream_s3_registry:init(),
+    rabbitmq_stream_s3_manifest:init(),
     SupFlags = #{strategy => one_for_one, intensity => 3, period => 5},
     UploadPool = pool_child(rabbitmq_stream_s3_upload_pool, #{
         name => rabbitmq_stream_s3_upload_pool,

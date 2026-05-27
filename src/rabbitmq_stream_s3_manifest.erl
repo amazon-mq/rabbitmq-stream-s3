@@ -21,12 +21,27 @@ fragments (via tree-branch-like "group" objects, for large enough streams).
 -export_type([t/0, edit/0]).
 
 -export([
+    init/0,
     new_edit/1,
     apply_edit/2,
     get_group_fun/1,
+    get_cached_group_fun/1,
+    clear_group_cache/2,
+    evict_group_cache/1,
     evaluate_remote_retention/3,
     evaluate_remote_retention/4
 ]).
+
+%% Public ETS table caching the first group object per stream. Keyed by
+%% stream_id(), value is {#group_ref{}, entries()}. Avoids re-downloading
+%% the same immutable group object on every retention evaluation cycle.
+-define(FIRST_GROUPS, rabbitmq_stream_s3_manifest_first_groups).
+
+-doc "Create the first-group cache ETS table.".
+-spec init() -> ok.
+init() ->
+    _ = ets:new(?FIRST_GROUPS, [named_table, public, set, {read_concurrency, true}]),
+    ok.
 
 %% ---------------------------------------------------------------------------
 
@@ -115,20 +130,80 @@ apply_edit(
 -doc """
 Returns a function that downloads group objects from S3 and returns their
 entries array. Used by the fragment iterator and offset resolution.
+Always downloads fresh from S3.
 """.
 -spec get_group_fun(stream_id()) -> rabbitmq_stream_s3_fragment_iterator:get_group_fun().
 get_group_fun(StreamId) ->
     fun(#group_ref{kind = Kind} = GroupRef) ->
-        Key = rabbitmq_stream_s3:group_key(StreamId, GroupRef),
-        case rabbitmq_stream_s3_api:get(Key, #{}) of
-            {ok, Data} ->
-                HeaderSize = group_header_size(Kind),
-                <<_Header:HeaderSize/binary, Entries/binary>> = Data,
-                {ok, Entries};
-            {error, _} = Err ->
-                Err
+        fetch_group(StreamId, Kind, GroupRef)
+    end.
+
+-doc """
+Like `get_group_fun/1` but caches the first plain group per stream in ETS.
+Retention evaluates the same first group repeatedly, so caching avoids
+redundant S3 round-trips. The cached entry is invalidated when the group
+is deleted.
+""".
+-spec get_cached_group_fun(stream_id()) -> rabbitmq_stream_s3_fragment_iterator:get_group_fun().
+get_cached_group_fun(StreamId) ->
+    fun(#group_ref{kind = Kind} = GroupRef) ->
+        case get_group_cached(StreamId, GroupRef) of
+            {ok, _} = Hit ->
+                Hit;
+            miss ->
+                case fetch_group(StreamId, Kind, GroupRef) of
+                    {ok, Entries} = Ok ->
+                        maybe_cache_group(StreamId, GroupRef, Entries),
+                        Ok;
+                    {error, _} = Err ->
+                        Err
+                end
         end
     end.
+
+fetch_group(StreamId, Kind, #group_ref{} = GroupRef) ->
+    Key = rabbitmq_stream_s3:group_key(StreamId, GroupRef),
+    case rabbitmq_stream_s3_api:get(Key, #{}) of
+        {ok, Data} ->
+            HeaderSize = group_header_size(Kind),
+            <<_Header:HeaderSize/binary, Entries/binary>> = Data,
+            {ok, Entries};
+        {error, _} = Err ->
+            Err
+    end.
+
+-doc """
+Clear the cached first group for a stream. Called when retention deletes
+a group object.
+""".
+-spec clear_group_cache(stream_id(), #group_ref{}) -> ok.
+clear_group_cache(StreamId, #group_ref{} = GroupRef) ->
+    _ = catch ets:match_delete(?FIRST_GROUPS, {StreamId, {GroupRef, '_'}}),
+    ok.
+
+-doc "Remove any cached group for a stream. Called on stream termination.".
+-spec evict_group_cache(stream_id()) -> ok.
+evict_group_cache(StreamId) ->
+    _ = catch ets:delete(?FIRST_GROUPS, StreamId),
+    ok.
+
+%% Cache only plain groups (not kilo/mega). The first group is the hot path
+%% for retention and is immutable once written.
+maybe_cache_group(StreamId, #group_ref{kind = ?MANIFEST_KIND_GROUP} = GroupRef, Entries) ->
+    _ = catch ets:insert(?FIRST_GROUPS, {StreamId, {GroupRef, Entries}}),
+    ok;
+maybe_cache_group(_, _, _) ->
+    ok.
+
+get_group_cached(StreamId, #group_ref{kind = ?MANIFEST_KIND_GROUP} = GroupRef) ->
+    try ets:lookup(?FIRST_GROUPS, StreamId) of
+        [{_, {GroupRef, Entries}}] -> {ok, Entries};
+        _ -> miss
+    catch
+        error:badarg -> miss
+    end;
+get_group_cached(_, _) ->
+    miss.
 
 -doc """
 Evaluate remote tier retention against the manifest.

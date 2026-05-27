@@ -516,6 +516,7 @@ terminate(_Reason, #state{
     end,
     ok = delete_metrics(MetricsId),
     rabbitmq_stream_s3_registry:unregister_name({StreamId, node()}),
+    rabbitmq_stream_s3_manifest:evict_group_cache(StreamId),
     ok.
 
 format_status(#{state := State} = Status) ->
@@ -875,7 +876,7 @@ maybe_evaluate_remote_retention(Manifest, Retention, StreamId, #state{core = Cor
 -spec on_remote_retention(#edit{}, [#fragment_ref{} | #group_ref{}], stream_id(), term(), #state{}) ->
     #state{}.
 on_remote_retention(Edit, Refs, StreamId, Core0, State) ->
-    on_remote_retention_deleted(Refs, State),
+    on_remote_retention_deleted(Refs, StreamId, State),
     Keys = lists:map(
         fun
             (#fragment_ref{} = FRef) ->
@@ -902,7 +903,7 @@ maybe_spawn_group_retention(
     State
 ) when Kind =/= ?MANIFEST_KIND_FRAGMENT ->
     Self = self(),
-    GetGroupFun = rabbitmq_stream_s3_manifest:get_group_fun(StreamId),
+    GetGroupFun = rabbitmq_stream_s3_manifest:get_cached_group_fun(StreamId),
     {Pid, MonRef} = spawn_monitor(fun() ->
         logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
         Result =
@@ -1410,12 +1411,13 @@ on_manifest_resolved(#manifest{} = Manifest, State) ->
     update_manifest_gauges(Manifest, State),
     State.
 
-on_remote_retention_deleted(Refs, State) ->
+on_remote_retention_deleted(Refs, StreamId, State) ->
     Counts = lists:foldl(
         fun
             (#fragment_ref{}, Acc) ->
                 maps:update_with(?C_FRAGMENTS_DELETED, fun(N) -> N + 1 end, 1, Acc);
-            (#group_ref{kind = ?MANIFEST_KIND_GROUP}, Acc) ->
+            (#group_ref{kind = ?MANIFEST_KIND_GROUP} = GroupRef, Acc) ->
+                rabbitmq_stream_s3_manifest:clear_group_cache(StreamId, GroupRef),
                 maps:update_with(?C_GROUPS_DELETED, fun(N) -> N + 1 end, 1, Acc);
             (#group_ref{kind = ?MANIFEST_KIND_KILO_GROUP}, Acc) ->
                 maps:update_with(?C_KILO_GROUPS_DELETED, fun(N) -> N + 1 end, 1, Acc);
