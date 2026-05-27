@@ -40,6 +40,7 @@ have a way to form a barrier. To assert the results of retention we use the
     start_writer/3,
     start_cluster/3,
     start_cluster/4,
+    start_replica_reader/3,
     flush_writer/1,
     seed_log/2,
     await_offset/2,
@@ -375,20 +376,7 @@ local_ahead_discards_manifest(Config) ->
     ),
 
     %% Phase 3: restart replica reader. It should discard old manifest and upload new data.
-    ReaderCtx = gen_batch_server:call(Writer, get_reader_context),
-    #{shared := Shared, dir := Dir} = ReaderCtx,
-    Counter = osiris_counters:fetch({osiris_writer, StreamId}),
-    {ok, _} = rabbitmq_stream_s3_replica_reader_sup:start_child(#{
-        stream => StreamId,
-        writer_pid => Writer,
-        dir => iolist_to_binary(Dir),
-        shared => Shared,
-        counter => Counter,
-        reference => StreamId,
-        epoch => 1,
-        fragment_target_size => 500,
-        persist_threshold => 1
-    }),
+    _ = start_replica_reader(Writer, Config, #{fragment_target_size => 500}),
 
     %% Wait for the new replica reader to upload.
     [FirstLocal | _] = list_segment_offsets(Config),

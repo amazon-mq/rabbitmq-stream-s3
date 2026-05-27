@@ -26,12 +26,14 @@ is the only source for old data.
     start_writer/3,
     start_cluster/3,
     start_cluster/4,
+    start_replica_reader/3,
     flush_writer/1,
     seed_log/2,
     write_sequential/3,
     reader_config/2,
     read_all/1,
     read_all/2,
+    drain_iter/3,
     await_offset/2,
     list_segment_offsets/1,
     list_segment_offsets/2,
@@ -59,6 +61,7 @@ groups() ->
             read_across_fragment_boundaries,
             read_from_remote_offset,
             read_repositions_on_fragment_not_found,
+            local_to_remote_transition,
             read_through_group,
             read_detects_crc_corruption
         ]},
@@ -232,6 +235,57 @@ read_repositions_on_fragment_not_found(Config) ->
 
     Records = read_all(Reader0, 10),
     assert_sequential(Records, 10, NextOffset - 1).
+
+local_to_remote_transition(Config) ->
+    %% A reader opens locally and reads some records. Then the replica reader
+    %% is started, uploads the data to S3, and local retention deletes the
+    %% segment. On the next read the consumer discovers the segment is gone,
+    %% checks the manifest, and transitions to the remote tier.
+    #{next_offset := NextOffset} = seed_log(Config, [
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]}
+    ]),
+
+    %% Start writer without plugin hooks so no upload happens yet.
+    WriterCfg0 = ?config(writer_cfg, Config),
+    WriterCfg = maps:merge(WriterCfg0, #{log_hooks => undefined}),
+    {ok, Writer} = osiris_writer:start(WriterCfg),
+    flush_writer(Writer),
+
+    %% Open a consumer reader at offset 0. Data is local, no manifest exists.
+    ReaderCfg = reader_config(Writer, Config),
+    {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(0, ReaderCfg),
+    ?assertEqual(local, rabbitmq_stream_s3_log_reader:mode(Reader0)),
+
+    %% Read the first chunk locally.
+    {ok, _Header, Iter, Reader1} =
+        rabbitmq_stream_s3_log_reader:chunk_iterator(Reader0, 1, undefined),
+    LocalRecords = drain_iter(Iter, 0, []),
+    ?assertEqual(5, length(LocalRecords)),
+    ?assertEqual(local, rabbitmq_stream_s3_log_reader:mode(Reader1)),
+
+    %% Now start the replica reader. This triggers upload and local retention.
+    %% Three segments were seeded. The writer opens the last one as current,
+    %% so retention can delete segments 0 and 1 (both fully uploaded).
+    #{shared := Shared} = ReaderCfg,
+    _ = start_replica_reader(Writer, Config, #{fragment_target_size => 500}),
+
+    %% Barrier: upload complete and local retention has deleted segments 0 and 1.
+    await_offset(Config, NextOffset),
+    ?awaitMatch(F when F >= 10, osiris_log_shared:first_chunk_id(Shared), 2000),
+
+    %% Read the next chunk. The reader is at offset 5 (segment 1) which is
+    %% gone. It checks the manifest, transitions to remote, and continues.
+    {ok, _Header2, Iter2, Reader2} =
+        rabbitmq_stream_s3_log_reader:chunk_iterator(Reader1, 1, undefined),
+    RemoteRecords = drain_iter(Iter2, 0, []),
+    ?assertEqual(5, length(RemoteRecords)),
+    ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader2)),
+
+    %% Verify continuity: local read offsets 0-4, remote read offsets 5-9.
+    AllRecords = LocalRecords ++ RemoteRecords,
+    assert_sequential(AllRecords, 10).
 
 read_through_group(Config) ->
     %% 5 segments, each producing a fragment (600 bytes > 500 target).

@@ -264,18 +264,45 @@ flush_writer(Writer) ->
     _ = osiris_writer:query_replication_state(Writer),
     ok.
 
-%% @doc Block until the remote replica reader has persisted past `Offset`.
-%%
-%% `Offset` is an exclusive upper bound: `await_offset(StreamId, N)` returns
-%% when the durable `next_offset >= N`. This means all records with offsets
-%% 0..N-1 are in S3 and referenced by a persisted manifest.
-%%
-%% Use this as the barrier between writing data and asserting on the remote
-%% tier. Do not assert on fragment count, segment count, or remote tier
-%% contents without calling this first.
-%%
-%% Accepts either a StreamId binary or a CT Config proplist as the first
-%% argument. The Config form provides better diagnostics on timeout.
+-doc """
+Start a replica reader for an existing writer.
+
+Use when the writer was started without plugin hooks and you want to trigger
+upload separately.
+""".
+start_replica_reader(Writer, Config, RemoteConfig) ->
+    StreamId = ?config(stream_id, Config),
+    #{shared := Shared, dir := Dir} = gen_batch_server:call(Writer, get_reader_context),
+    Counter = osiris_counters:fetch({osiris_writer, StreamId}),
+    Defaults = #{
+        stream => StreamId,
+        writer_pid => Writer,
+        dir => iolist_to_binary(Dir),
+        shared => Shared,
+        counter => Counter,
+        reference => StreamId,
+        epoch => 1,
+        persist_threshold => 1
+    },
+    {ok, Pid} = rabbitmq_stream_s3_replica_reader_sup:start_child(
+        maps:merge(Defaults, RemoteConfig)
+    ),
+    Pid.
+
+-doc """
+Block until the remote replica reader has persisted past `Offset`.
+
+`Offset` is an exclusive upper bound: `await_offset(StreamId, N)` returns
+when the durable `next_offset >= N`. This means all records with offsets
+0..N-1 are in S3 and referenced by a persisted manifest.
+
+Use this as the barrier between writing data and asserting on the remote
+tier. Do not assert on fragment count, segment count, or remote tier
+contents without calling this first.
+
+Accepts either a StreamId binary or a CT Config proplist as the first
+argument. The Config form provides better diagnostics on timeout.
+""".
 -spec await_offset(binary() | list(), osiris:offset()) -> ok.
 await_offset(StreamId, Offset) when is_binary(StreamId) ->
     await_offset(StreamId, Offset, 1000);
