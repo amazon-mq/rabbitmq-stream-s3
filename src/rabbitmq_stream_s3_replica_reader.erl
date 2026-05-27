@@ -319,9 +319,13 @@ handle_cast(
             rabbitmq_stream_s3_manifest_replica:sync(StreamId, Seq, Epoch, Manifest, Node),
             {noreply, State#state{replicas = Replicas#{Node => MonRef}}}
     end;
-handle_cast({retention_updated, Retention}, State) ->
+handle_cast(
+    {retention_updated, Retention}, #state{core = Core, cfg = #cfg{stream = StreamId}} = State
+) ->
     UserRetention = [S || S <- Retention, element(1, S) =/= 'fun'],
-    {noreply, State#state{retention = UserRetention}};
+    Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(Core),
+    State1 = State#state{retention = UserRetention},
+    {noreply, maybe_evaluate_remote_retention(Manifest, UserRetention, StreamId, State1)};
 handle_cast(
     {resync, Node},
     #state{
