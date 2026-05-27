@@ -41,7 +41,8 @@ is the only source for old data.
     get_range/1,
     get_range/2,
     assert_sequential/2,
-    assert_sequential/3
+    assert_sequential/3,
+    capture_log/2
 ]).
 
 suite() ->
@@ -335,12 +336,15 @@ read_detects_crc_corruption(Config) ->
     corrupt_first_fragment(Config),
 
     %% Reading should fail with CRC validation error.
-    {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg),
-    ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),
-    ?assertExit(
-        {crc_validation_failure, _},
-        read_all(Reader0)
-    ).
+    Log = capture_log(#{level => error}, fun() ->
+        {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg),
+        ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),
+        ?assertExit(
+            {crc_validation_failure, _},
+            read_all(Reader0)
+        )
+    end),
+    ?assertMatch({_, _}, binary:match(Log, <<"CRC validation failure">>)).
 
 read_from_replica_node(Config) ->
     StreamId = ?config(stream_id, Config),

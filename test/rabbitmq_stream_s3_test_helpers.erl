@@ -528,3 +528,57 @@ next_offset_spec({kilo_group, Children}) ->
     next_offset(Children);
 next_offset_spec({mega_group, Children}) ->
     next_offset(Children).
+
+%% ------------------------------------------------------------------
+%% Log capture
+%% ------------------------------------------------------------------
+
+-spec capture_log(fun(() -> term())) -> binary().
+capture_log(Fun) ->
+    capture_log(#{}, Fun).
+
+-spec capture_log(#{level => logger:level()}, fun(() -> term())) -> binary().
+capture_log(Opts, Fun) ->
+    {_, Log} = with_log(Opts, Fun),
+    Log.
+
+-spec with_log(fun(() -> Result)) -> {Result, binary()} when Result :: term().
+with_log(Fun) ->
+    with_log(#{}, Fun).
+
+-spec with_log(#{level => logger:level()}, fun(() -> Result)) -> {Result, binary()} when
+    Result :: term().
+with_log(Opts, Fun) ->
+    Level = maps:get(level, Opts, all),
+    Ref = make_ref(),
+    Self = self(),
+    HandlerId = list_to_atom("capture_log_" ++ integer_to_list(erlang:unique_integer([positive]))),
+    {ok, #{level := OrigLevel}} = logger:get_handler_config(default),
+    ok = logger:add_handler(HandlerId, ?MODULE, #{
+        pid => Self,
+        ref => Ref,
+        level => Level
+    }),
+    ok = logger:set_handler_config(default, level, none),
+    try
+        Result = Fun(),
+        {Result, collect_log(Ref)}
+    after
+        _ = logger:remove_handler(HandlerId),
+        _ = logger:set_handler_config(default, level, OrigLevel)
+    end.
+
+%% logger handler callback
+log(Event, #{pid := Pid, ref := Ref}) ->
+    Formatted = logger_formatter:format(Event, #{template => [level, ": ", msg, "\n"]}),
+    Pid ! {captured_log, Ref, iolist_to_binary(Formatted)},
+    ok.
+
+collect_log(Ref) ->
+    collect_log(Ref, []).
+
+collect_log(Ref, Acc) ->
+    receive
+        {captured_log, Ref, Bin} -> collect_log(Ref, [Bin | Acc])
+    after 0 -> iolist_to_binary(lists:reverse(Acc))
+    end.
