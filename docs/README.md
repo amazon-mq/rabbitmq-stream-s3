@@ -4,6 +4,12 @@
 
 ## Why
 
+Tiered storage makes "how much data should I keep?" purely a question of time. Keep 7 days. Keep 30 days. Keep everything. The system manages where data lives. Local disk holds recent data for low-latency reads. Older data lives in S3 at negligible cost. Consumers read the full window without knowing or caring which tier serves each byte.
+
+Without tiered storage, that question is tangled with capacity planning. How much disk can you afford? How much throughput do you expect? A stream producing 1 MB/s during off-hours and 100 MB/s during a traffic spike needs wildly different disk to cover the same time window. Any fixed byte limit is wrong half the time. Tiered storage removes the coupling between "how far back can I read?" and "how much disk do I need?"
+
+### How it achieves this
+
 Osiris stores stream data in segment files on local disk. Retention policies delete old segments to bound disk usage. Once a segment is deleted, any consumer that hasn't read it loses access permanently.
 
 This plugin makes local disk a cache over S3. Streams retain data in S3 indefinitely (or according to a remote retention policy) at low cost, while local disk only holds recent data. Consumers see a single continuous stream regardless of where the data lives.

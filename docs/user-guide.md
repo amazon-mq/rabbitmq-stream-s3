@@ -4,9 +4,13 @@ This page explains what tiered storage does from a user's perspective. It covers
 
 For how it works under the hood, see [concepts.md](./concepts.md).
 
-## What it does
+## What problem it solves
 
-RabbitMQ streams store data on local disk. Retention policies delete old data to bound disk usage. Once deleted, that data is gone.
+Tiered storage makes "how much data should I keep?" purely a question of time. Keep 7 days. Keep 30 days. Keep everything. The system decides where data lives. Local disk holds recent data for low-latency reads. Older data lives in S3 at negligible cost. You never have to think about how much disk your data requires.
+
+Without tiered storage, that question is tangled with capacity planning. How much disk can you afford? A stream producing 1 MB/s on an off day and 100 MB/s on Cyber Monday needs wildly different disk to cover the same replay window. Any fixed byte limit is either wasteful during troughs or hazardous during peaks. Tiered storage removes the coupling entirely.
+
+## What it does
 
 With tiered storage, old data is copied to Amazon S3 in the background before it is deleted locally. Consumers can read arbitrarily far back into the stream. Recent data is served from local disk. Older data is served from S3. The transition is transparent to clients.
 
