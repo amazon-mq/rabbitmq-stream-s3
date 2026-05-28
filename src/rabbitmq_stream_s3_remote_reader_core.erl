@@ -403,10 +403,22 @@ try_fragment_transition(
 %% Internal: fragment navigation
 %% ------------------------------------------------------------------
 
-%% Returns the offset of the next fragment in the iterator (the one that 404'd).
-%% Only called from the `not_found_check_range` branch of `try_serve`, where
-%% `next = not_found` guarantees the iterator is positioned at the 404'd entry
-%% and `next/1` will always return `{ok, _, _}`.
+%% Returns the offset of the next fragment in the iterator. Called from the
+%% `not_found_check_range` branch of `try_serve`. There are two paths into
+%% that branch:
+%%
+%%  1. `try_fragment_transition` matching `next = not_found`: the consumer
+%%     read past the current fragment and the prefetched-next 404'd. The
+%%     iterator is positioned at the 404'd entry, so this returns the
+%%     404'd offset. `next/1` always succeeds with `{ok, _, _}`.
+%%
+%%  2. `try_read` matching `current_not_found = true`: the *current*
+%%     fragment 404'd while no read was pending; a later read wants bytes
+%%     past the partial buffer. The iterator was already advanced past
+%%     the current fragment, so it points at the entry AFTER the 404'd
+%%     one. This function then returns a live fragment's offset, which
+%%     the shell uses to refresh the iterator and ends up skipping the
+%%     live fragment. Tracked by issue #173.
 next_fragment_offset(#state{iterator = Iterator}) ->
     {ok, #fragment_ref{offset = Offset}, _} = rabbitmq_stream_s3_fragment_iterator:next(Iterator),
     Offset.
