@@ -23,6 +23,8 @@ all() ->
         init_at_offset_middle,
         init_at_offset_beyond_end,
         group_fetch_failed,
+        group_not_found_skips,
+        group_not_found_mid_traversal_skips,
         size_field_correct,
         refresh_after_exhaustion,
         all_refs_empty,
@@ -206,6 +208,52 @@ group_fetch_failed(_Config) ->
         {error, {group_fetch_failed, timeout}},
         rabbitmq_stream_s3_fragment_iterator:next(It0)
     ).
+
+group_not_found_skips(_Config) ->
+    %% A group that returns not_found (deleted by retention) is skipped.
+    %% The iterator continues with the next entry.
+    {Manifest, _} = build_manifest([
+        {group, [
+            {fragment, #{offset => 0, uid => 1}}
+        ]},
+        {fragment, #{offset => 100, uid => 2}}
+    ]),
+    NotFoundGetGroup = fun(_) -> {error, not_found} end,
+    It0 = rabbitmq_stream_s3_fragment_iterator:init(Manifest, 0, NotFoundGetGroup),
+    %% Group is skipped, next fragment returned directly.
+    {ok, #fragment_ref{offset = 100, uid = 2}, It1} =
+        rabbitmq_stream_s3_fragment_iterator:next(It0),
+    ?assertEqual(end_of_manifest, rabbitmq_stream_s3_fragment_iterator:next(It1)).
+
+group_not_found_mid_traversal_skips(_Config) ->
+    %% First group succeeds, second group 404s. Iterator skips the
+    %% deleted group and returns the fragment after it.
+    {Manifest, GoodGetGroup} = build_manifest([
+        {group, [
+            {fragment, #{offset => 0, uid => 16#a1}}
+        ]},
+        {group, [
+            {fragment, #{offset => 100, uid => 16#a2}}
+        ]},
+        {fragment, #{offset => 200, uid => 16#a3}}
+    ]),
+    CallCount = counters:new(1, []),
+    GetGroup = fun(Ref) ->
+        case counters:get(CallCount, 1) of
+            0 ->
+                counters:add(CallCount, 1, 1),
+                GoodGetGroup(Ref);
+            _ ->
+                {error, not_found}
+        end
+    end,
+    It0 = rabbitmq_stream_s3_fragment_iterator:init(Manifest, 0, GetGroup),
+    {ok, #fragment_ref{offset = 0, uid = 16#a1}, It1} =
+        rabbitmq_stream_s3_fragment_iterator:next(It0),
+    %% Second group 404s, skipped. Returns the trailing fragment.
+    {ok, #fragment_ref{offset = 200, uid = 16#a3}, It2} =
+        rabbitmq_stream_s3_fragment_iterator:next(It1),
+    ?assertEqual(end_of_manifest, rabbitmq_stream_s3_fragment_iterator:next(It2)).
 
 size_field_correct(_Config) ->
     Size = 67_108_864,

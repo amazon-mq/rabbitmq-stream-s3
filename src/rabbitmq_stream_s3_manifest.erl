@@ -162,14 +162,22 @@ get_cached_group_fun(StreamId) ->
     end.
 
 fetch_group(StreamId, Kind, #group_ref{} = GroupRef) ->
+    fetch_group(StreamId, Kind, GroupRef, 2).
+
+fetch_group(StreamId, Kind, #group_ref{} = GroupRef, Retries) ->
     Key = rabbitmq_stream_s3:group_key(StreamId, GroupRef),
     case rabbitmq_stream_s3_api:get(Key, #{}) of
         {ok, Data} ->
             HeaderSize = group_header_size(Kind),
             <<_Header:HeaderSize/binary, Entries/binary>> = Data,
             {ok, Entries};
-        {error, _} = Err ->
-            Err
+        {error, not_found} = Err ->
+            Err;
+        {error, _} = Err when Retries =< 0 ->
+            Err;
+        {error, _} ->
+            timer:sleep(100),
+            fetch_group(StreamId, Kind, GroupRef, Retries - 1)
     end.
 
 -doc """

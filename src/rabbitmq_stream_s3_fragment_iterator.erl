@@ -123,6 +123,9 @@ descend(
                 stack = [{Entries, Idx + 1} | Stack]
             },
             next(It1);
+        {error, not_found} ->
+            %% Group deleted by retention. Skip past it and continue.
+            next(It#iterator{index = Idx + 1});
         {error, Reason} ->
             {error, {group_fetch_failed, Reason}}
     end.
