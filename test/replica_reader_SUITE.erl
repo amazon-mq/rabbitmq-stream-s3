@@ -76,6 +76,7 @@ groups() ->
             stream_deletion_during_active_upload,
             discover_attaches_to_existing_writer,
             remote_retention_deletes_fragments,
+            remote_retention_on_update,
             remote_retention_survives_multiple_persist_cycles,
             uploads_rebalance_into_group,
             remote_retention_deletes_within_group,
@@ -528,6 +529,28 @@ remote_retention_deletes_fragments(Config) ->
     ),
 
     %% Manifest reflects the deletion (after the retention persist completes).
+    ?awaitMatch({10, NextOffset}, get_range(Config), 2000).
+
+remote_retention_on_update(Config) ->
+    %% Updating retention on a running writer triggers remote retention
+    %% evaluation without requiring new writes.
+    #{next_offset := NextOffset} = seed_log(Config, [
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]}
+    ]),
+    Writer = start_writer(Config, #{}, #{fragment_target_size => 500}),
+    flush_writer(Writer),
+    await_offset(Config, NextOffset),
+
+    %% All 3 fragments exist.
+    ?assertEqual([0, 5, 10], list_fragment_offsets(Config)),
+
+    %% Update retention. No new writes needed.
+    osiris:update_retention(Writer, [{max_bytes, 700}]),
+
+    %% Retention is kicked off without needing to write extra documents.
+    ?awaitMatch([10], list_fragment_offsets(Config), 5000),
     ?awaitMatch({10, NextOffset}, get_range(Config), 2000).
 
 remote_retention_survives_multiple_persist_cycles(Config) ->

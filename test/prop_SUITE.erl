@@ -1529,7 +1529,7 @@ gen_rrc_event(NextReadPos) ->
         {3, ?LET(E, gen_rrc_data_event(), {E, NextReadPos})},
         {2, ?LET(E, gen_rrc_error_event(), {E, NextReadPos})},
         {1, {{retry}, NextReadPos}},
-        {1, ?LET(E, gen_rrc_manifest_range_event(), {E, NextReadPos})},
+        {1, ?LET(E, gen_rrc_iterator_refreshed_event(), {E, NextReadPos})},
         {1, {deadline_expired, NextReadPos}}
     ]).
 
@@ -1554,10 +1554,30 @@ gen_rrc_error_event() ->
         {request_error, make_ref(), 0, Reason}
     ).
 
-gen_rrc_manifest_range_event() ->
+gen_rrc_iterator_refreshed_event() ->
     oneof([
-        {manifest_range, empty},
-        ?LET({F, E}, {range(0, 100), range(101, 500)}, {manifest_range, {F, E}})
+        {iterator_refreshed, end_of_manifest},
+        ?LET(
+            {Offset, Size, Uid},
+            {range(0, 500), range(100_000, 5_000_000), range(1, 16#FFFFFFFF)},
+            begin
+                Manifest = #manifest{
+                    first_offset = Offset,
+                    next_offset = Offset + 1,
+                    entries = ?ENTRY(Offset, 0, 0, ?MANIFEST_KIND_FRAGMENT, Size, Uid)
+                },
+                GetGroupFun = fun(_) -> {error, not_found} end,
+                Iterator0 = rabbitmq_stream_s3_fragment_iterator:init(
+                    Manifest, Offset, GetGroupFun
+                ),
+                Iterator =
+                    case rabbitmq_stream_s3_fragment_iterator:next(Iterator0) of
+                        {ok, _, It} -> It;
+                        _ -> Iterator0
+                    end,
+                {iterator_refreshed, Iterator}
+            end
+        )
     ]).
 
 run_rrc_events([], State) ->

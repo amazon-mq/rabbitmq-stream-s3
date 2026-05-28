@@ -234,7 +234,13 @@ returned by the functional core module.
     %% Kind of the group upload currently in flight. Cleared when the
     %% group_upload_result message arrives. Only one rebalance is in
     %% flight at a time so a single slot suffices.
-    pending_group_kind :: rabbitmq_stream_s3:kind() | undefined
+    pending_group_kind :: rabbitmq_stream_s3:kind() | undefined,
+    %% Keys queued for deletion after the next successful persist.
+    %% Retention computes which objects to delete but we defer the actual
+    %% S3 DELETE until the manifest persist that records their removal
+    %% completes. This eliminates the race where a reader sees a stale
+    %% manifest pointing to already-deleted objects (issue #166).
+    deferred_deletions = [] :: [#fragment_ref{} | #group_ref{}]
 }).
 
 -doc "Start a remote replica reader for the given stream.".
@@ -313,9 +319,13 @@ handle_cast(
             rabbitmq_stream_s3_manifest_replica:sync(StreamId, Seq, Epoch, Manifest, Node),
             {noreply, State#state{replicas = Replicas#{Node => MonRef}}}
     end;
-handle_cast({retention_updated, Retention}, State) ->
+handle_cast(
+    {retention_updated, Retention}, #state{core = Core, cfg = #cfg{stream = StreamId}} = State
+) ->
     UserRetention = [S || S <- Retention, element(1, S) =/= 'fun'],
-    {noreply, State#state{retention = UserRetention}};
+    Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(Core),
+    State1 = State#state{retention = UserRetention},
+    {noreply, maybe_evaluate_remote_retention(Manifest, UserRetention, StreamId, State1)};
 handle_cast(
     {resync, Node},
     #state{
@@ -589,15 +599,7 @@ delete_manifest_objects(StreamId, Manifest) ->
             end
         end,
         Refs = rabbitmq_stream_s3_fragment_iterator:all_refs(Manifest, GetGroupFun),
-        Keys = lists:map(
-            fun
-                (#fragment_ref{} = FRef) ->
-                    rabbitmq_stream_s3:fragment_key(StreamId, FRef);
-                (#group_ref{} = GroupRef) ->
-                    rabbitmq_stream_s3:group_key(StreamId, GroupRef)
-            end,
-            Refs
-        ),
+        Keys = [rabbitmq_stream_s3:ref_key(StreamId, Ref) || Ref <- Refs],
         rabbitmq_stream_s3_reaper:delete_objects(StreamId, Keys)
     end),
     ok.
@@ -680,7 +682,7 @@ commit_khepri(StreamId, Epoch, Reference, ExpectedRevision, Uid) ->
 delete_old_manifest(_StreamId, undefined) ->
     ok;
 delete_old_manifest(StreamId, #manifest_ref{} = Ref) ->
-    Key = rabbitmq_stream_s3:manifest_key(StreamId, Ref),
+    Key = rabbitmq_stream_s3:ref_key(StreamId, Ref),
     rabbitmq_stream_s3_reaper:delete_objects(StreamId, [Key]).
 
 -spec serialize_manifest(#manifest{}) -> binary().
@@ -820,7 +822,11 @@ execute_effect(reinitialize, #state{cfg = #cfg{stream = StreamId}} = State0) ->
         assembly = undefined,
         transfer_sizes = #{},
         persist_pending_bytes = 0,
-        persisting_bytes = 0
+        persisting_bytes = 0,
+        %% Discard deferred deletions: the retention edit was not persisted,
+        %% so the objects must remain. The new writer will re-evaluate
+        %% retention and delete them after its own persist.
+        deferred_deletions = []
     }).
 
 cancel_timer(undefined) -> ok;
@@ -877,18 +883,12 @@ maybe_evaluate_remote_retention(Manifest, Retention, StreamId, #state{core = Cor
     #state{}.
 on_remote_retention(Edit, Refs, StreamId, Core0, State) ->
     on_remote_retention_deleted(Refs, StreamId, State),
-    Keys = lists:map(
-        fun
-            (#fragment_ref{} = FRef) ->
-                rabbitmq_stream_s3:fragment_key(StreamId, FRef);
-            (#group_ref{} = GRef) ->
-                rabbitmq_stream_s3:group_key(StreamId, GRef)
-        end,
-        Refs
-    ),
-    rabbitmq_stream_s3_reaper:delete_objects(StreamId, Keys),
+    %% Defer deletion until the persist that includes this retention edit
+    %% completes. Deleting now would leave a window where the manifest cache
+    %% still lists these objects but S3 has already removed them (issue #166).
+    Deferred = Refs ++ State#state.deferred_deletions,
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:retention_complete(Edit, Core0),
-    execute_effects(Effects, State#state{core = Core}).
+    execute_effects(Effects, State#state{core = Core, deferred_deletions = Deferred}).
 
 %% Spawn an async task to evaluate retention within a group object.
 -spec maybe_spawn_group_retention(
@@ -1356,7 +1356,29 @@ on_persist_completed(#manifest{} = Manifest, State) ->
     dec(State, ?C_BYTES_IN_PERSIST, PersistedBytes),
     inc(State, ?C_BYTES_PERSISTED, PersistedBytes),
     update_manifest_gauges(Manifest, State),
-    State#state{persisting_bytes = 0}.
+    %% Persist succeeded. Now safe to delete objects that retention removed
+    %% from the manifest. The manifest cache is updated, so readers will no
+    %% longer reference these objects.
+    %%
+    %% Flushing all deferred deletions is intentional even when some refs
+    %% belong to retention edits that arrived after this persist's snapshot
+    %% and are still queued in `edits_since_persist`. Those objects are
+    %% deleted from S3 here, but the persisted manifest does not reflect
+    %% their removal until persist N+1 lands. If we crash in this window,
+    %% on restart the persisted manifest will list fragments whose S3
+    %% objects are gone. Readers hitting those fragments get 404s, which
+    %% `rabbitmq_stream_s3_remote_reader` handles by refreshing the
+    %% iterator past the missing offset. End-state is consistent: the
+    %% next retention pass will re-emit the edit and a subsequent persist
+    %% will reconcile the manifest.
+    flush_deferred_deletions(State),
+    State#state{persisting_bytes = 0, deferred_deletions = []}.
+
+flush_deferred_deletions(#state{deferred_deletions = []}) ->
+    ok;
+flush_deferred_deletions(#state{deferred_deletions = Refs, cfg = #cfg{stream = StreamId}}) ->
+    Keys = [rabbitmq_stream_s3:ref_key(StreamId, Ref) || Ref <- Refs],
+    rabbitmq_stream_s3_reaper:delete_objects(StreamId, Keys).
 
 update_manifest_gauges(
     #manifest{

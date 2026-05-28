@@ -73,6 +73,7 @@ efficiently using the `rabbitmq_stream_s3_array` module.
     uid/0,
     format_uid/1,
     offset_filename/2,
+    ref_key/2,
     manifest_key/2,
     group_key/2,
     group_name/1,
@@ -118,6 +119,12 @@ pad_zeroes(Offset) ->
         false ->
             Num
     end.
+
+-doc "Returns the S3 key for any ref type.".
+-spec ref_key(stream_id(), #fragment_ref{} | #group_ref{} | #manifest_ref{}) -> key().
+ref_key(StreamId, #fragment_ref{} = Ref) -> fragment_key(StreamId, Ref);
+ref_key(StreamId, #group_ref{} = Ref) -> group_key(StreamId, Ref);
+ref_key(StreamId, #manifest_ref{} = Ref) -> manifest_key(StreamId, Ref).
 
 -doc "Creates the key for the given stream and manifest ref".
 -spec manifest_key(stream_id(), #manifest_ref{}) -> key().

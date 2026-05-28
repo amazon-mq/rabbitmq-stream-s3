@@ -205,35 +205,38 @@ read_from_remote_offset(Config) ->
     assert_sequential(Records, TargetOffset, N - 1).
 
 read_repositions_on_fragment_not_found(Config) ->
-    %% 3 fragments (600 bytes each, target 500). Remote retention with
-    %% max_bytes=1000 deletes the first two, leaving only offset 10.
-    %% A reader requesting offset 0 gets 404 and repositions at 10.
+    %% 3 fragments (600 bytes each, target 500). A reader opens while all
+    %% fragments exist, then retention deletes the first two. The reader's
+    %% iterator still points to the deleted fragments. When it tries to
+    %% fetch them it gets 404s and must advance to the surviving fragment.
     #{next_offset := NextOffset} = seed_log(Config, [
         {segment, [{chunk, #{records => 5, size => 600}}]},
         {segment, [{chunk, #{records => 5, size => 600}}]},
         {segment, [{chunk, #{records => 5, size => 600}}]}
     ]),
-    Writer = start_writer(
-        Config,
-        #{retention => [{max_bytes, 1000}]},
-        #{fragment_target_size => 500}
-    ),
+    Writer = start_writer(Config, #{}, #{fragment_target_size => 500}),
     flush_writer(Writer),
     await_offset(Config, NextOffset),
 
-    %% Wait for remote retention to delete the first two fragments.
-    ?awaitMatch([10], list_fragment_offsets(Config), 2000),
-
-    %% Wait for local retention to reclaim uploaded segments.
+    %% Wait for local retention to reclaim uploaded segments so the reader
+    %% enters remote mode.
     ReaderCfg = reader_config(Writer, Config),
     #{shared := Shared} = ReaderCfg,
     ?awaitMatch(F when F > 0, osiris_log_shared:first_chunk_id(Shared), 1000),
 
-    %% Open a reader at offset 0. The fragment is gone (retention deleted it).
-    %% The reader should reposition at the oldest available offset (10).
+    %% Open a reader at offset 0 while all 3 fragments still exist.
+    %% The reader's iterator references all of them.
     {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(0, ReaderCfg),
     ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),
 
+    %% Now tighten retention. This triggers immediate evaluation and a
+    %% persist cycle that flushes the deletions.
+    osiris:update_retention(Writer, [{max_bytes, 700}]),
+    ?awaitMatch([10], list_fragment_offsets(Config), 5000),
+
+    %% Read from the reader. Its iterator points to the now-deleted
+    %% fragments at offsets 0 and 5. It gets 404s, refreshes its iterator,
+    %% and advances to the surviving fragment at offset 10.
     Records = read_all(Reader0, 10),
     assert_sequential(Records, 10, NextOffset - 1).
 

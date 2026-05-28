@@ -15,20 +15,20 @@ returns a new state plus a list of effects describing what should happen next.
 
 ## Events (inputs)
 
-- `{read, Offset, Bytes, Hint}` — caller wants data at this position
-- `{data, RequestId, Fragment, Data, done | continue}` — S3 delivered bytes
-- `{request_error, RequestId, Reason}` — S3 request failed
-- `{request_timeout, RequestId}` — request exceeded deadline
-- `retry` — retry timer fired
-- `{iterator_refreshed, Iterator}` — manifest cache provided new iterator
+- `{read, Offset, Bytes, Hint}` - caller wants data at this position
+- `{data, RequestId, Fragment, Data, done | continue}` - S3 delivered bytes
+- `{request_error, RequestId, Fragment, Reason}` - S3 request failed
+- `retry` - retry timer fired
+- `deadline_expired` - pending read exceeded its deadline
+- `{iterator_refreshed, Iterator}` - manifest cache provided new iterator
 
 ## Effects (outputs)
 
-- `{reply, Result}` — respond to the pending read
-- `{start_request, Key, Range, Fragment}` — initiate an S3 GET
-- `{set_timer, Duration, Event}` — schedule a future event
-- `{cancel_request, RequestId}` — abort an in-flight request
-- `stop` — shut down the remote reader
+- `{reply, Result}` - respond to the pending read
+- `{start_request, Key, Range, Fragment}` - initiate an S3 GET
+- `{set_timer, Duration}` - schedule a retry timer
+- `{refresh_iterator, Offset}` - rebuild iterator past the given offset
+- `stop` - shut down the remote reader
 
 ## Design
 
@@ -112,17 +112,13 @@ and transitions immediately if available, or signals that more data is needed.
     | {request_error, request_id(), fragment_offset(), term()}
     | retry
     | deadline_expired
-    | {manifest_range, {osiris:offset(), osiris:offset()} | empty}
-    | {iterator_refreshed, rabbitmq_stream_s3_fragment_iterator:iterator() | end_of_manifest}
-    | {jumped, #fragment_ref{}, rabbitmq_stream_s3_fragment_iterator:iterator()}.
+    | {iterator_refreshed, rabbitmq_stream_s3_fragment_iterator:iterator() | end_of_manifest}.
 
 -type effect() ::
     {reply, read_result()}
     | {start_request, rabbitmq_stream_s3:key(), {byte_offset(), byte_offset()}, fragment_offset()}
     | {set_timer, pos_integer()}
-    | lookup_manifest_range
-    | refresh_iterator
-    | {jump_to_oldest, osiris:offset()}
+    | {refresh_iterator, osiris:offset()}
     | stop.
 
 -type read_result() ::
@@ -199,14 +195,14 @@ step(State0, {data, _RequestId, Fragment, Data, DoneOrContinue}) ->
 step(State0, {request_error, _RequestId, Fragment, not_found}) ->
     case Fragment =:= (State0#state.fragment_ref)#fragment_ref.offset of
         true ->
-            %% Current fragment 404. Need to check manifest range.
+            %% Current fragment 404. Refresh the iterator past this offset.
             State = State0#state{current_not_found = true, requests_in_flight = #{}},
             case State#state.pending of
                 undefined -> {State, []};
-                _ -> {State, [lookup_manifest_range]}
+                _ -> {State, [{refresh_iterator, Fragment}]}
             end;
         false ->
-            %% Next fragment 404. Mark it and try to serve (may trigger range lookup
+            %% Next fragment 404. Mark it and try to serve (may trigger refresh
             %% when the consumer reads past the current fragment).
             State = State0#state{
                 next = not_found,
@@ -256,40 +252,41 @@ step(#state{cfg = #cfg{min_retry_delay_ms = MinDelay}} = State0, deadline_expire
         retry_delay = MinDelay
     },
     {State, [{reply, {error, timeout}}]};
-step(State0, {manifest_range, Range}) ->
-    handle_manifest_range(Range, State0);
 step(State0, {iterator_refreshed, end_of_manifest}) ->
     %% No new entries. Become local.
     FragOffset = (State0#state.fragment_ref)#fragment_ref.offset,
     State = goto_next_fragment(State0),
     {State, [{reply, {become_local, FragOffset}}]};
 step(State0, {iterator_refreshed, Iterator}) ->
-    State1 = State0#state{iterator = Iterator},
-    {State2, Effects} = maybe_start_requests(State1),
-    {State3, Effects2} = try_serve(State2),
-    {State3, Effects ++ Effects2};
-step(#state{stream = StreamId, cfg = Cfg} = _State0, {jumped, FragRef, Iterator}) ->
-    %% Shell resolved a jump_to_oldest. Reinitialize at the new fragment.
-    #fragment_ref{offset = Offset, uid = Uid} = FragRef,
-    Key = rabbitmq_stream_s3:fragment_key(StreamId, Offset, Uid),
-    Iterator1 = advance_iterator(Iterator),
-    State = #state{
-        stream = StreamId,
-        cfg = Cfg,
-        read_size = Cfg#cfg.initial_read_size,
-        retry_delay = Cfg#cfg.min_retry_delay_ms,
-        fragment_ref = FragRef,
-        key = Key,
-        buffer = <<>>,
-        start_pos = ?SEGMENT_HEADER_B,
-        current_pos = ?SEGMENT_HEADER_B,
-        end_pos = ?SEGMENT_HEADER_B,
-        iterator = Iterator1,
-        next = undefined
-    },
-    %% Reply with next_fragment so the log reader repositions, then start fetching.
-    {State1, Effects} = start_current_request(State),
-    {State1, [{reply, {next_fragment, Offset}} | Effects]}.
+    %% Iterator has been refreshed past the 404'd fragment. Reinitialize
+    %% at the next available fragment.
+    case rabbitmq_stream_s3_fragment_iterator:next(Iterator) of
+        {ok, FragRef, Iterator1} ->
+            #fragment_ref{offset = Offset, uid = Uid} = FragRef,
+            StreamId = State0#state.stream,
+            Cfg = State0#state.cfg,
+            Key = rabbitmq_stream_s3:fragment_key(StreamId, Offset, Uid),
+            State = #state{
+                stream = StreamId,
+                cfg = Cfg,
+                read_size = Cfg#cfg.initial_read_size,
+                retry_delay = Cfg#cfg.min_retry_delay_ms,
+                fragment_ref = FragRef,
+                key = Key,
+                buffer = <<>>,
+                start_pos = ?SEGMENT_HEADER_B,
+                current_pos = ?SEGMENT_HEADER_B,
+                end_pos = ?SEGMENT_HEADER_B,
+                iterator = Iterator1,
+                next = undefined
+            },
+            {State1, Effects} = start_current_request(State),
+            {State1, [{reply, {next_fragment, Offset}} | Effects]};
+        _ ->
+            %% Iterator exhausted after refresh. Become local.
+            FragOffset = (State0#state.fragment_ref)#fragment_ref.offset,
+            {State0, [{reply, {become_local, FragOffset}}]}
+    end.
 
 %% @doc Returns the pending read, if any.
 -spec pending(state()) -> undefined | {byte_offset(), pos_integer()}.
@@ -325,9 +322,13 @@ try_serve(#state{pending = #pending{offset = Offset, bytes = Bytes}} = State) ->
             {State3, Effects} = maybe_start_requests(State2),
             {State3, Effects};
         {not_found_check_range, State1} ->
-            {State1, [lookup_manifest_range]};
+            %% Next fragment was 404. Refresh iterator past it.
+            NotFoundOffset = next_fragment_offset(State1),
+            {State1, [{refresh_iterator, NotFoundOffset}]};
         {refresh_iterator, State1} ->
-            {State1, [refresh_iterator]}
+            %% Iterator exhausted. Refresh past current fragment.
+            CurrentOffset = (State1#state.fragment_ref)#fragment_ref.offset,
+            {State1, [{refresh_iterator, CurrentOffset}]}
     end.
 
 %% ------------------------------------------------------------------
@@ -399,60 +400,28 @@ try_fragment_transition(
     end.
 
 %% ------------------------------------------------------------------
-%% Internal: manifest range handling (for 404 cases)
-%% ------------------------------------------------------------------
-
-handle_manifest_range(empty, #state{pending = undefined} = State) ->
-    {State, []};
-handle_manifest_range(empty, State) ->
-    State1 = State#state{pending = undefined},
-    {State1, [{reply, end_of_stream}]};
-handle_manifest_range(_Range, #state{pending = undefined} = State) ->
-    %% No pending read. Ignore stale manifest range response.
-    {State, []};
-handle_manifest_range(
-    {FirstOffset, EndOffset},
-    #state{
-        fragment_ref = #fragment_ref{offset = CurrentOffset, size = FragSize},
-        pending = #pending{offset = Offset}
-    } = State
-) ->
-    AtFragmentEnd = Offset >= ?SEGMENT_HEADER_B + FragSize,
-    case {AtFragmentEnd, State#state.next} of
-        {true, not_found} ->
-            %% Next fragment was 404. Check if retention evicted it.
-            case rabbitmq_stream_s3_fragment_iterator:next(State#state.iterator) of
-                {ok, #fragment_ref{offset = NextFragment}, _} when FirstOffset >= NextFragment ->
-                    maybe_jump_to_oldest(FirstOffset, CurrentOffset, State);
-                {ok, #fragment_ref{offset = NextFragment}, _} when EndOffset =< NextFragment ->
-                    FragOffset = (State#state.fragment_ref)#fragment_ref.offset,
-                    State1 = goto_next_fragment(State#state{pending = undefined}),
-                    {State1, [{reply, {become_local, FragOffset}}]};
-                _ ->
-                    State1 = goto_next_fragment(State#state{pending = undefined}),
-                    {State1, [
-                        {reply, {become_local, (State#state.fragment_ref)#fragment_ref.offset}}
-                    ]}
-            end;
-        {false, _} ->
-            maybe_jump_to_oldest(FirstOffset, CurrentOffset, State);
-        _ ->
-            State1 = goto_next_fragment(State#state{pending = undefined}),
-            {State1, [{reply, {become_local, (State#state.fragment_ref)#fragment_ref.offset}}]}
-    end.
-
-%% If the manifest's first_offset points to the fragment we already know is
-%% gone (404), the manifest is stale. Fall through to the local tier to avoid
-%% an infinite jump loop. See: https://github.com/amazon-mq/rabbitmq-stream-s3/issues/166
-maybe_jump_to_oldest(FirstOffset, CurrentOffset, State) when FirstOffset =:= CurrentOffset ->
-    State1 = goto_next_fragment(State#state{pending = undefined}),
-    {State1, [{reply, {become_local, CurrentOffset}}]};
-maybe_jump_to_oldest(FirstOffset, _CurrentOffset, State) ->
-    {State, [{jump_to_oldest, FirstOffset}]}.
-
-%% ------------------------------------------------------------------
 %% Internal: fragment navigation
 %% ------------------------------------------------------------------
+
+%% Returns the offset of the next fragment in the iterator. Called from the
+%% `not_found_check_range` branch of `try_serve`. There are two paths into
+%% that branch:
+%%
+%%  1. `try_fragment_transition` matching `next = not_found`: the consumer
+%%     read past the current fragment and the prefetched-next 404'd. The
+%%     iterator is positioned at the 404'd entry, so this returns the
+%%     404'd offset. `next/1` always succeeds with `{ok, _, _}`.
+%%
+%%  2. `try_read` matching `current_not_found = true`: the *current*
+%%     fragment 404'd while no read was pending; a later read wants bytes
+%%     past the partial buffer. The iterator was already advanced past
+%%     the current fragment, so it points at the entry AFTER the 404'd
+%%     one. This function then returns a live fragment's offset, which
+%%     the shell uses to refresh the iterator and ends up skipping the
+%%     live fragment. Tracked by issue #173.
+next_fragment_offset(#state{iterator = Iterator}) ->
+    {ok, #fragment_ref{offset = Offset}, _} = rabbitmq_stream_s3_fragment_iterator:next(Iterator),
+    Offset.
 
 goto_next_fragment(#state{stream = StreamId, next = Next0, iterator = Iterator0} = State) ->
     Iterator = advance_iterator(Iterator0),
