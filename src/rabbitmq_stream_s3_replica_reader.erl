@@ -1359,6 +1359,9 @@ on_persist_completed(#manifest{} = Manifest, State) ->
     %% Persist succeeded. Now safe to delete objects that retention removed
     %% from the manifest. The manifest cache is updated, so readers will no
     %% longer reference these objects.
+    %% Flushing all deferred deletions is safe: retention_in_flight prevents
+    %% persist from starting until the retention edit is in edits_since_persist,
+    %% so every ref here is covered by this persist's snapshot.
     flush_deferred_deletions(State),
     State#state{persisting_bytes = 0, deferred_deletions = []}.
 

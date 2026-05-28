@@ -404,6 +404,9 @@ try_fragment_transition(
 %% ------------------------------------------------------------------
 
 %% Returns the offset of the next fragment in the iterator (the one that 404'd).
+%% Only called from the `not_found_check_range` branch of `try_serve`, where
+%% `next = not_found` guarantees the iterator is positioned at the 404'd entry
+%% and `next/1` will always return `{ok, _, _}`.
 next_fragment_offset(#state{iterator = Iterator}) ->
     {ok, #fragment_ref{offset = Offset}, _} = rabbitmq_stream_s3_fragment_iterator:next(Iterator),
     Offset.
