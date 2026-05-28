@@ -212,22 +212,13 @@ handle_info(deadline_expired, #state{from = undefined} = State) ->
     %% Timer fired after the read was already served. Ignore.
     {noreply, State};
 handle_info(
-    deadline_expired, #state{core = Core0, requests = Requests, cancelled = Cancelled0} = State0
+    deadline_expired, #state{core = Core0} = State0
 ) ->
     %% Cancel in-flight S3 requests so they don't feed stale data into the
     %% reset buffer after the core clears it.
-    maps:foreach(
-        fun(_FragOff, {ReqId, AsyncState}) ->
-            rabbitmq_stream_s3_api:cancel_async(ReqId, AsyncState)
-        end,
-        Requests
-    ),
-    counters:sub(counter(), ?C_REQUESTS_IN_FLIGHT, map_size(Requests)),
-    NewCancelled = maps:merge(Cancelled0, #{ReqId => ok || _ := {ReqId, _} <- Requests}),
+    State1 = cancel_all_requests(State0),
     {Core1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(Core0, deadline_expired),
-    State = execute_effects(Effects, State0#state{
-        core = Core1, requests = #{}, cancelled = NewCancelled, deadline_timer = undefined
-    }),
+    State = execute_effects(Effects, State1#state{core = Core1, deadline_timer = undefined}),
     maybe_stop(State);
 handle_info(Msg, #state{requests = Requests0, cancelled = Cancelled0} = State0) ->
     AsyncStates = #{Req => AsyncState || _ := {Req, AsyncState} <- Requests0},
@@ -246,13 +237,8 @@ handle_info(Msg, #state{requests = Requests0, cancelled = Cancelled0} = State0) 
             {noreply, State0}
     end.
 
-terminate(_Reason, #state{requests = Requests}) ->
-    maps:foreach(
-        fun(_FragOff, {ReqId, AsyncState}) ->
-            rabbitmq_stream_s3_api:cancel_async(ReqId, AsyncState)
-        end,
-        Requests
-    ),
+terminate(_Reason, State) ->
+    _ = cancel_all_requests(State),
     ok.
 
 format_status(#{state := #state{stream = StreamId, core = Core, from = From}} = Status) ->
@@ -390,19 +376,11 @@ execute_effect(refresh_iterator, #state{stream = StreamId, core = Core0} = State
     execute_effects(Effects, State#state{core = Core1});
 execute_effect(
     {jump_to_oldest, FirstOffset},
-    #state{stream = StreamId, core = Core0, requests = Requests, cancelled = Cancelled0} = State0
+    #state{stream = StreamId, core = Core0} = State0
 ) ->
     %% Cancel in-flight requests, resolve the fragment from the manifest,
     %% and feed back to the core.
-    maps:foreach(
-        fun(_FragOff, {ReqId, AsyncState}) ->
-            rabbitmq_stream_s3_api:cancel_async(ReqId, AsyncState)
-        end,
-        Requests
-    ),
-    counters:sub(counter(), ?C_REQUESTS_IN_FLIGHT, map_size(Requests)),
-    NewCancelled = maps:merge(Cancelled0, #{ReqId => ok || _ := {ReqId, _} <- Requests}),
-    State1 = State0#state{requests = #{}, cancelled = NewCancelled},
+    State1 = cancel_all_requests(State0),
     case resolve_fragment_at(StreamId, FirstOffset) of
         {ok, FragRef, Iterator} ->
             {Core1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
@@ -472,6 +450,17 @@ build_cfg(Opts) ->
         request_timeout_ms = maps:get(request_timeout_ms, Opts, 15_000),
         pending_read_deadline_ms = maps:get(pending_read_deadline_ms, Opts, 50_000)
     }.
+
+cancel_all_requests(#state{requests = Requests, cancelled = Cancelled0} = State) ->
+    maps:foreach(
+        fun(_FragOff, {ReqId, AsyncState}) ->
+            rabbitmq_stream_s3_api:cancel_async(ReqId, AsyncState)
+        end,
+        Requests
+    ),
+    counters:sub(counter(), ?C_REQUESTS_IN_FLIGHT, map_size(Requests)),
+    NewCancelled = maps:merge(Cancelled0, #{ReqId => ok || _ := {ReqId, _} <- Requests}),
+    State#state{requests = #{}, cancelled = NewCancelled}.
 
 cancel_deadline_timer(undefined) ->
     ok;
