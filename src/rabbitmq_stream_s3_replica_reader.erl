@@ -1359,9 +1359,18 @@ on_persist_completed(#manifest{} = Manifest, State) ->
     %% Persist succeeded. Now safe to delete objects that retention removed
     %% from the manifest. The manifest cache is updated, so readers will no
     %% longer reference these objects.
-    %% Flushing all deferred deletions is safe: retention_in_flight prevents
-    %% persist from starting until the retention edit is in edits_since_persist,
-    %% so every ref here is covered by this persist's snapshot.
+    %%
+    %% Flushing all deferred deletions is intentional even when some refs
+    %% belong to retention edits that arrived after this persist's snapshot
+    %% and are still queued in `edits_since_persist`. Those objects are
+    %% deleted from S3 here, but the persisted manifest does not reflect
+    %% their removal until persist N+1 lands. If we crash in this window,
+    %% on restart the persisted manifest will list fragments whose S3
+    %% objects are gone. Readers hitting those fragments get 404s, which
+    %% `rabbitmq_stream_s3_remote_reader` handles by refreshing the
+    %% iterator past the missing offset. End-state is consistent: the
+    %% next retention pass will re-emit the edit and a subsequent persist
+    %% will reconcile the manifest.
     flush_deferred_deletions(State),
     State#state{persisting_bytes = 0, deferred_deletions = []}.
 
