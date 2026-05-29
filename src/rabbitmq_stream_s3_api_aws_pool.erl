@@ -295,13 +295,20 @@ handle_info(
         _ ->
             case CheckoutsRev0 of
                 #{MRef := Conn} ->
-                    %% A caller process is down which has a conn checked out.
-                    %% Return the conn.
+                    %% A caller process is down while holding a checked-out
+                    %% connection. The connection may be in any state on the
+                    %% wire (e.g. mid-body in a chunked PUT if the caller
+                    %% died between `gun:headers/4` and `gun:data/4 fin`).
+                    %% Reusing it would land a `headers` cast on a connection
+                    %% whose `out` field is not `head`, crashing gun's
+                    %% gen_statem with `function_clause`. Drop the connection
+                    %% and grow a replacement.
+                    %% See: https://github.com/amazon-mq/rabbitmq-stream-s3/issues/177
                     State1 = State0#?MODULE{
                         checkouts = maps:remove(Conn, Checkouts0),
                         checkouts_rev = maps:remove(MRef, CheckoutsRev0)
                     },
-                    {noreply, make_available(Conn, State1)};
+                    {noreply, grow(close_connection(Conn, State1))};
                 _ ->
                     %% A pending caller process is down. Remove it from the
                     %% pending queue.
@@ -312,21 +319,14 @@ handle_info(
                     {noreply, State}
             end
     end;
-handle_info({idle_timeout, Conn}, #?MODULE{idle_timers = Timers, monitors = Monitors} = State0) ->
+handle_info({idle_timeout, Conn}, #?MODULE{idle_timers = Timers} = State0) ->
     case Timers of
         #{Conn := _} ->
             %% Timer is still active (wasn't cancelled by a checkout), so the
             %% connection has been idle too long. Close it.
             State1 = State0#?MODULE{idle_timers = maps:remove(Conn, Timers)},
             State2 = cancel(Conn, State1),
-            case Monitors of
-                #{Conn := ConnMRef} ->
-                    erlang:demonitor(ConnMRef, [flush]),
-                    gun:close(Conn),
-                    {noreply, State2#?MODULE{monitors = maps:remove(Conn, Monitors)}};
-                _ ->
-                    {noreply, State2}
-            end;
+            {noreply, close_connection(Conn, State2)};
         _ ->
             %% Timer was already cancelled (stale message). Ignore.
             {noreply, State0}
@@ -489,6 +489,19 @@ make_available(Conn, #?MODULE{available = Available, idle_timers = Timers} = Sta
         available = [Conn | Available],
         idle_timers = Timers#{Conn => TRef}
     }).
+
+%% Close a connection and stop monitoring it. Used when the connection has
+%% been idle too long, or when its caller died holding it (and we cannot
+%% trust its on-wire state). A no-op if the connection is not in `monitors`.
+close_connection(Conn, #?MODULE{monitors = Monitors} = State) ->
+    case Monitors of
+        #{Conn := ConnMRef} ->
+            erlang:demonitor(ConnMRef, [flush]),
+            gun:close(Conn),
+            State#?MODULE{monitors = maps:remove(Conn, Monitors)};
+        _ ->
+            State
+    end.
 
 cancel_idle_timer(Conn, #?MODULE{idle_timers = Timers0} = State) ->
     case Timers0 of
