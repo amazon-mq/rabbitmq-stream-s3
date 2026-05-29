@@ -122,20 +122,14 @@ checkin(Pool, Conn) ->
     gen_server:cast(Pool, {checkin, Conn}).
 
 -doc """
-Non-blocking checkout. Returns `{ok, Conn}` if a connection is immediately
-available, or `busy` if the pool is at capacity. If the pool has room to grow,
-queues the caller and waits for a new connection (like `checkout/2`).
+Non-blocking checkout. Returns `Conn` if a connection is immediately available,
+or `busy` if no connection is available. If the pool has room to grow, the
+grow is kicked off in the background and `busy` is returned immediately so the
+caller can retry on a later event.
 """.
 -spec try_checkout(pool()) -> conn() | busy.
 try_checkout(Pool) ->
-    Checkout = erlang:make_ref(),
-    try
-        gen_server:call(Pool, {try_checkout, Checkout}, 5000)
-    catch
-        C:E:Stack ->
-            gen_server:cast(Pool, {cancel_checkout, Checkout}),
-            erlang:raise(C, E, Stack)
-    end.
+    gen_server:call(Pool, try_checkout).
 
 -spec with(pool(), timeout(), fun((conn()) -> term())) -> term().
 with(Pool, Timeout, Fun) ->
@@ -183,12 +177,11 @@ handle_call(
             {noreply, grow(State1)}
     end;
 handle_call(
-    {try_checkout, Checkout},
-    {Pid, _} = From,
+    try_checkout,
+    {Pid, _},
     #?MODULE{
         max_size = MaxSize,
         monitors = Monitors,
-        pending = Pending0,
         counter = Cnt
     } = State0
 ) ->
@@ -197,12 +190,11 @@ handle_call(
             counters:add(Cnt, ?C_CHECKOUTS, 1),
             {reply, Conn, State};
         empty when map_size(Monitors) < MaxSize ->
-            counters:add(Cnt, ?C_CHECKOUT_QUEUED, 1),
-            %% Pool has room to grow — queue the caller and grow.
-            MRef = erlang:monitor(process, Pid),
-            P = #pending{from = From, checkout = Checkout, mref = MRef},
-            State1 = State0#?MODULE{pending = queue:in(P, Pending0)},
-            {noreply, grow(State1)};
+            %% Pool has room to grow. Kick off a grow in the background
+            %% and return `busy` immediately so the caller is not held
+            %% past the gen_server:call deadline waiting for a new
+            %% connection. The caller will retry on a later event.
+            {reply, busy, grow(State0)};
         empty ->
             {reply, busy, State0}
     end;

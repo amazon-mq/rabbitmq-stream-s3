@@ -26,6 +26,11 @@ for batched deletion. The task exits when the listing is exhausted.
 -export([init_counters/0]).
 
 -define(MAX_BATCH, 1000).
+%% The reaper has no upstream caller waiting on a deadline. Under sustained
+%% S3 throttling the pool's default 5s checkout timeout can starve the reaper
+%% and crash the gen_batch_server. Use a generous timeout consistent with
+%% other write-side background work (see `retention_task_timeout`).
+-define(DELETE_TIMEOUT_MS, 60_000).
 
 -define(C_OBJECTS_DELETED, 1).
 -define(C_STREAMS_DELETED, 2).
@@ -81,11 +86,11 @@ delete_batched([]) ->
     ok;
 delete_batched(Keys) when length(Keys) =< ?MAX_BATCH ->
     inc(?C_OBJECTS_DELETED, length(Keys)),
-    rabbitmq_stream_s3_api:delete(Keys);
+    rabbitmq_stream_s3_api:delete(Keys, #{timeout => ?DELETE_TIMEOUT_MS});
 delete_batched(Keys) ->
     {Batch, Rest} = lists:split(?MAX_BATCH, Keys),
     inc(?C_OBJECTS_DELETED, length(Batch)),
-    _ = rabbitmq_stream_s3_api:delete(Batch),
+    _ = rabbitmq_stream_s3_api:delete(Batch, #{timeout => ?DELETE_TIMEOUT_MS}),
     delete_batched(Rest).
 
 list_and_delete(StreamId) ->
