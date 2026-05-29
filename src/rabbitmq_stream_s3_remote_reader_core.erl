@@ -28,6 +28,7 @@ returns a new state plus a list of effects describing what should happen next.
 - `{start_request, Key, Range, Fragment}` - initiate an S3 GET
 - `{set_timer, Duration}` - schedule a retry timer
 - `{refresh_iterator, Offset}` - rebuild iterator past the given offset
+- `{observe, Kind, ReadSize}` - report a notable read-path event for metrics
 - `stop` - shut down the remote reader
 
 ## Design
@@ -114,11 +115,14 @@ and transitions immediately if available, or signals that more data is needed.
     | deadline_expired
     | {iterator_refreshed, rabbitmq_stream_s3_fragment_iterator:iterator() | end_of_manifest}.
 
+-type observe_kind() :: hit | miss | fragment_transition.
+
 -type effect() ::
     {reply, read_result()}
     | {start_request, rabbitmq_stream_s3:key(), {byte_offset(), byte_offset()}, fragment_offset()}
     | {set_timer, pos_integer()}
     | {refresh_iterator, osiris:offset()}
+    | {observe, observe_kind(), pos_integer()}
     | stop.
 
 -type read_result() ::
@@ -308,11 +312,19 @@ try_serve(#state{pending = #pending{offset = Offset, bytes = Bytes}} = State) ->
         {ok, Data, State1} ->
             State2 = adjust_read_size(hit, State1#state{pending = undefined}),
             {State3, Effects} = maybe_start_requests(State2),
-            {State3, [{reply, {ok, Data}} | Effects]};
+            {State3, [
+                {reply, {ok, Data}},
+                {observe, hit, State3#state.read_size}
+                | Effects
+            ]};
         {next_fragment, NextOffset, State1} ->
             State2 = State1#state{pending = undefined},
             {State3, Effects} = maybe_start_requests(State2),
-            {State3, [{reply, {next_fragment, NextOffset}} | Effects]};
+            {State3, [
+                {reply, {next_fragment, NextOffset}},
+                {observe, fragment_transition, State3#state.read_size}
+                | Effects
+            ]};
         {become_local, State1} ->
             FragOffset = (State1#state.fragment_ref)#fragment_ref.offset,
             State2 = State1#state{pending = undefined},
@@ -320,7 +332,7 @@ try_serve(#state{pending = #pending{offset = Offset, bytes = Bytes}} = State) ->
         {await, State1} ->
             State2 = adjust_read_size(miss, State1),
             {State3, Effects} = maybe_start_requests(State2),
-            {State3, Effects};
+            {State3, [{observe, miss, State3#state.read_size} | Effects]};
         {not_found_check_range, State1} ->
             %% Next fragment was 404. Refresh iterator past it.
             NotFoundOffset = next_fragment_offset(State1),

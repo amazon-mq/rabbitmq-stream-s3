@@ -36,11 +36,9 @@ synchronous feedback is generated.
 -define(C_BUFFER_MISS, 2).
 -define(C_FRAGMENT_TRANSITION, 3).
 -define(C_REQUESTS_IN_FLIGHT, 4).
--define(C_AWAIT_DURATION_MS, 5).
--define(C_AWAIT, 6).
--define(C_READ_DURATION_MS, 7).
--define(C_READ, 8).
--define(C_TOTAL_REQUESTS, 9).
+-define(C_READ_DURATION_MS, 5).
+-define(C_READ, 6).
+-define(C_TOTAL_REQUESTS, 7).
 -define(COUNTER_KEY, {rabbitmq_stream_s3_remote_reader, counter}).
 -define(COUNTERS, [
     {buffer_hit, ?C_BUFFER_HIT, counter, "Number of reads served from the buffer"},
@@ -48,9 +46,6 @@ synchronous feedback is generated.
     {fragment_transition, ?C_FRAGMENT_TRANSITION, counter, "Number of fragment transitions"},
     {requests_in_flight, ?C_REQUESTS_IN_FLIGHT, gauge,
         "Current number of in-flight async requests"},
-    {await_duration_ms, ?C_AWAIT_DURATION_MS, counter,
-        "Total milliseconds spent awaiting async data"},
-    {await, ?C_AWAIT, counter, "Number of awaits"},
     {read_duration_ms, ?C_READ_DURATION_MS, counter, "Total milliseconds spent in read calls"},
     {read, ?C_READ, counter, "Number of read/4,5 calls"},
     {remote_reader_total_requests, ?C_TOTAL_REQUESTS, counter, "Number of S3 requests initiated"}
@@ -76,7 +71,6 @@ synchronous feedback is generated.
     reader_ref :: reference(),
     %% Pending caller (at most one).
     from :: gen_server:from() | undefined,
-    since :: integer() | undefined,
     %% Timer that fires deadline_expired if the pending read is not served in time.
     deadline_timer :: reference() | undefined,
     %% Maps fragment_offset -> {async_req, async_state}
@@ -191,7 +185,6 @@ handle_call(
     State1 = State0#state{
         core = Core1,
         from = From,
-        since = erlang:monotonic_time(),
         deadline_timer = Timer
     },
     State = execute_effects(Effects, State1),
@@ -332,18 +325,27 @@ execute_effects([Effect | Rest], State0) ->
     execute_effects(Rest, State).
 
 execute_effect(
-    {reply, Result}, #state{from = From, since = Since, deadline_timer = Timer} = State
+    {reply, Result}, #state{from = From, deadline_timer = Timer} = State
 ) when
     From =/= undefined
 ->
-    Duration = rabbitmq_stream_s3_util:elapsed_ms(Since),
-    counters:add(counter(), ?C_AWAIT_DURATION_MS, Duration),
-    counters:add(counter(), ?C_AWAIT, 1),
     cancel_deadline_timer(Timer),
     gen_server:reply(From, Result),
-    State#state{from = undefined, since = undefined, deadline_timer = undefined};
+    State#state{from = undefined, deadline_timer = undefined};
 execute_effect({reply, _Result}, State) ->
     %% No pending caller (e.g. reply generated during init before any call).
+    State;
+execute_effect({observe, hit, ReadSize}, State) ->
+    counters:add(counter(), ?C_BUFFER_HIT, 1),
+    rabbitmq_stream_s3_histogram:observe(?MODULE, ReadSize),
+    State;
+execute_effect({observe, miss, ReadSize}, State) ->
+    counters:add(counter(), ?C_BUFFER_MISS, 1),
+    rabbitmq_stream_s3_histogram:observe(?MODULE, ReadSize),
+    State;
+execute_effect({observe, fragment_transition, ReadSize}, State) ->
+    counters:add(counter(), ?C_FRAGMENT_TRANSITION, 1),
+    rabbitmq_stream_s3_histogram:observe(?MODULE, ReadSize),
     State;
 execute_effect(
     {start_request, Key, Range, FragOffset},

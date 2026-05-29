@@ -42,7 +42,8 @@ all() ->
         next_fragment_404_triggers_refresh_iterator,
         deadline_expired_replies_error_timeout,
         deadline_expired_resets_buffer_for_retry,
-        fragment_404_emits_refresh_iterator
+        fragment_404_emits_refresh_iterator,
+        observe_effects_emitted_for_hit_miss_and_transition
     ].
 
 init_per_suite(Config) ->
@@ -590,3 +591,43 @@ fragment_404_emits_refresh_iterator(_Config) ->
         S1, {request_error, make_ref(), 0, not_found}
     ),
     ?assertMatch([{refresh_iterator, 0}], Effects).
+
+observe_effects_emitted_for_hit_miss_and_transition(_Config) ->
+    %% Verify the core emits one `{observe, Kind, ReadSize}` effect per
+    %% buffer hit, miss, and fragment transition. The shell increments
+    %% Prometheus counters from these effects (see
+    %% https://github.com/amazon-mq/rabbitmq-stream-s3/issues/175).
+    FragRef = frag_ref(0, 200, 42),
+    Iterator = mock_iterator([{0, 200, 42}, {100, 500, 43}]),
+    {S0, _} = init(stream_id(), FragRef, 8, Iterator),
+
+    %% Read against an empty buffer emits a miss observation.
+    {S1, MissEffects} = rabbitmq_stream_s3_remote_reader_core:step(
+        S0, {read, 8, 100, chunk_boundary}
+    ),
+    [{observe, miss, MissReadSize}] = [E || E = {observe, _, _} <- MissEffects],
+    ?assert(is_integer(MissReadSize) andalso MissReadSize > 0),
+
+    %% Data arrives, then a read against the buffered range emits a hit.
+    Data = binary:copy(<<0>>, 200),
+    {S2, _} = rabbitmq_stream_s3_remote_reader_core:step(
+        S1, {data, make_ref(), 0, Data, done}
+    ),
+    {S3, HitEffects} = rabbitmq_stream_s3_remote_reader_core:step(
+        S2, {read, 8, 100, chunk_boundary}
+    ),
+    [{observe, hit, HitReadSize}] = [E || E = {observe, _, _} <- HitEffects],
+    ?assert(is_integer(HitReadSize) andalso HitReadSize > 0),
+
+    %% Pre-fetch the next fragment, then read past the current fragment's end
+    %% to trigger a fragment transition observation.
+    NextData = binary:copy(<<1>>, 200),
+    {S4, _} = rabbitmq_stream_s3_remote_reader_core:step(
+        S3, {data, make_ref(), 100, NextData, done}
+    ),
+    {_S5, TransEffects} = rabbitmq_stream_s3_remote_reader_core:step(
+        S4, {read, 208, 50, chunk_boundary}
+    ),
+    [{observe, fragment_transition, TransReadSize}] =
+        [E || E = {observe, _, _} <- TransEffects],
+    ?assert(is_integer(TransReadSize) andalso TransReadSize > 0).
