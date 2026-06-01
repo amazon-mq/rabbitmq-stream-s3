@@ -64,7 +64,8 @@ groups() ->
             read_repositions_on_fragment_not_found,
             local_to_remote_transition,
             read_through_group,
-            read_detects_crc_corruption
+            read_detects_crc_corruption,
+            offset_spec_at_tier_boundary
         ]},
         {with_replica, [], [
             read_from_replica_node
@@ -348,6 +349,51 @@ read_detects_crc_corruption(Config) ->
         )
     end),
     ?assertMatch({_, _}, binary:match(Log, <<"CRC validation failure">>)).
+
+offset_spec_at_tier_boundary(Config) ->
+    %% Tests offset spec resolution at the exact boundary between tiers.
+    %%
+    %% After upload and retention, the remote tier covers [0, NextOffset) and
+    %% the local tier covers [FirstChunkId, NextOffset). The tiers overlap
+    %% because retention keeps the current segment. The resolution boundary
+    %% is FirstChunkId: offsets >= FirstChunkId resolve to local, offsets
+    %% below resolve to remote.
+    #{next_offset := NextOffset} = seed_log(Config, [
+        {segment, [{chunk, #{records => 10, size => 600}}]},
+        {segment, [{chunk, #{records => 10, size => 600}}]},
+        {segment, [{chunk, #{records => 10, size => 600}}]}
+    ]),
+
+    Writer = start_writer(Config, #{}, #{fragment_target_size => 500}),
+    flush_writer(Writer),
+    await_offset(Config, NextOffset),
+
+    ReaderCfg = reader_config(Writer, Config),
+    #{shared := Shared} = ReaderCfg,
+    ?awaitMatch(F when F > 0, osiris_log_shared:first_chunk_id(Shared), 1000),
+
+    FirstChunkId = osiris_log_shared:first_chunk_id(Shared),
+    ?assert(FirstChunkId > 0),
+    ?assert(FirstChunkId =< NextOffset),
+
+    %% Exactly at FirstChunkId: resolves to local.
+    {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(FirstChunkId, ReaderCfg),
+    ?assertEqual(local, rabbitmq_stream_s3_log_reader:mode(Reader0)),
+    rabbitmq_stream_s3_log_reader:close(Reader0),
+
+    %% Same via {abs, _}.
+    {ok, Reader1} = rabbitmq_stream_s3_log_reader:init_offset_reader(
+        {abs, FirstChunkId}, ReaderCfg
+    ),
+    ?assertEqual(local, rabbitmq_stream_s3_log_reader:mode(Reader1)),
+    rabbitmq_stream_s3_log_reader:close(Reader1),
+
+    %% One below the boundary: resolves to remote.
+    {ok, Reader2} = rabbitmq_stream_s3_log_reader:init_offset_reader(
+        FirstChunkId - 1, ReaderCfg
+    ),
+    ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader2)),
+    rabbitmq_stream_s3_log_reader:close(Reader2).
 
 read_from_replica_node(Config) ->
     StreamId = ?config(stream_id, Config),
