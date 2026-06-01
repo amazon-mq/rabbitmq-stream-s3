@@ -602,8 +602,11 @@ handle_async(
 
 -spec cancel_async(async_req(), async_state()) -> ok.
 cancel_async(StreamRef, #{conn := Conn, stream_ref := StreamRef} = State) ->
-    gun:cancel(Conn, StreamRef),
-    ok = finish_async(State).
+    %% On HTTP/1.1, gun:cancel only marks the stream dead; the response body
+    %% continues draining on the wire, blocking subsequent pipelined requests.
+    %% Close the connection so the pool replaces it with a fresh one.
+    gun:close(Conn),
+    ok = finish_async_close(State).
 
 %% Cancel the request timer without checking in the connection or
 %% decrementing the active-request counter. Used when the response
