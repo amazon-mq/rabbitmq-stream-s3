@@ -190,10 +190,6 @@ handle_call(
             counters:add(Cnt, ?C_CHECKOUTS, 1),
             {reply, Conn, State};
         empty when map_size(Monitors) < MaxSize ->
-            %% Pool has room to grow. Open one connection in the
-            %% background and return `busy` so the caller retries on a
-            %% later event. grow/1 calculates demand from Pending, which
-            %% is empty for try_checkout callers, so call grow/2 directly.
             {reply, busy, grow(1, State0)};
         empty ->
             {reply, busy, State0}
