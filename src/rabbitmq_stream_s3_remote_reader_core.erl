@@ -228,7 +228,9 @@ step(
     #state{cfg = #cfg{max_retry_delay_ms = MaxDelay}} = State0,
     {request_error, _RequestId, _Fragment, Reason}
 ) when
-    Reason =:= timeout; Reason =:= stream_error; Reason =:= connection_error;
+    Reason =:= timeout;
+    Reason =:= stream_error;
+    Reason =:= connection_error;
     Reason =:= pool_busy
 ->
     %% Transient error. Retry with current delay.

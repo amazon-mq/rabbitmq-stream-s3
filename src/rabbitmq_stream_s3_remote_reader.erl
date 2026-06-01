@@ -358,8 +358,10 @@ execute_effect(
             Requests = Requests0#{FragOffset => {RequestId, AsyncState}},
             State#state{requests = Requests};
         {error, pool_busy} ->
-            ?LOG_WARNING("remote_reader start_request: pool_busy key=~ts frag=~b",
-                         [Key, FragOffset]),
+            ?LOG_WARNING(
+                "remote_reader start_request: pool_busy key=~ts frag=~b",
+                [Key, FragOffset]
+            ),
             {Core1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
                 Core0, {request_error, make_ref(), FragOffset, pool_busy}
             ),

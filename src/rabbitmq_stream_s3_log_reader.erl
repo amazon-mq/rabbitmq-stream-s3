@@ -391,7 +391,9 @@ send_file(Socket, #?MODULE{mode = Local0} = State0, Callback, DeferredClose) ->
                 false ->
                     case osiris_log:open_next_segment(Local1) of
                         {ok, Local} ->
-                            send_file(Socket, State0#?MODULE{mode = Local}, Callback, DeferredClose);
+                            send_file(
+                                Socket, State0#?MODULE{mode = Local}, Callback, DeferredClose
+                            );
                         not_found ->
                             close_deferred(DeferredClose),
                             {end_of_stream, State0#?MODULE{mode = Local1}}
@@ -491,7 +493,9 @@ chunk_iterator(#?MODULE{mode = Local0} = State0, Credit, PrevIter, DeferredClose
                 false ->
                     case osiris_log:open_next_segment(Local1) of
                         {ok, Local} ->
-                            chunk_iterator(State0#?MODULE{mode = Local}, Credit, undefined, DeferredClose);
+                            chunk_iterator(
+                                State0#?MODULE{mode = Local}, Credit, undefined, DeferredClose
+                            );
                         not_found ->
                             close_deferred(DeferredClose),
                             {end_of_stream, State0#?MODULE{mode = Local1}}
