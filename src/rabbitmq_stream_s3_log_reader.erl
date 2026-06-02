@@ -25,7 +25,7 @@ tier.
 %% and osiris_log:chunk_iterator/3 than their specs declare, causing false
 %% positives for the {offset_not_found, ...} branches and maybe_become_remote/2.
 %% Remove these suppressions once OTP 28 is required.
--dialyzer({no_match, [send_file/3, chunk_iterator/3]}).
+-dialyzer({no_match, [send_file/4, chunk_iterator/4]}).
 -dialyzer({no_unused, maybe_become_remote/2}).
 
 -define(READ_TIMEOUT, 10000).
@@ -295,10 +295,17 @@ close(#?MODULE{mode = Local}) ->
     counters:add(counter(), ?C_LOCAL_CLOSE, 1),
     ok = osiris_log:close(Local).
 
+close_deferred(undefined) -> ok;
+close_deferred(Local) -> osiris_log:close(Local).
+
+send_file(Socket, State, Callback) ->
+    send_file(Socket, State, Callback, undefined).
+
 send_file(
     Socket,
     #?MODULE{config = Config, mode = #remote{} = Remote0, verify_crc = VerifyCrc} = State0,
-    Callback
+    Callback,
+    DeferredClose
 ) ->
     case read_header(Remote0) of
         {ok,
@@ -324,6 +331,7 @@ send_file(
                     PrefixData = Callback(Header, ToSend + byte_size(HeaderData)),
                     case send(Transport, Socket, [PrefixData, HeaderData, Data]) of
                         ok ->
+                            close_deferred(DeferredClose),
                             Remote = Remote1#remote{
                                 next_offset = ChId + NumRecords,
                                 position = NextPosition
@@ -339,60 +347,73 @@ send_file(
                             position = ?SEGMENT_HEADER_B
                         }
                     },
-                    send_file(Socket, State, Callback);
+                    send_file(Socket, State, Callback, DeferredClose);
                 {become_local, _} ->
+                    close_deferred(DeferredClose),
                     counters:add(counter(), ?C_REMOTE_CLOSE, 1),
                     case init_local_reader(Remote1#remote.next_offset, Config) of
                         {ok, State} ->
-                            send_file(Socket, State, Callback);
+                            send_file(Socket, State, Callback, undefined);
                         {error, _} = Err ->
                             Err
                     end;
                 end_of_stream ->
+                    close_deferred(DeferredClose),
                     {end_of_stream, State0#?MODULE{mode = Remote1}};
                 {error, timeout} = Err ->
                     Err
             end;
         {become_local, _} ->
+            close_deferred(DeferredClose),
             counters:add(counter(), ?C_REMOTE_CLOSE, 1),
             case init_local_reader(Remote0#remote.next_offset, Config) of
                 {ok, State} ->
-                    send_file(Socket, State, Callback);
+                    send_file(Socket, State, Callback, undefined);
                 {error, _} = Err ->
                     Err
             end;
         {end_of_stream, Remote} ->
+            close_deferred(DeferredClose),
             {end_of_stream, State0#?MODULE{mode = Remote}};
         {error, timeout} = Err ->
             Err
     end;
-send_file(Socket, #?MODULE{mode = Local0} = State0, Callback) ->
+send_file(Socket, #?MODULE{mode = Local0} = State0, Callback, DeferredClose) ->
     case osiris_log:send_file(Socket, Local0, Callback) of
         {ok, Local} ->
+            close_deferred(DeferredClose),
             {ok, State0#?MODULE{mode = Local}};
         {offset_not_found, Local1} ->
             Offset = osiris_log:next_offset(Local1),
             case maybe_become_remote(Offset, State0#?MODULE{mode = Local1}) of
-                {ok, State} ->
-                    send_file(Socket, State, Callback);
+                {ok, State, LocalToClose} ->
+                    send_file(Socket, State, Callback, LocalToClose);
                 false ->
                     case osiris_log:open_next_segment(Local1) of
                         {ok, Local} ->
-                            send_file(Socket, State0#?MODULE{mode = Local}, Callback);
+                            send_file(
+                                Socket, State0#?MODULE{mode = Local}, Callback, DeferredClose
+                            );
                         not_found ->
+                            close_deferred(DeferredClose),
                             {end_of_stream, State0#?MODULE{mode = Local1}}
                     end
             end;
         {end_of_stream, Local} ->
+            close_deferred(DeferredClose),
             {end_of_stream, State0#?MODULE{mode = Local}};
         {error, _} = Err ->
             Err
     end.
 
+chunk_iterator(State, Credit, PrevIter) ->
+    chunk_iterator(State, Credit, PrevIter, undefined).
+
 chunk_iterator(
     #?MODULE{config = Config, mode = #remote{} = Remote0, verify_crc = VerifyCrc} = State0,
     Credit,
-    _PrevIter
+    _PrevIter,
+    DeferredClose
 ) ->
     case read_header(Remote0) of
         {ok,
@@ -410,6 +431,7 @@ chunk_iterator(
             case read(Pid, DataPos, DataSize, within_chunk) of
                 {ok, Data} ->
                     ok = maybe_validate_crc(ChId, Crc, Data, DataSize, VerifyCrc),
+                    close_deferred(DeferredClose),
                     Iter = #remote_iterator{
                         next_offset = ChId,
                         data = Data
@@ -427,51 +449,60 @@ chunk_iterator(
                             position = ?SEGMENT_HEADER_B
                         }
                     },
-                    chunk_iterator(State, Credit, undefined);
+                    chunk_iterator(State, Credit, undefined, DeferredClose);
                 {become_local, _} ->
+                    close_deferred(DeferredClose),
                     counters:add(counter(), ?C_REMOTE_CLOSE, 1),
                     case init_local_reader(Remote1#remote.next_offset, Config) of
                         {ok, State} ->
-                            chunk_iterator(State, Credit, undefined);
+                            chunk_iterator(State, Credit, undefined, undefined);
                         {error, _} = Err ->
                             Err
                     end;
                 end_of_stream ->
+                    close_deferred(DeferredClose),
                     {end_of_stream, State0#?MODULE{mode = Remote1}};
                 {error, timeout} = Err ->
                     Err
             end;
         {become_local, _} ->
+            close_deferred(DeferredClose),
             counters:add(counter(), ?C_REMOTE_CLOSE, 1),
             case init_local_reader(Remote0#remote.next_offset, Config) of
                 {ok, State} ->
-                    chunk_iterator(State, Credit, undefined);
+                    chunk_iterator(State, Credit, undefined, undefined);
                 {error, _} = Err ->
                     Err
             end;
         {end_of_stream, Remote} ->
+            close_deferred(DeferredClose),
             {end_of_stream, State0#?MODULE{mode = Remote}};
         {error, timeout} = Err ->
             Err
     end;
-chunk_iterator(#?MODULE{mode = Local0} = State0, Credit, PrevIter) ->
+chunk_iterator(#?MODULE{mode = Local0} = State0, Credit, PrevIter, DeferredClose) ->
     case osiris_log:chunk_iterator(Local0, Credit, PrevIter) of
         {ok, Header, Iter, Local} ->
+            close_deferred(DeferredClose),
             {ok, Header, Iter, State0#?MODULE{mode = Local}};
         {offset_not_found, Local1} ->
             Offset = osiris_log:next_offset(Local1),
             case maybe_become_remote(Offset, State0#?MODULE{mode = Local1}) of
-                {ok, State} ->
-                    chunk_iterator(State, Credit, undefined);
+                {ok, State, LocalToClose} ->
+                    chunk_iterator(State, Credit, undefined, LocalToClose);
                 false ->
                     case osiris_log:open_next_segment(Local1) of
                         {ok, Local} ->
-                            chunk_iterator(State0#?MODULE{mode = Local}, Credit, undefined);
+                            chunk_iterator(
+                                State0#?MODULE{mode = Local}, Credit, undefined, DeferredClose
+                            );
                         not_found ->
+                            close_deferred(DeferredClose),
                             {end_of_stream, State0#?MODULE{mode = Local1}}
                     end
             end;
         {end_of_stream, Local} ->
+            close_deferred(DeferredClose),
             {end_of_stream, State0#?MODULE{mode = Local}};
         {error, _} = Err ->
             Err
@@ -707,8 +738,7 @@ maybe_become_remote(Offset, #?MODULE{config = Config, mode = Local}) ->
             case init_remote_reader(Location, Config) of
                 {ok, RemoteState} ->
                     counters:add(counter(), ?C_LOCAL_CLOSE, 1),
-                    osiris_log:close(Local),
-                    {ok, RemoteState};
+                    {ok, RemoteState, Local};
                 {error, _} ->
                     false
             end;

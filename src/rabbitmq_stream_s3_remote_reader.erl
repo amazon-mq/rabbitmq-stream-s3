@@ -349,7 +349,7 @@ execute_effect({observe, fragment_transition, ReadSize}, State) ->
     State;
 execute_effect(
     {start_request, Key, Range, FragOffset},
-    #state{cfg = #cfg{request_timeout_ms = Timeout}, requests = Requests0} = State
+    #state{cfg = #cfg{request_timeout_ms = Timeout}, core = Core0, requests = Requests0} = State
 ) ->
     case rabbitmq_stream_s3_api:get_range_async(Key, Range, #{timeout => Timeout}) of
         {ok, RequestId, AsyncState} ->
@@ -358,8 +358,14 @@ execute_effect(
             Requests = Requests0#{FragOffset => {RequestId, AsyncState}},
             State#state{requests = Requests};
         {error, pool_busy} ->
-            %% Can't start now. The core will retry on the next event.
-            State
+            ?LOG_WARNING(
+                "remote_reader start_request: pool_busy key=~ts frag=~b",
+                [Key, FragOffset]
+            ),
+            {Core1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
+                Core0, {request_error, make_ref(), FragOffset, pool_busy}
+            ),
+            execute_effects(Effects, State#state{core = Core1})
     end;
 execute_effect({set_timer, DelayMs}, State) ->
     erlang:send_after(DelayMs, self(), retry_requests),

@@ -1550,7 +1550,7 @@ gen_rrc_data_event() ->
 gen_rrc_error_event() ->
     ?LET(
         Reason,
-        oneof([timeout, slow_down, connection_error, stream_error, internal_error]),
+        oneof([timeout, slow_down, connection_error, stream_error, internal_error, pool_busy]),
         {request_error, make_ref(), 0, Reason}
     ).
 
