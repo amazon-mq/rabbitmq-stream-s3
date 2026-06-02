@@ -94,6 +94,7 @@ init_per_group(integration, Config) ->
         ->
             {ok, _} = application:ensure_all_started(gun),
             ok = application:set_env(rabbitmq_stream_s3, bucket, list_to_binary(Bucket0)),
+            ok = application:set_env(rabbitmq_stream_s3, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_aws),
             Config;
         {_, false, _, _, _, _} ->
             Skip;
@@ -116,6 +117,7 @@ init_per_group(integration, Config) ->
             ),
             ok = application:set_env(rabbitmq_stream_s3, aws_region, list_to_binary(Region)),
             ok = application:set_env(rabbitmq_stream_s3, bucket, list_to_binary(Bucket1)),
+            ok = application:set_env(rabbitmq_stream_s3, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_aws),
             Config
     end.
 
