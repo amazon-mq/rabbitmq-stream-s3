@@ -40,6 +40,7 @@ all() ->
         read_larger_than_buffer_awaits,
         header_overread_capped_at_index_boundary,
         next_fragment_404_triggers_refresh_iterator,
+        prefetch_404_full_recovery,
         deadline_expired_replies_error_timeout,
         deadline_expired_resets_buffer_for_retry,
         fragment_404_emits_refresh_iterator,
@@ -539,6 +540,49 @@ next_fragment_404_triggers_refresh_iterator(_Config) ->
         S2, {read, 208, 50, chunk_boundary}
     ),
     ?assertMatch([{refresh_iterator, 100}], Effects).
+
+prefetch_404_full_recovery(_Config) ->
+    %% Full cycle: prefetch of next fragment returns 404, consumer reads past
+    %% current fragment, refresh returns a surviving fragment further ahead,
+    %% consumer continues reading from that fragment.
+    FragRef = frag_ref(0, 200, 42),
+    %% Three fragments: 0, 100, 200. Fragment 100 will be deleted by retention.
+    Iterator = mock_iterator([{0, 200, 42}, {100, 500, 43}, {200, 300, 44}]),
+    {S0, _} = init(stream_id(), FragRef, 8, Iterator),
+    %% Fill current fragment.
+    Data = binary:copy(<<0>>, 200),
+    {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {data, make_ref(), 0, Data, done}),
+    %% Prefetch of fragment 100 returns 404.
+    {S2, _} = rabbitmq_stream_s3_remote_reader_core:step(
+        S1, {request_error, make_ref(), 100, not_found}
+    ),
+    %% Consumer reads past current fragment → refresh_iterator.
+    {S3, E1} = rabbitmq_stream_s3_remote_reader_core:step(
+        S2, {read, 208, 50, chunk_boundary}
+    ),
+    ?assertMatch([{refresh_iterator, 100}], E1),
+    %% Shell provides a refreshed iterator starting at fragment 200.
+    RefreshedManifest = build_manifest([{200, 300, 44}]),
+    GetGroupFun = fun(_) -> {error, not_found} end,
+    RefreshedIterator = rabbitmq_stream_s3_fragment_iterator:init(
+        RefreshedManifest, 0, GetGroupFun
+    ),
+    {S4, E2} = rabbitmq_stream_s3_remote_reader_core:step(
+        S3, {iterator_refreshed, RefreshedIterator}
+    ),
+    %% Core replies with next_fragment pointing to 200 and starts a request.
+    ?assertMatch([{reply, {next_fragment, 200}} | _], E2),
+    Requests = [F || {start_request, _, _, F} <- E2],
+    ?assertEqual([200], Requests),
+    %% Data arrives for fragment 200. Consumer can read from it.
+    NextData = binary:copy(<<1>>, 300),
+    {S5, _} = rabbitmq_stream_s3_remote_reader_core:step(
+        S4, {data, make_ref(), 200, NextData, done}
+    ),
+    {_S6, E3} = rabbitmq_stream_s3_remote_reader_core:step(
+        S5, {read, 8, 50, chunk_boundary}
+    ),
+    ?assertMatch([{reply, {ok, _}} | _], E3).
 
 deadline_expired_replies_error_timeout(_Config) ->
     %% When the shell fires deadline_expired, the core replies {error, timeout}
