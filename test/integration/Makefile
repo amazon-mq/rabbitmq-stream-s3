@@ -39,17 +39,12 @@ MESSAGE_SIZE ?= 1024
 MAX_LENGTH_BYTES ?= 10000000000
 REPLAY_TIMEOUT ?= 3600
 
-.PHONY: cleanup s3-cleanup high-throughput remote-only-read multi-offset-consumer
+.PHONY: cleanup high-throughput remote-only-read multi-offset-consumer
 
 cleanup: package
 	$(JAVA) -jar $(JAR) cleanup \
-		--mgmt-uri $(MGMT_URI)
-
-s3-cleanup:
-ifndef S3_BUCKET
-	$(error S3_BUCKET is not set - ensure ~/env.mk defines RMQ_S3_BUCKET)
-endif
-	aws s3 rm s3://$(S3_BUCKET)/rabbitmq/stream/ --recursive --region $(S3_REGION)
+		--mgmt-uri $(MGMT_URI) \
+		$(if $(S3_BUCKET),--s3-bucket $(S3_BUCKET) --s3-region $(S3_REGION))
 
 high-throughput: package
 	$(JAVA) -jar $(JAR) high-throughput \
@@ -76,6 +71,13 @@ multi-offset-consumer: package
 		--mgmt-uri $(MGMT_URI) \
 		--stream $(STREAM) \
 		--duration $(DURATION)
+
+# --- Dependency management ---
+
+.PHONY: update-deps
+
+update-deps:
+	$(CURDIR)/mvnw versions:update-properties -B -q
 
 # --- Formatting ---
 
