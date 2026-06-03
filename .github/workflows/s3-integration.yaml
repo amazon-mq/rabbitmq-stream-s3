@@ -56,7 +56,7 @@ jobs:
         with:
           path: rabbitmq-server/deps/rabbitmq_stream_s3
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v6.1.1
+        uses: aws-actions/configure-aws-credentials@v6.2.0
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_REGION }}
