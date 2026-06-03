@@ -275,11 +275,13 @@ handle_info(
 ) ->
     case Monitors0 of
         #{Pid := MRef} ->
-            %% A connection is down. Forget it and maybe grow a new one.
+            %% A connection is down. Replace it unconditionally: the connection
+            %% was in use (or at least monitored), so demand exists regardless
+            %% of whether anyone is in the Pending queue.
             Conn = Pid,
             State1 = State0#?MODULE{monitors = maps:remove(Conn, Monitors0)},
             State2 = cancel(Pid, State1),
-            {noreply, grow(State2)};
+            {noreply, grow(1, State2)};
         _ ->
             case CheckoutsRev0 of
                 #{MRef := Conn} ->
