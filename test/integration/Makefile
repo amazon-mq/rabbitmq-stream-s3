@@ -42,7 +42,11 @@ MESSAGE_SIZE ?= 1024
 MAX_LENGTH_BYTES ?= 10000000000
 REPLAY_TIMEOUT ?= 3600
 
-.PHONY: high-throughput remote-only-read multi-offset-consumer
+.PHONY: cleanup high-throughput remote-only-read multi-offset-consumer
+
+cleanup: package
+	java -jar $(JAR) cleanup \
+		--mgmt-uri $(MGMT_URI)
 
 high-throughput: package
 	java -jar $(JAR) high-throughput \

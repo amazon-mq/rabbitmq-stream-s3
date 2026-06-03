@@ -9,6 +9,7 @@ import picocli.CommandLine;
       HighThroughputTest.class,
       RemoteOnlyReadTest.class,
       MultiOffsetConsumerTest.class,
+      CleanupCommand.class,
       CommandLine.HelpCommand.class
     })
 public class Main implements Runnable {
