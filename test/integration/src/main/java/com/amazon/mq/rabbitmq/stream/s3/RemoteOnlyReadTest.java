@@ -54,9 +54,11 @@ public class RemoteOnlyReadTest implements Runnable {
     CountDownLatch done = new CountDownLatch(1);
 
     try (Environment env = cluster.buildEnvironment()) {
+      var consumerBuilder = env.consumerBuilder().stream(cluster.stream)
+              .offset(OffsetSpecification.first());
+      consumerBuilder.flow().initialCredits(10);
       Consumer consumer =
-          env.consumerBuilder().stream(cluster.stream)
-              .offset(OffsetSpecification.first())
+          consumerBuilder
               .messageHandler(
                   (context, message) -> {
                     long count = consumed.incrementAndGet();
