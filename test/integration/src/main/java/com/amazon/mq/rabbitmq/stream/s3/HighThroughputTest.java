@@ -87,14 +87,13 @@ public class HighThroughputTest implements Runnable {
       setupStream(env, mgmt);
       long published = publishPhase(env, mgmt);
 
-      long expectedMessages = mgmt.getMessageCount(cluster.stream);
+      LOG.info("Publish phase complete: confirmed={}", published);
+      LOG.info("Waiting for management stats to stabilize...");
+      long expectedMessages = mgmt.getStableMessageCount(cluster.stream, 12, 5000);
       if (expectedMessages <= 0) {
         expectedMessages = published;
       }
-      LOG.info(
-          "Publish phase complete: confirmed={} management-messages={}",
-          published,
-          expectedMessages);
+      LOG.info("Expected messages for replay: {}", expectedMessages);
 
       replayPhase(env, expectedMessages);
       LOG.info("SUCCESS: high-throughput test passed");
