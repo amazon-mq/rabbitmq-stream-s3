@@ -25,6 +25,13 @@ public class ClusterOptions {
       defaultValue = "http://localhost:15672")
   String mgmtUri;
 
+  @CommandLine.Option(
+      names = {"--metrics-uris"},
+      description = "Prometheus metrics endpoints, comma-separated",
+      defaultValue = "http://localhost:15692",
+      split = ",")
+  List<String> metricsUris;
+
   Environment buildEnvironment() {
     return Environment.builder().uris(uris).build();
   }

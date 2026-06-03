@@ -21,10 +21,7 @@ class ManagementApi {
     try {
       this.client =
           new Client(
-              new ClientParameters()
-                  .url(baseUri + "/api/")
-                  .username("guest")
-                  .password("guest"));
+              new ClientParameters().url(baseUri + "/api/").username("guest").password("guest"));
     } catch (Exception e) {
       throw new RuntimeException("Failed to create management API client", e);
     }

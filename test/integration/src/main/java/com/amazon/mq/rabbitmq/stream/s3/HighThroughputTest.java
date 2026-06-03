@@ -1,10 +1,10 @@
 package com.amazon.mq.rabbitmq.stream.s3;
 
+import com.rabbitmq.stream.ByteCapacity;
 import com.rabbitmq.stream.Consumer;
 import com.rabbitmq.stream.Environment;
 import com.rabbitmq.stream.OffsetSpecification;
 import com.rabbitmq.stream.Producer;
-import com.rabbitmq.stream.ByteCapacity;
 import com.rabbitmq.stream.StreamException;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -88,10 +88,11 @@ public class HighThroughputTest implements Runnable {
         maxLengthBytes);
 
     ManagementApi mgmt = new ManagementApi(cluster.mgmtUri);
+    MetricsClient metrics = new MetricsClient(cluster.metricsUris);
 
     try (Environment env = cluster.buildEnvironment()) {
       setupStream(env, mgmt);
-      long published = publishPhase(env, mgmt);
+      long published = publishPhase(env, mgmt, metrics);
 
       LOG.info("Publish phase complete: confirmed={}", published);
       LOG.info("Waiting for management stats to stabilize...");
@@ -101,7 +102,7 @@ public class HighThroughputTest implements Runnable {
       }
       LOG.info("Expected messages for replay: {}", expectedMessages);
 
-      replayPhase(env, expectedMessages);
+      replayPhase(env, expectedMessages, metrics);
       LOG.info("SUCCESS: high-throughput test passed");
     } catch (Exception e) {
       LOG.error("FAILED", e);
@@ -121,8 +122,7 @@ public class HighThroughputTest implements Runnable {
 
     LOG.info("Creating stream: {} (max-length-bytes={})", cluster.stream, maxLengthBytes);
     try {
-      env.streamCreator()
-          .stream(cluster.stream)
+      env.streamCreator().stream(cluster.stream)
           .maxLengthBytes(ByteCapacity.B(maxLengthBytes))
           .create();
     } catch (StreamException e) {
@@ -135,7 +135,8 @@ public class HighThroughputTest implements Runnable {
     LOG.info("Stream ready");
   }
 
-  private long publishPhase(Environment env, ManagementApi mgmt) throws InterruptedException {
+  private long publishPhase(Environment env, ManagementApi mgmt, MetricsClient metrics)
+      throws InterruptedException {
     byte[] body = new byte[messageSize];
     AtomicLong totalPublished = new AtomicLong(0);
     AtomicLong totalConsumed = new AtomicLong(0);
@@ -144,8 +145,7 @@ public class HighThroughputTest implements Runnable {
 
     List<Consumer> consumers = new ArrayList<>();
     for (int i = 0; i < numConsumers; i++) {
-      var builder =
-          env.consumerBuilder().stream(cluster.stream).offset(OffsetSpecification.next());
+      var builder = env.consumerBuilder().stream(cluster.stream).offset(OffsetSpecification.next());
       builder.flow().initialCredits(10);
       Consumer c =
           builder
@@ -189,6 +189,8 @@ public class HighThroughputTest implements Runnable {
     long startTime = System.currentTimeMillis();
     long deadline = startTime + Duration.ofSeconds(durationSeconds).toMillis();
     long nextReport = startTime + Duration.ofSeconds(progressInterval).toMillis();
+    int zeroSentIntervals = 0;
+    int reportCount = 0;
 
     LOG.info("Publishing for {}s...", durationSeconds);
 
@@ -196,17 +198,35 @@ public class HighThroughputTest implements Runnable {
       Thread.sleep(1000);
       long now = System.currentTimeMillis();
       if (now >= nextReport) {
+        reportCount++;
         long elapsed = (now - startTime) / 1000;
         long pub = totalPublished.get();
         long cons = totalConsumed.get();
         double pubRate = pub * 1000.0 / (now - startTime);
+        MetricsClient.Snapshot snap = metrics.snapshot();
         LOG.info(
-            "Publish [{}s]: published={} ({} msg/s) consumed={} head-offset={}",
+            "Publish [{}s]: published={} ({} msg/s) consumed={} head-offset={}"
+                + " s3-recv={} MiB/s s3-sent={} MiB/s",
             elapsed,
             pub,
             String.format("%.0f", pubRate),
             cons,
-            headOffset.get());
+            headOffset.get(),
+            String.format("%.1f", snap.receivedMiBPerS(progressInterval)),
+            String.format("%.1f", snap.sentMiBPerS(progressInterval)));
+
+        if (reportCount > 3) {
+          if (snap.deltaBytesSent > 0) {
+            zeroSentIntervals = 0;
+          } else {
+            zeroSentIntervals++;
+            if (zeroSentIntervals >= 3) {
+              LOG.warn(
+                  "S3 uploads stalled: zero bytes sent for {} consecutive intervals",
+                  zeroSentIntervals);
+            }
+          }
+        }
 
         if (mgmt.hasMemoryAlarm()) {
           LOG.error("MEMORY ALARM detected - aborting");
@@ -231,16 +251,14 @@ public class HighThroughputTest implements Runnable {
     return totalPublished.get();
   }
 
-  private void replayPhase(Environment env, long expectedMessages) throws InterruptedException {
+  private void replayPhase(Environment env, long expectedMessages, MetricsClient metrics)
+      throws InterruptedException {
     long threshold = expectedMessages * 95 / 100;
     long sliceSize = expectedMessages / replayConsumers;
 
     LOG.info(
         "Replay: {} consumers, expecting >= {} messages (95% of {}), timeout={}s",
-        replayConsumers,
-        threshold,
-        expectedMessages,
-        replayTimeoutSeconds);
+        replayConsumers, threshold, expectedMessages, replayTimeoutSeconds);
 
     AtomicLong totalConsumed = new AtomicLong(0);
     CountDownLatch done = new CountDownLatch(1);
@@ -252,8 +270,7 @@ public class HighThroughputTest implements Runnable {
       int consumerIdx = i;
 
       var builder =
-          env.consumerBuilder()
-              .stream(cluster.stream)
+          env.consumerBuilder().stream(cluster.stream)
               .offset(OffsetSpecification.offset(startOffset));
       builder.flow().initialCredits(10);
       Consumer c =
@@ -270,12 +287,17 @@ public class HighThroughputTest implements Runnable {
                   })
               .build();
       consumers.add(c);
-      LOG.info("  Consumer {}: offset {} to {}", consumerIdx, startOffset,
+      LOG.info(
+          "  Consumer {}: offset {} to {}",
+          consumerIdx,
+          startOffset,
           endOffset == Long.MAX_VALUE ? "end" : endOffset);
     }
 
     long startTime = System.currentTimeMillis();
     long nextReport = startTime + Duration.ofSeconds(progressInterval).toMillis();
+    int zeroRecvIntervals = 0;
+    int reportCount = 0;
 
     while (!done.await(1, TimeUnit.SECONDS)) {
       long elapsed = System.currentTimeMillis() - startTime;
@@ -292,15 +314,37 @@ public class HighThroughputTest implements Runnable {
       }
       long now = System.currentTimeMillis();
       if (now >= nextReport) {
+        reportCount++;
         long current = totalConsumed.get();
         double rate = current * 1000.0 / (now - startTime);
         long elapsedSec = (now - startTime) / 1000;
+        MetricsClient.Snapshot snap = metrics.snapshot();
         LOG.info(
-            "Replay [{}s]: {}/{} ({} msg/s)",
+            "Replay [{}s]: {}/{} ({} msg/s) s3-recv={} MiB/s",
             elapsedSec,
             current,
             expectedMessages,
-            String.format("%.0f", rate));
+            String.format("%.0f", rate),
+            String.format("%.1f", snap.receivedMiBPerS(progressInterval)));
+
+        if (reportCount > 2) {
+          if (snap.deltaBytesReceived > 0) {
+            zeroRecvIntervals = 0;
+          } else {
+            zeroRecvIntervals++;
+            if (zeroRecvIntervals >= 3) {
+              for (Consumer c : consumers) {
+                c.close();
+              }
+              LOG.error(
+                  "REPLAY FAILED: S3 bytes received was zero for {} consecutive intervals "
+                      + "- consumers fell back to local tier",
+                  zeroRecvIntervals);
+              System.exit(1);
+            }
+          }
+        }
+
         nextReport = now + Duration.ofSeconds(progressInterval).toMillis();
       }
     }

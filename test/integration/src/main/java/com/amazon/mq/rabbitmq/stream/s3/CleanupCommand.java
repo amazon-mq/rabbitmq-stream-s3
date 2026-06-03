@@ -125,8 +125,7 @@ public class CleanupCommand implements Runnable {
                 .build());
 
         totalDeleted += keys.size();
-        continuationToken =
-            response.isTruncated() ? response.nextContinuationToken() : null;
+        continuationToken = response.isTruncated() ? response.nextContinuationToken() : null;
 
       } while (continuationToken != null);
 
