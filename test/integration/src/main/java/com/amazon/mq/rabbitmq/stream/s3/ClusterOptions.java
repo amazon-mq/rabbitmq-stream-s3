@@ -19,6 +19,12 @@ public class ClusterOptions {
       required = true)
   String stream;
 
+  @CommandLine.Option(
+      names = {"--mgmt-uri"},
+      description = "Management API base URI",
+      defaultValue = "http://localhost:15672")
+  String mgmtUri;
+
   Environment buildEnvironment() {
     return Environment.builder().uris(uris).build();
   }
