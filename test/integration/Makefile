@@ -7,16 +7,10 @@ SRC_DIR := $(CURDIR)/src/main/java/com/amazon/mq/rabbitmq/stream/s3
 SRCS := $(wildcard $(SRC_DIR)/*.java)
 JAR := $(CURDIR)/target/stream-s3-integration-test-1.0.0.jar
 
-STREAM_PORT ?= 5552
-MGMT_PORT ?= 15672
-
-ifdef RMQ_NODE0
-STREAM_URIS := rabbitmq-stream://$(RMQ_NODE0):$(STREAM_PORT),rabbitmq-stream://$(RMQ_NODE1):$(STREAM_PORT),rabbitmq-stream://$(RMQ_NODE2):$(STREAM_PORT)
-MGMT_URI := http://$(RMQ_NODE0):$(MGMT_PORT)
-else
-STREAM_URIS := rabbitmq-stream://localhost:$(STREAM_PORT)
-MGMT_URI := http://localhost:$(MGMT_PORT)
-endif
+STREAM_URIS ?= $(if $(RMQ_STREAM_URIS),$(RMQ_STREAM_URIS),rabbitmq-stream://localhost:5552)
+MGMT_URI ?= $(if $(RMQ_MGMT_URI0),$(RMQ_MGMT_URI0),http://localhost:15672)
+S3_BUCKET ?= $(RMQ_S3_BUCKET)
+S3_REGION ?= $(if $(RMQ_REGION),$(RMQ_REGION),us-west-2)
 
 clean:
 	$(CURDIR)/mvnw clean
@@ -42,11 +36,17 @@ MESSAGE_SIZE ?= 1024
 MAX_LENGTH_BYTES ?= 10000000000
 REPLAY_TIMEOUT ?= 3600
 
-.PHONY: cleanup high-throughput remote-only-read multi-offset-consumer
+.PHONY: cleanup s3-cleanup high-throughput remote-only-read multi-offset-consumer
 
 cleanup: package
 	java -jar $(JAR) cleanup \
 		--mgmt-uri $(MGMT_URI)
+
+s3-cleanup:
+ifndef S3_BUCKET
+	$(error S3_BUCKET is not set - ensure ~/env.mk defines RMQ_S3_BUCKET)
+endif
+	aws s3 rm s3://$(S3_BUCKET)/rabbitmq/stream/ --recursive --region $(S3_REGION)
 
 high-throughput: package
 	java -jar $(JAR) high-throughput \

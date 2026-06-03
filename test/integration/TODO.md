@@ -1,18 +1,17 @@
 # TODO
 
-## S3 bucket cleanup
+## Full environment reset
 
-The `cleanup` command deletes all streams and closes connections, but it does NOT clean the S3 bucket. After streams are deleted, orphaned objects remain in S3 until the garbage collector runs (or indefinitely if the stream IDs no longer exist in the broker's metadata).
+A complete reset requires both `make cleanup` (streams + connections) and `make s3-cleanup` (orphaned S3 objects). These are separate because S3 cleanup is slow and sometimes not needed between short test iterations.
 
-For a truly clean environment between test runs, the S3 bucket contents under the `rabbitmq/stream/` prefix must be deleted. This requires:
+For a full reset: `make cleanup s3-cleanup`
 
-- The bucket name (available in `~/env.mk` or from the deployment state)
-- AWS credentials (available on EC2 via instance profile)
-- The AWS SDK or shelling out to `aws s3 rm --recursive`
+## Consolidate AWS CLI into Java
 
-Options:
-1. Add `--s3-bucket` to the cleanup command and use the AWS SDK (adds a Maven dependency)
-2. Add an `s3-cleanup` Makefile target that calls `aws s3 rm` directly
-3. Keep it manual: `aws s3 rm s3://BUCKET/rabbitmq/stream/ --recursive --region us-west-2`
+The `s3-cleanup` target shells out to `aws s3 rm`. Eventually all AWS CLI usage should move into the Java harness (via the AWS SDK) so the test suite is fully self-contained with no external tool dependencies beyond `java` and `make`.
 
-Option 2 is simplest and avoids pulling in the AWS SDK for a single operation.
+## Remaining test commands
+
+- Pool exhaustion test (FUTURE.md #2): reduce pool size, run consumers, verify progress under pool pressure
+- Retention during active reads (FUTURE.md #5): consumer mid-fragment when retention fires
+- S3 bandwidth / Prometheus checks during high-throughput (deferred from initial implementation)
