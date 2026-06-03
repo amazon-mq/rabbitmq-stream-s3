@@ -12,6 +12,9 @@ MGMT_URI ?= $(if $(RMQ_MGMT_URI0),$(RMQ_MGMT_URI0),http://localhost:15672)
 S3_BUCKET ?= $(RMQ_S3_BUCKET)
 S3_REGION ?= $(if $(RMQ_REGION),$(RMQ_REGION),us-west-2)
 
+JAVA_OPTS ?= --sun-misc-unsafe-memory-access=allow --enable-final-field-mutation=ALL-UNNAMED
+JAVA := java $(JAVA_OPTS)
+
 clean:
 	$(CURDIR)/mvnw clean
 
@@ -24,7 +27,7 @@ $(JAR): $(SRCS) pom.xml
 package: $(JAR)
 
 run: package
-	java -jar $(JAR) $(ARGS)
+	$(JAVA) -jar $(JAR) $(ARGS)
 
 # --- Integration tests ---
 
@@ -39,7 +42,7 @@ REPLAY_TIMEOUT ?= 3600
 .PHONY: cleanup s3-cleanup high-throughput remote-only-read multi-offset-consumer
 
 cleanup: package
-	java -jar $(JAR) cleanup \
+	$(JAVA) -jar $(JAR) cleanup \
 		--mgmt-uri $(MGMT_URI)
 
 s3-cleanup:
@@ -49,7 +52,7 @@ endif
 	aws s3 rm s3://$(S3_BUCKET)/rabbitmq/stream/ --recursive --region $(S3_REGION)
 
 high-throughput: package
-	java -jar $(JAR) high-throughput \
+	$(JAVA) -jar $(JAR) high-throughput \
 		--uris $(STREAM_URIS) \
 		--mgmt-uri $(MGMT_URI) \
 		--stream $(STREAM) \
@@ -61,14 +64,14 @@ high-throughput: package
 		--replay-timeout $(REPLAY_TIMEOUT)
 
 remote-only-read: package
-	java -jar $(JAR) remote-only-read \
+	$(JAVA) -jar $(JAR) remote-only-read \
 		--uris $(STREAM_URIS) \
 		--mgmt-uri $(MGMT_URI) \
 		--stream $(STREAM) \
 		--expected-messages $(EXPECTED_MESSAGES)
 
 multi-offset-consumer: package
-	java -jar $(JAR) multi-offset-consumer \
+	$(JAVA) -jar $(JAR) multi-offset-consumer \
 		--uris $(STREAM_URIS) \
 		--mgmt-uri $(MGMT_URI) \
 		--stream $(STREAM) \
