@@ -267,7 +267,7 @@ request_resync(StreamId, WriterNode) ->
 maybe_evaluate_retention(
     StreamId,
     #manifest{next_offset = OldManifestNextOffset},
-    #manifest{next_offset = NewManifestNextOffset},
+    #manifest{first_offset = ManifestFirstOffset, next_offset = NewManifestNextOffset},
     #state{contexts = Ctxs}
 ) when NewManifestNextOffset > OldManifestNextOffset ->
     case maps:get(StreamId, Ctxs, undefined) of
@@ -276,7 +276,11 @@ maybe_evaluate_retention(
             EvalFun = fun
                 ({{FstOff, _}, _FstTs, NumSegLeft}) when is_integer(FstOff) ->
                     osiris_log_shared:set_first_chunk_id(Shared, FstOff),
-                    counters:put(Cnt, ?C_OSIRIS_LOG_FIRST_OFFSET, FstOff),
+                    counters:put(
+                        Cnt,
+                        ?C_OSIRIS_LOG_FIRST_OFFSET,
+                        min(FstOff, ManifestFirstOffset)
+                    ),
                     counters:put(Cnt, ?C_OSIRIS_LOG_SEGMENTS, NumSegLeft);
                 (_) ->
                     ok

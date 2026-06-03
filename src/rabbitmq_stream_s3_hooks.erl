@@ -17,6 +17,7 @@ retention is updated.
 -export([
     on_init/3,
     on_retention_updated/2,
+    on_retention_evaluated/2,
     local_retention_fun/1,
     discover/0
 ]).
@@ -83,6 +84,29 @@ on_retention_updated(Retention, #{name := Name}) ->
         Pid -> gen_server:cast(Pid, {retention_updated, Retention})
     end,
     [{'fun', local_retention_fun(StreamId)} | Retention].
+
+-doc """
+Called after retention evaluation sets the first_offset counter.
+
+Overrides `?C_FIRST_OFFSET` with the manifest's first offset when the
+remote tier holds older data than the local tier. Without this, the
+management UI reports only the local segment window as the message count.
+""".
+-spec on_retention_evaluated(counters:counters_ref(), map()) -> ok.
+on_retention_evaluated(Cnt, #{name := Name}) ->
+    StreamId = iolist_to_binary(Name),
+    case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
+        #manifest{first_offset = ManifestFirst} when ManifestFirst > 0 ->
+            LocalFirst = counters:get(Cnt, ?C_OSIRIS_LOG_FIRST_OFFSET),
+            case ManifestFirst < LocalFirst of
+                true ->
+                    counters:put(Cnt, ?C_OSIRIS_LOG_FIRST_OFFSET, ManifestFirst);
+                false ->
+                    ok
+            end;
+        _ ->
+            ok
+    end.
 
 -doc """
 Discover existing osiris writers and replicas on this node and attach
