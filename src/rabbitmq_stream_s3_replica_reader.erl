@@ -837,23 +837,22 @@ cancel_timer(Ref) -> erlang:cancel_timer(Ref).
 %% ------------------------------------------------------------------
 
 -spec maybe_evaluate_retention(#manifest{}, #state{}) -> ok.
-maybe_evaluate_retention(Manifest, #state{cfg = Cfg} = State) ->
-    case Manifest#manifest.next_offset > 0 of
-        true ->
-            #cfg{stream = StreamId, dir = Dir, shared = Shared, counter = Cnt} = Cfg,
-            Spec = [{'fun', rabbitmq_stream_s3_hooks:local_retention_fun(StreamId)}],
-            inc(State, ?C_LOCAL_TIER_RETENTION_EVALUATIONS, 1),
-            EvalFun = fun
-                ({{FstOff, _}, _FstTs, NumSegLeft}) when is_integer(FstOff) ->
-                    osiris_log_shared:set_first_chunk_id(Shared, FstOff),
-                    update_counter(Cnt, FstOff, NumSegLeft);
-                (_) ->
-                    ok
-            end,
-            osiris_retention:eval(StreamId, Dir, Spec, EvalFun);
-        false ->
+maybe_evaluate_retention(
+    #manifest{next_offset = ManifestNextOffset}, #state{cfg = Cfg} = State
+) when ManifestNextOffset > 0 ->
+    #cfg{stream = StreamId, dir = Dir, shared = Shared, counter = Cnt} = Cfg,
+    Spec = [{'fun', rabbitmq_stream_s3_hooks:local_retention_fun(StreamId)}],
+    inc(State, ?C_LOCAL_TIER_RETENTION_EVALUATIONS, 1),
+    EvalFun = fun
+        ({{FstOff, _}, _FstTs, NumSegLeft}) when is_integer(FstOff) ->
+            osiris_log_shared:set_first_chunk_id(Shared, FstOff),
+            update_counter(Cnt, FstOff, NumSegLeft);
+        (_) ->
             ok
-    end.
+    end,
+    osiris_retention:eval(StreamId, Dir, Spec, EvalFun);
+maybe_evaluate_retention(#manifest{}, #state{}) ->
+    ok.
 
 update_counter(Cnt, FstOff, NumSegLeft) ->
     counters:put(Cnt, ?C_OSIRIS_LOG_FIRST_OFFSET, FstOff),

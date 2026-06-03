@@ -264,24 +264,28 @@ request_resync(StreamId, WriterNode) ->
         {resync, node()}
     ).
 
-maybe_evaluate_retention(StreamId, OldManifest, NewManifest, #state{contexts = Ctxs}) ->
-    case NewManifest#manifest.next_offset > OldManifest#manifest.next_offset of
-        true ->
-            case maps:get(StreamId, Ctxs, undefined) of
-                #replica_ctx{dir = Dir, shared = Shared, counter = Cnt} ->
-                    Spec = [{'fun', rabbitmq_stream_s3_hooks:local_retention_fun(StreamId)}],
-                    EvalFun = fun
-                        ({{FstOff, _}, _FstTs, NumSegLeft}) when is_integer(FstOff) ->
-                            osiris_log_shared:set_first_chunk_id(Shared, FstOff),
-                            counters:put(Cnt, ?C_OSIRIS_LOG_FIRST_OFFSET, FstOff),
-                            counters:put(Cnt, ?C_OSIRIS_LOG_SEGMENTS, NumSegLeft);
-                        (_) ->
-                            ok
-                    end,
-                    osiris_retention:eval(StreamId, Dir, Spec, EvalFun);
-                undefined ->
+maybe_evaluate_retention(
+    StreamId,
+    #manifest{next_offset = OldManifestNextOffset},
+    #manifest{next_offset = NewManifestNextOffset},
+    #state{contexts = Ctxs}
+) when NewManifestNextOffset > OldManifestNextOffset ->
+    case maps:get(StreamId, Ctxs, undefined) of
+        #replica_ctx{dir = Dir, shared = Shared, counter = Cnt} ->
+            Spec = [{'fun', rabbitmq_stream_s3_hooks:local_retention_fun(StreamId)}],
+            EvalFun = fun
+                ({{FstOff, _}, _FstTs, NumSegLeft}) when is_integer(FstOff) ->
+                    osiris_log_shared:set_first_chunk_id(Shared, FstOff),
+                    counters:put(Cnt, ?C_OSIRIS_LOG_FIRST_OFFSET, FstOff),
+                    counters:put(Cnt, ?C_OSIRIS_LOG_SEGMENTS, NumSegLeft);
+                (_) ->
                     ok
-            end;
-        false ->
+            end,
+            osiris_retention:eval(StreamId, Dir, Spec, EvalFun);
+        undefined ->
             ok
-    end.
+    end;
+maybe_evaluate_retention(
+    _StreamId, _OldManifest = #manifest{}, _NewManifest = #manifest{}, #state{}
+) ->
+    ok.
