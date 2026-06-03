@@ -69,6 +69,12 @@ public class HighThroughputTest implements Runnable {
       defaultValue = "3600")
   private int replayTimeoutSeconds;
 
+  @CommandLine.Option(
+      names = "--replay-consumers",
+      description = "Number of parallel consumers for the replay phase",
+      defaultValue = "8")
+  private int replayConsumers;
+
   @Override
   public void run() {
     LOG.info(
@@ -227,30 +233,46 @@ public class HighThroughputTest implements Runnable {
 
   private void replayPhase(Environment env, long expectedMessages) throws InterruptedException {
     long threshold = expectedMessages * 95 / 100;
+    long sliceSize = expectedMessages / replayConsumers;
+
     LOG.info(
-        "Replay: consuming from 'first', expecting >= {} messages (95% of {}), timeout={}s",
+        "Replay: {} consumers, expecting >= {} messages (95% of {}), timeout={}s",
+        replayConsumers,
         threshold,
         expectedMessages,
         replayTimeoutSeconds);
 
-    AtomicLong consumed = new AtomicLong(0);
-    AtomicLong lastOffset = new AtomicLong(-1);
+    AtomicLong totalConsumed = new AtomicLong(0);
     CountDownLatch done = new CountDownLatch(1);
 
-    var builder =
-        env.consumerBuilder().stream(cluster.stream).offset(OffsetSpecification.first());
-    builder.flow().initialCredits(10);
-    Consumer consumer =
-        builder
-            .messageHandler(
-                (context, message) -> {
-                  long count = consumed.incrementAndGet();
-                  lastOffset.set(context.offset());
-                  if (count >= threshold) {
-                    done.countDown();
-                  }
-                })
-            .build();
+    List<Consumer> consumers = new ArrayList<>();
+    for (int i = 0; i < replayConsumers; i++) {
+      long startOffset = i * sliceSize;
+      long endOffset = (i == replayConsumers - 1) ? Long.MAX_VALUE : (i + 1) * sliceSize;
+      int consumerIdx = i;
+
+      var builder =
+          env.consumerBuilder()
+              .stream(cluster.stream)
+              .offset(OffsetSpecification.offset(startOffset));
+      builder.flow().initialCredits(10);
+      Consumer c =
+          builder
+              .messageHandler(
+                  (context, message) -> {
+                    if (context.offset() >= endOffset) {
+                      return;
+                    }
+                    long count = totalConsumed.incrementAndGet();
+                    if (count >= threshold) {
+                      done.countDown();
+                    }
+                  })
+              .build();
+      consumers.add(c);
+      LOG.info("  Consumer {}: offset {} to {}", consumerIdx, startOffset,
+          endOffset == Long.MAX_VALUE ? "end" : endOffset);
+    }
 
     long startTime = System.currentTimeMillis();
     long nextReport = startTime + Duration.ofSeconds(progressInterval).toMillis();
@@ -258,33 +280,35 @@ public class HighThroughputTest implements Runnable {
     while (!done.await(1, TimeUnit.SECONDS)) {
       long elapsed = System.currentTimeMillis() - startTime;
       if (elapsed > Duration.ofSeconds(replayTimeoutSeconds).toMillis()) {
-        consumer.close();
+        for (Consumer c : consumers) {
+          c.close();
+        }
         LOG.error(
-            "REPLAY TIMEOUT: consumed {} of {} expected in {}s (last offset={})",
-            consumed.get(),
+            "REPLAY TIMEOUT: consumed {} of {} expected in {}s",
+            totalConsumed.get(),
             expectedMessages,
-            replayTimeoutSeconds,
-            lastOffset.get());
+            replayTimeoutSeconds);
         System.exit(1);
       }
       long now = System.currentTimeMillis();
       if (now >= nextReport) {
-        long current = consumed.get();
+        long current = totalConsumed.get();
         double rate = current * 1000.0 / (now - startTime);
         long elapsedSec = (now - startTime) / 1000;
         LOG.info(
-            "Replay [{}s]: {}/{} ({} msg/s, offset={})",
+            "Replay [{}s]: {}/{} ({} msg/s)",
             elapsedSec,
             current,
             expectedMessages,
-            String.format("%.0f", rate),
-            lastOffset.get());
+            String.format("%.0f", rate));
         nextReport = now + Duration.ofSeconds(progressInterval).toMillis();
       }
     }
 
-    consumer.close();
-    long total = consumed.get();
+    for (Consumer c : consumers) {
+      c.close();
+    }
+    long total = totalConsumed.get();
     long elapsedSec = (System.currentTimeMillis() - startTime) / 1000;
 
     LOG.info(
