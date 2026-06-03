@@ -68,6 +68,7 @@ groups() ->
             fragment_spans_segment_boundary,
             range_advances_monotonically,
             retention_reclaims_uploaded_segments,
+            message_count_reflects_remote_tier,
             resumes_after_restart,
             large_record_cuts_immediately,
             seed_log_uploads_deterministic,
@@ -262,6 +263,49 @@ retention_reclaims_uploaded_segments(Config) ->
 
     %% Retention will eventually reclaim everything but the current segment.
     ?awaitMatch([_], list_segment_offsets(Config), 1_000).
+
+message_count_reflects_remote_tier(Config) ->
+    StreamId = ?config(stream_id, Config),
+
+    _Writer = start_writer(Config, #{max_segment_size_bytes => 5000}, #{
+        fragment_target_size => 10000
+    }),
+
+    %% Write enough to produce multiple segments and fragments.
+    Record = binary:copy(<<"x">>, 50),
+    lists:foreach(
+        fun(_) -> osiris_writer:write(_Writer, Record) end,
+        lists:seq(1, 501)
+    ),
+    flush_writer(_Writer),
+    ?assert(length(list_segment_offsets(Config)) > 1),
+
+    %% Wait for uploads to advance past the first segment.
+    CurrentSegment = lists:last(list_segment_offsets(Config)),
+    await_offset(StreamId, CurrentSegment),
+
+    %% Wait for local retention to trim uploaded segments.
+    ?awaitMatch([_], list_segment_offsets(Config), 1_000),
+
+    %% After local retention, only one segment remains. Its offset is the
+    %% local tier's first offset and must be > 0 (earlier segments were
+    %% trimmed). The manifest covers from offset 0, so the counter should
+    %% report 0 (the manifest's first_offset), not the local segment offset.
+    [LocalFirst] = list_segment_offsets(Config),
+    ?assert(LocalFirst > 0),
+
+    #manifest{first_offset = ManifestFirst} =
+        rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId),
+
+    %% The counter must report the manifest's first_offset (the overall
+    %% stream first), not the local segment's first offset. This is what
+    %% rabbit_osiris_metrics reads for the management UI message count.
+    ?awaitMatch(
+        #{first_offset := FO} when FO =:= ManifestFirst,
+        osiris_counters:overview({osiris_writer, StreamId}),
+        1_000
+    ),
+    ?assert(ManifestFirst < LocalFirst).
 
 resumes_after_restart(Config) ->
     StreamId = ?config(stream_id, Config),
