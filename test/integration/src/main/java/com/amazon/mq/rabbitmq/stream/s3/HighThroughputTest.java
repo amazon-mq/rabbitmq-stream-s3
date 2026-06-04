@@ -346,23 +346,43 @@ public class HighThroughputTest implements Runnable {
       long endOffset = (i == replayConsumers - 1) ? Long.MAX_VALUE : (i + 1) * sliceSize;
       int consumerIdx = i;
 
-      var builder =
-          env.consumerBuilder().stream(cluster.stream)
-              .offset(OffsetSpecification.offset(startOffset));
-      builder.flow().initialCredits(10);
-      Consumer c =
-          builder
-              .messageHandler(
-                  (context, message) -> {
-                    if (context.offset() >= endOffset) {
-                      return;
-                    }
-                    long count = totalConsumed.incrementAndGet();
-                    if (count >= threshold) {
-                      done.countDown();
-                    }
-                  })
-              .build();
+      // Retry subscribe to work around issue #191: the rabbit_stream_reader
+      // gen_statem can be blocked in send_chunks (synchronous S3 reads),
+      // causing subscribe frames to time out. The server eventually processes
+      // them, so a retry after a delay succeeds.
+      Consumer c = null;
+      for (int attempt = 1; attempt <= 5; attempt++) {
+        try {
+          var builder =
+              env.consumerBuilder().stream(cluster.stream)
+                  .offset(OffsetSpecification.offset(startOffset));
+          builder.flow().initialCredits(10);
+          c =
+              builder
+                  .messageHandler(
+                      (context, message) -> {
+                        if (context.offset() >= endOffset) {
+                          return;
+                        }
+                        long count = totalConsumed.incrementAndGet();
+                        if (count >= threshold) {
+                          done.countDown();
+                        }
+                      })
+                  .build();
+          break;
+        } catch (StreamException e) {
+          if (attempt == 5) {
+            throw e;
+          }
+          LOG.warn(
+              "  Consumer {} subscribe attempt {}/5 failed: {} — retrying in 15s",
+              consumerIdx,
+              attempt,
+              e.getMessage());
+          Thread.sleep(15000);
+        }
+      }
       consumers.add(c);
       LOG.info(
           "  Consumer {}: offset {} to {}",
