@@ -25,6 +25,7 @@ class MetricsClient {
   private final HttpClient client;
   private long previousBytesReceived = -1;
   private long previousBytesSent = -1;
+  private int previousEndpointsScraped = 0;
 
   MetricsClient(List<String> endpoints) {
     this.endpoints = endpoints;
@@ -58,6 +59,7 @@ class MetricsClient {
   Snapshot snapshot() {
     long totalReceived = 0;
     long totalSent = 0;
+    int endpointsScraped = 0;
 
     for (String endpoint : endpoints) {
       try {
@@ -71,16 +73,25 @@ class MetricsClient {
           String body = response.body();
           totalReceived += extractMetric(body, BYTES_RECEIVED_PATTERN);
           totalSent += extractMetric(body, BYTES_SENT_PATTERN);
+          endpointsScraped++;
         }
       } catch (Exception e) {
         LOG.debug("Failed to scrape {}: {}", endpoint, e.getMessage());
       }
     }
 
-    long deltaReceived = previousBytesReceived >= 0 ? totalReceived - previousBytesReceived : 0;
-    long deltaSent = previousBytesSent >= 0 ? totalSent - previousBytesSent : 0;
+    // Only compute deltas when consecutive scrapes reached the same number of
+    // endpoints. A partial scrape produces a lower total, causing a false spike
+    // on the next full scrape.
+    long deltaReceived = 0;
+    long deltaSent = 0;
+    if (previousBytesReceived >= 0 && endpointsScraped == previousEndpointsScraped) {
+      deltaReceived = totalReceived - previousBytesReceived;
+      deltaSent = totalSent - previousBytesSent;
+    }
     previousBytesReceived = totalReceived;
     previousBytesSent = totalSent;
+    previousEndpointsScraped = endpointsScraped;
 
     return new Snapshot(totalReceived, totalSent, deltaReceived, deltaSent);
   }

@@ -333,8 +333,14 @@ public class HighThroughputTest implements Runnable {
     long threshold = expectedMessages * 95 / 100;
 
     StreamStats stats = env.queryStreamStats(cluster.stream);
-    long firstOffset = stats.firstOffset();
     long committedOffset = stats.committedOffset();
+    // stats.firstOffset() returns the local-tier first offset, which does not
+    // account for messages in the remote tier. Derive the actual first readable
+    // offset from committedOffset and the management API message count.
+    long firstOffset = committedOffset - expectedMessages;
+    if (firstOffset < 0) {
+      firstOffset = 0;
+    }
     long offsetRange = committedOffset - firstOffset;
     long sliceSize = offsetRange / replayConsumers;
 
