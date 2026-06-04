@@ -1,6 +1,5 @@
 package com.amazon.mq.rabbitmq.stream.s3;
 
-import com.rabbitmq.stream.ByteCapacity;
 import com.rabbitmq.stream.Consumer;
 import com.rabbitmq.stream.Environment;
 import com.rabbitmq.stream.OffsetSpecification;
@@ -140,32 +139,7 @@ public class HighThroughputTest implements Runnable {
   }
 
   private void setupStream(Environment env, ManagementApi mgmt, S3Monitor s3Monitor) {
-    if (s3Monitor != null) {
-      s3Monitor.deleteAll();
-    }
-
-    LOG.info("Deleting stream if it exists: {}", cluster.stream);
-    mgmt.deleteStream(cluster.stream);
-
-    try {
-      Thread.sleep(2000);
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-    }
-
-    LOG.info("Creating stream: {} (max-length-bytes={})", cluster.stream, maxLengthBytes);
-    try {
-      env.streamCreator().stream(cluster.stream)
-          .maxLengthBytes(ByteCapacity.B(maxLengthBytes))
-          .create();
-    } catch (StreamException e) {
-      if (e.getMessage() != null && e.getMessage().contains("precondition")) {
-        LOG.info("Stream already exists with compatible settings");
-      } else {
-        throw e;
-      }
-    }
-    LOG.info("Stream ready");
+    TestSetup.setupStream(env, mgmt, s3Monitor, cluster.stream, maxLengthBytes);
   }
 
   private long publishPhase(

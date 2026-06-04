@@ -61,12 +61,20 @@ high-throughput: package
 		--replay-timeout $(REPLAY_TIMEOUT) \
 		$(if $(S3_BUCKET),--s3-bucket $(S3_BUCKET) --s3-region $(S3_REGION))
 
+CONSUMER_RATE ?= 5000
+WARMUP ?= 120
+
 multi-offset-consumer: package
 	$(JAVA) -jar $(JAR) multi-offset-consumer \
 		--uris $(STREAM_URIS) \
 		--mgmt-uri $(MGMT_URI) \
-		--stream $(STREAM) \
-		--duration $(DURATION)
+		--metrics-uris $(METRICS_URIS) \
+		--stream s3-multi-offset \
+		--duration $(DURATION) \
+		--consumer-rate $(CONSUMER_RATE) \
+		--warmup $(WARMUP) \
+		--max-length-bytes $(MAX_LENGTH_BYTES) \
+		$(if $(S3_BUCKET),--s3-bucket $(S3_BUCKET) --s3-region $(S3_REGION))
 
 # --- Dependency management ---
 
