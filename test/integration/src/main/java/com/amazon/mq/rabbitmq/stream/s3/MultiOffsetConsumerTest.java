@@ -2,6 +2,7 @@ package com.amazon.mq.rabbitmq.stream.s3;
 
 import com.google.common.util.concurrent.RateLimiter;
 import com.rabbitmq.stream.Consumer;
+import com.rabbitmq.stream.ConsumerFlowStrategy;
 import com.rabbitmq.stream.Environment;
 import com.rabbitmq.stream.OffsetSpecification;
 import com.rabbitmq.stream.Producer;
@@ -145,7 +146,11 @@ public class MultiOffsetConsumerTest implements Runnable {
         try {
           var laggingBuilder =
               env.consumerBuilder().stream(cluster.stream).offset(OffsetSpecification.first());
-          laggingBuilder.flow().initialCredits(10);
+          // Use creditWhenHalfMessagesProcessed so the server only delivers new
+          // chunks after the handler has processed half the current chunk. Combined
+          // with the rate limiter, this throttles wire-level delivery and keeps the
+          // consumer's offset genuinely behind the head.
+          laggingBuilder.flow().strategy(ConsumerFlowStrategy.creditWhenHalfMessagesProcessed(1));
           laggingConsumer =
               laggingBuilder
                   .messageHandler(
@@ -153,6 +158,7 @@ public class MultiOffsetConsumerTest implements Runnable {
                         rateLimiter.acquire();
                         laggingConsumed.incrementAndGet();
                         laggingOffset.set(context.offset());
+                        context.processed();
                       })
                   .build();
           break;
