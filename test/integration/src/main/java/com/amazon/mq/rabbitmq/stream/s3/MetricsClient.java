@@ -15,9 +15,11 @@ class MetricsClient {
 
   private static final Logger LOG = LoggerFactory.getLogger(MetricsClient.class);
   private static final Pattern BYTES_RECEIVED_PATTERN =
-      Pattern.compile("^rabbitmq_stream_s3_bytes_received\\s+(\\d+)", Pattern.MULTILINE);
+      Pattern.compile(
+          "^rabbitmq_stream_s3_bytes_received(?:\\{[^}]*\\})?\\s+(\\d+)", Pattern.MULTILINE);
   private static final Pattern BYTES_SENT_PATTERN =
-      Pattern.compile("^rabbitmq_stream_s3_bytes_sent\\s+(\\d+)", Pattern.MULTILINE);
+      Pattern.compile(
+          "^rabbitmq_stream_s3_bytes_sent(?:\\{[^}]*\\})?\\s+(\\d+)", Pattern.MULTILINE);
 
   private final List<String> endpoints;
   private final HttpClient client;

@@ -268,8 +268,7 @@ public class HighThroughputTest implements Runnable {
         ClusterHealthMonitor.Snapshot healthSnap = health.snapshot();
         LOG.info(
             "Publish [{}s]: published={} ({} msg/s) consumed={} head-offset={}"
-                + " s3-recv={} MiB/s s3-sent={} MiB/s{}"
-                + " | mem={} MiB disk={} GiB fd={}",
+                + " s3-recv={} MiB/s s3-sent={} MiB/s{}",
             elapsed,
             pub,
             String.format("%.0f", pubRate),
@@ -277,10 +276,8 @@ public class HighThroughputTest implements Runnable {
             headOffset.get(),
             String.format("%.1f", snap.receivedMiBPerS(progressInterval)),
             String.format("%.1f", snap.sentMiBPerS(progressInterval)),
-            s3ObjectInfo,
-            String.format("%.0f", healthSnap.totalMemoryUsedMiB()),
-            String.format("%.1f", healthSnap.totalDiskFreeGiB()),
-            healthSnap.totalFileDescriptorsUsed);
+            s3ObjectInfo);
+        LOG.info("  Health: {}", healthSnap.format());
 
         if (reportCount > 3 && s3ObjectCount > 0) {
           if (snap.deltaBytesSent > 0) {
@@ -296,11 +293,13 @@ public class HighThroughputTest implements Runnable {
         }
 
         if (healthSnap.hasAlarm()) {
-          if (healthSnap.memoryAlarm) {
-            LOG.error("MEMORY ALARM detected - aborting");
-          }
-          if (healthSnap.diskAlarm) {
-            LOG.error("DISK ALARM detected - aborting");
+          for (ClusterHealthMonitor.NodeSnapshot n : healthSnap.nodes) {
+            if (n.memoryAlarm) {
+              LOG.error("MEMORY ALARM on {} - aborting", n.shortName());
+            }
+            if (n.diskAlarm) {
+              LOG.error("DISK ALARM on {} - aborting", n.shortName());
+            }
           }
           System.exit(1);
         }
