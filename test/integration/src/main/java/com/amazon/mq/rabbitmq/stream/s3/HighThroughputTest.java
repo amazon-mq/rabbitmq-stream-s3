@@ -6,6 +6,7 @@ import com.rabbitmq.stream.Environment;
 import com.rabbitmq.stream.OffsetSpecification;
 import com.rabbitmq.stream.Producer;
 import com.rabbitmq.stream.StreamException;
+import com.rabbitmq.stream.StreamStats;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -331,19 +332,32 @@ public class HighThroughputTest implements Runnable {
       Environment env, long expectedMessages, MetricsClient metrics, boolean expectS3Reads)
       throws InterruptedException {
     long threshold = expectedMessages * 95 / 100;
-    long sliceSize = expectedMessages / replayConsumers;
+
+    StreamStats stats = env.queryStreamStats(cluster.stream);
+    long firstOffset = stats.firstOffset();
+    long committedOffset = stats.committedOffset();
+    long offsetRange = committedOffset - firstOffset;
+    long sliceSize = offsetRange / replayConsumers;
 
     LOG.info(
-        "Replay: {} consumers, expecting >= {} messages (95% of {}), timeout={}s, expectS3={}",
-        replayConsumers, threshold, expectedMessages, replayTimeoutSeconds, expectS3Reads);
+        "Replay: {} consumers, expecting >= {} messages (95% of {}), timeout={}s, expectS3={},"
+            + " firstOffset={}, committedOffset={}",
+        replayConsumers,
+        threshold,
+        expectedMessages,
+        replayTimeoutSeconds,
+        expectS3Reads,
+        firstOffset,
+        committedOffset);
 
     AtomicLong totalConsumed = new AtomicLong(0);
     CountDownLatch done = new CountDownLatch(1);
 
     List<Consumer> consumers = new ArrayList<>();
     for (int i = 0; i < replayConsumers; i++) {
-      long startOffset = i * sliceSize;
-      long endOffset = (i == replayConsumers - 1) ? Long.MAX_VALUE : (i + 1) * sliceSize;
+      long startOffset = firstOffset + i * sliceSize;
+      long endOffset =
+          (i == replayConsumers - 1) ? Long.MAX_VALUE : firstOffset + (i + 1) * sliceSize;
       int consumerIdx = i;
 
       // Retry subscribe to work around issue #191: the rabbit_stream_reader
