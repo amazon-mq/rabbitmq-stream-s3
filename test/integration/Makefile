@@ -40,7 +40,7 @@ MESSAGE_SIZE ?= 1024
 MAX_LENGTH_BYTES ?= 10000000000
 REPLAY_TIMEOUT ?= 3600
 
-.PHONY: cleanup high-throughput remote-only-read multi-offset-consumer
+.PHONY: cleanup high-throughput multi-offset-consumer
 
 cleanup: package
 	$(JAVA) -jar $(JAR) cleanup \
@@ -60,13 +60,6 @@ high-throughput: package
 		--max-length-bytes $(MAX_LENGTH_BYTES) \
 		--replay-timeout $(REPLAY_TIMEOUT) \
 		$(if $(S3_BUCKET),--s3-bucket $(S3_BUCKET) --s3-region $(S3_REGION))
-
-remote-only-read: package
-	$(JAVA) -jar $(JAR) remote-only-read \
-		--uris $(STREAM_URIS) \
-		--mgmt-uri $(MGMT_URI) \
-		--stream $(STREAM) \
-		--expected-messages $(EXPECTED_MESSAGES)
 
 multi-offset-consumer: package
 	$(JAVA) -jar $(JAR) multi-offset-consumer \

@@ -29,6 +29,10 @@
 - **Long-running stability (8h+):** Not a new command — just `--duration 28800` on high-throughput. Surfaces memory leaks, connection pool drift, binary reference accumulation, GC pressure
 - **Group object retention:** Publish long enough for rebalancing to produce group objects, then tighten retention. Verify the `maybe_spawn_group_retention` path works end-to-end
 
+## Removed
+
+- **RemoteOnlyReadTest:** Removed because it duplicates what `high-throughput` already verifies. The replay phase of `high-throughput` consumes from offset 0 through data that only exists in the remote tier and asserts S3 bytes_received > 0. A standalone remote-read-only test would exercise the same code path without adding coverage
+
 ## Notes
 
 - Node restart, full cluster restart, and S3 unavailability tests require the ability to SSH to cluster nodes and run `rabbitmqctl stop_app` / `rabbitmqctl start_app` or manipulate IAM policies. The Java harness may need a mechanism for this (SSH exec, or a separate Makefile target that coordinates)

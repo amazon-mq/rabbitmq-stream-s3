@@ -7,7 +7,6 @@ import picocli.CommandLine;
     description = "Integration test harness for rabbitmq_stream_s3",
     subcommands = {
       HighThroughputTest.class,
-      RemoteOnlyReadTest.class,
       MultiOffsetConsumerTest.class,
       CleanupCommand.class,
       CommandLine.HelpCommand.class
