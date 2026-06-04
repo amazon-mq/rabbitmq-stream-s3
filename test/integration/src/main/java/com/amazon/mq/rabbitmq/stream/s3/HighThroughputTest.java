@@ -101,29 +101,35 @@ public class HighThroughputTest implements Runnable {
     S3Monitor s3Monitor = cluster.buildS3Monitor();
 
     boolean s3Populated = false;
+    long published;
     try (Environment env = cluster.buildEnvironment()) {
       setupStream(env, mgmt, s3Monitor);
-      long published = publishPhase(env, mgmt, metrics, health, s3Monitor);
-
+      published = publishPhase(env, mgmt, metrics, health, s3Monitor);
       LOG.info("Publish phase complete: confirmed={}", published);
+    } catch (Exception e) {
+      LOG.error("FAILED during publish phase", e);
+      System.exit(1);
+      return;
+    }
 
-      if (s3Monitor != null) {
-        S3Monitor.Snapshot finalSnap = s3Monitor.snapshot();
-        s3Populated = finalSnap.objectCount > 0;
-        LOG.info("S3 objects at end of publish: {}", finalSnap.objectCount);
-      }
+    if (s3Monitor != null) {
+      S3Monitor.Snapshot finalSnap = s3Monitor.snapshot();
+      s3Populated = finalSnap.objectCount > 0;
+      LOG.info("S3 objects at end of publish: {}", finalSnap.objectCount);
+    }
 
-      LOG.info("Waiting for management stats to stabilize...");
-      long expectedMessages = mgmt.getStableMessageCount(cluster.stream, 12, 5000);
-      if (expectedMessages <= 0) {
-        expectedMessages = published;
-      }
-      LOG.info("Expected messages for replay: {}", expectedMessages);
+    LOG.info("Waiting for management stats to stabilize...");
+    long expectedMessages = mgmt.getStableMessageCount(cluster.stream, 12, 5000);
+    if (expectedMessages <= 0) {
+      expectedMessages = published;
+    }
+    LOG.info("Expected messages for replay: {}", expectedMessages);
 
-      replayPhase(env, expectedMessages, metrics, s3Populated);
+    try (Environment replayEnv = cluster.buildEnvironment()) {
+      replayPhase(replayEnv, expectedMessages, metrics, s3Populated);
       LOG.info("SUCCESS: high-throughput test passed");
     } catch (Exception e) {
-      LOG.error("FAILED", e);
+      LOG.error("FAILED during replay phase", e);
       System.exit(1);
     } finally {
       if (s3Monitor != null) {
