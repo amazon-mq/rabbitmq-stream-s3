@@ -100,11 +100,19 @@ public class HighThroughputTest implements Runnable {
     ClusterHealthMonitor health = new ClusterHealthMonitor(cluster.mgmtUri);
     S3Monitor s3Monitor = cluster.buildS3Monitor();
 
+    boolean s3Populated = false;
     try (Environment env = cluster.buildEnvironment()) {
       setupStream(env, mgmt);
       long published = publishPhase(env, mgmt, metrics, health, s3Monitor);
 
       LOG.info("Publish phase complete: confirmed={}", published);
+
+      if (s3Monitor != null) {
+        S3Monitor.Snapshot finalSnap = s3Monitor.snapshot();
+        s3Populated = finalSnap.objectCount > 0;
+        LOG.info("S3 objects at end of publish: {}", finalSnap.objectCount);
+      }
+
       LOG.info("Waiting for management stats to stabilize...");
       long expectedMessages = mgmt.getStableMessageCount(cluster.stream, 12, 5000);
       if (expectedMessages <= 0) {
@@ -112,7 +120,7 @@ public class HighThroughputTest implements Runnable {
       }
       LOG.info("Expected messages for replay: {}", expectedMessages);
 
-      replayPhase(env, expectedMessages, metrics);
+      replayPhase(env, expectedMessages, metrics, s3Populated);
       LOG.info("SUCCESS: high-throughput test passed");
     } catch (Exception e) {
       LOG.error("FAILED", e);
@@ -226,14 +234,16 @@ public class HighThroughputTest implements Runnable {
         MetricsClient.Snapshot snap = metrics.snapshot();
 
         String s3ObjectInfo = "";
+        long s3ObjectCount = 0;
         if (s3Monitor != null) {
           S3Monitor.Snapshot s3Snap = s3Monitor.snapshot();
+          s3ObjectCount = s3Snap.objectCount;
           s3ObjectInfo =
               String.format(" s3-objects=%d (delta=%+d)", s3Snap.objectCount, s3Snap.delta);
           if (s3Snap.retentionActive()) {
             retentionSeen = true;
           }
-          if (reportCount > 5
+          if (s3Snap.objectCount > 0
               && !retentionSeen
               && s3Snap.monotonicGrowthIntervals >= retentionStallThreshold) {
             LOG.error(
@@ -261,7 +271,7 @@ public class HighThroughputTest implements Runnable {
             String.format("%.1f", healthSnap.totalDiskFreeGiB()),
             healthSnap.totalFileDescriptorsUsed);
 
-        if (reportCount > 3) {
+        if (reportCount > 3 && s3ObjectCount > 0) {
           if (snap.deltaBytesSent > 0) {
             zeroSentIntervals = 0;
           } else {
@@ -307,14 +317,15 @@ public class HighThroughputTest implements Runnable {
     return totalPublished.get();
   }
 
-  private void replayPhase(Environment env, long expectedMessages, MetricsClient metrics)
+  private void replayPhase(
+      Environment env, long expectedMessages, MetricsClient metrics, boolean expectS3Reads)
       throws InterruptedException {
     long threshold = expectedMessages * 95 / 100;
     long sliceSize = expectedMessages / replayConsumers;
 
     LOG.info(
-        "Replay: {} consumers, expecting >= {} messages (95% of {}), timeout={}s",
-        replayConsumers, threshold, expectedMessages, replayTimeoutSeconds);
+        "Replay: {} consumers, expecting >= {} messages (95% of {}), timeout={}s, expectS3={}",
+        replayConsumers, threshold, expectedMessages, replayTimeoutSeconds, expectS3Reads);
 
     AtomicLong totalConsumed = new AtomicLong(0);
     CountDownLatch done = new CountDownLatch(1);
@@ -383,7 +394,7 @@ public class HighThroughputTest implements Runnable {
             String.format("%.0f", rate),
             String.format("%.1f", snap.receivedMiBPerS(progressInterval)));
 
-        if (reportCount > 2) {
+        if (expectS3Reads && reportCount > 2) {
           if (snap.deltaBytesReceived > 0) {
             zeroRecvIntervals = 0;
           } else {
