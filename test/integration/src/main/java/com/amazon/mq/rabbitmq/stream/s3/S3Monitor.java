@@ -26,7 +26,9 @@ class S3Monitor implements AutoCloseable {
   S3Monitor(String bucket, String region, String streamName) {
     this.s3 = S3Client.builder().region(Region.of(region)).build();
     this.bucket = bucket;
-    this.prefix = "rabbitmq/stream/" + streamName + "/";
+    // The stream ID in S3 keys is osiris_util:to_base64uri(Vhost ++ "_" ++ Name ++ "_" ++ Ts).
+    // For the default "/" vhost, "/" becomes "_", giving a prefix of "__<name>_".
+    this.prefix = "rabbitmq/stream/__" + streamName + "_";
   }
 
   static class Snapshot {
