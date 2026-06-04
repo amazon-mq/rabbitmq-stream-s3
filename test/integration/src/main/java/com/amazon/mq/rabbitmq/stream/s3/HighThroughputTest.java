@@ -231,7 +231,8 @@ public class HighThroughputTest implements Runnable {
     int reportCount = 0;
     boolean retentionSeen = false;
 
-    LOG.info("Publishing for {}s...", durationSeconds);
+    LOG.info(
+        "Publishing for {}s with {} head-tracking consumer(s)...", durationSeconds, numConsumers);
 
     while (System.currentTimeMillis() < deadline) {
       Thread.sleep(1000);
@@ -240,7 +241,7 @@ public class HighThroughputTest implements Runnable {
         reportCount++;
         long elapsed = (now - startTime) / 1000;
         long pub = totalPublished.get();
-        long cons = totalConsumed.get();
+        long cons = totalConsumed.get() / Math.max(1, numConsumers);
         double pubRate = pub * 1000.0 / (now - startTime);
         MetricsClient.Snapshot snap = metrics.snapshot();
 
