@@ -54,8 +54,8 @@ public class MultiOffsetConsumerTest implements Runnable {
     AtomicLong laggingOffset = new AtomicLong(-1);
 
     try (Environment env = cluster.buildEnvironment()) {
-      var headBuilder = env.consumerBuilder().stream(cluster.stream)
-              .offset(OffsetSpecification.next());
+      var headBuilder =
+          env.consumerBuilder().stream(cluster.stream).offset(OffsetSpecification.next());
       headBuilder.flow().initialCredits(10);
       Consumer headConsumer =
           headBuilder
@@ -66,8 +66,8 @@ public class MultiOffsetConsumerTest implements Runnable {
                   })
               .build();
 
-      var laggingBuilder = env.consumerBuilder().stream(cluster.stream)
-              .offset(OffsetSpecification.first());
+      var laggingBuilder =
+          env.consumerBuilder().stream(cluster.stream).offset(OffsetSpecification.first());
       laggingBuilder.flow().initialCredits(10);
       Consumer laggingConsumer =
           laggingBuilder
