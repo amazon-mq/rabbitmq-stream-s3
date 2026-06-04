@@ -140,12 +140,12 @@ public class HighThroughputTest implements Runnable {
   }
 
   private void setupStream(Environment env, ManagementApi mgmt, S3Monitor s3Monitor) {
-    LOG.info("Deleting stream if it exists: {}", cluster.stream);
-    mgmt.deleteStream(cluster.stream);
-
     if (s3Monitor != null) {
       s3Monitor.deleteAll();
     }
+
+    LOG.info("Deleting stream if it exists: {}", cluster.stream);
+    mgmt.deleteStream(cluster.stream);
 
     try {
       Thread.sleep(2000);
