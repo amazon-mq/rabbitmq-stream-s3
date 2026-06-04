@@ -102,7 +102,7 @@ public class HighThroughputTest implements Runnable {
 
     boolean s3Populated = false;
     try (Environment env = cluster.buildEnvironment()) {
-      setupStream(env, mgmt);
+      setupStream(env, mgmt, s3Monitor);
       long published = publishPhase(env, mgmt, metrics, health, s3Monitor);
 
       LOG.info("Publish phase complete: confirmed={}", published);
@@ -132,9 +132,13 @@ public class HighThroughputTest implements Runnable {
     }
   }
 
-  private void setupStream(Environment env, ManagementApi mgmt) {
+  private void setupStream(Environment env, ManagementApi mgmt, S3Monitor s3Monitor) {
     LOG.info("Deleting stream if it exists: {}", cluster.stream);
     mgmt.deleteStream(cluster.stream);
+
+    if (s3Monitor != null) {
+      s3Monitor.deleteAll();
+    }
 
     try {
       Thread.sleep(2000);

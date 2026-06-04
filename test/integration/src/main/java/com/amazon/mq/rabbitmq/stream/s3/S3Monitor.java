@@ -1,11 +1,17 @@
 package com.amazon.mq.rabbitmq.stream.s3;
 
+import java.util.ArrayList;
+import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.Delete;
+import software.amazon.awssdk.services.s3.model.DeleteObjectsRequest;
 import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
 import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
+import software.amazon.awssdk.services.s3.model.ObjectIdentifier;
+import software.amazon.awssdk.services.s3.model.S3Object;
 
 class S3Monitor implements AutoCloseable {
 
@@ -74,6 +80,41 @@ class S3Monitor implements AutoCloseable {
       return previousCount >= 0 ? previousCount : 0;
     }
     return total;
+  }
+
+  int deleteAll() {
+    LOG.info("Deleting all S3 objects under prefix: {}", prefix);
+    int totalDeleted = 0;
+    String continuationToken = null;
+    try {
+      do {
+        ListObjectsV2Request.Builder listBuilder =
+            ListObjectsV2Request.builder().bucket(bucket).prefix(prefix).maxKeys(1000);
+        if (continuationToken != null) {
+          listBuilder.continuationToken(continuationToken);
+        }
+        ListObjectsV2Response response = s3.listObjectsV2(listBuilder.build());
+        List<S3Object> objects = response.contents();
+        if (objects.isEmpty()) {
+          break;
+        }
+        List<ObjectIdentifier> keys = new ArrayList<>(objects.size());
+        for (S3Object obj : objects) {
+          keys.add(ObjectIdentifier.builder().key(obj.key()).build());
+        }
+        s3.deleteObjects(
+            DeleteObjectsRequest.builder()
+                .bucket(bucket)
+                .delete(Delete.builder().objects(keys).quiet(true).build())
+                .build());
+        totalDeleted += keys.size();
+        continuationToken = response.isTruncated() ? response.nextContinuationToken() : null;
+      } while (continuationToken != null);
+    } catch (Exception e) {
+      LOG.error("S3 deleteAll failed: {}", e.getMessage());
+    }
+    LOG.info("Deleted {} S3 object(s) under prefix: {}", totalDeleted, prefix);
+    return totalDeleted;
   }
 
   @Override
