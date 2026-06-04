@@ -32,7 +32,29 @@ public class ClusterOptions {
       split = ",")
   List<String> metricsUris;
 
+  @CommandLine.Option(
+      names = {"--s3-bucket"},
+      description = "S3 bucket name (enables S3 object monitoring when provided)")
+  String s3Bucket;
+
+  @CommandLine.Option(
+      names = {"--s3-region"},
+      description = "AWS region for the S3 bucket",
+      defaultValue = "us-west-2")
+  String s3Region;
+
   Environment buildEnvironment() {
     return Environment.builder().uris(uris).build();
+  }
+
+  boolean hasS3Config() {
+    return s3Bucket != null && !s3Bucket.isEmpty();
+  }
+
+  S3Monitor buildS3Monitor() {
+    if (!hasS3Config()) {
+      return null;
+    }
+    return new S3Monitor(s3Bucket, s3Region, stream);
   }
 }

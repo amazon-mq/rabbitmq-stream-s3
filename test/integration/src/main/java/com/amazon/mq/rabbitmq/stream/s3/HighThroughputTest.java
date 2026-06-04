@@ -75,6 +75,14 @@ public class HighThroughputTest implements Runnable {
       defaultValue = "8")
   private int replayConsumers;
 
+  @CommandLine.Option(
+      names = "--retention-stall-intervals",
+      description =
+          "Fail if S3 object count grows monotonically for this many consecutive intervals"
+              + " (only when --s3-bucket is provided)",
+      defaultValue = "10")
+  private int retentionStallThreshold;
+
   @Override
   public void run() {
     LOG.info(
@@ -89,10 +97,12 @@ public class HighThroughputTest implements Runnable {
 
     ManagementApi mgmt = new ManagementApi(cluster.mgmtUri);
     MetricsClient metrics = new MetricsClient(cluster.metricsUris);
+    ClusterHealthMonitor health = new ClusterHealthMonitor(cluster.mgmtUri);
+    S3Monitor s3Monitor = cluster.buildS3Monitor();
 
     try (Environment env = cluster.buildEnvironment()) {
       setupStream(env, mgmt);
-      long published = publishPhase(env, mgmt, metrics);
+      long published = publishPhase(env, mgmt, metrics, health, s3Monitor);
 
       LOG.info("Publish phase complete: confirmed={}", published);
       LOG.info("Waiting for management stats to stabilize...");
@@ -107,6 +117,10 @@ public class HighThroughputTest implements Runnable {
     } catch (Exception e) {
       LOG.error("FAILED", e);
       System.exit(1);
+    } finally {
+      if (s3Monitor != null) {
+        s3Monitor.close();
+      }
     }
   }
 
@@ -135,7 +149,12 @@ public class HighThroughputTest implements Runnable {
     LOG.info("Stream ready");
   }
 
-  private long publishPhase(Environment env, ManagementApi mgmt, MetricsClient metrics)
+  private long publishPhase(
+      Environment env,
+      ManagementApi mgmt,
+      MetricsClient metrics,
+      ClusterHealthMonitor health,
+      S3Monitor s3Monitor)
       throws InterruptedException {
     byte[] body = new byte[messageSize];
     AtomicLong totalPublished = new AtomicLong(0);
@@ -191,6 +210,7 @@ public class HighThroughputTest implements Runnable {
     long nextReport = startTime + Duration.ofSeconds(progressInterval).toMillis();
     int zeroSentIntervals = 0;
     int reportCount = 0;
+    boolean retentionSeen = false;
 
     LOG.info("Publishing for {}s...", durationSeconds);
 
@@ -204,16 +224,42 @@ public class HighThroughputTest implements Runnable {
         long cons = totalConsumed.get();
         double pubRate = pub * 1000.0 / (now - startTime);
         MetricsClient.Snapshot snap = metrics.snapshot();
+
+        String s3ObjectInfo = "";
+        if (s3Monitor != null) {
+          S3Monitor.Snapshot s3Snap = s3Monitor.snapshot();
+          s3ObjectInfo =
+              String.format(" s3-objects=%d (delta=%+d)", s3Snap.objectCount, s3Snap.delta);
+          if (s3Snap.retentionActive()) {
+            retentionSeen = true;
+          }
+          if (reportCount > 5
+              && !retentionSeen
+              && s3Snap.monotonicGrowthIntervals >= retentionStallThreshold) {
+            LOG.error(
+                "RETENTION STALLED: S3 object count has grown for {} consecutive"
+                    + " intervals without any decrease — retention may not be working",
+                s3Snap.monotonicGrowthIntervals);
+            System.exit(1);
+          }
+        }
+
+        ClusterHealthMonitor.Snapshot healthSnap = health.snapshot();
         LOG.info(
             "Publish [{}s]: published={} ({} msg/s) consumed={} head-offset={}"
-                + " s3-recv={} MiB/s s3-sent={} MiB/s",
+                + " s3-recv={} MiB/s s3-sent={} MiB/s{}"
+                + " | mem={} MiB disk={} GiB fd={}",
             elapsed,
             pub,
             String.format("%.0f", pubRate),
             cons,
             headOffset.get(),
             String.format("%.1f", snap.receivedMiBPerS(progressInterval)),
-            String.format("%.1f", snap.sentMiBPerS(progressInterval)));
+            String.format("%.1f", snap.sentMiBPerS(progressInterval)),
+            s3ObjectInfo,
+            String.format("%.0f", healthSnap.totalMemoryUsedMiB()),
+            String.format("%.1f", healthSnap.totalDiskFreeGiB()),
+            healthSnap.totalFileDescriptorsUsed);
 
         if (reportCount > 3) {
           if (snap.deltaBytesSent > 0) {
@@ -228,8 +274,13 @@ public class HighThroughputTest implements Runnable {
           }
         }
 
-        if (mgmt.hasMemoryAlarm()) {
-          LOG.error("MEMORY ALARM detected - aborting");
+        if (healthSnap.hasAlarm()) {
+          if (healthSnap.memoryAlarm) {
+            LOG.error("MEMORY ALARM detected - aborting");
+          }
+          if (healthSnap.diskAlarm) {
+            LOG.error("DISK ALARM detected - aborting");
+          }
           System.exit(1);
         }
 
@@ -246,6 +297,11 @@ public class HighThroughputTest implements Runnable {
     }
     for (Consumer c : consumers) {
       c.close();
+    }
+
+    if (s3Monitor != null && !retentionSeen) {
+      LOG.warn(
+          "Retention was never observed during the publish phase (no S3 object count decrease)");
     }
 
     return totalPublished.get();

@@ -58,7 +58,8 @@ high-throughput: package
 		--consumers $(CONSUMERS) \
 		--message-size $(MESSAGE_SIZE) \
 		--max-length-bytes $(MAX_LENGTH_BYTES) \
-		--replay-timeout $(REPLAY_TIMEOUT)
+		--replay-timeout $(REPLAY_TIMEOUT) \
+		$(if $(S3_BUCKET),--s3-bucket $(S3_BUCKET) --s3-region $(S3_REGION))
 
 remote-only-read: package
 	$(JAVA) -jar $(JAR) remote-only-read \
