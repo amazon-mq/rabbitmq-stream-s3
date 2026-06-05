@@ -197,7 +197,7 @@ step(State0, {data, _RequestId, Fragment, Data, DoneOrContinue}) ->
     {State5, Effects2} = try_serve(State4),
     {State5, Effects1 ++ Effects2};
 step(State0, {request_error, _RequestId, Fragment, not_found}) ->
-    case Fragment =:= (State0#state.fragment_ref)#fragment_ref.offset of
+    case Fragment =:= current_fragment_offset(State0) of
         true ->
             %% Current fragment 404. Refresh the iterator past this offset.
             State = State0#state{current_not_found = true, requests_in_flight = #{}},
@@ -261,9 +261,8 @@ step(#state{cfg = #cfg{min_retry_delay_ms = MinDelay}} = State0, deadline_expire
     {State, [{reply, {error, timeout}}]};
 step(State0, {iterator_refreshed, end_of_manifest}) ->
     %% No new entries. Become local.
-    FragOffset = (State0#state.fragment_ref)#fragment_ref.offset,
     State = goto_next_fragment(State0),
-    {State, [{reply, {become_local, FragOffset}}]};
+    {State, [{reply, {become_local, current_fragment_offset(State0)}}]};
 step(State0, {iterator_refreshed, Iterator}) ->
     %% Iterator has been refreshed past the 404'd fragment. Reinitialize
     %% at the next available fragment.
@@ -291,8 +290,7 @@ step(State0, {iterator_refreshed, Iterator}) ->
             {State1, [{reply, {next_fragment, Offset}} | Effects]};
         _ ->
             %% Iterator exhausted after refresh. Become local.
-            FragOffset = (State0#state.fragment_ref)#fragment_ref.offset,
-            {State0, [{reply, {become_local, FragOffset}}]}
+            {State0, [{reply, {become_local, current_fragment_offset(State0)}}]}
     end.
 
 %% @doc Returns the pending read, if any.
@@ -329,21 +327,25 @@ try_serve(#state{pending = #pending{offset = Offset, bytes = Bytes}} = State) ->
                 | Effects
             ]};
         {become_local, State1} ->
-            FragOffset = (State1#state.fragment_ref)#fragment_ref.offset,
             State2 = State1#state{pending = undefined},
-            {State2, [{reply, {become_local, FragOffset}}]};
+            {State2, [{reply, {become_local, current_fragment_offset(State1)}}]};
         {await, State1} ->
             State2 = adjust_read_size(miss, State1),
             {State3, Effects} = maybe_start_requests(State2),
             {State3, [{observe, miss, State3#state.read_size} | Effects]};
         {not_found_check_range, State1} ->
-            %% Next fragment was 404. Refresh iterator past it.
-            NotFoundOffset = next_fragment_offset(State1),
-            {State1, [{refresh_iterator, NotFoundOffset}]};
+            %% Fragment was 404. Refresh iterator past it. If the iterator
+            %% is exhausted (last fragment in manifest was deleted), fall
+            %% back to refreshing past the current fragment's offset.
+            case next_fragment_offset(State1) of
+                {ok, NotFoundOffset} ->
+                    {State1, [{refresh_iterator, NotFoundOffset}]};
+                end_of_manifest ->
+                    {State1, [{refresh_iterator, current_fragment_offset(State1)}]}
+            end;
         {refresh_iterator, State1} ->
             %% Iterator exhausted. Refresh past current fragment.
-            CurrentOffset = (State1#state.fragment_ref)#fragment_ref.offset,
-            {State1, [{refresh_iterator, CurrentOffset}]}
+            {State1, [{refresh_iterator, current_fragment_offset(State1)}]}
     end.
 
 %% ------------------------------------------------------------------
@@ -407,36 +409,34 @@ try_fragment_transition(
         end_of_manifest ->
             {refresh_iterator, State};
         {error, _} ->
-            FragOffset = (State#state.fragment_ref)#fragment_ref.offset,
-            {become_local, State#state{
-                pending = undefined,
-                fragment_ref = State#state.fragment_ref#fragment_ref{offset = FragOffset}
-            }}
+            {become_local, State#state{pending = undefined}}
     end.
 
 %% ------------------------------------------------------------------
 %% Internal: fragment navigation
 %% ------------------------------------------------------------------
 
-%% Returns the offset of the next fragment in the iterator. Called from the
-%% `not_found_check_range` branch of `try_serve`. There are two paths into
-%% that branch:
+%% Returns the offset of the next fragment in the iterator, or
+%% `end_of_manifest` if the iterator is exhausted. Called from the
+%% `not_found_check_range` branch of `try_serve`. There are two paths
+%% into that branch:
 %%
 %%  1. `try_fragment_transition` matching `next = not_found`: the consumer
 %%     read past the current fragment and the prefetched-next 404'd. The
 %%     iterator is positioned at the 404'd entry, so this returns the
-%%     404'd offset. `next/1` always succeeds with `{ok, _, _}`.
+%%     404'd offset.
 %%
 %%  2. `try_read` matching `current_not_found = true`: the *current*
 %%     fragment 404'd while no read was pending; a later read wants bytes
 %%     past the partial buffer. The iterator was already advanced past
 %%     the current fragment, so it points at the entry AFTER the 404'd
-%%     one. This function then returns a live fragment's offset, which
-%%     the shell uses to refresh the iterator and ends up skipping the
-%%     live fragment. Tracked by issue #173.
+%%     one. If the current fragment was the last in the manifest, the
+%%     iterator is exhausted and this returns `end_of_manifest`.
 next_fragment_offset(#state{iterator = Iterator}) ->
-    {ok, #fragment_ref{offset = Offset}, _} = rabbitmq_stream_s3_fragment_iterator:next(Iterator),
-    Offset.
+    case rabbitmq_stream_s3_fragment_iterator:next(Iterator) of
+        {ok, #fragment_ref{offset = Offset}, _} -> {ok, Offset};
+        _ -> end_of_manifest
+    end.
 
 goto_next_fragment(#state{stream = StreamId, next = Next0, iterator = Iterator0} = State) ->
     Iterator = advance_iterator(Iterator0),

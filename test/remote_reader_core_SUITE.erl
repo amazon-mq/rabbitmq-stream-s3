@@ -44,6 +44,7 @@ all() ->
         deadline_expired_replies_error_timeout,
         deadline_expired_resets_buffer_for_retry,
         fragment_404_emits_refresh_iterator,
+        last_fragment_404_no_pending_read_refreshes_past_current,
         observe_effects_emitted_for_hit_miss_and_transition
     ].
 
@@ -635,6 +636,31 @@ fragment_404_emits_refresh_iterator(_Config) ->
         S1, {request_error, make_ref(), 0, not_found}
     ),
     ?assertMatch([{refresh_iterator, 0}], Effects).
+
+last_fragment_404_no_pending_read_refreshes_past_current(_Config) ->
+    %% Regression test for issue #193. When the current fragment is the last
+    %% in the manifest and 404s while no read is pending, a subsequent read
+    %% must not crash with {badmatch, end_of_manifest}. Instead it should
+    %% emit {refresh_iterator, CurrentOffset}.
+    FragRef = frag_ref(0, 1_000_000, 42),
+    Iterator = mock_iterator([{0, 1_000_000, 42}]),
+    {S0, _} = init(stream_id(), FragRef, 64, Iterator),
+    %% Partially fill buffer so the fragment has some data but not all.
+    Data = binary:copy(<<0>>, 500),
+    {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {data, make_ref(), 0, Data, done}),
+    %% Read from buffered range succeeds (consuming the pending read slot).
+    {S2, E1} = rabbitmq_stream_s3_remote_reader_core:step(S1, {read, 64, 100, chunk_boundary}),
+    ?assertMatch([{reply, {ok, _}} | _], E1),
+    %% Current fragment 404s while no read is pending.
+    {S3, E2} = rabbitmq_stream_s3_remote_reader_core:step(
+        S2, {request_error, make_ref(), 0, not_found}
+    ),
+    %% No refresh_iterator emitted (pending = undefined).
+    ?assertEqual([], [Eff || {refresh_iterator, _} = Eff <- E2]),
+    %% A new read beyond the buffer triggers not_found_check_range.
+    %% Before the fix, this crashed with {badmatch, end_of_manifest}.
+    {_S4, E3} = rabbitmq_stream_s3_remote_reader_core:step(S3, {read, 600, 100, chunk_boundary}),
+    ?assertMatch([{refresh_iterator, 0}], E3).
 
 observe_effects_emitted_for_hit_miss_and_transition(_Config) ->
     %% Verify the core emits one `{observe, Kind, ReadSize}` effect per
