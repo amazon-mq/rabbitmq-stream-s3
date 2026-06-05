@@ -204,6 +204,7 @@ public class HighThroughputTest implements Runnable {
     int zeroSentIntervals = 0;
     int reportCount = 0;
     boolean retentionSeen = false;
+    long cumulativeBytesSent = 0;
 
     LOG.info(
         "Publishing for {}s with {} head-tracking consumer(s)...", durationSeconds, numConsumers);
@@ -221,6 +222,7 @@ public class HighThroughputTest implements Runnable {
 
         String s3ObjectInfo = "";
         long s3ObjectCount = 0;
+        cumulativeBytesSent += snap.deltaBytesSent;
         if (s3Monitor != null) {
           S3Monitor.Snapshot s3Snap = s3Monitor.snapshot();
           s3ObjectCount = s3Snap.objectCount;
@@ -229,13 +231,18 @@ public class HighThroughputTest implements Runnable {
           if (s3Snap.retentionActive()) {
             retentionSeen = true;
           }
-          if (s3Snap.objectCount > 0
+          // Only check for retention stalls after enough data has been sent to
+          // S3 to exceed max-length-bytes — retention cannot fire until then.
+          if (cumulativeBytesSent > maxLengthBytes
               && !retentionSeen
               && s3Snap.monotonicGrowthIntervals >= retentionStallThreshold) {
             LOG.error(
                 "RETENTION STALLED: S3 object count has grown for {} consecutive"
-                    + " intervals without any decrease — retention may not be working",
-                s3Snap.monotonicGrowthIntervals);
+                    + " intervals without any decrease (sent {} bytes > max-length-bytes {})"
+                    + " — retention may not be working",
+                s3Snap.monotonicGrowthIntervals,
+                cumulativeBytesSent,
+                maxLengthBytes);
             System.exit(1);
           }
         }
