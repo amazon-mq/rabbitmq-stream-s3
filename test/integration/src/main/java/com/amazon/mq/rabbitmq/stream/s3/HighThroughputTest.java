@@ -123,7 +123,16 @@ public class HighThroughputTest implements Runnable {
     if (expectedMessages <= 0) {
       expectedMessages = published;
     }
-    LOG.info("Expected messages for replay: {}", expectedMessages);
+    LOG.info("Expected messages for replay: {} (published={})", expectedMessages, published);
+
+    if (s3Populated && expectedMessages >= published) {
+      LOG.error(
+          "RETENTION NOT WORKING: message count ({}) equals published ({}) "
+              + "— first_offset did not advance despite S3 being populated",
+          expectedMessages,
+          published);
+      System.exit(1);
+    }
 
     try (Environment replayEnv = cluster.buildEnvironment()) {
       replayPhase(replayEnv, expectedMessages, metrics, s3Populated);
