@@ -1013,10 +1013,19 @@ request_credentials_from_instance_metadata_locked() ->
 
 request_credentials_from_container_endpoint(URI) ->
     %% <https://docs.aws.amazon.com/sdkref/latest/guide/feature-container-credentials.html>
-    #{host := Host, port := Port, path := Path0} = uri_string:parse(URI),
+    Parsed = uri_string:parse(URI),
+    Scheme = maps:get(scheme, Parsed, "http"),
+    Host = maps:get(host, Parsed),
+    Port = maps:get(port, Parsed, undefined),
+    Path0 = maps:get(path, Parsed, "/"),
+    {Transport, DefaultPort} =
+        case Scheme of
+            "https" -> {tls, 443};
+            _ -> {tcp, 80}
+        end,
     PortInt =
         case Port of
-            undefined -> 80;
+            undefined -> DefaultPort;
             _ -> Port
         end,
     Path =
@@ -1026,7 +1035,7 @@ request_credentials_from_container_endpoint(URI) ->
         end,
     Req = #container_creds_req{host = Host, port = PortInt, path = Path},
     do_request_credentials_from_container_endpoint(
-        open, Req, gun:open(Host, PortInt, #{transport => tcp, protocols => [http]})
+        open, Req, gun:open(Host, PortInt, #{transport => Transport, protocols => [http]})
     ).
 
 do_request_credentials_from_container_endpoint(open, _Req, {error, _} = Err) ->
