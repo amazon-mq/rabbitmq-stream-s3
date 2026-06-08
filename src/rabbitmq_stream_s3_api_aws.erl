@@ -197,12 +197,13 @@ get_range_async(Key, Range, Opts) when is_binary(Key) andalso is_map(Opts) ->
 -doc "Uploads the given `Data` as an object at key `Key`".
 -spec put(key(), iodata(), request_opts()) -> ok | {error, any()}.
 put(Key, Data, Opts) when is_binary(Key) andalso is_map(Opts) ->
+    Headers0 = sse_headers(),
     Headers =
         case Opts of
             #{crc32 := Checksum} ->
-                #{<<"x-amz-checksum-crc32">> => base64:encode(<<Checksum:32/unsigned>>)};
+                Headers0#{<<"x-amz-checksum-crc32">> => base64:encode(<<Checksum:32/unsigned>>)};
             _ ->
-                #{}
+                Headers0
         end,
     case request(<<"PUT">>, key_to_path(Key), Headers, Data, Opts) of
         {ok, #{status := 200}} ->
@@ -219,7 +220,7 @@ stream_put(Key, ContentLength, Opts0) when is_binary(Key) andalso is_map(Opts0) 
     Method = <<"PUT">>,
     Path = key_to_path(Key),
     EncodedLength = aws_chunked_encoded_length(ContentLength),
-    Headers0 = #{
+    Headers0 = (sse_headers())#{
         <<"content-length">> => integer_to_binary(EncodedLength),
         <<"content-encoding">> => <<"aws-chunked">>,
         <<"x-amz-decoded-content-length">> => integer_to_binary(ContentLength),
@@ -1396,6 +1397,21 @@ delete_many_body(Keys) when is_list(Keys) ->
 -spec key_to_path(rabbitmq_stream_s3:key()) -> binary().
 key_to_path(Key) ->
     <<$/, (uri_string:quote(Key, "/"))/binary>>.
+
+%% Server-side encryption headers for PUT requests. Always requests SSE-S3
+%% (AES256) to satisfy bucket policies that deny uploads without an explicit
+%% encryption header. When a KMS key is configured, uses SSE-KMS instead.
+-spec sse_headers() -> req_headers().
+sse_headers() ->
+    case rabbitmq_stream_s3_config:kms_key_id() of
+        undefined ->
+            #{<<"x-amz-server-side-encryption">> => <<"AES256">>};
+        KeyId ->
+            #{
+                <<"x-amz-server-side-encryption">> => <<"aws:kms">>,
+                <<"x-amz-server-side-encryption-aws-kms-key-id">> => KeyId
+            }
+    end.
 
 %% Computes the aws-chunked framing overhead for a single chunk of DataSize bytes.
 %% Each chunk is framed as: <hex-size>\r\n<data>\r\n

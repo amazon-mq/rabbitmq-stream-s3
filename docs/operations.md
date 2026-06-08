@@ -106,6 +106,21 @@ stream_s3.verify_crc_on_read = false
 
 Osiris does not validate CRC when sending chunk data to consumers via `send_file` or the chunk iterator. The CRC in each chunk header is validated on the write path (when replicas accept chunks) and during `read_chunk/1`, but not on the streaming read paths used for consumer delivery. This setting adds validation on the remote read path where data has traversed an additional network hop (S3) beyond the original replication.
 
+### Server-side encryption
+
+The plugin sends an `x-amz-server-side-encryption: AES256` header on every PUT request. This is a no-op on default S3 buckets (S3 encrypts all objects with SSE-S3 automatically) but satisfies bucket policies or SCPs that deny uploads without an explicit encryption header.
+
+When the bucket requires SSE-KMS, configure the key ARN:
+
+```ini
+# KMS key ARN for server-side encryption. When set, the plugin uses
+# SSE-KMS (aws:kms) instead of SSE-S3 (AES256) for all uploads.
+# Type: binary. Default: not set (uses AES256).
+stream_s3.kms_key_id = arn:aws:kms:us-east-1:123456789012:key/example-key-id
+```
+
+For more information on S3 server-side encryption options, see [Protecting data with server-side encryption](https://docs.aws.amazon.com/AmazonS3/latest/userguide/serv-side-encryption.html).
+
 ## Monitoring
 
 The plugin exposes its metrics via Prometheus through the existing `rabbitmq_prometheus` plugin. Enabling `rabbitmq_stream_s3` implicitly enables `rabbitmq_prometheus`, which opens the Prometheus metrics endpoint on port 15692 (TCP) or 15691 (TLS).

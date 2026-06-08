@@ -73,4 +73,8 @@
  {stream_s3_verify_crc_on_read,
   "stream_s3.verify_crc_on_read = true",
   [{rabbitmq_stream_s3, [{verify_crc_on_read, true}]}],
+  []},
+ {stream_s3_kms_key_id,
+  "stream_s3.kms_key_id = arn:aws:kms:us-east-1:123456789012:key/example-key-id",
+  [{rabbitmq_stream_s3, [{kms_key_id, <<"arn:aws:kms:us-east-1:123456789012:key/example-key-id">>}]}],
   []}].
