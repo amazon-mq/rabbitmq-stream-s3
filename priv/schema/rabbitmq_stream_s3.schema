@@ -202,3 +202,19 @@ end}.
 {mapping, "stream_s3.verify_crc_on_read", "rabbitmq_stream_s3.verify_crc_on_read", [
     {datatype, {enum, [true, false]}}
 ]}.
+
+%%
+%% Server-side encryption (KMS)
+%%
+
+{mapping, "stream_s3.kms_key_id", "rabbitmq_stream_s3.kms_key_id", [
+    {datatype, binary}
+]}.
+
+{translation, "rabbitmq_stream_s3.kms_key_id",
+fun(Conf) ->
+    case cuttlefish:conf_get("stream_s3.kms_key_id", Conf, undefined) of
+        undefined -> cuttlefish:unset();
+        Value     -> Value
+    end
+end}.

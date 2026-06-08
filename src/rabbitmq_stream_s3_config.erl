@@ -42,7 +42,8 @@ lives here. Callers use these functions instead of calling
     tick_timeout_milliseconds/0,
     max_transfer_bytes_per_sec/0,
     max_transfer_burst_bytes/0,
-    verify_crc_on_read/0
+    verify_crc_on_read/0,
+    kms_key_id/0
 ]).
 
 -define(APP, rabbitmq_stream_s3).
@@ -189,6 +190,10 @@ max_transfer_burst_bytes() ->
 verify_crc_on_read() ->
     application:get_env(?APP, verify_crc_on_read, false).
 
+-spec kms_key_id() -> binary() | undefined.
+kms_key_id() ->
+    application:get_env(?APP, kms_key_id, undefined).
+
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
@@ -222,7 +227,8 @@ defaults_test_() ->
         ?_assertEqual(45_000, segment_upload_timeout()),
         ?_assertEqual(60_000, retention_task_timeout()),
         ?_assertEqual(5000, tick_timeout_milliseconds()),
-        ?_assertEqual(false, verify_crc_on_read())
+        ?_assertEqual(false, verify_crc_on_read()),
+        ?_assertEqual(undefined, kms_key_id())
     ].
 
 configured_test_() ->
