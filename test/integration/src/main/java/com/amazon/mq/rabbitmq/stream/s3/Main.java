@@ -8,6 +8,7 @@ import picocli.CommandLine;
     subcommands = {
       HighThroughputTest.class,
       MultiOffsetConsumerTest.class,
+      StreamDeletionTest.class,
       CleanupCommand.class,
       CommandLine.HelpCommand.class
     })

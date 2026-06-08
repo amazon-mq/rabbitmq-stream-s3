@@ -40,7 +40,7 @@ MESSAGE_SIZE ?= 1024
 MAX_LENGTH_BYTES ?= 10000000000
 REPLAY_TIMEOUT ?= 3600
 
-.PHONY: cleanup high-throughput multi-offset-consumer
+.PHONY: cleanup high-throughput multi-offset-consumer stream-deletion
 
 cleanup: package
 	$(JAVA) -jar $(JAR) cleanup \
@@ -75,6 +75,18 @@ multi-offset-consumer: package
 		--warmup $(WARMUP) \
 		--max-length-bytes $(MAX_LENGTH_BYTES) \
 		$(if $(S3_BUCKET),--s3-bucket $(S3_BUCKET) --s3-region $(S3_REGION))
+
+DELETE_TIMEOUT ?= 60
+
+stream-deletion: package
+	$(JAVA) -jar $(JAR) stream-deletion \
+		--uris $(STREAM_URIS) \
+		--mgmt-uri $(MGMT_URI) \
+		--stream s3-stream-deletion \
+		--duration $(DURATION) \
+		--delete-timeout $(DELETE_TIMEOUT) \
+		--max-length-bytes 500000000 \
+		--s3-bucket $(S3_BUCKET) --s3-region $(S3_REGION)
 
 # --- Dependency management ---
 
