@@ -237,7 +237,7 @@ public class HighThroughputTest implements Runnable {
           s3ObjectCount = s3Snap.objectCount;
           s3ObjectInfo =
               String.format(" s3-objects=%d (delta=%+d)", s3Snap.objectCount, s3Snap.delta);
-          if (s3Snap.retentionActive()) {
+          if (s3Snap.retentionActive() || snap.deltaDeleteMany > 0) {
             retentionSeen = true;
           }
           // Only check for retention stalls after enough data has been sent to
@@ -312,7 +312,8 @@ public class HighThroughputTest implements Runnable {
 
     if (s3Monitor != null && !retentionSeen) {
       LOG.warn(
-          "Retention was never observed during the publish phase (no S3 object count decrease)");
+          "Retention was never observed during the publish phase"
+              + " (no S3 object count decrease and no delete_many activity)");
     }
 
     return totalPublished.get();

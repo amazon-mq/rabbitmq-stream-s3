@@ -21,7 +21,6 @@ synchronous feedback is generated.
 
 -include_lib("kernel/include/logger.hrl").
 -include_lib("stdlib/include/assert.hrl").
--include_lib("rabbit_common/include/rabbit.hrl").
 -include("include/rabbitmq_stream_s3.hrl").
 -include("include/logging.hrl").
 
@@ -131,12 +130,24 @@ read_size_prometheus_format() ->
 start(Config) ->
     gen_server:start(?MODULE, Config, []).
 
+%% The gen_server:call timeout must exceed PENDING_READ_DEADLINE_MS so the
+%% internal deadline always fires first and replies {error, timeout} to the
+%% caller. This avoids overlapping reads (caller times out, new read arrives
+%% while from is still set) which require unsafe buffer resets.
+-define(PENDING_READ_DEADLINE_MS, 18_000).
+-define(SEND_FILE_READ_TIMEOUT_MS, 20_000).
+
 read(Server, Offset, Bytes, Hint) ->
-    read(Server, Offset, Bytes, Hint, ?GEN_SERVER_CALL_TIMEOUT).
+    read(Server, Offset, Bytes, Hint, ?SEND_FILE_READ_TIMEOUT_MS).
 
 read(Server, Offset, Bytes, Hint, Timeout) ->
     T0 = erlang:monotonic_time(),
-    Result = gen_server:call(Server, #read{offset = Offset, bytes = Bytes, hint = Hint}, Timeout),
+    Result =
+        try
+            gen_server:call(Server, #read{offset = Offset, bytes = Bytes, hint = Hint}, Timeout)
+        catch
+            exit:{timeout, _} -> {error, timeout}
+        end,
     Duration = rabbitmq_stream_s3_util:elapsed_ms(T0),
     counters:add(counter(), ?C_READ_DURATION_MS, Duration),
     counters:add(counter(), ?C_READ, 1),
@@ -333,7 +344,6 @@ execute_effect(
     gen_server:reply(From, Result),
     State#state{from = undefined, deadline_timer = undefined};
 execute_effect({reply, _Result}, State) ->
-    %% No pending caller (e.g. reply generated during init before any call).
     State;
 execute_effect({observe, hit, ReadSize}, State) ->
     counters:add(counter(), ?C_BUFFER_HIT, 1),
@@ -417,7 +427,9 @@ maybe_stop(State) ->
 build_cfg(Opts) ->
     #cfg{
         request_timeout_ms = maps:get(request_timeout_ms, Opts, 15_000),
-        pending_read_deadline_ms = maps:get(pending_read_deadline_ms, Opts, 50_000)
+        pending_read_deadline_ms = maps:get(
+            pending_read_deadline_ms, Opts, ?PENDING_READ_DEADLINE_MS
+        )
     }.
 
 cancel_all_requests(#state{requests = Requests, cancelled = Cancelled0} = State) ->

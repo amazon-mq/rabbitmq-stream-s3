@@ -20,11 +20,15 @@ class MetricsClient {
   private static final Pattern BYTES_SENT_PATTERN =
       Pattern.compile(
           "^rabbitmq_stream_s3_bytes_sent(?:\\{[^}]*\\})?\\s+(\\d+)", Pattern.MULTILINE);
+  private static final Pattern DELETE_MANY_PATTERN =
+      Pattern.compile(
+          "^rabbitmq_stream_s3_delete_many(?:\\{[^}]*\\})?\\s+(\\d+)", Pattern.MULTILINE);
 
   private final List<String> endpoints;
   private final HttpClient client;
   private long previousBytesReceived = -1;
   private long previousBytesSent = -1;
+  private long previousDeleteMany = -1;
   private int previousEndpointsScraped = 0;
 
   MetricsClient(List<String> endpoints) {
@@ -35,14 +39,24 @@ class MetricsClient {
   static class Snapshot {
     final long bytesReceived;
     final long bytesSent;
+    final long deleteMany;
     final long deltaBytesReceived;
     final long deltaBytesSent;
+    final long deltaDeleteMany;
 
-    Snapshot(long bytesReceived, long bytesSent, long deltaReceived, long deltaSent) {
+    Snapshot(
+        long bytesReceived,
+        long bytesSent,
+        long deleteMany,
+        long deltaReceived,
+        long deltaSent,
+        long deltaDeleteMany) {
       this.bytesReceived = bytesReceived;
       this.bytesSent = bytesSent;
+      this.deleteMany = deleteMany;
       this.deltaBytesReceived = deltaReceived;
       this.deltaBytesSent = deltaSent;
+      this.deltaDeleteMany = deltaDeleteMany;
     }
 
     double receivedMiBPerS(long intervalSeconds) {
@@ -59,6 +73,7 @@ class MetricsClient {
   Snapshot snapshot() {
     long totalReceived = 0;
     long totalSent = 0;
+    long totalDeleteMany = 0;
     int endpointsScraped = 0;
 
     for (String endpoint : endpoints) {
@@ -73,6 +88,7 @@ class MetricsClient {
           String body = response.body();
           totalReceived += extractMetric(body, BYTES_RECEIVED_PATTERN);
           totalSent += extractMetric(body, BYTES_SENT_PATTERN);
+          totalDeleteMany += extractMetric(body, DELETE_MANY_PATTERN);
           endpointsScraped++;
         }
       } catch (Exception e) {
@@ -85,15 +101,19 @@ class MetricsClient {
     // on the next full scrape.
     long deltaReceived = 0;
     long deltaSent = 0;
+    long deltaDeleteMany = 0;
     if (previousBytesReceived >= 0 && endpointsScraped == previousEndpointsScraped) {
       deltaReceived = totalReceived - previousBytesReceived;
       deltaSent = totalSent - previousBytesSent;
+      deltaDeleteMany = totalDeleteMany - previousDeleteMany;
     }
     previousBytesReceived = totalReceived;
     previousBytesSent = totalSent;
+    previousDeleteMany = totalDeleteMany;
     previousEndpointsScraped = endpointsScraped;
 
-    return new Snapshot(totalReceived, totalSent, deltaReceived, deltaSent);
+    return new Snapshot(
+        totalReceived, totalSent, totalDeleteMany, deltaReceived, deltaSent, deltaDeleteMany);
   }
 
   private long extractMetric(String body, Pattern pattern) {
