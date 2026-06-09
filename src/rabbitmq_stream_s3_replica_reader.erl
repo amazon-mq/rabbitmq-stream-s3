@@ -18,6 +18,7 @@ returned by the functional core module.
 -include("include/rabbitmq_stream_s3.hrl").
 
 -export([start_link/1, format_state/1]).
+-export([evaluate_local_retention/1, evaluate_local_retention/2]).
 -export([identity_formatter/1]).
 -export([counter_fields/0, init_counters/0]).
 -export([
@@ -253,6 +254,28 @@ start_link(#{stream := StreamId} = Args) ->
         []
     ).
 
+-doc "Trigger local retention evaluation for a stream on the current node.".
+-spec evaluate_local_retention(stream_id()) -> ok | {error, term()}.
+evaluate_local_retention(StreamId) ->
+    case rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}) of
+        undefined ->
+            {error, {not_found, StreamId}};
+        Pid ->
+            gen_server:call(Pid, evaluate_local_retention)
+    end.
+
+-doc "Trigger local retention evaluation by vhost and queue name.".
+-spec evaluate_local_retention(rabbit_types:vhost(), binary()) -> ok | {error, term()}.
+evaluate_local_retention(VHost, QueueName) ->
+    QName = rabbit_misc:r(VHost, queue, QueueName),
+    case rabbit_amqqueue:lookup(QName) of
+        {ok, Q} ->
+            #{name := StreamId} = amqqueue:get_type_state(Q),
+            evaluate_local_retention(iolist_to_binary(StreamId));
+        {error, not_found} ->
+            {error, {not_found, QueueName}}
+    end.
+
 init(
     #{
         stream := StreamId,
@@ -298,6 +321,10 @@ init(
 handle_call({await_offset, Offset}, From, #state{core = Core0} = State) ->
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:await_offset(Offset, From, Core0),
     {noreply, execute_effects(Effects, State#state{core = Core})};
+handle_call(evaluate_local_retention, _From, #state{core = Core} = State) ->
+    Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(Core),
+    maybe_evaluate_retention(Manifest, State),
+    {reply, ok, State};
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown}, State}.
 
