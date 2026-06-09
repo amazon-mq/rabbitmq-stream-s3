@@ -95,15 +95,10 @@ management UI reports only the local segment window as the message count.
 -spec on_retention_evaluated(counters:counters_ref(), map()) -> ok.
 on_retention_evaluated(Cnt, #{name := Name}) ->
     StreamId = iolist_to_binary(Name),
-    case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
-        #manifest{first_offset = ManifestFirst} when ManifestFirst > 0 ->
+    case rabbitmq_stream_s3_manifest_replica:get_range(StreamId) of
+        {RemoteFirst, _} ->
             LocalFirst = counters:get(Cnt, ?C_OSIRIS_LOG_FIRST_OFFSET),
-            case ManifestFirst < LocalFirst of
-                true ->
-                    counters:put(Cnt, ?C_OSIRIS_LOG_FIRST_OFFSET, ManifestFirst);
-                false ->
-                    ok
-            end;
+            counters:put(Cnt, ?C_OSIRIS_LOG_FIRST_OFFSET, min(LocalFirst, RemoteFirst));
         _ ->
             ok
     end.
