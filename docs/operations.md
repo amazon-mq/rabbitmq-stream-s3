@@ -434,8 +434,8 @@ The plugin adds commands to `rabbitmq-streams` for debugging the upload pipeline
 
 ```bash
 rabbitmq-streams stream_s3_status my-stream --vhost /
-# Status of tiered storage for stream sq in vhost / ...
-# stream:	<<"__sq_1781016420026141262">>
+# Status of tiered storage for stream my-stream in vhost / ...
+# stream:	<<"__my-stream_1781016420026141262">>
 # fragment_target_size:	67108864
 # log_next_offset:	1421556
 # manifest_first_offset:	0
@@ -454,6 +454,9 @@ rabbitmq-streams stream_s3_status my-stream --vhost /
 # assembly_num_chunks:	6661
 # assembly_cut:	false
 ```
+
+> [!TIP]
+> Use `--formatter=json` for machine-readable output: `rabbitmq-streams stream_s3_status my-stream --formatter=json`
 
 **Evaluate local retention** triggers the local retention job for a stream. Useful to determine whether retention is correctly reclaiming segments after upload.
 
