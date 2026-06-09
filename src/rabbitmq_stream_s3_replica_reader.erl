@@ -17,8 +17,10 @@ returned by the functional core module.
 -include("include/logging.hrl").
 -include("include/rabbitmq_stream_s3.hrl").
 
--export([start_link/1, format_state/1]).
+-export([start_link/1, format_state/1, status/1, status/2]).
 -export([evaluate_local_retention/1, evaluate_local_retention/2]).
+-export([evaluate_remote_retention/1, evaluate_remote_retention/2]).
+-export([force_fragment_cut/1, force_fragment_cut/2]).
 -export([identity_formatter/1]).
 -export([counter_fields/0, init_counters/0]).
 -export([
@@ -254,27 +256,51 @@ start_link(#{stream := StreamId} = Args) ->
         []
     ).
 
+-doc "Return the formatted status of the replica reader for a stream.".
+-spec status(stream_id()) -> {ok, map()} | {error, term()}.
+status(StreamId) ->
+    case call(StreamId, status) of
+        {error, _} = Err -> Err;
+        Result -> {ok, Result}
+    end.
+
+-doc "Return the formatted status by vhost and queue name.".
+-spec status(rabbit_types:vhost(), binary()) -> {ok, map()} | {error, term()}.
+status(VHost, QueueName) ->
+    case call(VHost, QueueName, status) of
+        {error, _} = Err -> Err;
+        Result -> {ok, Result}
+    end.
+
 -doc "Trigger local retention evaluation for a stream on the current node.".
 -spec evaluate_local_retention(stream_id()) -> ok | {error, term()}.
 evaluate_local_retention(StreamId) ->
-    case rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}) of
-        undefined ->
-            {error, {not_found, StreamId}};
-        Pid ->
-            gen_server:call(Pid, evaluate_local_retention)
-    end.
+    call(StreamId, evaluate_local_retention).
 
 -doc "Trigger local retention evaluation by vhost and queue name.".
 -spec evaluate_local_retention(rabbit_types:vhost(), binary()) -> ok | {error, term()}.
 evaluate_local_retention(VHost, QueueName) ->
-    QName = rabbit_misc:r(VHost, queue, QueueName),
-    case rabbit_amqqueue:lookup(QName) of
-        {ok, Q} ->
-            #{name := StreamId} = amqqueue:get_type_state(Q),
-            evaluate_local_retention(iolist_to_binary(StreamId));
-        {error, not_found} ->
-            {error, {not_found, QueueName}}
-    end.
+    call(VHost, QueueName, evaluate_local_retention).
+
+-doc "Trigger remote retention evaluation for a stream on the current node.".
+-spec evaluate_remote_retention(stream_id()) -> ok | {error, term()}.
+evaluate_remote_retention(StreamId) ->
+    call(StreamId, evaluate_remote_retention).
+
+-doc "Trigger remote retention evaluation by vhost and queue name.".
+-spec evaluate_remote_retention(rabbit_types:vhost(), binary()) -> ok | {error, term()}.
+evaluate_remote_retention(VHost, QueueName) ->
+    call(VHost, QueueName, evaluate_remote_retention).
+
+-doc "Force the current in-progress fragment to cut and upload immediately.".
+-spec force_fragment_cut(stream_id()) -> ok | {error, term()}.
+force_fragment_cut(StreamId) ->
+    call(StreamId, force_fragment_cut).
+
+-doc "Force fragment cut by vhost and queue name.".
+-spec force_fragment_cut(rabbit_types:vhost(), binary()) -> ok | {error, term()}.
+force_fragment_cut(VHost, QueueName) ->
+    call(VHost, QueueName, force_fragment_cut).
 
 init(
     #{
@@ -321,10 +347,46 @@ init(
 handle_call({await_offset, Offset}, From, #state{core = Core0} = State) ->
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:await_offset(Offset, From, Core0),
     {noreply, execute_effects(Effects, State#state{core = Core})};
+handle_call(status, _From, State) ->
+    {reply, format_state(State), State};
 handle_call(evaluate_local_retention, _From, #state{core = Core} = State) ->
     Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(Core),
     maybe_evaluate_retention(Manifest, State),
     {reply, ok, State};
+handle_call(
+    evaluate_remote_retention,
+    _From,
+    #state{core = Core, retention = Retention, cfg = #cfg{stream = StreamId}} = State
+) ->
+    Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(Core),
+    State1 = maybe_evaluate_remote_retention(Manifest, Retention, StreamId, State),
+    {reply, ok, State1};
+handle_call(force_fragment_cut, _From, #state{assembly = undefined} = State) ->
+    {reply, {error, no_assembly}, State};
+handle_call(
+    force_fragment_cut,
+    _From,
+    #state{assembly = Assembly0, core = Core0, cfg = #cfg{fragment_target_size = TargetSize}} =
+        State
+) ->
+    Meta = rabbitmq_stream_s3_fragment_assembly:metadata(Assembly0),
+    case maps:get(num_chunks, Meta) of
+        0 ->
+            {reply, {error, empty_assembly}, State};
+        _ ->
+            IdxRecords = rabbitmq_stream_s3_fragment_assembly:index_records(Assembly0),
+            {Core, _Ref, Effects} =
+                rabbitmq_stream_s3_replica_reader_core:fragment_cut(
+                    Meta#{index_records => IdxRecords}, Core0
+                ),
+            FragmentSize = maps:get(size, Meta),
+            dec(State, ?C_BYTES_IN_ASSEMBLY, FragmentSize),
+            Assembly1 = rabbitmq_stream_s3_fragment_assembly:new(TargetSize),
+            State1 = execute_effects(
+                Effects, State#state{assembly = Assembly1, core = Core}
+            ),
+            {reply, ok, State1}
+    end;
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown}, State}.
 
@@ -588,6 +650,22 @@ format_state(#state{
 %% ------------------------------------------------------------------
 %% Internal
 %% ------------------------------------------------------------------
+
+call(StreamId, Msg) ->
+    case rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}) of
+        undefined -> {error, {not_found, StreamId}};
+        Pid -> gen_server:call(Pid, Msg)
+    end.
+
+call(VHost, QueueName, Msg) ->
+    QName = rabbit_misc:r(VHost, queue, QueueName),
+    case rabbit_amqqueue:lookup(QName) of
+        {ok, Q} ->
+            #{name := StreamId} = amqqueue:get_type_state(Q),
+            call(iolist_to_binary(StreamId), Msg);
+        {error, not_found} ->
+            {error, {not_found, QueueName}}
+    end.
 
 identity_formatter(Evt) -> Evt.
 

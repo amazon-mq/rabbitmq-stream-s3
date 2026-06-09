@@ -426,6 +426,53 @@ A single `rabbitmq_stream_s3_archival_lag_bytes` metric would not give this deco
 
 ## Debugging
 
+### CLI commands
+
+The plugin adds commands to `rabbitmq-streams` for debugging the upload pipeline.
+
+**Stream S3 status** shows the current state of the tiered storage replica reader for a stream: manifest offsets, pipeline state, assembly progress, and whether persist/rebalance/retention operations are in flight.
+
+```bash
+rabbitmq-streams stream_s3_status my-stream --vhost /
+# Status of tiered storage for stream sq in vhost / ...
+# stream:	<<"__sq_1781016420026141262">>
+# fragment_target_size:	67108864
+# log_next_offset:	1421556
+# manifest_first_offset:	0
+# manifest_next_offset:	1317635
+# manifest_total_size:	1339723340
+# persisted_next_offset:	1317635
+# transfers_in_flight:	1
+# transfers_pending_order:	0
+# since_persist:	0
+# persist_in_flight:	false
+# rebalance_in_flight:	false
+# retention_in_flight:	false
+# waiters:	0
+# assembly_payload_size:	38043104
+# assembly_target_size:	67108864
+# assembly_num_chunks:	6661
+# assembly_cut:	false
+```
+
+**Evaluate local retention** triggers the local retention job for a stream. Useful to determine whether retention is correctly reclaiming segments after upload.
+
+```bash
+rabbitmq-streams evaluate_local_retention my-stream --vhost /
+```
+
+**Evaluate remote retention** triggers the remote retention job for a stream. Useful when the retention policy has changed and you want immediate effect, or to verify that remote retention is not stuck.
+
+```bash
+rabbitmq-streams evaluate_remote_retention my-stream --vhost /
+```
+
+**Force fragment cut** forces the current in-progress fragment to cut and upload immediately, regardless of whether it has reached the target size. Useful to verify that the upload pipeline works end-to-end without waiting for data to accumulate.
+
+```bash
+rabbitmq-streams force_fragment_cut my-stream --vhost /
+```
+
 ### Inspect a replica reader
 
 ```erlang
