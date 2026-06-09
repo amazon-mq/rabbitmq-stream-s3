@@ -130,10 +130,11 @@ read_size_prometheus_format() ->
 start(Config) ->
     gen_server:start(?MODULE, Config, []).
 
-%% The gen_server:call timeout must exceed pending_read_deadline_ms so the
+%% The gen_server:call timeout must exceed PENDING_READ_DEADLINE_MS so the
 %% internal deadline always fires first and replies {error, timeout} to the
 %% caller. This avoids overlapping reads (caller times out, new read arrives
 %% while from is still set) which require unsafe buffer resets.
+-define(PENDING_READ_DEADLINE_MS, 18_000).
 -define(SEND_FILE_READ_TIMEOUT_MS, 20_000).
 
 read(Server, Offset, Bytes, Hint) ->
@@ -426,7 +427,9 @@ maybe_stop(State) ->
 build_cfg(Opts) ->
     #cfg{
         request_timeout_ms = maps:get(request_timeout_ms, Opts, 15_000),
-        pending_read_deadline_ms = maps:get(pending_read_deadline_ms, Opts, 18_000)
+        pending_read_deadline_ms = maps:get(
+            pending_read_deadline_ms, Opts, ?PENDING_READ_DEADLINE_MS
+        )
     }.
 
 cancel_all_requests(#state{requests = Requests, cancelled = Cancelled0} = State) ->
