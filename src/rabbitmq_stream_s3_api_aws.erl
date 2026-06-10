@@ -53,12 +53,14 @@ A wrapper around the AWS S3 HTTP API.
 
 -define(C_ACTIVE_REQUESTS, 1).
 -define(C_TOTAL_REQUESTS, 2).
--define(C_RESPONSE_500, 3).
--define(C_RESPONSE_503, 4).
--define(C_REQUEST_TIMEOUTS, 5).
+-define(C_RESPONSE_403, 3).
+-define(C_RESPONSE_500, 4).
+-define(C_RESPONSE_503, 5).
+-define(C_REQUEST_TIMEOUTS, 6).
 -define(COUNTERS, [
     {active_requests, ?C_ACTIVE_REQUESTS, gauge, "Current number of requests to S3"},
     {total_requests, ?C_TOTAL_REQUESTS, counter, "Total number of requests to S3"},
+    {response_403, ?C_RESPONSE_403, counter, "Number of HTTP 403 responses"},
     {response_500, ?C_RESPONSE_500, counter, "Number of HTTP 500 responses"},
     {response_503, ?C_RESPONSE_503, counter, "Number of HTTP 503 responses"},
     {request_timeouts, ?C_REQUEST_TIMEOUTS, counter, "Number of S3 requests that timed out"}
@@ -759,6 +761,8 @@ await_response(Conn, StreamRef, Timeout) ->
             Err
     end.
 
+postprocess_response(#{status := 403}) ->
+    counters:add(counter(), ?C_RESPONSE_403, 1);
 postprocess_response(#{status := 503}) ->
     counters:add(counter(), ?C_RESPONSE_503, 1);
 postprocess_response(#{status := 500}) ->

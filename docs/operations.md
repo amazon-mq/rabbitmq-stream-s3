@@ -256,6 +256,7 @@ Owned by `rabbitmq_stream_s3_api_aws`.
 |-------------------------------------|---------|-------------------------------------------------------------------|
 | `rabbitmq_stream_s3_active_requests`                   | gauge   | Current in-flight S3 requests                                     |
 | `rabbitmq_stream_s3_total_requests`                    | counter | Total S3 API requests (includes internal pagination)              |
+| `rabbitmq_stream_s3_response_403`                      | counter | HTTP 403 responses                                                |
 | `rabbitmq_stream_s3_response_500`                      | counter | HTTP 500 responses                                                |
 | `rabbitmq_stream_s3_response_503`                      | counter | HTTP 503 responses                                                |
 | `rabbitmq_stream_s3_request_timeouts`                  | counter | Request timeouts                                                  |
