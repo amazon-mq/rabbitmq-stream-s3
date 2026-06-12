@@ -35,14 +35,30 @@ rabbitmq_stream_s3_sup (one_for_one)
 │     Per-node transfer pacing. Accepts fragment upload submissions from
 │     replica readers, paces them via a token bucket, spawns tasks, and
 │     reports completions back.
-└── rabbitmq_stream_s3_replica_reader_sup (simple_one_for_one, temporary)
-      └── rabbitmq_stream_s3_replica_reader (per-stream)
-            Owns the full upload lifecycle for one stream: drain committed
-            chunks, assemble fragments, submit to governor, apply completions
-            in order, persist manifest, broadcast edits, evaluate retention.
+└── rabbitmq_stream_s3_replica_reader_sup (simple_one_for_one)
+      Factory. Its dynamic children are per-stream supervisors, started
+      `temporary` so the factory never restarts them.
+      └── rabbitmq_stream_s3_stream_sup (one per stream)
+            Per-stream supervisor. Owns its own restart-intensity budget
+            and auto-shuts-down when its reader exits normally.
+            └── rabbitmq_stream_s3_replica_reader (per-stream worker)
+                  Owns the full upload lifecycle for one stream: drain
+                  committed chunks, assemble fragments, submit to governor,
+                  apply completions in order, persist manifest, broadcast
+                  edits, evaluate retention.
 ```
 
 The supervisor init also performs one-time setup: creates the seshat counter group, initializes the API backend, sets the osiris hooks (`log_hooks` and `log_reader`), registers the Khepri deletion trigger, and creates the process registry ETS table.
+
+### Replica reader fault isolation
+
+Replica readers are supervised in two layers so that one stream's failure stays confined to that stream.
+
+The factory (`rabbitmq_stream_s3_replica_reader_sup`) is a `simple_one_for_one` whose dynamic children are per-stream supervisors (`rabbitmq_stream_s3_stream_sup`), each owning exactly one replica reader. The reason for the extra layer is the restart-intensity budget. A supervisor's `intensity`/`period` is a single counter shared by all of its children; if it is exceeded the supervisor terminates every child. With replica readers as direct children of one supervisor, a single reader that crash-loops on bad state (or several unrelated readers crashing in the same window) could exhaust that shared budget and take down every reader on the node. Giving each stream its own supervisor gives each stream its own budget, so a poison stream parks alone.
+
+The worker is `transient` and `significant`, and the per-stream supervisor sets `auto_shutdown => any_significant`. The replica reader stops with reason `normal` when its osiris writer goes down (the reader monitors the writer; writer DOWN is the normal end of a stream's life on this node, e.g. leadership transfer or stream deletion). `transient` means that normal stop is not restarted; `auto_shutdown` then terminates the now-childless per-stream supervisor, so a departed stream does not leave an idle supervisor behind. A genuine crash is an abnormal exit, which is restarted within the per-stream budget; only after that budget is exhausted does the per-stream supervisor exit (`shutdown`) and the stream park.
+
+Because the per-stream supervisors are `temporary`, the factory never restarts them and never spends its own budget on their termination, whether they park or auto-shut-down. A parked stream has a live writer but no reader; re-attaching it is the job of discovery (on plugin start) or membership reconciliation, not the supervisor.
 
 ## Process registry
 
