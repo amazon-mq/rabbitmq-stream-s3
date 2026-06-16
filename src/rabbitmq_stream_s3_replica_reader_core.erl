@@ -441,8 +441,11 @@ retention_complete(Edit, #state{manifest = Manifest0} = State0) ->
     {State2, PersistEffects}.
 
 -doc """
-A retention evaluation failed (e.g. group download failed). Clear the flag
-so the next persist_complete can re-trigger evaluation.
+A retention evaluation finished without producing an edit: it either failed
+(group download crashed or timed out) or found nothing to remove. Either way,
+clear the in-flight flag so the next persist_complete can re-trigger
+evaluation. Failures are counted by the shell; the core does not distinguish
+them here because both outcomes mean the same thing to the core.
 """.
 -spec retention_failed(term(), state()) -> {state(), [core_effect()]}.
 retention_failed(_Reason, State) ->
