@@ -477,6 +477,16 @@ rabbitmq-streams evaluate_remote_retention my-stream --vhost /
 rabbitmq-streams force_fragment_cut my-stream --vhost /
 ```
 
+**Garbage collection** identifies (and optionally deletes) dangling S3 objects that are not referenced by any manifest. Defaults to `dry_run` mode which reports orphans without deleting them. Pass `--mode delete` to actually remove the objects.
+
+```bash
+rabbitmq-streams stream_s3_gc
+rabbitmq-streams stream_s3_gc --formatter json
+rabbitmq-streams stream_s3_gc --mode delete
+```
+
+See [Garbage collection](#garbage-collection) below for the mechanism and safety guarantees.
+
 ### Inspect a replica reader
 
 ```erlang
@@ -521,6 +531,49 @@ Per-stream metrics live behind `/metrics/per-object`. Scrape this endpoint for d
 ```bash
 curl http://node:15692/metrics/per-object | grep 'queue="my-stream"'
 ```
+
+## Garbage collection
+
+Objects in S3 can become orphaned (not referenced by any manifest) in several scenarios: a deposed writer uploads a fragment but loses the Khepri race, a manifest persist fails or the process crashes before completion, or retention deletes entries from the manifest but the corresponding object deletion does not complete.
+
+The GC mechanism identifies these orphans by listing S3 objects and comparing their keys against current authoritative state. It is invoked on demand via the CLI.
+
+### Safety guarantee: monotonicity
+
+The correctness of GC depends on a single structural property: the values used as barriers (`first_offset`, `epoch`) only ever increase. This makes false positives (deleting a live object) structurally impossible, regardless of timing or consistency:
+
+- `first_offset` advances monotonically as retention removes data from the front of the manifest. An object whose offset is below first_offset was already removed by retention. It can never become live again.
+- `epoch` advances monotonically with each new writer. A manifest root whose epoch is below the current epoch belongs to a deposed writer. The new writer's manifest is authoritative and the old root can never become active again.
+
+Eventually-consistent reads (from Khepri or the manifest replica ETS cache) can only return stale values that are lower than or equal to the true current value. A stale barrier is more conservative: it classifies fewer objects as garbage. The GC may miss orphans on a given run (false negatives) but can never delete live objects (false positives).
+
+### Classifying garbage
+
+| Object type   | Key format                                                  | Condition for "garbage"
+|---            |---                                                          |---
+| Fragment      | `rabbitmq/stream/<id>/data/<offset>.<uid>.fragment`         | offset < manifest first_offset
+| Group         | `rabbitmq/stream/<id>/metadata/<offset>.<uid>.<kind>`       | offset < manifest first_offset
+| Manifest root | `rabbitmq/stream/<id>/metadata/root.<epoch>.<uid>.manifest` | epoch < current epoch according to Khepri
+
+Note that objects belonging to an unknown stream ID are not currently considered garbage. Handling this case is planned.
+
+### Modes
+
+- `dry_run` (default): lists S3 objects, classifies orphans, logs each finding at info level, returns the list. No deletions.
+- `delete`: same as dry_run, but also sends each orphan's key to the reaper for batched deletion as it is discovered.
+
+### Output
+
+With `--formatter json`, the output is a JSON array of objects:
+
+```json
+[
+  {"stream_id": "...", "key": "rabbitmq/stream/.../00000000000000000042.abcd1234.fragment", "reason": "below_first_offset"},
+  {"stream_id": "...", "key": "rabbitmq/stream/.../metadata/root.1.deadbeef.manifest", "reason": "stale_epoch"}
+]
+```
+
+Without `--formatter json`, the output is tab-separated with a summary line.
 
 ## Cost considerations
 

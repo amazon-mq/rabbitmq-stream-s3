@@ -182,4 +182,12 @@ aws s3 ls "s3://${BUCKET}/rabbitmq/stream/${STREAM_ID}/data/" --recursive
 
 **Mitigation.** None needed urgently. Orphans do not affect operation. For unbounded accumulation (typically only after data-directory resets), operators can manually delete S3 prefixes for streams that no longer exist in Khepri.
 
-**Resolution.** A periodic garbage collection mechanism is planned (see `redesign.md` "Orphan cleanup"); it is not yet implemented. The intended design lists stream ID prefixes under the bucket's `rabbitmq/stream/` path on the Khepri leader and removes prefixes with no matching Khepri entry. Orphan storage cost is bounded: typically a few fragments worth of bytes per leadership election.
+**Resolution.** The `rabbitmq_stream_s3_gc` module identifies and optionally deletes orphaned objects. Run it via the CLI:
+
+```bash
+rabbitmq-streams stream_s3_gc
+rabbitmq-streams stream_s3_gc --formatter json
+rabbitmq-streams stream_s3_gc --mode delete
+```
+
+See [operations.md](./operations.md#garbage-collection) for details on the GC mechanism, its safety guarantees, and current scope limitations.
