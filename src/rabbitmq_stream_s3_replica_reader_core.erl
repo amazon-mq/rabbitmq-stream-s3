@@ -226,7 +226,7 @@ transfer_failed(Ref, Reason, #state{cfg = Cfg} = State) ->
 persist_complete(
     Revision,
     #state{
-        cfg = Cfg,
+        cfg = #cfg{persist_interval_ms = PersistInterval} = Cfg,
         persisting_manifest = CommittingManifest,
         in_persist_count = Committed,
         since_persist = N
@@ -268,7 +268,20 @@ persist_complete(
     case State2#state.since_persist > 0 of
         true ->
             {State3, CommitEffects} = maybe_start_persist(State2),
-            {State3, Effects1 ++ CommitEffects};
+            %% If the remainder is below the persist threshold, maybe_start_persist
+            %% produces no start_persist. We emitted cancel_persist_timer above, so
+            %% without re-arming here the remainder would sit unpersisted until the
+            %% next publish: await_offset waiters block, the range table stalls, and
+            %% local retention cannot reclaim those segments. Re-arm so tick/1 flushes
+            %% it. Mirrors the same guard in drain_completions/1.
+            TimerEffects =
+                case CommitEffects of
+                    [] ->
+                        [{start_persist_timer, PersistInterval}];
+                    _ ->
+                        []
+                end,
+            {State3, Effects1 ++ CommitEffects ++ TimerEffects};
         false ->
             {State2, Effects1}
     end.

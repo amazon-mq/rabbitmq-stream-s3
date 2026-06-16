@@ -28,6 +28,7 @@ all() ->
         tick_no_op_before_interval,
         persist_complete_emits_range_broadcast_retention,
         persist_complete_triggers_another_if_pending,
+        persist_complete_rearms_timer_for_subthreshold_remainder,
         persist_failed_conflict_returns_reinitialize,
         persist_failed_transient_retries,
         transfer_failed_retriable_resubmits,
@@ -226,6 +227,28 @@ persist_complete_triggers_another_if_pending(_Config) ->
     {_S5, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_complete(1, S4),
     Commits = [E || {start_persist, _, _, _, _, _} = E <- Effects],
     ?assertMatch([{start_persist, _, _, _, _, _}], Commits).
+
+persist_complete_rearms_timer_for_subthreshold_remainder(_Config) ->
+    %% Regression: when a persist completes leaving a remainder that is
+    %% above zero but below the threshold, persist_complete must re-arm the
+    %% persist timer. Otherwise the cancel_persist_timer it emits leaves the
+    %% remainder unpersisted until the next publish (a quiesce stall).
+    %% Threshold = 3. Apply 3 to start a persist, then 2 more while in flight,
+    %% leaving a remainder of 2 (0 < 2 < 3) when the persist completes.
+    {S0, _} = init_core(#{persist_threshold => 3}),
+    S1 = cut_and_complete(S0, 0, 100, 1001),
+    S2 = cut_and_complete(S1, 100, 200, 1002),
+    S3 = cut_and_complete(S2, 200, 300, 1003),
+    S4 = cut_and_complete(S3, 300, 400, 1004),
+    S5 = cut_and_complete(S4, 400, 500, 1005),
+    {_S6, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_complete(1, S5),
+    %% No new persist should start (remainder is below threshold)...
+    ?assertEqual([], [E || {start_persist, _, _, _, _, _} = E <- Effects]),
+    %% ...but a timer must be re-armed so tick/1 flushes the remainder.
+    ?assertMatch(
+        [{start_persist_timer, _} | _],
+        [E || {start_persist_timer, _} = E <- Effects]
+    ).
 
 persist_failed_conflict_returns_reinitialize(_Config) ->
     {S0, _} = init_core(#{persist_threshold => 1}),
