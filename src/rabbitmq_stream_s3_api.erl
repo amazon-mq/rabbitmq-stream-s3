@@ -60,7 +60,6 @@ file-system operations. Use that in non-unit tests.
     list_continuation/0
 ]).
 
--callback init() -> ok.
 -callback get(key(), request_opts()) -> {ok, binary()} | {error, any()}.
 -callback get_range(key(), range_spec(), request_opts()) ->
     {ok, binary()} | {error, any()}.
@@ -143,7 +142,7 @@ init() ->
         end,
         [read, write]
     ),
-    (backend()):init().
+    ok.
 
 -doc #{equiv => get(Key, #{})}.
 -spec get(key()) -> {ok, binary()} | {error, any()}.

@@ -14,7 +14,6 @@ associated file in that folder.
 -include_lib("kernel/include/file.hrl").
 
 -export([
-    init/0,
     get/2,
     get_range/3,
     get_range_async/3,
@@ -47,11 +46,6 @@ associated file in that folder.
 -behaviour(rabbitmq_stream_s3_api).
 
 -type key() :: rabbitmq_stream_s3_api:key().
-
--spec init() -> ok.
-init() ->
-    ?LOG_INFO(?MODULE_STRING ": initializing"),
-    ok.
 
 -spec get(key(), rabbitmq_stream_s3_api:request_opts()) ->
     {ok, binary()} | {error, any()}.
