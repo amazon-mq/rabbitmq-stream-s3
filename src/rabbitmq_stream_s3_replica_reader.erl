@@ -243,7 +243,10 @@ returned by the functional core module.
     %% S3 DELETE until the manifest persist that records their removal
     %% completes. This eliminates the race where a reader sees a stale
     %% manifest pointing to already-deleted objects (issue #166).
-    deferred_deletions = [] :: [#fragment_ref{} | #group_ref{}]
+    deferred_deletions = [] :: [#fragment_ref{} | #group_ref{}],
+    %% Set when the core asks to shut down (the stream's metadata node was
+    %% deleted). The handler that executed the effect returns {stop, normal}.
+    stopping = false :: boolean()
 }).
 
 -doc "Start a remote replica reader for the given stream.".
@@ -560,10 +563,11 @@ handle_info({persist_result, {error, Reason}}, #state{core = Core0, persist_mon 
     demonitor(Mon, [flush]),
     State1 = on_persist_failed(Reason, State0),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_failed(Reason, Core0),
-    {noreply,
+    maybe_stop(
         execute_effects(Effects, State1#state{
             core = Core, persist_mon = undefined, persist_pid = undefined
-        })};
+        })
+    );
 handle_info(
     {'DOWN', Mon, process, _, Reason},
     #state{persist_mon = Mon, core = Core0, cfg = #cfg{stream = StreamId}} = State0
@@ -937,10 +941,23 @@ execute_effect(reinitialize, #state{cfg = #cfg{stream = StreamId}} = State0) ->
         %% so the objects must remain. The new writer will re-evaluate
         %% retention and delete them after its own persist.
         deferred_deletions = []
-    }).
+    });
+execute_effect(stop, State) ->
+    %% The stream's metadata node was deleted (the queue was removed). Mark the
+    %% reader for shutdown; the handler that ran this effect returns
+    %% {stop, normal} via maybe_stop/1.
+    State#state{stopping = true}.
 
 cancel_timer(undefined) -> ok;
 cancel_timer(Ref) -> erlang:cancel_timer(Ref).
+
+%% Return the gen_server result for a handler, honouring a stop requested by
+%% the core (e.g. on stream deletion). transient restart means a normal stop
+%% is not restarted by the supervisor.
+maybe_stop(#state{stopping = true} = State) ->
+    {stop, normal, State};
+maybe_stop(State) ->
+    {noreply, State}.
 
 %% ------------------------------------------------------------------
 %% Retention

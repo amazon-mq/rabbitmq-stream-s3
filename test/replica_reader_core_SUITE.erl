@@ -30,6 +30,8 @@ all() ->
         persist_complete_triggers_another_if_pending,
         persist_complete_rearms_timer_for_subthreshold_remainder,
         persist_failed_conflict_returns_reinitialize,
+        persist_failed_not_found_nonzero_revision_stops,
+        persist_failed_not_found_zero_revision_reinitializes,
         persist_failed_transient_retries,
         transfer_failed_retriable_resubmits,
         transfer_failed_fatal_retries_no_gap,
@@ -255,6 +257,30 @@ persist_failed_conflict_returns_reinitialize(_Config) ->
     S1 = cut_and_complete(S0, 0, 100, 1001),
     {_S2, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_failed(conflict, S1),
     ?assertMatch([reinitialize], Effects).
+
+persist_failed_not_found_nonzero_revision_stops(_Config) ->
+    %% not_found with a non-zero expected revision means the stream's metadata
+    %% node was deleted out from under an established stream. The reader must
+    %% stop (not retry the orphan-PUT, not reinitialize and risk resurrecting
+    %% the deleted stream). A non-zero last_persisted revision is produced by a
+    %% completed persist, so drive one first.
+    {S0, _} = init_core(#{persist_threshold => 1}),
+    S1 = cut_and_complete(S0, 0, 100, 1001),
+    {S2, _} = rabbitmq_stream_s3_replica_reader_core:persist_complete(7, S1),
+    %% Start a second persist; its expected revision is the persisted 7.
+    S3 = cut_and_complete(S2, 100, 200, 1002),
+    {_S4, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_failed(not_found, S3),
+    ?assertEqual([stop], Effects).
+
+persist_failed_not_found_zero_revision_reinitializes(_Config) ->
+    %% A first-ever persist (expected revision 0) uses create-if-absent and
+    %% cannot legitimately return not_found. If it somehow does, do not stop a
+    %% possibly-live new stream and do not retry forever: reinitialize once.
+    %% Here last_persisted_manifest is the initial empty manifest (revision 0).
+    {S0, _} = init_core(#{persist_threshold => 1}),
+    S1 = cut_and_complete(S0, 0, 100, 1001),
+    {_S2, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_failed(not_found, S1),
+    ?assertEqual([reinitialize], Effects).
 
 persist_failed_transient_retries(_Config) ->
     {S0, _} = init_core(#{persist_threshold => 1}),

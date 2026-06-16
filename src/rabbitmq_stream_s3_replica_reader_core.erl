@@ -95,7 +95,10 @@ testable without mocks or timing.
     | cancel_persist_timer
     | {resubmit_transfer, reference(), stream_id(), directory(), fragment_meta()}
     | {resubmit_transfer_delayed, reference(), stream_id(), directory(), fragment_meta(), term()}
-    | reinitialize.
+    | reinitialize
+    %% Stop the reader: the stream's metadata node was deleted, so there is
+    %% nothing left to persist to.
+    | stop.
 
 %% ------------------------------------------------------------------
 %% API
@@ -290,6 +293,25 @@ persist_complete(
 persist_failed(conflict, State) ->
     %% Khepri conflict. The shell must re-resolve the manifest externally
     %% and re-init the core. We signal this by returning a special effect.
+    {State#state{persist_in_flight = false}, [reinitialize]};
+persist_failed(not_found, #state{last_persisted_manifest = #manifest{revision = Rev}} = State) when
+    Rev > 0
+->
+    %% not_found with a non-zero expected revision means the stream's metadata
+    %% node was deleted out from under this persist (the queue was removed; the
+    %% node is removed by Khepri's keep-while condition). The stream is gone, so
+    %% the reader has nothing left to do: stop. Retrying would re-PUT an orphan
+    %% manifest forever, and reinitializing could resurrect the deleted stream
+    %% (an empty manifest resolves to revision 0, whose create-if-absent put
+    %% would re-create the node). Rev is the ExpectedRevision the failed put
+    %% used: start_persist takes it from last_persisted_manifest.revision, and a
+    %% non-zero value can only come from a prior successful upload.
+    {State#state{persist_in_flight = false}, [stop]};
+persist_failed(not_found, State) ->
+    %% Revision 0 is a first-ever persist, which uses a create-if-absent
+    %% condition and cannot legitimately return not_found. If we somehow reach
+    %% here, do not stop a possibly-live new stream and do not fall through to
+    %% the retry-forever path below: reinitialize once to re-resolve.
     {State#state{persist_in_flight = false}, [reinitialize]};
 persist_failed(_Reason, #state{cfg = Cfg} = State0) ->
     %% S3 or transient error. Retry the persist.
