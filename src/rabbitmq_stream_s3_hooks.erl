@@ -13,6 +13,7 @@ retention is updated.
 -behaviour(osiris_log_hooks).
 
 -include("include/rabbitmq_stream_s3.hrl").
+-include_lib("kernel/include/logger.hrl").
 
 -export([
     on_init/3,
@@ -39,7 +40,7 @@ on_init(writer, Pid, #{name := Name, dir := Dir, shared := Shared, counter := Co
     %% Pass user retention specs (max_bytes, max_age) for remote tier evaluation.
     %% Filter out the {'fun', ...} specs we add — those are for local retention only.
     UserRetention = [S || S <- maps:get(retention, Config, []), element(1, S) =/= 'fun'],
-    {ok, _} = rabbitmq_stream_s3_replica_reader_sup:start_child(
+    StartResult = rabbitmq_stream_s3_replica_reader_sup:start_child(
         RemoteConfig#{
             stream => StreamId,
             writer_pid => Pid,
@@ -51,6 +52,30 @@ on_init(writer, Pid, #{name := Name, dir := Dir, shared := Shared, counter := Co
             retention => UserRetention
         }
     ),
+    case StartResult of
+        {ok, _} ->
+            ok;
+        %% A replica reader may already exist for this stream on this node:
+        %% discover/0 ran first at plugin (re)enable, or a prior incarnation
+        %% has not finished terminating. The reader is registered by
+        %% {StreamId, node()}, not by writer pid, so start_child returns
+        %% {already_started, _} on that race. Tolerate it instead of letting a
+        %% badmatch crash osiris_log:init/2 and take down the writer's log init
+        %% on the discovery/restart race. Mirrors the discovery path in
+        %% attach_writer/1.
+        {error, {already_started, _}} ->
+            ok;
+        %% A genuine failure to start the tiering reader must not crash the
+        %% writer's log init: the stream still functions on local disk. Surface
+        %% it rather than swallowing it. (A genuine start failure still leaves
+        %% the stream un-tiered; surfacing that more loudly is a separate,
+        %% larger change.)
+        {error, Reason} ->
+            ?LOG_WARNING(
+                "Failed to start remote replica reader for stream ~ts: ~p",
+                [StreamId, Reason]
+            )
+    end,
     append_retention(StreamId, Config);
 on_init(acceptor, _Pid, #{name := Name, leader_pid := LeaderPid, counter := Counter} = Config) ->
     StreamId = iolist_to_binary(Name),

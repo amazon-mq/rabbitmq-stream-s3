@@ -76,6 +76,7 @@ groups() ->
             stream_deletion_cleans_remote_tier,
             stream_deletion_during_active_upload,
             discover_attaches_to_existing_writer,
+            on_init_writer_tolerates_already_started,
             remote_retention_deletes_fragments,
             remote_retention_on_update,
             remote_retention_survives_multiple_persist_cycles,
@@ -160,6 +161,33 @@ registry_lifecycle(Config) ->
         rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}),
         1000
     ).
+
+on_init_writer_tolerates_already_started(Config) ->
+    %% Regression. The writer init hook starts the replica reader,
+    %% which is registered by {StreamId, node()} rather than by writer pid. If
+    %% a reader already exists for the stream on this node (discover/0 ran
+    %% first, or a prior incarnation has not terminated), start_child returns
+    %% {error, {already_started, _}}. The hook must tolerate that instead of a
+    %% badmatch crashing osiris_log:init/2.
+    StreamId = ?config(stream_id, Config),
+    Writer = start_writer(Config, #{}),
+    %% The hook already started and registered the reader.
+    ?assertMatch(
+        Pid when is_pid(Pid),
+        rabbitmq_stream_s3_registry:whereis_name({StreamId, node()})
+    ),
+    #{shared := Shared, dir := Dir} = gen_batch_server:call(Writer, get_reader_context),
+    Counter = osiris_counters:fetch({osiris_writer, StreamId}),
+    HookConfig = (?config(writer_cfg, Config))#{
+        shared => Shared,
+        dir => Dir,
+        counter => Counter,
+        remote_config => #{persist_threshold => 1}
+    },
+    %% Re-invoke the writer init hook against the already-running reader.
+    %% Before this fix it exited with {badmatch, {error, {already_started, _}}}.
+    Result = rabbitmq_stream_s3_hooks:on_init(writer, Writer, HookConfig),
+    ?assertMatch(#{retention := _}, Result).
 
 uploads_fragments(Config) ->
     StreamId = ?config(stream_id, Config),
