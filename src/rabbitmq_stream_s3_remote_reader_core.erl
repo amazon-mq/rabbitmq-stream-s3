@@ -438,10 +438,25 @@ next_fragment_offset(#state{iterator = Iterator}) ->
         _ -> end_of_manifest
     end.
 
-goto_next_fragment(#state{stream = StreamId, next = Next0, iterator = Iterator0} = State) ->
+goto_next_fragment(
+    #state{
+        stream = StreamId,
+        next = Next0,
+        iterator = Iterator0,
+        fragment_ref = #fragment_ref{offset = CurrentOffset}
+    } = State
+) ->
     Iterator = advance_iterator(Iterator0),
     case Next0 of
         {#fragment_ref{offset = NextOffset, uid = NextUid} = NextFragRef, Buffer} ->
+            %% Forward navigation must be strictly increasing. A fragment
+            %% iterator that mispositions (for example descending into a group
+            %% at the wrong offset) can hand back an earlier fragment, which
+            %% would deliver out-of-order or duplicate offsets to the consumer
+            %% with no other signal. Assert the invariant here so such a bug is
+            %% a loud crash at the transition rather than silent data corruption
+            %% downstream, and so any future iterator regression fails fast.
+            ?assert(NextOffset > CurrentOffset),
             Key = rabbitmq_stream_s3:fragment_key(StreamId, NextOffset, NextUid),
             State#state{
                 start_pos = ?SEGMENT_HEADER_B,
