@@ -20,6 +20,11 @@ init([]) ->
     rabbitmq_stream_s3_registry:init(),
     rabbitmq_stream_s3_manifest:init(),
     SupFlags = #{strategy => one_for_one, intensity => 3, period => 5},
+    CredentialServer = #{
+        id => rabbitmq_stream_s3_api_aws,
+        type => worker,
+        start => {rabbitmq_stream_s3_api_aws, start_link, []}
+    },
     UploadPool = pool_child(rabbitmq_stream_s3_upload_pool, #{
         name => rabbitmq_stream_s3_upload_pool,
         min_size => rabbitmq_stream_s3_config:upload_pool_min_size(),
@@ -56,6 +61,7 @@ init([]) ->
         start => {rabbitmq_stream_s3_membership_reconciliation, start_link, []}
     },
     Procs = [
+        CredentialServer,
         ManifestCache,
         Reaper,
         MembershipReconciliation,

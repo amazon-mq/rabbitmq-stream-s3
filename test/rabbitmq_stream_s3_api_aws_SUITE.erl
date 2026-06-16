@@ -132,11 +132,27 @@ init_per_testcase(_Testcase, Config) ->
     application:ensure_all_started(gun),
     application:ensure_all_started(seshat),
     _ = seshat:new_group(rabbitmq_stream_s3),
-    ok = rabbitmq_stream_s3_api_aws:init(),
-    Config.
+    %% Establish our own precondition: rabbitmq_stream_s3_api_aws:init/1 only
+    %% starts (returns {ok, _}) when the configured backend is the AWS one,
+    %% otherwise it returns `ignore`. This suite does not use
+    %% rabbitmq_stream_s3_cth, but other suites that do leave the shared CT
+    %% node's app env set to the FS backend (see rabbitmq_stream_s3_cth:
+    %% pre_init_per_suite/3). In a full `make ct` run that leaked value would
+    %% make start_link/0 return `ignore`. Set the backend explicitly so the
+    %% suite is self-contained regardless of run order.
+    ok = application:set_env(
+        rabbitmq_stream_s3, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_aws
+    ),
+    {ok, Pid} = rabbitmq_stream_s3_api_aws:start_link(),
+    [{api_aws_pid, Pid} | Config].
 
 end_per_testcase(_Testcase, Config) ->
-    catch ets:delete(rabbitmq_stream_s3_api_aws),
+    case proplists:get_value(api_aws_pid, Config) of
+        Pid when is_pid(Pid) ->
+            gen_server:stop(Pid);
+        _ ->
+            ok
+    end,
     Config.
 
 %%----------------------------------------------------------------------------
@@ -246,8 +262,12 @@ container_credentials(_Config) ->
     URI = "http://127.0.0.1:" ++ integer_to_list(Port),
     true = os:putenv("AWS_CONTAINER_CREDENTIALS_FULL_URI", URI),
     try
-        %% Remove any cached credentials so get_credentials/0 fetches fresh ones.
-        ets:delete(rabbitmq_stream_s3_api_aws, credentials),
+        %% The credential server selects its source (static/imds/container) when
+        %% it reads config, not per get_credentials/0 call. It was started in
+        %% init_per_testcase before this env var was set, so reload_config/0 is
+        %% needed to pick up the container credentials source. (The ETS table is
+        %% protected and owned by the server, so the test cannot poke it directly.)
+        ok = rabbitmq_stream_s3_api_aws:reload_config(),
         {ok, <<"AKIAIOSFODNN7EXAMPLE">>, <<"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY">>,
             <<"test-session-token">>} = rabbitmq_stream_s3_api_aws:get_credentials()
     after

@@ -14,7 +14,7 @@ A wrapper around the AWS S3 HTTP API.
 
 %% API:
 -export([
-    init/0,
+    start_link/0,
     reload_config/0,
     get/2,
     get_range/3,
@@ -31,10 +31,13 @@ A wrapper around the AWS S3 HTTP API.
 ]).
 
 %% For apply/3:
--export([get_credentials/0, get_credentials/2]).
+-export([get_credentials/0]).
 
 %% For the pool. Not to be called by anyone else.
 -export([hostname/0]).
+
+%% gen_server callbacks
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, format_status/1]).
 
 -define(ALGORITHM, "AWS4-HMAC-SHA256").
 -define(ISOFORMAT_BASIC, "~4.10.0b~2.10.0b~2.10.0bT~2.10.0b~2.10.0b~2.10.0bZ").
@@ -69,7 +72,14 @@ A wrapper around the AWS S3 HTTP API.
 
 -record(container_creds_req, {host, port, path, conn, stream_ref}).
 
+-behaviour(gen_server).
 -behaviour(rabbitmq_stream_s3_api).
+
+-record(state, {
+    metadata_token :: {Token :: binary(), Expiration :: non_neg_integer()} | undefined,
+    refresh_timer :: reference() | undefined,
+    source :: static | imds | {container, string()} | undefined
+}).
 
 -type key() :: rabbitmq_stream_s3:key().
 -type request_opts() ::
@@ -116,39 +126,141 @@ Called "HTTP Verb" in S3 docs. "GET", "PUT", "HEAD", "POST", "DELETE", etc..
 %% Re-use the gun stream ref since it's already a reference.
 -type async_req() :: gun:stream_ref().
 
--spec init() -> ok.
-init() ->
-    Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?COUNTERS, #{module => ?MODULE}),
-    persistent_term:put(?COUNTER_KEY, Cnt),
-    _ = ets:new(?TABLE, [public, named_table]),
-    reload_config().
+-spec start_link() -> gen_server:start_ret().
+start_link() ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+
+init([]) ->
+    case rabbitmq_stream_s3_api:backend() of
+        rabbitmq_stream_s3_api_aws ->
+            Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?COUNTERS, #{module => ?MODULE}),
+            persistent_term:put(?COUNTER_KEY, Cnt),
+            _ = ets:new(?TABLE, [protected, named_table, {read_concurrency, true}]),
+            State = do_reload_config(#state{metadata_token = undefined, refresh_timer = undefined}),
+            {ok, State};
+        _ ->
+            ignore
+    end.
 
 -spec reload_config() -> ok.
 reload_config() ->
+    gen_server:call(?MODULE, reload_config).
+
+%% -------------------------------------------------------------------------
+%% gen_server callbacks
+%% -------------------------------------------------------------------------
+
+handle_call(reload_config, _From, State0) ->
+    State = do_reload_config(State0),
+    {reply, ok, State};
+handle_call(refresh_credentials, _From, State0) ->
+    %% Re-check ETS to collapse concurrent callers (thundering herd).
+    case get_credentials_cached() of
+        {ok, _, _, _} = Ok ->
+            {reply, Ok, State0};
+        error ->
+            {Reply, State} = do_refresh_credentials(State0),
+            {reply, Reply, State}
+    end;
+handle_call(refresh_region, _From, State0) ->
+    %% Re-check persistent_term to collapse concurrent callers.
+    case persistent_term:get(?REGION_KEY, undefined) of
+        undefined ->
+            {Result, State} = request_region_from_instance_metadata(State0),
+            {reply, Result, State};
+        Region ->
+            {reply, {ok, Region}, State0}
+    end.
+
+handle_cast(_Msg, State) ->
+    {noreply, State}.
+
+handle_info(refresh_credentials, State0) ->
+    {_Result, State} = do_refresh_credentials(State0),
+    {noreply, State};
+handle_info(_Msg, State) ->
+    {noreply, State}.
+
+terminate(_Reason, _State) ->
+    ok.
+
+format_status(#{state := #state{source = Source, refresh_timer = TRef}} = Status) ->
+    Status#{state := #{source => Source, refresh_timer => TRef}}.
+
+%% -------------------------------------------------------------------------
+%% Internal: config and credential refresh
+%% -------------------------------------------------------------------------
+
+do_reload_config(State0) ->
     AccessKey0 = rabbitmq_stream_s3_config:aws_access_key(),
     SecretKey0 = rabbitmq_stream_s3_config:aws_secret_key(),
-    case {AccessKey0, SecretKey0} of
-        {undefined, undefined} ->
-            ok;
-        {AccessKey, SecretKey} when is_binary(AccessKey) andalso is_binary(SecretKey) ->
-            _ = ets:insert(?TABLE, {
-                credentials,
-                AccessKey,
-                SecretKey,
-                rabbitmq_stream_s3_config:aws_security_token(),
-                undefined
-            }),
-            ok
-        %% TODO: helpful error message when only one of these keys is set...
-    end,
+    Source =
+        case {AccessKey0, SecretKey0} of
+            {undefined, undefined} ->
+                case os:getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI") of
+                    false -> imds;
+                    URI -> {container, URI}
+                end;
+            {AccessKey, SecretKey} when is_binary(AccessKey) andalso is_binary(SecretKey) ->
+                _ = ets:insert(?TABLE, {
+                    credentials,
+                    AccessKey,
+                    SecretKey,
+                    rabbitmq_stream_s3_config:aws_security_token(),
+                    undefined
+                }),
+                static
+        end,
     case rabbitmq_stream_s3_config:aws_region() of
-        undefined ->
-            ok;
-        Region ->
-            persistent_term:put(?REGION_KEY, Region),
-            ok
+        undefined -> ok;
+        Region -> persistent_term:put(?REGION_KEY, Region)
     end,
-    ok.
+    State0#state{source = Source}.
+
+do_refresh_credentials(#state{source = static} = State) ->
+    {{error, no_credentials}, State};
+do_refresh_credentials(#state{source = imds} = State0) ->
+    ?LOG_INFO(?MODULE_STRING ": refreshing credentials from EC2 instance metadata"),
+    {Msec, {Result, State1}} = timer:tc(
+        fun() -> request_credentials_from_instance_metadata(State0) end, millisecond
+    ),
+    log_credentials_result(Result, Msec, "EC2 instance metadata service"),
+    State = schedule_refresh(Result, State1),
+    {Result, State};
+do_refresh_credentials(#state{source = {container, URI}} = State0) ->
+    ?LOG_INFO(?MODULE_STRING ": refreshing credentials from container credentials endpoint"),
+    {Msec, Result} = timer:tc(
+        fun() -> request_credentials_from_container_endpoint(URI) end, millisecond
+    ),
+    log_credentials_result(Result, Msec, "container credentials endpoint"),
+    State = schedule_refresh(Result, State0),
+    {Result, State}.
+
+log_credentials_result({ok, _, _, _}, Msec, Source) ->
+    ?LOG_INFO("Successfully acquired credentials from ~ts in ~bms", [Source, Msec]);
+log_credentials_result({error, _}, Msec, Source) ->
+    ?LOG_ERROR("Failed to acquire credentials from ~ts in ~bms", [Source, Msec]).
+
+%% Schedule a proactive refresh before credentials expire.
+schedule_refresh({ok, _, _, _}, #state{refresh_timer = OldTimer} = State) ->
+    _ = cancel_timer(OldTimer),
+    RefreshIn =
+        case ets:lookup(?TABLE, credentials) of
+            [{credentials, _, _, _, Expiration}] when is_integer(Expiration) ->
+                Now = calendar:datetime_to_gregorian_seconds(calendar:universal_time()),
+                max((Expiration - Now - 30) * 1000, 5_000);
+            _ ->
+                60_000
+        end,
+    TRef = erlang:send_after(RefreshIn, self(), refresh_credentials),
+    State#state{refresh_timer = TRef};
+schedule_refresh({error, _}, #state{refresh_timer = OldTimer} = State) ->
+    _ = cancel_timer(OldTimer),
+    TRef = erlang:send_after(5_000, self(), refresh_credentials),
+    State#state{refresh_timer = TRef}.
+
+cancel_timer(undefined) -> ok;
+cancel_timer(TRef) -> erlang:cancel_timer(TRef, [{async, true}, {info, false}]).
 
 -doc "Gets the body of an object at key `Key`".
 -spec get(key(), request_opts()) -> {ok, binary()} | {error, any()}.
@@ -230,31 +342,37 @@ stream_put(Key, ContentLength, Opts0) when is_binary(Key) andalso is_map(Opts0) 
     },
     case get_credentials() of
         {ok, AccessKey, SecretKey, SecurityToken} ->
-            Headers = sign_headers(
-                Headers0,
-                AccessKey,
-                SecretKey,
-                SecurityToken,
-                Method,
-                Path,
-                no_body,
-                Opts0#{stream_payload => true}
-            ),
-            Cnt = counter(),
-            counters:add(Cnt, ?C_ACTIVE_REQUESTS, 1),
-            counters:add(Cnt, ?C_TOTAL_REQUESTS, 1),
-            Pool = ?UPLOAD_POOL,
-            Conn = rabbitmq_stream_s3_api_aws_pool:checkout(Pool, 10_000),
-            StreamRef = gun:headers(Conn, Method, Path, Headers),
-            State = #{
-                pool => Pool,
-                conn => Conn,
-                stream_ref => StreamRef,
-                data => [],
-                pending_bytes => 0,
-                timeout => maps:get(timeout, Opts0, 60_000)
-            },
-            {ok, State};
+            case
+                sign_headers(
+                    Headers0,
+                    AccessKey,
+                    SecretKey,
+                    SecurityToken,
+                    Method,
+                    Path,
+                    no_body,
+                    Opts0#{stream_payload => true}
+                )
+            of
+                {ok, Headers} ->
+                    Cnt = counter(),
+                    counters:add(Cnt, ?C_ACTIVE_REQUESTS, 1),
+                    counters:add(Cnt, ?C_TOTAL_REQUESTS, 1),
+                    Pool = ?UPLOAD_POOL,
+                    Conn = rabbitmq_stream_s3_api_aws_pool:checkout(Pool, 10_000),
+                    StreamRef = gun:headers(Conn, Method, Path, Headers),
+                    State = #{
+                        pool => Pool,
+                        conn => Conn,
+                        stream_ref => StreamRef,
+                        data => [],
+                        pending_bytes => 0,
+                        timeout => maps:get(timeout, Opts0, 60_000)
+                    },
+                    {ok, State};
+                {error, _} = Err ->
+                    Err
+            end;
         {error, _} = Err ->
             Err
     end.
@@ -682,23 +800,29 @@ request(Method, Path, Headers0, Body, Opts) when
     %% TODO: pass timeout through get_credentials/0?
     case get_credentials() of
         {ok, AccessKey, SecretKey, SecurityToken} ->
-            Headers = sign_headers(
-                Headers0,
-                AccessKey,
-                SecretKey,
-                SecurityToken,
-                Method,
-                Path,
-                Body,
-                Opts
-            ),
-            Cnt = counter(),
-            counters:add(Cnt, ?C_ACTIVE_REQUESTS, 1),
-            counters:add(Cnt, ?C_TOTAL_REQUESTS, 1),
-            try
-                request0(Method, Path, Headers, Body, Opts)
-            after
-                counters:sub(Cnt, ?C_ACTIVE_REQUESTS, 1)
+            case
+                sign_headers(
+                    Headers0,
+                    AccessKey,
+                    SecretKey,
+                    SecurityToken,
+                    Method,
+                    Path,
+                    Body,
+                    Opts
+                )
+            of
+                {ok, Headers} ->
+                    Cnt = counter(),
+                    counters:add(Cnt, ?C_ACTIVE_REQUESTS, 1),
+                    counters:add(Cnt, ?C_TOTAL_REQUESTS, 1),
+                    try
+                        request0(Method, Path, Headers, Body, Opts)
+                    after
+                        counters:sub(Cnt, ?C_ACTIVE_REQUESTS, 1)
+                    end;
+                {error, _} = Err ->
+                    Err
             end;
         {error, _} = Err ->
             Err
@@ -773,18 +897,24 @@ postprocess_response(_) ->
 request_async(Method, Path, Headers0, Body, Opts) ->
     case get_credentials() of
         {ok, AccessKey, SecretKey, SecurityToken} ->
-            Headers = sign_headers(
-                Headers0,
-                AccessKey,
-                SecretKey,
-                SecurityToken,
-                Method,
-                Path,
-                Body,
-                Opts
-            ),
-            Pool = ?GENERAL_POOL,
-            start_async_request(Pool, Method, Path, Headers, Body, Opts);
+            case
+                sign_headers(
+                    Headers0,
+                    AccessKey,
+                    SecretKey,
+                    SecurityToken,
+                    Method,
+                    Path,
+                    Body,
+                    Opts
+                )
+            of
+                {ok, Headers} ->
+                    Pool = ?GENERAL_POOL,
+                    start_async_request(Pool, Method, Path, Headers, Body, Opts);
+                {error, _} = Err ->
+                    Err
+            end;
         {error, _} = Err ->
             Err
     end.
@@ -810,60 +940,80 @@ maybe_set_timer(#{timeout := Timeout}, StreamRef, State) ->
 maybe_set_timer(_Opts, _StreamRef, State) ->
     State.
 
--spec hostname() -> binary().
+-spec hostname() -> {ok, binary()} | {error, any()}.
 hostname() ->
-    hostname(region()).
+    case region() of
+        {ok, Region} -> {ok, hostname(Region)};
+        {error, _} = Err -> Err
+    end.
 
 -spec hostname(Region :: binary()) -> binary().
 hostname(Region) ->
     <<"s3.", Region/binary, $., (tld(Region))/binary>>.
 
--spec region() -> binary().
+%% Region is required to build the request host and to sign requests, so a
+%% failure here cannot be papered over: callers must surface it. We return a
+%% tagged tuple (rather than the bare binary) so the failure propagates as a
+%% clean {error, _} through hostname/0 and sign_headers/8 instead of crashing
+%% the calling worker with a badarg on binary construction. Once a region is
+%% known (from config or a successful IMDS lookup) it is cached in
+%% persistent_term and never expires, so this only ever fails transiently before
+%% the first successful lookup.
+-spec region() -> {ok, binary()} | {error, any()}.
 region() ->
-    Attempts = rabbitmq_stream_s3_config:get_region_attempts(),
-    region(Attempts).
-
-region(Retries) ->
     case persistent_term:get(?REGION_KEY, undefined) of
         undefined ->
-            get_region_from_instance_metadata(Retries);
+            safe_call(refresh_region, 15_000);
         Region ->
-            Region
+            {ok, Region}
     end.
 
-get_region_from_instance_metadata(0) ->
-    {error, cannot_acquire_region_lock};
-get_region_from_instance_metadata(Retries) ->
-    LockId = {?REGION_KEY, erlang:make_ref()},
-    case global:set_lock(LockId, [node()], 0) of
-        true ->
-            %% If we get the lock with no retries then we are the first to try,
-            %% and we are in charge of the request.
-            try
-                request_region_from_instance_metadata_locked()
-            after
-                global:del_lock(LockId, [node()])
-            end;
-        false ->
-            %% Another process is performing the refresh. Please wait...
-            timer:sleep(100),
-            region(Retries - 1)
+%% gen_server:call/3 exits the *calling* process on timeout, and likewise if the
+%% server is down (noproc) or crashes mid-call. Our callers here are pool workers
+%% and osiris readers/uploaders signing S3 requests; a refresh does blocking IMDS
+%% or container HTTP I/O inside the server, and a slow or unreachable endpoint can
+%% push that past the call timeout. An exit in those callers is a crash, not a
+%% handleable error. Convert any such exit into an {error, _} tuple so the request
+%% path returns cleanly: get/put/request all already handle {error, _} from
+%% get_credentials/0 and region/0. We deliberately do not log here: the refresh
+%% failure is already logged once per attempt inside the server (every ~5s under a
+%% sustained outage), whereas logging per caller could flood under load.
+-spec safe_call(term(), timeout()) -> term().
+safe_call(Request, Timeout) ->
+    try
+        gen_server:call(?MODULE, Request, Timeout)
+    catch
+        exit:{Reason, {gen_server, call, _}} ->
+            {error, {credential_server, Reason}}
     end.
 
-request_region_from_instance_metadata_locked() ->
-    {ok, R} = with_instance_metadata_conn(fun(Conn) ->
-        {ok, #{status := 200, body := Body}} = get_instance_metadata(
-            Conn,
-            <<"GET">>,
-            <<"/latest/meta-data/placement/availability-zone">>,
-            #{<<"x-aws-ec2-metadata-token">> => metadata_token()}
-        ),
-        %% Strip trailing availability zone character, e.g. us-east-2c -> us-east-2
-        Region = binary:part(Body, 0, byte_size(Body) - 1),
-        persistent_term:put(?REGION_KEY, Region),
-        {ok, Region}
-    end),
-    R.
+request_region_from_instance_metadata(State0) ->
+    case ensure_metadata_token(State0) of
+        {error, Reason, State1} ->
+            {{error, Reason}, State1};
+        {ok, Token, State1} ->
+            Result = with_instance_metadata_conn(fun(Conn) ->
+                case
+                    get_instance_metadata(
+                        Conn,
+                        <<"GET">>,
+                        <<"/latest/meta-data/placement/availability-zone">>,
+                        #{<<"x-aws-ec2-metadata-token">> => Token}
+                    )
+                of
+                    {ok, #{status := 200, body := Body}} ->
+                        %% Strip trailing availability zone character, e.g. us-east-2c -> us-east-2
+                        Region = binary:part(Body, 0, byte_size(Body) - 1),
+                        persistent_term:put(?REGION_KEY, Region),
+                        {ok, Region};
+                    {ok, #{status := Status}} ->
+                        {error, {unexpected_status, Status}};
+                    {error, _} = Err ->
+                        Err
+                end
+            end),
+            {Result, State1}
+    end.
 
 -spec tld(Region :: binary()) -> binary().
 tld(Region) ->
@@ -888,38 +1038,8 @@ tld(Region) ->
 get_credentials() ->
     case get_credentials_cached() of
         {ok, _, _, _} = Ok -> Ok;
-        error -> fetch_credentials(os:getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI"))
+        error -> safe_call(refresh_credentials, 15_000)
     end.
-
-fetch_credentials(false) ->
-    ?LOG_INFO(
-        ?MODULE_STRING
-        ": no AWS credentials available, requesting from EC2 instance metadata"
-    ),
-    Attempts = rabbitmq_stream_s3_config:get_credentials_attempts(),
-    {Msec, Result} = timer:tc(?MODULE, get_credentials, [Attempts, imds], millisecond),
-    log_credentials_result(Result, Msec, "EC2 instance metadata service"),
-    Result;
-fetch_credentials(URI) ->
-    ?LOG_INFO(
-        ?MODULE_STRING
-        ": no AWS credentials available, requesting from container credentials endpoint"
-    ),
-    Attempts = rabbitmq_stream_s3_config:get_credentials_attempts(),
-    {Msec, Result} = timer:tc(?MODULE, get_credentials, [Attempts, {container, URI}], millisecond),
-    log_credentials_result(Result, Msec, "container credentials endpoint"),
-    Result.
-
-log_credentials_result({ok, _, _, _}, Msec, Source) ->
-    ?LOG_INFO(
-        "Successfully acquired credentials from ~ts in ~bms",
-        [Source, Msec]
-    );
-log_credentials_result({error, _}, Msec, Source) ->
-    ?LOG_ERROR(
-        "Failed to acquire credentials from ~ts in ~bms",
-        [Source, Msec]
-    ).
 
 get_credentials_cached() ->
     case ets:lookup(?TABLE, credentials) of
@@ -940,80 +1060,56 @@ is_expired(Expiration) when is_integer(Expiration) ->
 is_expired(undefined) ->
     false.
 
-get_credentials(Retries, Source) ->
-    case get_credentials_cached() of
-        {ok, _, _, _} = Ok ->
-            Ok;
-        error ->
-            get_credentials_with_lock(Retries, Source)
-    end.
-
-get_credentials_with_lock(0, _Source) ->
-    {error, cannot_acquire_credential_lock};
-get_credentials_with_lock(Retries, Source) ->
-    %% NOTE: lock ID `global:id()` is a tuple where the second element is the
-    %% requester. We don't want any other process or even code path within the
-    %% current process to attempt to join this lock request, so we use a
-    %% random reference for uniqueness.
-    LockId = {{?MODULE, credentials}, erlang:make_ref()},
-    case global:set_lock(LockId, [node()], 0) of
-        true ->
-            %% If we get the lock with no retries then we are the first to try,
-            %% and we are in charge of the request.
-            try
-                get_credentials_locked(Source)
-            after
-                global:del_lock(LockId, [node()])
-            end;
-        false ->
-            %% Another process is performing the refresh. Please wait...
-            timer:sleep(100),
-            get_credentials(Retries - 1, Source)
-    end.
-
-get_credentials_locked(imds) ->
-    request_credentials_from_instance_metadata_locked();
-get_credentials_locked({container, URI}) ->
-    request_credentials_from_container_endpoint(URI).
-
-request_credentials_from_instance_metadata_locked() ->
+request_credentials_from_instance_metadata(State0) ->
     %% <https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-metadata-security-credentials.html>
-    with_instance_metadata_conn(fun(Conn) ->
-        maybe
-            {ok, RoleResp} ?=
-                get_instance_metadata(
-                    Conn,
-                    <<"GET">>,
-                    <<"/latest/meta-data/iam/security-credentials">>,
-                    #{<<"x-aws-ec2-metadata-token">> => metadata_token()}
-                ),
-            %% TODO: more error handling...
-            #{status := 200, body := Role} = RoleResp,
-            {ok, CredsResp} ?=
-                get_instance_metadata(
-                    Conn,
-                    <<"GET">>,
-                    <<"/latest/meta-data/iam/security-credentials/", Role/binary>>,
-                    #{<<"x-aws-ec2-metadata-token">> => metadata_token()}
-                ),
-            #{status := 200, body := Creds} = CredsResp,
-            #{
-                <<"AccessKeyId">> := AccessKey,
-                <<"SecretAccessKey">> := SecretKey,
-                <<"Token">> := SecurityToken,
-                <<"Expiration">> := ExpirationIso8601
-            } = json:decode(Creds),
-            Expiration = parse_iso8601(ExpirationIso8601),
-            _ = ets:insert(?TABLE, {
-                credentials,
-                AccessKey,
-                SecretKey,
-                SecurityToken,
-                Expiration
-            }),
-            {ok, AccessKey, SecretKey, SecurityToken}
-        end
-    end).
+    case ensure_metadata_token(State0) of
+        {error, Reason, State1} ->
+            {{error, Reason}, State1};
+        {ok, Token, State1} ->
+            Result = with_instance_metadata_conn(fun(Conn) ->
+                maybe
+                    {ok, RoleResp} ?=
+                        get_instance_metadata(
+                            Conn,
+                            <<"GET">>,
+                            <<"/latest/meta-data/iam/security-credentials">>,
+                            #{<<"x-aws-ec2-metadata-token">> => Token}
+                        ),
+                    {ok, Role} ?= expect_200(RoleResp),
+                    {ok, CredsResp} ?=
+                        get_instance_metadata(
+                            Conn,
+                            <<"GET">>,
+                            <<"/latest/meta-data/iam/security-credentials/", Role/binary>>,
+                            #{<<"x-aws-ec2-metadata-token">> => Token}
+                        ),
+                    {ok, Creds} ?= expect_200(CredsResp),
+                    #{
+                        <<"AccessKeyId">> := AccessKey,
+                        <<"SecretAccessKey">> := SecretKey,
+                        <<"Token">> := SecurityToken,
+                        <<"Expiration">> := ExpirationIso8601
+                    } = json:decode(Creds),
+                    Expiration = parse_iso8601(ExpirationIso8601),
+                    _ = ets:insert(?TABLE, {
+                        credentials,
+                        AccessKey,
+                        SecretKey,
+                        SecurityToken,
+                        Expiration
+                    }),
+                    {ok, AccessKey, SecretKey, SecurityToken}
+                end
+            end),
+            {Result, State1}
+    end.
+
+%% IMDS responds with a non-200 status on throttling or transient errors. Return
+%% an error tuple instead of letting a badmatch crash the gen_server: a crash
+%% combined with the supervisor's restart intensity could escalate and take down
+%% the whole tree on a flaky metadata endpoint.
+expect_200(#{status := 200, body := Body}) -> {ok, Body};
+expect_200(#{status := Status}) -> {error, {unexpected_status, Status}}.
 
 request_credentials_from_container_endpoint(URI) ->
     %% <https://docs.aws.amazon.com/sdkref/latest/guide/feature-container-credentials.html>
@@ -1124,44 +1220,60 @@ get_instance_metadata(Conn, Method, Path, Headers) ->
             Err
     end.
 
--spec metadata_token() -> binary().
-metadata_token() ->
-    case ets:lookup(?TABLE, metadata_token) of
-        [{metadata_token, Token, Expiration}] ->
-            case is_expired(Expiration) of
-                true ->
-                    get_metadata_token();
-                false ->
-                    Token
-            end;
-        [] ->
-            get_metadata_token()
+%% Returns a valid IMDS session token and the (possibly updated) state. Runs in
+%% the gen_server process, so the token cached in State is the single source of
+%% truth. A fresh token is fetched only when the cached one is missing or within
+%% ?TTL_SECONDS_BUFFER of expiry. Threading the token back through State is what
+%% makes the cache work: a previous version discarded the fetched token, so every
+%% IMDS request paid for a fresh token fetch.
+-spec ensure_metadata_token(#state{}) ->
+    {ok, binary(), #state{}} | {error, any(), #state{}}.
+ensure_metadata_token(#state{metadata_token = {Token, Expiration}} = State) ->
+    case is_expired(Expiration) of
+        false -> {ok, Token, State};
+        true -> fetch_and_cache_metadata_token(State)
+    end;
+ensure_metadata_token(#state{metadata_token = undefined} = State) ->
+    fetch_and_cache_metadata_token(State).
+
+fetch_and_cache_metadata_token(State) ->
+    case fetch_metadata_token() of
+        {ok, {Token, Expiration}} ->
+            {ok, Token, State#state{metadata_token = {Token, Expiration}}};
+        {error, Reason} ->
+            {error, Reason, State}
     end.
 
-get_metadata_token() ->
-    {ok, T} = with_instance_metadata_conn(fun(Conn) ->
-        {ok, #{status := 200, body := Token}} = get_instance_metadata(
-            Conn,
-            <<"PUT">>,
-            <<"/latest/api/token">>,
-            #{
-                <<"x-aws-ec2-metadata-token-ttl-seconds">> => integer_to_binary(
-                    ?METADATA_TOKEN_TTL_SECONDS
-                )
-            }
-        ),
-        Expiration =
-            calendar:datetime_to_gregorian_seconds(calendar:universal_time()) +
-                ?METADATA_TOKEN_TTL_SECONDS,
-        _ = ets:insert(?TABLE, {metadata_token, Token, Expiration}),
-        {ok, Token}
-    end),
-    T.
+-spec fetch_metadata_token() ->
+    {ok, {binary(), non_neg_integer()}} | {error, any()}.
+fetch_metadata_token() ->
+    with_instance_metadata_conn(fun(Conn) ->
+        case
+            get_instance_metadata(
+                Conn,
+                <<"PUT">>,
+                <<"/latest/api/token">>,
+                #{
+                    <<"x-aws-ec2-metadata-token-ttl-seconds">> => integer_to_binary(
+                        ?METADATA_TOKEN_TTL_SECONDS
+                    )
+                }
+            )
+        of
+            {ok, #{status := 200, body := Token}} ->
+                Expiration =
+                    calendar:datetime_to_gregorian_seconds(calendar:universal_time()) +
+                        ?METADATA_TOKEN_TTL_SECONDS,
+                {ok, {Token, Expiration}};
+            {ok, #{status := Status}} ->
+                {error, {unexpected_status, Status}};
+            {error, _} = Err ->
+                Err
+        end
+    end).
 
 with_instance_metadata_conn(Fun) when is_function(Fun, 1) ->
-    %% TODO: determine what we should be logging at info level here.
     ?LOG_DEBUG(?MODULE_STRING ": connecting to EC2 instance metadata service"),
-    % <https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instancedata-data-retrieval.html>
     Host =
         case proplists:get_value(inet6, inet:get_rc(), false) of
             true -> "fd00:ec2::254";
@@ -1185,22 +1297,27 @@ with_instance_metadata_conn(Fun) when is_function(Fun, 1) ->
     end.
 
 sign_headers(Headers, AccessKey, SecretKey, SecurityToken, Method, Path, Body, Opts) ->
-    Bucket = rabbitmq_stream_s3_config:bucket(),
-    Region = region(),
-    Host = <<Bucket/binary, $., (hostname(Region))/binary>>,
-    sign_headers(
-        calendar:universal_time(),
-        Host,
-        region(),
-        Headers,
-        AccessKey,
-        SecretKey,
-        SecurityToken,
-        Method,
-        Path,
-        Body,
-        Opts
-    ).
+    case region() of
+        {ok, Region} ->
+            Bucket = rabbitmq_stream_s3_config:bucket(),
+            Host = <<Bucket/binary, $., (hostname(Region))/binary>>,
+            {ok,
+                sign_headers(
+                    calendar:universal_time(),
+                    Host,
+                    Region,
+                    Headers,
+                    AccessKey,
+                    SecretKey,
+                    SecurityToken,
+                    Method,
+                    Path,
+                    Body,
+                    Opts
+                )};
+        {error, _} = Err ->
+            Err
+    end.
 
 sign_headers(
     {{Y, M, D}, {HH, MM, SS}} = _UniversalTimestamp,

@@ -376,32 +376,39 @@ Opens a connection to S3 in the configured region.
 -spec open() -> {ok, pid()} | {error, any()}.
 open() ->
     %% NOTE: unfortunately, `inet:hostname()` is a string not a binary.
-    Host = binary_to_list(rabbitmq_stream_s3_api_aws:hostname()),
-    Opts = #{
-        transport => tls,
-        %% AWS S3 only supports HTTP/1.1.
-        protocols => [http],
-        tls_opts => [
-            {verify, verify_peer},
-            {cacerts, public_key:cacerts_get()},
-            {customize_hostname_check, [
-                {match_fun, public_key:pkix_verify_hostname_match_fun(https)}
-            ]},
-            %% Connections are mostly data pipes for large refc binaries.
-            %% Full sweeps are nearly free since the process's heap doesn't
-            %% contain much, and the immediate cleanup of dead refc binary
-            %% references lets the binary allocator free promptly rather than
-            %% holding until the nth minor GC triggers a full sweep.
-            {receiver_spawn_opts, [{fullsweep_after, 0}]},
-            {sender_spawn_opts, [{fullsweep_after, 0}]}
-        ],
-        %% Let connections which were closed from idleness (or errors) close
-        %% and be reopened lazily. With TLSv1.3 it only costs one round trip.
-        %% This pool optimizes for best resource use rather than consistently
-        %% low latency. (A fully idle broker should have a min-sized pool.)
-        retry => 0
-    },
-    gun:open(Host, 443, Opts).
+    case rabbitmq_stream_s3_api_aws:hostname() of
+        {ok, HostBin} ->
+            Host = binary_to_list(HostBin),
+            Opts = #{
+                transport => tls,
+                %% AWS S3 only supports HTTP/1.1.
+                protocols => [http],
+                tls_opts => [
+                    {verify, verify_peer},
+                    {cacerts, public_key:cacerts_get()},
+                    {customize_hostname_check, [
+                        {match_fun, public_key:pkix_verify_hostname_match_fun(https)}
+                    ]},
+                    %% Connections are mostly data pipes for large refc binaries.
+                    %% Full sweeps are nearly free since the process's heap doesn't
+                    %% contain much, and the immediate cleanup of dead refc binary
+                    %% references lets the binary allocator free promptly rather than
+                    %% holding until the nth minor GC triggers a full sweep.
+                    {receiver_spawn_opts, [{fullsweep_after, 0}]},
+                    {sender_spawn_opts, [{fullsweep_after, 0}]}
+                ],
+                %% Let connections which were closed from idleness (or errors) close
+                %% and be reopened lazily. With TLSv1.3 it only costs one round trip.
+                %% This pool optimizes for best resource use rather than consistently
+                %% low latency. (A fully idle broker should have a min-sized pool.)
+                retry => 0
+            },
+            gun:open(Host, 443, Opts);
+        {error, _} = Err ->
+            %% Region is not yet known (e.g. IMDS lookup not yet successful).
+            %% Surface a clean error rather than crashing the pool.
+            Err
+    end.
 
 take_available(
     Pid,

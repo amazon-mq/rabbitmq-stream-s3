@@ -17,8 +17,6 @@ lives here. Callers use these functions instead of calling
     aws_security_token/0,
     aws_region/0,
     aws_region_endpoints/0,
-    get_region_attempts/0,
-    get_credentials_attempts/0,
     bucket/0,
     api_fs_data_dir/0,
     upload_pool_min_size/0,
@@ -83,14 +81,6 @@ aws_region() ->
 -spec aws_region_endpoints() -> #{binary() => binary()}.
 aws_region_endpoints() ->
     application:get_env(?APP, aws_region_endpoints, #{}).
-
--spec get_region_attempts() -> pos_integer().
-get_region_attempts() ->
-    application:get_env(?APP, get_region_attempts, 10).
-
--spec get_credentials_attempts() -> pos_integer().
-get_credentials_attempts() ->
-    application:get_env(?APP, get_credentials_attempts, 10).
 
 %% Required. Crashes with badmatch if not configured.
 -spec bucket() -> binary().
@@ -205,8 +195,6 @@ defaults_test_() ->
         ?_assertEqual(undefined, aws_security_token()),
         ?_assertEqual(undefined, aws_region()),
         ?_assertEqual(#{}, aws_region_endpoints()),
-        ?_assertEqual(10, get_region_attempts()),
-        ?_assertEqual(10, get_credentials_attempts()),
         ?_assertEqual(undefined, api_fs_data_dir()),
         ?_assertEqual(0, upload_pool_min_size()),
         ?_assertEqual(20, upload_pool_max_size()),
