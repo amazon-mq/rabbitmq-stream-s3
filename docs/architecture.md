@@ -213,7 +213,17 @@ The plugin manages two retention domains.
 
 The `{'fun', ...}` retention spec deletes local segments whose data has been fully uploaded to S3. This is what makes local disk a sliding window over the full stream. It runs on both writer and replica nodes, triggered when the manifest's `next_offset` advances.
 
-The user's configured retention (max-bytes, max-age) runs independently alongside the plugin's spec. If user retention deletes segments the plugin has not uploaded, the remote tier has a gap. The replica reader accepts the gap and jumps forward.
+The user's configured retention (max-bytes, max-age) runs independently alongside the plugin's spec. If user retention deletes segments the plugin has not uploaded, the remote tier has a gap. The replica reader accepts the gap and jumps forward, as described next.
+
+### Durability versus the local retention bound
+
+The user's retention bound (`max-length-bytes`, `max-age`) is a hard limit on local resources. Tiering to S3 is asynchronous and best-effort, and the plugin never extends local retention to wait for an upload to become durable. The bound always wins. This is a deliberate prioritisation: if an S3 outage could pin segments locally until they were durable, the local log would grow without bound for the duration of the outage, defeating the very limit the user set and risking a full disk, which turns an object-store availability problem into a broker availability problem. A bounded loss of the un-uploaded tail is preferable to an unbounded local resource leak. This is also continuous with the no-tiering contract, where data simply ages out at the bound: tiering extends effective retention cheaply, it does not promise durability in S3 regardless of upload progress.
+
+The consequence is a durability window. A record reaches S3 only if its fragment is uploaded before local retention trims the segment backing it. The safety margin is the size of the local retention window against upload throughput. If the object store is unavailable, or uploads simply cannot keep up with ingress, for longer than the local window can buffer, the un-uploaded tail is lost from both tiers. An operator who needs to survive an outage of a given length must size the local window to cover it at the expected ingress rate.
+
+When user retention trims past the manifest's `next_offset`, the segment backing the next fragment to upload is gone from both tiers, so no upload retry can ever make that offset durable. The replica reader recovers by discarding the remote manifest and resuming from the local log's first offset, accepting the lost range, rather than stalling on the missing segment forever. This recovery runs when the data reader is opened (at reader init, and after a re-resolution) and on the upload path when a fragment's source segment has been trimmed mid-stream (issue #225). It is observable through the `local_log_ahead_recoveries` counter and a warning naming the discarded range. Because the manifest must stay contiguous, the recovery also discards the small durable prefix below the trimmed range; keeping it would require a manifest with a hole, which the read path and the Coverage invariant forbid. The manifest mutation this performs is the `reset` operation and its safety is stated as the Reset safety invariant in [invariants.md](./invariants.md).
+
+Two alternatives were considered and rejected. Holding segments past the bound until they are durable reintroduces the unbounded local growth the bound exists to prevent. Applying back-pressure to producers when uploads fall behind couples producer availability to object-store availability, which for a streaming workload is usually worse than a bounded gap.
 
 ### Remote retention
 

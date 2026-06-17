@@ -13,7 +13,9 @@ A manifest `M` describes the remote tier:
 - A fragment `x` carries an offset interval `I(x) = [lo(x), hi(x))`, a byte size `size(x) ≥ 0`, and a timestamp span `[t₀(x), t₁(x)]`. A group's interval is the union of its descendants'.
 - `Frag(M) ⊆ Obj(M)` is the set of fragments, and `Cov(M) = ⋃_{x ∈ Frag(M)} I(x)` is the covered offset set.
 
-States evolve as `M₀, M₁, …` under four operations: append (upload), rebalance, retention, and replication. Unsubscripted symbols denote the current state.
+States evolve as `M₀, M₁, …` under five operations: append (upload), rebalance, retention, replication, and reset (local-log-ahead recovery, see [Recovery](#recovery)). Unsubscripted symbols denote the current state.
+
+`f_local` denotes the first offset of the local log, the floor below which the local log has been trimmed. The local segments cover `[f_local, T)`.
 
 ## Durability
 
@@ -56,6 +58,14 @@ Retention is the only operation that removes data, and it removes only a prefix.
 | Invariant | Statement | Where |
 |---|---|---|
 | Replica prefix | A replica's applied edits are always a prefix `(ε₁, …, ε_j)` of the writer's edit sequence, and its manifest equals `fold(apply, M₀, (ε₁, …, ε_j))`. A sequence gap forces a re-sync rather than an out-of-order apply. Modeled in [`tla/manifest-replication/`](../tla/manifest-replication/). | [manifest.md](./manifest.md) (Manifest edit replication) |
+
+## Recovery
+
+Append, rebalance, and retention keep the remote tier a contiguous extension below the local log. None of them handles the local log being trimmed past the tier: when user retention deletes segments faster than they upload, the local floor `f_local` rises above the seam `n`, and the offsets `[n, f_local)` are durable in neither tier and can never be uploaded. The reset operation recovers from this. The local retention bound is authoritative and is never extended to wait for upload, so reset accepts the loss rather than stalling (see [architecture.md](./architecture.md), Durability versus the local retention bound).
+
+| Invariant | Statement | Where |
+|---|---|---|
+| Reset safety | When `f_local > n`, the writer discards `M` and installs the empty manifest at the floor: `f := n := f_local` and `Frag := ∅`. Coverage and Durability hold vacuously, since `Cov = ∅ = [f, n)`; the step advances `n` over `[n, f_local)` only while emptying coverage, so it never claims durability it lacks. This is the inverse of the #206 hole, which advanced `n` while claiming coverage. `f` and `n` are non-decreasing, and the seam is restored at `f_local`, so Tier overlap holds again with the remote tier empty and the local segments covering `[f_local, T)`. The discarded range `[f, f_local)` is lost by design: it is the un-uploaded tail together with the now-disconnected durable prefix, which cannot be kept without a hole in `M`. | [architecture.md](./architecture.md) (Durability versus the local retention bound) |
 
 ## Read path
 
