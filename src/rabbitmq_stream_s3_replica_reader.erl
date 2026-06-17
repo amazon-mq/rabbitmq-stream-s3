@@ -835,7 +835,7 @@ execute_effect(
     {resubmit_transfer_delayed, Ref, _StreamId, Dir, Meta, Reason}, #state{cfg = Cfg} = State0
 ) ->
     StreamId = Cfg#cfg.stream,
-    Delay = application:get_env(rabbitmq_stream_s3, upload_retry_delay_ms, 1000),
+    Delay = rabbitmq_stream_s3_config:upload_retry_delay_ms(),
     ?LOG_WARNING(
         "~ts fragment upload at offset ~b failed with non-transient error ~p; "
         "retrying in ~bms. The upload pipeline and local-tier cleanup are "
