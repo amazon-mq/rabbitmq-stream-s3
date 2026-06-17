@@ -50,7 +50,11 @@ all() ->
         %% pool_busy backoff (separate from the network-error backoff)
         pool_busy_backoff_capped_at_500,
         pool_busy_delay_resets_on_data,
-        pool_busy_backoff_independent_of_network_errors
+        pool_busy_backoff_independent_of_network_errors,
+        %% Transient group fetch errors must retry, not become local (F3)
+        group_fetch_failure_retries_not_become_local,
+        group_fetch_failure_on_refreshed_iterator_retries,
+        group_fetch_failure_backs_off_and_retries
     ].
 
 init_per_suite(Config) ->
@@ -99,6 +103,35 @@ build_manifest(Entries) ->
         next_offset = element(1, lists:last(Entries)) + 100,
         entries = EntriesBin
     }.
+
+%% Build an iterator whose manifest is the given fragment entries followed by a
+%% group entry, and whose group fetch fails transiently. After init advances
+%% past the first fragment the iterator points at the group, so the next call to
+%% `next/1` descends into it and returns `{error, {group_fetch_failed, _}}`.
+mock_iterator_failing_group(FragEntries, {GroupOffset, _, GroupUid}) ->
+    FragBin = lists:foldl(
+        fun({Offset, Size, Uid}, Acc) ->
+            E = ?ENTRY(Offset, 0, 0, ?MANIFEST_KIND_FRAGMENT, Size, Uid),
+            <<Acc/binary, E/binary>>
+        end,
+        <<>>,
+        FragEntries
+    ),
+    GroupEntry = ?ENTRY(GroupOffset, 0, 0, ?MANIFEST_KIND_GROUP, 0, GroupUid),
+    FirstOffset = element(1, hd(FragEntries)),
+    Manifest = #manifest{
+        first_offset = FirstOffset,
+        next_offset = GroupOffset + 100,
+        entries = <<FragBin/binary, GroupEntry/binary>>
+    },
+    %% A transient S3 error (not `not_found`, which would mean the group was
+    %% deleted by retention and is skipped).
+    GetGroupFun = fun(_) -> {error, slow_down} end,
+    Iterator0 = rabbitmq_stream_s3_fragment_iterator:init(Manifest, FirstOffset, GetGroupFun),
+    case rabbitmq_stream_s3_fragment_iterator:next(Iterator0) of
+        {ok, _, It} -> It;
+        _ -> Iterator0
+    end.
 
 frag_ref(Offset, Size, Uid) ->
     #fragment_ref{offset = Offset, uid = Uid, size = Size}.
@@ -804,3 +837,59 @@ pool_busy_backoff_independent_of_network_errors(_Config) ->
         S3, {request_error, make_ref(), 0, slow_down}
     ),
     ok.
+
+group_fetch_failure_retries_not_become_local(_Config) ->
+    %% Advancing past the current fragment, the next entry is a group object
+    %% whose fetch fails transiently. The core must retry (set_timer), not route
+    %% the consumer to the local tier: the group is part of the remote tier
+    %% being read, so becoming local could serve missing or wrong data (F3,
+    %% Tier overlap).
+    FragRef = frag_ref(0, 100, 42),
+    Iterator = mock_iterator_failing_group([{0, 100, 42}], {100, 0, 99}),
+    {S0, _} = init(stream_id(), FragRef, 64, Iterator),
+    %% Fill the current fragment buffer.
+    Data = binary:copy(<<0>>, 100),
+    {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {data, make_ref(), 0, Data, done}),
+    %% Read past the end → fragment transition → group fetch fails.
+    {_S2, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
+        S1, {read, 164, 50, chunk_boundary}
+    ),
+    ?assertMatch([{set_timer, _}], Effects),
+    ?assertEqual([], [E || {reply, {become_local, _}} = E <- Effects]).
+
+group_fetch_failure_on_refreshed_iterator_retries(_Config) ->
+    %% After a refresh, advancing the refreshed iterator hits a transient group
+    %% fetch error. Retry rather than becoming local. Without the fix the
+    %% `{iterator_refreshed, _}` handler collapsed any non-{ok} result to
+    %% become_local.
+    FragRef = frag_ref(0, 100, 42),
+    Iterator = mock_iterator([{0, 100, 42}]),
+    {S0, _} = init(stream_id(), FragRef, 64, Iterator),
+    %% A read is pending (the situation in which a refresh is requested).
+    {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {read, 64, 50, chunk_boundary}),
+    %% The shell feeds back a refreshed iterator whose group fetch fails.
+    Refreshed = mock_iterator_failing_group([{0, 100, 42}], {100, 0, 99}),
+    {_S2, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
+        S1, {iterator_refreshed, Refreshed}
+    ),
+    ?assertMatch([{set_timer, _}], Effects),
+    ?assertEqual([], [E || {reply, {become_local, _}} = E <- Effects]).
+
+group_fetch_failure_backs_off_and_retries(_Config) ->
+    %% A persistently-failing group fetch backs off exponentially and keeps
+    %% re-attempting the fetch (the retry re-enters the transition and calls the
+    %% iterator again), rather than giving up to local. The read deadline, not a
+    %% local fallback, bounds the loop.
+    FragRef = frag_ref(0, 100, 42),
+    Iterator = mock_iterator_failing_group([{0, 100, 42}], {100, 0, 99}),
+    {S0, _} = init(stream_id(), FragRef, 64, Iterator),
+    Data = binary:copy(<<0>>, 100),
+    {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {data, make_ref(), 0, Data, done}),
+    %% First transition: group fetch fails → retry at the minimum delay.
+    {S2, E1} = rabbitmq_stream_s3_remote_reader_core:step(S1, {read, 164, 50, chunk_boundary}),
+    [{set_timer, D1}] = [E || {set_timer, _} = E <- E1],
+    %% The retry re-attempts the fetch (still failing) → retry at a larger delay.
+    {_S3, E2} = rabbitmq_stream_s3_remote_reader_core:step(S2, retry),
+    [{set_timer, D2}] = [E || {set_timer, _} = E <- E2],
+    ?assert(D2 > D1),
+    ?assertEqual([], [E || {reply, {become_local, _}} = E <- E2]).
