@@ -310,9 +310,15 @@ step(State0, {iterator_refreshed, Iterator}) ->
             },
             {State1, Effects} = start_current_request(State),
             {State1, [{reply, {next_fragment, Offset}} | Effects]};
-        _ ->
+        end_of_manifest ->
             %% Iterator exhausted after refresh. Become local.
-            {State0, [{reply, {become_local, current_fragment_offset(State0)}}]}
+            {State0, [{reply, {become_local, current_fragment_offset(State0)}}]};
+        {error, {group_fetch_failed, _Reason}} ->
+            %% A group object could not be fetched while advancing the
+            %% refreshed iterator. Transient S3 error, not end of manifest:
+            %% retry rather than routing to a local tier that may lack the
+            %% data.
+            retry_group_fetch(State0)
     end.
 
 %% @doc Returns the pending read, if any.
@@ -348,9 +354,6 @@ try_serve(#state{pending = #pending{offset = Offset, bytes = Bytes}} = State) ->
                 {observe, fragment_transition, State3#state.read_size}
                 | Effects
             ]};
-        {become_local, State1} ->
-            State2 = State1#state{pending = undefined},
-            {State2, [{reply, {become_local, current_fragment_offset(State1)}}]};
         {await, State1} ->
             State2 = adjust_read_size(miss, State1),
             {State3, Effects} = maybe_start_requests(State2),
@@ -363,11 +366,19 @@ try_serve(#state{pending = #pending{offset = Offset, bytes = Bytes}} = State) ->
                 {ok, NotFoundOffset} ->
                     {State1, [{refresh_iterator, NotFoundOffset}]};
                 end_of_manifest ->
-                    {State1, [{refresh_iterator, current_fragment_offset(State1)}]}
+                    {State1, [{refresh_iterator, current_fragment_offset(State1)}]};
+                group_fetch_failed ->
+                    %% Probing the next entry hit a transient group fetch
+                    %% error. Retry rather than becoming local.
+                    retry_group_fetch(State1)
             end;
         {refresh_iterator, State1} ->
             %% Iterator exhausted. Refresh past current fragment.
-            {State1, [{refresh_iterator, current_fragment_offset(State1)}]}
+            {State1, [{refresh_iterator, current_fragment_offset(State1)}]};
+        {group_fetch_failed, State1} ->
+            %% A group fetch failed transiently while advancing. Retry rather
+            %% than becoming local.
+            retry_group_fetch(State1)
     end.
 
 %% ------------------------------------------------------------------
@@ -430,9 +441,25 @@ try_fragment_transition(
             {await, State};
         end_of_manifest ->
             {refresh_iterator, State};
-        {error, _} ->
-            {become_local, State#state{pending = undefined}}
+        {error, {group_fetch_failed, _Reason}} ->
+            %% A group object referenced by the manifest could not be fetched.
+            %% This is a transient S3 error, not the end of the manifest (a
+            %% group deleted by retention surfaces as `not_found`, which the
+            %% iterator skips). The group is part of the remote tier we are
+            %% reading, so becoming local here would risk serving missing or
+            %% wrong data (Tier overlap). Retry instead.
+            {group_fetch_failed, State}
     end.
+
+%% A group object could not be fetched (a transient S3 error). Keep the pending
+%% read and retry with backoff rather than routing the consumer to the local
+%% tier. The pending-read deadline bounds the loop and surfaces
+%% `{error, timeout}` if S3 stays unavailable.
+retry_group_fetch(
+    #state{cfg = #cfg{max_retry_delay_ms = MaxDelay}, retry_delay = RetryDelay} = State
+) ->
+    NextDelay = min(RetryDelay * 2, MaxDelay),
+    {State#state{retry_delay = NextDelay, requests_in_flight = #{}}, [{set_timer, RetryDelay}]}.
 
 %% ------------------------------------------------------------------
 %% Internal: fragment navigation
@@ -457,7 +484,8 @@ try_fragment_transition(
 next_fragment_offset(#state{iterator = Iterator}) ->
     case rabbitmq_stream_s3_fragment_iterator:next(Iterator) of
         {ok, #fragment_ref{offset = Offset}, _} -> {ok, Offset};
-        _ -> end_of_manifest
+        end_of_manifest -> end_of_manifest;
+        {error, {group_fetch_failed, _}} -> group_fetch_failed
     end.
 
 goto_next_fragment(
