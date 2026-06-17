@@ -106,7 +106,7 @@
 %% * first timestamp (8)
 %% * first last timestamp (8)
 %% * size (9)
-%% = 41 bytes
+%% = 49 bytes
 -define(MANIFEST_HEADER_SIZE, 49).
 
 -define(MANIFEST(FirstOffset, NextOffset, FirstTs, FirstLastTs, TotalSize, Entries), <<
