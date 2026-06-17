@@ -324,152 +324,261 @@ build_retention_result(#manifest{entries = Entries} = Manifest, NumEntries) ->
     },
     {Edit, Refs}.
 
-%% Evaluate retention within the first group entry, if present.
+%% Evaluate retention when the oldest root entry is a group of any kind.
 maybe_eval_group_retention(_Manifest, _Specs, _Now, undefined) ->
     unchanged;
 maybe_eval_group_retention(#manifest{entries = Entries} = Manifest, Specs, Now, GetGroupFun) ->
     case Entries of
-        <<Offset:64/unsigned, _FTs:64/signed, _LTs:64/signed, Kind:8/unsigned, _Size:40/unsigned,
-            Uid:32/unsigned,
-            _Rest/binary>> when Kind =/= ?MANIFEST_KIND_FRAGMENT ->
-            GroupRef = #group_ref{offset = Offset, kind = Kind, uid = Uid},
-            case GetGroupFun(GroupRef) of
-                {ok, GroupEntries} ->
-                    eval_group_entries(Manifest, GroupEntries, GroupRef, Specs, Now);
-                {error, _} ->
-                    unchanged
-            end;
+        <<_:64, _:64/signed, _:64/signed, Kind:8/unsigned, _:40, _:32, _/binary>> when
+            Kind =/= ?MANIFEST_KIND_FRAGMENT
+        ->
+            group_retention_result(Manifest, Specs, Now, GetGroupFun);
         _ ->
             unchanged
     end.
 
-%% Evaluate retention on fragment entries within a group.
+%% Retention over a manifest whose oldest root entry is a group. The manifest
+%% tree may be several levels deep (group, kilo-group, mega-group), so this
+%% recurses to fragment granularity.
 %%
-%% A group object is immutable, so after an earlier cycle partially consumed
-%% this group it still lists the children those cycles already removed. Skip
-%% that already-consumed prefix (children below the manifest's first_offset)
-%% before evaluating. Otherwise retention re-counts and re-deletes them and
-%% double-subtracts their sizes from total_size on every subsequent cycle,
-%% which drifts total_size below the true durable size (silently disabling
-%% max_bytes retention) or negative (crashing the persist under max_age), and
-%% regresses first_offset below the real data floor.
-eval_group_entries(Manifest, GroupEntries0, GroupRef, Specs, Now) ->
-    GroupEntries = drop_consumed_children(GroupEntries0, Manifest#manifest.first_offset),
-    NumToRemove = eval_group_retention_specs(
-        GroupEntries, Manifest#manifest.total_size, Specs, Now
-    ),
-    case NumToRemove of
-        0 ->
+%% The computation is in two phases. First it finds the new first_offset f': the
+%% offset of the oldest fragment that survives the policy, found by descending
+%% the tree. Then it deletes exactly the objects whose offset interval lies in
+%% [f, f') -- the fragments below f' and every group object all of whose
+%% descendants are below f' -- and splices out the leading root entries that are
+%% wholly consumed. Objects below the current first_offset were removed by an
+%% earlier cycle and are skipped, which keeps retention idempotent at every
+%% level. Group objects are immutable and are never rewritten.
+group_retention_result(
+    #manifest{entries = Entries, first_offset = Lo, next_offset = N, total_size = TotalSize},
+    Specs,
+    Now,
+    Get
+) ->
+    try new_first_offset(Lo, N, Entries, Specs, Now, TotalSize, Get) of
+        unchanged ->
             unchanged;
-        _ ->
-            NumGroupEntries = byte_size(GroupEntries) div ?ENTRY_B,
-            build_group_retention_result(
-                Manifest, GroupEntries, GroupRef, NumToRemove, NumGroupEntries
-            )
+        {Hi, NewFirstTs, NewFirstLastTs} ->
+            case collect_deletions(Entries, Lo, Hi, Get) of
+                {[], _, _} ->
+                    unchanged;
+                {Refs, Bytes, _} ->
+                    NumWhole = count_whole_root(Entries, Hi, Get, 0),
+                    Edit = #edit{
+                        first_offset = Hi,
+                        first_timestamp = NewFirstTs,
+                        first_last_timestamp = NewFirstLastTs,
+                        next_offset = undefined,
+                        size = -Bytes,
+                        entries = <<>>,
+                        pos = 0,
+                        len = NumWhole * ?ENTRY_B
+                    },
+                    {Edit, Refs}
+            end
+    catch
+        throw:group_fetch_failed ->
+            unchanged
     end.
 
-%% Drop the leading group children whose offset is below first_offset: an
-%% earlier retention cycle already removed them, but they remain in the
-%% immutable group object.
-drop_consumed_children(GroupEntries, FirstOffset) ->
-    Skip = consumed_prefix_bytes(GroupEntries, FirstOffset, 0),
-    binary:part(GroupEntries, Skip, byte_size(GroupEntries) - Skip).
+%% Fetch a group object's child entries, aborting retention on a fetch error.
+get_children(Get, GroupRef) ->
+    case Get(GroupRef) of
+        {ok, Children} -> Children;
+        {error, _} -> throw(group_fetch_failed)
+    end.
 
-consumed_prefix_bytes(
-    <<Offset:64/unsigned, _FTs:64/signed, _LTs:64/signed, _K:8, _Sz:40, _Uid:32, Rest/binary>>,
-    FirstOffset,
-    Acc
-) when Offset < FirstOffset ->
-    consumed_prefix_bytes(Rest, FirstOffset, Acc + ?ENTRY_B);
-consumed_prefix_bytes(_Entries, _FirstOffset, Acc) ->
-    Acc.
-
-eval_group_retention_specs(GroupEntries, ManifestTotalSize, Specs, Now) ->
-    lists:foldl(
-        fun(Spec, Acc) ->
-            max(Acc, group_entries_to_remove(GroupEntries, ManifestTotalSize, Spec, Now))
+%% The new first_offset: the largest f' any policy in Specs requires, with the
+%% timestamps of the fragment that becomes the new first. Returns unchanged when
+%% no policy removes anything.
+new_first_offset(Lo, N, Entries, Specs, Now, TotalSize, Get) ->
+    Best = lists:foldl(
+        fun(Spec, {BestHi, _, _} = Acc) ->
+            {Hi, _, _} = Cand = spec_boundary(Lo, N, Entries, Spec, Now, TotalSize, Get),
+            case Hi > BestHi of
+                true -> Cand;
+                false -> Acc
+            end
         end,
-        0,
+        {Lo, -1, -1},
         Specs
-    ).
-
-group_entries_to_remove(Entries, ManifestTotalSize, {max_bytes, MaxBytes}, _Now) ->
-    remove_for_max_bytes_in_group(Entries, ManifestTotalSize, MaxBytes, 0);
-group_entries_to_remove(Entries, _ManifestTotalSize, {max_age, MaxAgeMs}, Now) ->
-    Cutoff = Now - MaxAgeMs,
-    remove_for_max_age_in_group(Entries, Cutoff, 0);
-group_entries_to_remove(_, _, _, _) ->
-    0.
-
-%% Like remove_for_max_bytes but allows removing all entries (groups can be
-%% fully consumed).
-remove_for_max_bytes_in_group(_Entries, TotalSize, MaxBytes, N) when TotalSize =< MaxBytes ->
-    N;
-remove_for_max_bytes_in_group(<<>>, _TotalSize, _MaxBytes, N) ->
-    N;
-remove_for_max_bytes_in_group(Entries, TotalSize, MaxBytes, N) ->
-    <<_:64, _:64, _:64, _:8, Size:40, _:32, Rest/binary>> = Entries,
-    remove_for_max_bytes_in_group(Rest, TotalSize - Size, MaxBytes, N + 1).
-
-%% Like remove_for_max_age but doesn't stop at the last entry (groups can be
-%% fully consumed).
-remove_for_max_age_in_group(<<>>, _Cutoff, N) ->
-    N;
-remove_for_max_age_in_group(Entries, Cutoff, N) ->
-    <<_Offset:64, _FirstTs:64/signed, LastTs:64/signed, _Kind:8, _Size:40, _Uid:32, Rest/binary>> =
-        Entries,
-    case LastTs < Cutoff of
-        true -> remove_for_max_age_in_group(Rest, Cutoff, N + 1);
-        false -> N
+    ),
+    case Best of
+        {Lo, _, _} -> unchanged;
+        _ -> Best
     end.
 
-build_group_retention_result(Manifest, GroupEntries, GroupRef, NumToRemove, NumGroupEntries) ->
-    BytesToRemove = NumToRemove * ?ENTRY_B,
-    Removed = binary:part(GroupEntries, 0, BytesToRemove),
-    FragRefs = collect_fragment_refs(Removed, []),
-    SizeDelta = lists:foldl(fun(#fragment_ref{size = S}, Acc) -> Acc - S end, 0, FragRefs),
-    case NumToRemove >= NumGroupEntries of
+%% The new first_offset a single policy requires, as {Offset, FirstTs, LastTs}.
+%% A boundary equal to Lo means the policy removes nothing.
+spec_boundary(Lo, N, Entries, {max_age, MaxAgeMs}, Now, _TotalSize, Get) ->
+    Cutoff = Now - MaxAgeMs,
+    case boundary_age(Entries, Lo, Cutoff, Get) of
+        all -> {N, -1, -1};
+        {_, _, _} = B -> B
+    end;
+spec_boundary(Lo, N, Entries, {max_bytes, MaxBytes}, _Now, TotalSize, Get) ->
+    case TotalSize - MaxBytes of
+        ToRemove when ToRemove > 0 ->
+            case boundary_bytes(Entries, Lo, ToRemove, Get) of
+                {all, _} -> {N, -1, -1};
+                {boundary, Off, FTs, LTs} -> {Off, FTs, LTs}
+            end;
+        _ ->
+            {Lo, -1, -1}
+    end;
+spec_boundary(Lo, _N, _Entries, _Spec, _Now, _TotalSize, _Get) ->
+    {Lo, -1, -1}.
+
+%% The oldest fragment at or after Lo whose last timestamp is at or after the
+%% cutoff -- i.e. the oldest survivor. `all` if every fragment is expired.
+%% Timestamps are monotonic across fragments, so the expired prefix is
+%% contiguous and a group whose last timestamp predates the cutoff is wholly
+%% expired and can be skipped without descending.
+boundary_age(<<>>, _Lo, _Cutoff, _Get) ->
+    all;
+boundary_age(
+    <<Offset:64/unsigned, FTs:64/signed, LTs:64/signed, Kind:8/unsigned, _:40, Uid:32/unsigned,
+        Rest/binary>>,
+    Lo,
+    Cutoff,
+    Get
+) ->
+    case Kind of
+        ?MANIFEST_KIND_FRAGMENT when Offset >= Lo andalso LTs >= Cutoff ->
+            {Offset, FTs, LTs};
+        ?MANIFEST_KIND_FRAGMENT ->
+            boundary_age(Rest, Lo, Cutoff, Get);
+        _ when LTs < Cutoff ->
+            boundary_age(Rest, Lo, Cutoff, Get);
+        _ ->
+            Children = get_children(Get, #group_ref{offset = Offset, kind = Kind, uid = Uid}),
+            case boundary_age(Children, Lo, Cutoff, Get) of
+                all -> boundary_age(Rest, Lo, Cutoff, Get);
+                Found -> Found
+            end
+    end.
+
+%% The fragment at which the oldest ToRemove bytes have been removed (removing
+%% whole fragments oldest-first), as {boundary, Offset, FirstTs, LastTs}, or
+%% {all, RemainingToRemove} if every fragment is removed. Group entries carry no
+%% size, so groups are descended to reach their fragments.
+boundary_bytes(<<>>, _Lo, ToRemove, _Get) ->
+    {all, ToRemove};
+boundary_bytes(
+    <<Offset:64/unsigned, FTs:64/signed, LTs:64/signed, Kind:8/unsigned, Size:40/unsigned,
+        Uid:32/unsigned, Rest/binary>>,
+    Lo,
+    ToRemove,
+    Get
+) ->
+    case Kind of
+        ?MANIFEST_KIND_FRAGMENT when Offset < Lo ->
+            boundary_bytes(Rest, Lo, ToRemove, Get);
+        ?MANIFEST_KIND_FRAGMENT when ToRemove =< 0 ->
+            {boundary, Offset, FTs, LTs};
+        ?MANIFEST_KIND_FRAGMENT ->
+            boundary_bytes(Rest, Lo, ToRemove - Size, Get);
+        _ ->
+            Children = get_children(Get, #group_ref{offset = Offset, kind = Kind, uid = Uid}),
+            case boundary_bytes(Children, Lo, ToRemove, Get) of
+                {boundary, _, _, _} = B -> B;
+                {all, ToRemove1} -> boundary_bytes(Rest, Lo, ToRemove1, Get)
+            end
+    end.
+
+%% Collect the objects to delete -- fragments in [Lo, Hi) and groups all of
+%% whose descendants are below Hi -- with the total fragment bytes removed.
+%% Returns {Refs, Bytes, AllConsumed}; AllConsumed is true when every entry of
+%% this node lies below Hi. Fragments below Lo were deleted by an earlier cycle
+%% and are skipped; a group with no newly-deleted children is likewise already
+%% gone and its object is not re-deleted.
+collect_deletions(<<>>, _Lo, _Hi, _Get) ->
+    {[], 0, true};
+collect_deletions(
+    <<Offset:64/unsigned, _:64/signed, _:64/signed, Kind:8/unsigned, Size:40/unsigned,
+        Uid:32/unsigned, Rest/binary>>,
+    Lo,
+    Hi,
+    Get
+) ->
+    case Offset >= Hi of
         true ->
-            %% Entire group consumed. Remove the group entry from the root.
-            Remaining = binary:part(
-                Manifest#manifest.entries, ?ENTRY_B, byte_size(Manifest#manifest.entries) - ?ENTRY_B
-            ),
-            {NewFirstOffset, NewFirstTs, NewFirstLastTs} =
-                case Remaining of
-                    <<>> ->
-                        {Manifest#manifest.next_offset, -1, -1};
-                    ?ENTRY(Off, FTs, LTs, _, _, _, _) ->
-                        {Off, FTs, LTs}
-                end,
-            Edit = #edit{
-                first_offset = NewFirstOffset,
-                first_timestamp = NewFirstTs,
-                first_last_timestamp = NewFirstLastTs,
-                next_offset = undefined,
-                size = SizeDelta,
-                entries = <<>>,
-                pos = 0,
-                len = ?ENTRY_B
-            },
-            {Edit, [GroupRef | FragRefs]};
+            {[], 0, false};
         false ->
-            %% Partial group consumption. Update root metadata only.
-            %% The group entry stays. Determine new first_offset from the
-            %% first surviving entry in the group.
-            SurvivingStart = binary:part(GroupEntries, BytesToRemove, ?ENTRY_B),
-            <<NewFirstOffset:64/unsigned, NewFirstTs:64/signed, NewFirstLastTs:64/signed, _:8, _:40,
-                _:32>> = SurvivingStart,
-            Edit = #edit{
-                first_offset = NewFirstOffset,
-                first_timestamp = NewFirstTs,
-                first_last_timestamp = NewFirstLastTs,
-                next_offset = undefined,
-                size = SizeDelta,
-                entries = <<>>,
-                pos = 0,
-                len = 0
-            },
-            {Edit, FragRefs}
+            case Kind of
+                ?MANIFEST_KIND_FRAGMENT when Offset >= Lo ->
+                    {RRefs, RBytes, RAll} = collect_deletions(Rest, Lo, Hi, Get),
+                    Ref = #fragment_ref{offset = Offset, uid = Uid, size = Size},
+                    {[Ref | RRefs], Size + RBytes, RAll};
+                ?MANIFEST_KIND_FRAGMENT ->
+                    collect_deletions(Rest, Lo, Hi, Get);
+                _ ->
+                    GroupRef = #group_ref{offset = Offset, kind = Kind, uid = Uid},
+                    Children = get_children(Get, GroupRef),
+                    {CRefs, CBytes, CAll} = collect_deletions(Children, Lo, Hi, Get),
+                    {RRefs, RBytes, RAll} = collect_deletions(Rest, Lo, Hi, Get),
+                    case CAll of
+                        true ->
+                            GroupDel =
+                                case CRefs of
+                                    [] -> [];
+                                    _ -> [GroupRef]
+                                end,
+                            {GroupDel ++ CRefs ++ RRefs, CBytes + RBytes, RAll};
+                        false ->
+                            {CRefs ++ RRefs, CBytes + RBytes, false}
+                    end
+            end
+    end.
+
+%% Number of leading root entries lying wholly below Hi, which are spliced out
+%% of the root array. A group is wholly consumed when it has no descendant at or
+%% beyond Hi.
+count_whole_root(<<>>, _Hi, _Get, N) ->
+    N;
+count_whole_root(
+    <<Offset:64/unsigned, _:64/signed, _:64/signed, Kind:8/unsigned, _:40, Uid:32/unsigned,
+        Rest/binary>>,
+    Hi,
+    Get,
+    N
+) ->
+    case Offset >= Hi of
+        true ->
+            N;
+        false ->
+            case Kind of
+                ?MANIFEST_KIND_FRAGMENT ->
+                    count_whole_root(Rest, Hi, Get, N + 1);
+                _ ->
+                    Children = get_children(Get, #group_ref{offset = Offset, kind = Kind, uid = Uid}),
+                    case has_offset_ge(Children, Hi, Get) of
+                        true -> N;
+                        false -> count_whole_root(Rest, Hi, Get, N + 1)
+                    end
+            end
+    end.
+
+%% Whether any fragment at or beyond Hi exists within these entries.
+has_offset_ge(<<>>, _Hi, _Get) ->
+    false;
+has_offset_ge(
+    <<Offset:64/unsigned, _:64/signed, _:64/signed, Kind:8/unsigned, _:40, Uid:32/unsigned,
+        Rest/binary>>,
+    Hi,
+    Get
+) ->
+    case Offset >= Hi of
+        true ->
+            true;
+        false ->
+            case Kind of
+                ?MANIFEST_KIND_FRAGMENT ->
+                    has_offset_ge(Rest, Hi, Get);
+                _ ->
+                    Children = get_children(Get, #group_ref{offset = Offset, kind = Kind, uid = Uid}),
+                    has_offset_ge(Children, Hi, Get) orelse has_offset_ge(Rest, Hi, Get)
+            end
     end.
 
 collect_fragment_refs(<<>>, Acc) ->

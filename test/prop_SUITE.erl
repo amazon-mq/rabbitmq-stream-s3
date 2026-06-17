@@ -256,19 +256,34 @@ gen_ret_scenario() ->
                 ],
                 GroupFrags = lists:sublist(Frags, G),
                 RootFrags = lists:nthtail(G, Frags),
-                TreeSpec =
-                    [{group, [frag_spec(F) || F <- GroupFrags]}] ++
-                        [frag_spec(F) || F <- RootFrags],
                 Total = lists:sum(Sizes),
                 MaxTs = N * 1000,
                 ?LET(
-                    Schedule,
-                    gen_ret_schedule(Total, MaxTs),
-                    {TreeSpec, Frags, Schedule}
+                    {Structure, Schedule},
+                    {oneof([flat, kilo]), gen_ret_schedule(Total, MaxTs)},
+                    begin
+                        TreeSpec =
+                            [leading_tree(Structure, GroupFrags)] ++
+                                [frag_spec(F) || F <- RootFrags],
+                        {TreeSpec, Frags, Schedule}
+                    end
                 )
             end
         )
     ).
+
+%% Nest the leading fragments either in one flat group or, to exercise the
+%% recursive multi-tier retention path, in a kilo-group of two-fragment groups.
+leading_tree(flat, Frags) ->
+    {group, [frag_spec(F) || F <- Frags]};
+leading_tree(kilo, Frags) ->
+    {kilo_group, [{group, [frag_spec(F) || F <- Chunk]} || Chunk <- chunks_of(2, Frags)]}.
+
+chunks_of(_N, []) ->
+    [];
+chunks_of(N, Frags) ->
+    {Head, Tail} = lists:split(min(N, length(Frags)), Frags),
+    [Head | chunks_of(N, Tail)].
 
 frag_spec({Off, Size, LastTs}) ->
     {fragment, #{
