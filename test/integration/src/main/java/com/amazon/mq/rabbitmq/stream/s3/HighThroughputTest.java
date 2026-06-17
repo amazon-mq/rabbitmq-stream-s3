@@ -326,35 +326,34 @@ public class HighThroughputTest implements Runnable {
 
     StreamStats stats = env.queryStreamStats(cluster.stream);
     long committedOffset = stats.committedOffset();
-    // stats.firstOffset() returns the local-tier first offset, which does not
-    // account for messages in the remote tier. Derive the actual first readable
-    // offset from committedOffset and the management API message count.
-    long firstOffset = committedOffset - expectedMessages;
-    if (firstOffset < 0) {
-      firstOffset = 0;
-    }
-    long offsetRange = committedOffset - firstOffset;
-    long sliceSize = offsetRange / replayConsumers;
+    // The tail at replay start. Publishing has stopped, so this offset is stable
+    // and is the last offset every consumer must reach.
+    long endOffset = committedOffset;
 
     LOG.info(
-        "Replay: {} consumers, expecting >= {} messages (95% of {}), timeout={}s, expectS3={},"
-            + " firstOffset={}, committedOffset={}",
+        "Replay: {} consumers each reading first..{}, expecting >= {} messages each"
+            + " (95% of {}), timeout={}s, expectS3={}",
         replayConsumers,
+        endOffset,
         threshold,
         expectedMessages,
         replayTimeoutSeconds,
-        expectS3Reads,
-        firstOffset,
-        committedOffset);
+        expectS3Reads);
 
-    AtomicLong totalConsumed = new AtomicLong(0);
-    CountDownLatch done = new CountDownLatch(1);
+    // Real-world fan-out: every consumer independently replays the whole stream
+    // from 'first' to the tail, the way separate applications each read the same
+    // log non-destructively. See README.md (Consumption patterns). Per-consumer
+    // counters let the slowest consumer gate completion so a single stuck
+    // consumer fails the test rather than being masked by faster ones.
+    AtomicLong[] counts = new AtomicLong[replayConsumers];
+    boolean[] finished = new boolean[replayConsumers];
+    for (int i = 0; i < replayConsumers; i++) {
+      counts[i] = new AtomicLong(0);
+    }
+    CountDownLatch done = new CountDownLatch(replayConsumers);
 
     List<Consumer> consumers = new ArrayList<>();
     for (int i = 0; i < replayConsumers; i++) {
-      long startOffset = firstOffset + i * sliceSize;
-      long endOffset =
-          (i == replayConsumers - 1) ? Long.MAX_VALUE : firstOffset + (i + 1) * sliceSize;
       int consumerIdx = i;
 
       // Retry subscribe to work around issue #191: the rabbit_stream_reader
@@ -365,18 +364,21 @@ public class HighThroughputTest implements Runnable {
       for (int attempt = 1; attempt <= 5; attempt++) {
         try {
           var builder =
-              env.consumerBuilder().stream(cluster.stream)
-                  .offset(OffsetSpecification.offset(startOffset));
+              env.consumerBuilder().stream(cluster.stream).offset(OffsetSpecification.first());
           builder.flow().initialCredits(10);
           c =
               builder
                   .messageHandler(
                       (context, message) -> {
-                        if (context.offset() >= endOffset) {
+                        long off = context.offset();
+                        // Ignore anything past the tail captured at replay start.
+                        if (off > endOffset) {
                           return;
                         }
-                        long count = totalConsumed.incrementAndGet();
-                        if (count >= threshold) {
+                        counts[consumerIdx].incrementAndGet();
+                        // Reaching the tail offset marks this consumer complete.
+                        if (off >= endOffset && !finished[consumerIdx]) {
+                          finished[consumerIdx] = true;
                           done.countDown();
                         }
                       })
@@ -395,11 +397,7 @@ public class HighThroughputTest implements Runnable {
         }
       }
       consumers.add(c);
-      LOG.info(
-          "  Consumer {}: offset {} to {}",
-          consumerIdx,
-          startOffset,
-          endOffset == Long.MAX_VALUE ? "end" : endOffset);
+      LOG.info("  Consumer {}: reading first..{}", consumerIdx, endOffset);
     }
 
     long startTime = System.currentTimeMillis();
@@ -414,24 +412,27 @@ public class HighThroughputTest implements Runnable {
           c.close();
         }
         LOG.error(
-            "REPLAY TIMEOUT: consumed {} of {} expected in {}s",
-            totalConsumed.get(),
+            "REPLAY TIMEOUT: slowest consumer at {} of {} expected in {}s",
+            ReplayProgress.min(counts),
             expectedMessages,
             replayTimeoutSeconds);
+        LOG.info("  Per-consumer: {}", ReplayProgress.format(counts));
         System.exit(1);
       }
       long now = System.currentTimeMillis();
       if (now >= nextReport) {
         reportCount++;
-        long current = totalConsumed.get();
-        double rate = current * 1000.0 / (now - startTime);
+        long min = ReplayProgress.min(counts);
+        long sum = ReplayProgress.sum(counts);
+        double rate = sum * 1000.0 / (now - startTime);
         long elapsedSec = (now - startTime) / 1000;
         MetricsClient.Snapshot snap = metrics.snapshot();
         LOG.info(
-            "Replay [{}s]: {}/{} ({} msg/s) s3-recv={} MiB/s",
+            "Replay [{}s]: slowest={}/{} total={} ({} msg/s) s3-recv={} MiB/s",
             elapsedSec,
-            current,
+            min,
             expectedMessages,
+            sum,
             String.format("%.0f", rate),
             String.format("%.1f", snap.receivedMiBPerS(progressInterval)));
 
@@ -460,18 +461,21 @@ public class HighThroughputTest implements Runnable {
     for (Consumer c : consumers) {
       c.close();
     }
-    long total = totalConsumed.get();
+    long min = ReplayProgress.min(counts);
     long elapsedSec = (System.currentTimeMillis() - startTime) / 1000;
 
     LOG.info(
-        "Replay complete: {} messages in {}s ({}% of {})",
-        total,
+        "Replay complete: slowest consumer {} messages in {}s ({}% of {})",
+        min,
         elapsedSec,
-        expectedMessages > 0 ? total * 100 / expectedMessages : 0,
+        expectedMessages > 0 ? min * 100 / expectedMessages : 0,
         expectedMessages);
+    LOG.info("  Per-consumer: {}", ReplayProgress.format(counts));
 
-    if (total < threshold) {
-      LOG.error("REPLAY FAILED: {} < {} (95% of {})", total, threshold, expectedMessages);
+    // Every consumer must independently reach the threshold.
+    if (min < threshold) {
+      LOG.error(
+          "REPLAY FAILED: slowest consumer {} < {} (95% of {})", min, threshold, expectedMessages);
       System.exit(1);
     }
 

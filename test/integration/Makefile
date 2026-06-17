@@ -40,11 +40,28 @@ MESSAGE_SIZE ?= 1024
 MAX_LENGTH_BYTES ?= 10000000000
 REPLAY_TIMEOUT ?= 3600
 
-.PHONY: cleanup high-throughput multi-offset-consumer stream-deletion
+.PHONY: cleanup content-verification high-throughput multi-offset-consumer stream-deletion
 
 cleanup: package
 	$(JAVA) -jar $(JAR) cleanup \
 		--mgmt-uri $(MGMT_URI) \
+		$(if $(S3_BUCKET),--s3-bucket $(S3_BUCKET) --s3-region $(S3_REGION))
+
+CONTENT_VERIFY_DURATION ?= 300
+CONTENT_VERIFY_PRODUCERS ?= 1
+CONTENT_VERIFY_MAX_LENGTH_BYTES ?= 500000000
+CONTENT_VERIFY_REPLAY_CONSUMERS ?= 4
+
+content-verification: package
+	$(JAVA) -jar $(JAR) content-verification \
+		--uris $(STREAM_URIS) \
+		--mgmt-uri $(MGMT_URI) \
+		--metrics-uris $(METRICS_URIS) \
+		--stream s3-content-verify \
+		--duration $(CONTENT_VERIFY_DURATION) \
+		--producers $(CONTENT_VERIFY_PRODUCERS) \
+		--max-length-bytes $(CONTENT_VERIFY_MAX_LENGTH_BYTES) \
+		--replay-consumers $(CONTENT_VERIFY_REPLAY_CONSUMERS) \
 		$(if $(S3_BUCKET),--s3-bucket $(S3_BUCKET) --s3-region $(S3_REGION))
 
 high-throughput: package
