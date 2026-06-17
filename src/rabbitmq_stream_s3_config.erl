@@ -103,7 +103,7 @@ upload_pool_max_size() ->
 
 -spec general_pool_min_size() -> non_neg_integer().
 general_pool_min_size() ->
-    application:get_env(?APP, general_pool_min_size, 0).
+    application:get_env(?APP, general_pool_min_size, 2).
 
 -spec general_pool_max_size() -> pos_integer().
 general_pool_max_size() ->
@@ -206,7 +206,7 @@ defaults_test_() ->
         ?_assertEqual(undefined, api_fs_data_dir()),
         ?_assertEqual(0, upload_pool_min_size()),
         ?_assertEqual(20, upload_pool_max_size()),
-        ?_assertEqual(0, general_pool_min_size()),
+        ?_assertEqual(2, general_pool_min_size()),
         ?_assertEqual(50, general_pool_max_size()),
         ?_assertEqual(1024, manifest_rebalance_factor()),
         ?_assertEqual(10, manifest_debounce_modifications()),

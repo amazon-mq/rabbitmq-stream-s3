@@ -341,6 +341,11 @@ send_file(
                             Err
                     end;
                 {next_fragment, Offset} ->
+                    ?LOG_DEBUG(
+                        "send_file: data read returned next_fragment at ~b",
+                        [Offset],
+                        ?DOMAIN
+                    ),
                     State = State0#?MODULE{
                         mode = Remote1#remote{
                             next_offset = Offset,
@@ -351,22 +356,34 @@ send_file(
                 {become_local, _} ->
                     close_deferred(DeferredClose),
                     counters:add(counter(), ?C_REMOTE_CLOSE, 1),
-                    case init_local_reader(Remote1#remote.next_offset, Config) of
+                    case become_local_init(Remote1#remote.next_offset, Config) of
                         {ok, State} ->
                             send_file(Socket, State, Callback, undefined);
                         {error, _} = Err ->
                             Err
                     end;
                 end_of_stream ->
+                    ?LOG_DEBUG(
+                        "send_file: data read returned end_of_stream"
+                        " (next_offset=~b position=~b)",
+                        [Remote1#remote.next_offset, Position],
+                        ?DOMAIN
+                    ),
                     close_deferred(DeferredClose),
                     {end_of_stream, State0#?MODULE{mode = Remote1}};
                 {error, timeout} = Err ->
+                    ?LOG_DEBUG(
+                        "send_file: data read returned timeout"
+                        " (next_offset=~b position=~b)",
+                        [Remote1#remote.next_offset, Position],
+                        ?DOMAIN
+                    ),
                     Err
             end;
         {become_local, _} ->
             close_deferred(DeferredClose),
             counters:add(counter(), ?C_REMOTE_CLOSE, 1),
-            case init_local_reader(Remote0#remote.next_offset, Config) of
+            case become_local_init(Remote0#remote.next_offset, Config) of
                 {ok, State} ->
                     send_file(Socket, State, Callback, undefined);
                 {error, _} = Err ->
@@ -453,7 +470,7 @@ chunk_iterator(
                 {become_local, _} ->
                     close_deferred(DeferredClose),
                     counters:add(counter(), ?C_REMOTE_CLOSE, 1),
-                    case init_local_reader(Remote1#remote.next_offset, Config) of
+                    case become_local_init(Remote1#remote.next_offset, Config) of
                         {ok, State} ->
                             chunk_iterator(State, Credit, undefined, undefined);
                         {error, _} = Err ->
@@ -468,7 +485,7 @@ chunk_iterator(
         {become_local, _} ->
             close_deferred(DeferredClose),
             counters:add(counter(), ?C_REMOTE_CLOSE, 1),
-            case init_local_reader(Remote0#remote.next_offset, Config) of
+            case become_local_init(Remote0#remote.next_offset, Config) of
                 {ok, State} ->
                     chunk_iterator(State, Credit, undefined, undefined);
                 {error, _} = Err ->
@@ -550,13 +567,21 @@ send(ssl, Socket, Data) ->
     | {end_of_stream, #remote{}}
     | {error, timeout}.
 read_header(#remote{shared = Shared, next_offset = NextOffset} = Remote) ->
+    LastChunkId = osiris_log_shared:last_chunk_id(Shared),
+    CommittedChunkId = osiris_log_shared:committed_chunk_id(Shared),
     CanReadNext =
-        osiris_log_shared:last_chunk_id(Shared) >= NextOffset andalso
-            osiris_log_shared:committed_chunk_id(Shared) >= NextOffset,
+        LastChunkId >= NextOffset andalso
+            CommittedChunkId >= NextOffset,
     case CanReadNext of
         true ->
             read_header1(Remote);
         false ->
+            ?LOG_WARNING(
+                "Remote read_header returning end_of_stream:"
+                " next_offset=~b last_chunk_id=~b committed_chunk_id=~b",
+                [NextOffset, LastChunkId, CommittedChunkId],
+                ?DOMAIN
+            ),
             {end_of_stream, Remote}
     end.
 
@@ -688,6 +713,31 @@ init_local_reader(OffsetSpec, Config) ->
         {error, _} = Err ->
             Err
     end.
+
+%% Transition from the remote tier to the local tier after a become_local.
+%% Logs the local tier's offset bounds against the requested offset so a
+%% failed or premature transition can be diagnosed from the logs.
+become_local_init(NextOffset, #{name := StreamId, shared := Shared} = Config) ->
+    Result = init_local_reader(NextOffset, Config),
+    Tag =
+        case Result of
+            {ok, _} -> ok;
+            {error, Reason} -> {error, Reason}
+        end,
+    ?LOG_DEBUG(
+        "become_local transition for stream '~ts': next_offset=~b"
+        " local_first=~b local_committed=~b local_last=~b result=~p",
+        [
+            StreamId,
+            NextOffset,
+            osiris_log_shared:first_chunk_id(Shared),
+            osiris_log_shared:committed_chunk_id(Shared),
+            osiris_log_shared:last_chunk_id(Shared),
+            Tag
+        ],
+        ?DOMAIN
+    ),
+    Result.
 
 init_remote_reader(
     #remote_location{
@@ -907,6 +957,9 @@ resolve_first(StreamId, FirstOffset) ->
             {local, first}
     end.
 
+-define(READ_RETRY_ATTEMPTS, 3).
+-define(READ_RETRY_DELAY_MS, 500).
+
 -spec read(pid(), byte_offset(), pos_integer(), rabbitmq_stream_s3_remote_reader:hint()) ->
     {ok, binary()}
     | {next_fragment, osiris:offset()}
@@ -914,6 +967,9 @@ resolve_first(StreamId, FirstOffset) ->
     | end_of_stream
     | {error, timeout}.
 read(RemoteReader, Offset, Bytes, Hint) ->
+    read(RemoteReader, Offset, Bytes, Hint, 1).
+
+read(RemoteReader, Offset, Bytes, Hint, Attempt) ->
     {Ms, Result} = timer:tc(
         rabbitmq_stream_s3_remote_reader,
         read,
@@ -929,7 +985,27 @@ read(RemoteReader, Offset, Bytes, Hint) ->
         false ->
             ok
     end,
-    Result.
+    case Result of
+        {error, timeout} when Attempt < ?READ_RETRY_ATTEMPTS ->
+            ?LOG_DEBUG(
+                "Remote tier read timeout after ~bms, retrying"
+                " (attempt=~b/~b offset=~b bytes=~b hint=~p reader=~p)",
+                [Ms, Attempt, ?READ_RETRY_ATTEMPTS, Offset, Bytes, Hint, RemoteReader],
+                ?DOMAIN
+            ),
+            timer:sleep(?READ_RETRY_DELAY_MS),
+            read(RemoteReader, Offset, Bytes, Hint, Attempt + 1);
+        {error, timeout} ->
+            ?LOG_DEBUG(
+                "Remote tier read timeout after ~bms, giving up"
+                " (attempt=~b/~b offset=~b bytes=~b hint=~p reader=~p)",
+                [Ms, Attempt, ?READ_RETRY_ATTEMPTS, Offset, Bytes, Hint, RemoteReader],
+                ?DOMAIN
+            ),
+            Result;
+        _ ->
+            Result
+    end.
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").

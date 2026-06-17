@@ -181,7 +181,9 @@ handle_call(
     {Pid, _},
     #?MODULE{
         max_size = MaxSize,
+        available = Available,
         monitors = Monitors,
+        checkouts = Checkouts,
         counter = Cnt
     } = State0
 ) ->
@@ -190,8 +192,32 @@ handle_call(
             counters:add(Cnt, ?C_CHECKOUTS, 1),
             {reply, Conn, State};
         empty when map_size(Monitors) < MaxSize ->
+            ?LOG_DEBUG(
+                "Pool ~p try_checkout: busy, growing"
+                " (available=~b total=~b checked_out=~b max=~b caller=~p)",
+                [
+                    self(),
+                    length(Available),
+                    map_size(Monitors),
+                    map_size(Checkouts),
+                    MaxSize,
+                    Pid
+                ]
+            ),
             {reply, busy, grow(1, State0)};
         empty ->
+            ?LOG_DEBUG(
+                "Pool ~p try_checkout: busy at max"
+                " (available=~b total=~b checked_out=~b max=~b caller=~p)",
+                [
+                    self(),
+                    length(Available),
+                    map_size(Monitors),
+                    map_size(Checkouts),
+                    MaxSize,
+                    Pid
+                ]
+            ),
             {reply, busy, State0}
     end;
 handle_call(Request, From, State) ->
@@ -249,10 +275,21 @@ handle_info(grow, State0) ->
     {noreply, grow(State0)};
 handle_info(
     {gun_up, Conn, _Protocol},
-    #?MODULE{monitors = Monitors} = State0
+    #?MODULE{monitors = Monitors, available = Available, checkouts = Checkouts} = State0
 ) ->
     case is_map_key(Conn, Monitors) of
         true ->
+            ?LOG_DEBUG(
+                "Pool ~p gun_up: connection ~p ready"
+                " (available=~b total=~b checked_out=~b)",
+                [
+                    self(),
+                    Conn,
+                    length(Available),
+                    map_size(Monitors),
+                    map_size(Checkouts)
+                ]
+            ),
             {noreply, make_available(Conn, State0)};
         false ->
             %% Stale gun_up from a connection opened by a previous pool instance.
