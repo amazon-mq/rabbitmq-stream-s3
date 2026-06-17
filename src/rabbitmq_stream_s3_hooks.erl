@@ -13,6 +13,7 @@ retention is updated.
 -behaviour(osiris_log_hooks).
 
 -include("include/rabbitmq_stream_s3.hrl").
+-include("include/logging.hrl").
 -include_lib("kernel/include/logger.hrl").
 
 -export([
@@ -73,7 +74,8 @@ on_init(writer, Pid, #{name := Name, dir := Dir, shared := Shared, counter := Co
         {error, Reason} ->
             ?LOG_WARNING(
                 "Failed to start remote replica reader for stream ~ts: ~p",
-                [StreamId, Reason]
+                [StreamId, Reason],
+                #{domain => ?RMQLOG_DOMAIN_STREAM_S3}
             )
     end,
     append_retention(StreamId, Config);
