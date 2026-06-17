@@ -137,8 +137,8 @@ start(Config) ->
 %% internal deadline always fires first and replies {error, timeout} to the
 %% caller. This avoids overlapping reads (caller times out, new read arrives
 %% while from is still set) which require unsafe buffer resets.
--define(PENDING_READ_DEADLINE_MS, 18_000).
--define(SEND_FILE_READ_TIMEOUT_MS, 20_000).
+-define(PENDING_READ_DEADLINE_MS, 40_000).
+-define(SEND_FILE_READ_TIMEOUT_MS, 45_000).
 
 read(Server, Offset, Bytes, Hint) ->
     read(Server, Offset, Bytes, Hint, ?SEND_FILE_READ_TIMEOUT_MS).
@@ -211,7 +211,11 @@ handle_cast(_Msg, State) ->
 
 handle_info({'DOWN', MRef, process, _Pid, _Reason}, #state{reader_ref = MRef} = State) ->
     {stop, normal, State};
-handle_info(retry_requests, #state{core = Core0} = State0) ->
+handle_info(retry_requests, #state{stream = StreamId, core = Core0} = State0) ->
+    ?LOG_DEBUG(
+        "remote_reader retry_requests firing for stream ~ts",
+        [StreamId]
+    ),
     {Core1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(Core0, retry),
     State = execute_effects(Effects, State0#state{core = Core1}),
     maybe_stop(State);
@@ -219,8 +223,13 @@ handle_info(deadline_expired, #state{from = undefined} = State) ->
     %% Timer fired after the read was already served. Ignore.
     {noreply, State};
 handle_info(
-    deadline_expired, #state{core = Core0} = State0
+    deadline_expired, #state{stream = StreamId, core = Core0} = State0
 ) ->
+    ?LOG_DEBUG(
+        "remote_reader deadline_expired for stream ~ts"
+        " (requests_in_flight=~b)",
+        [StreamId, map_size(State0#state.requests)]
+    ),
     %% Cancel in-flight S3 requests so they don't feed stale data into the
     %% reset buffer after the core clears it.
     State1 = cancel_all_requests(State0),
@@ -339,10 +348,24 @@ execute_effects([Effect | Rest], State0) ->
     execute_effects(Rest, State).
 
 execute_effect(
-    {reply, Result}, #state{from = From, deadline_timer = Timer} = State
+    {reply, Result}, #state{stream = StreamId, from = From, deadline_timer = Timer} = State
 ) when
     From =/= undefined
 ->
+    case Result of
+        {ok, _} ->
+            ok;
+        {error, Reason} ->
+            ?LOG_DEBUG(
+                "remote_reader replying {error, ~p} for stream ~ts",
+                [Reason, StreamId]
+            );
+        Other ->
+            ?LOG_DEBUG(
+                "remote_reader replying ~p for stream ~ts",
+                [Other, StreamId]
+            )
+    end,
     cancel_deadline_timer(Timer),
     gen_server:reply(From, Result),
     State#state{from = undefined, deadline_timer = undefined};
@@ -371,7 +394,7 @@ execute_effect(
             Requests = Requests0#{FragOffset => {RequestId, AsyncState}},
             State#state{requests = Requests};
         {error, pool_busy} ->
-            ?LOG_WARNING(
+            ?LOG_DEBUG(
                 "remote_reader start_request: pool_busy key=~ts frag=~b",
                 [Key, FragOffset]
             ),
@@ -380,7 +403,11 @@ execute_effect(
             ),
             execute_effects(Effects, State#state{core = Core1})
     end;
-execute_effect({set_timer, DelayMs}, State) ->
+execute_effect({set_timer, DelayMs}, #state{stream = StreamId} = State) ->
+    ?LOG_DEBUG(
+        "remote_reader scheduling retry in ~bms for stream ~ts",
+        [DelayMs, StreamId]
+    ),
     erlang:send_after(DelayMs, self(), retry_requests),
     State;
 execute_effect(
@@ -409,7 +436,7 @@ execute_effect(stop, State) ->
 %% the given offset (the fragment known to be 404).
 refresh_iterator(StreamId, NotFoundOffset) ->
     case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
-        #manifest{} = Manifest ->
+        #manifest{first_offset = First, next_offset = Next} = Manifest ->
             GetGroupFun = rabbitmq_stream_s3_manifest:get_group_fun(StreamId),
             Iterator0 = rabbitmq_stream_s3_fragment_iterator:init(
                 Manifest, NotFoundOffset, GetGroupFun
@@ -421,11 +448,26 @@ refresh_iterator(StreamId, NotFoundOffset) ->
                     _ -> Iterator0
                 end,
             %% Check if there's anything after.
-            case rabbitmq_stream_s3_fragment_iterator:next(Iterator) of
-                {ok, _, _} -> Iterator;
-                _ -> end_of_manifest
+            Result =
+                case rabbitmq_stream_s3_fragment_iterator:next(Iterator) of
+                    {ok, #fragment_ref{offset = NextOff}, _} -> {iterator, NextOff};
+                    _ -> end_of_manifest
+                end,
+            ?LOG_DEBUG(
+                "refresh_iterator for stream '~ts': not_found_offset=~b"
+                " manifest_first=~b manifest_next=~b result=~p",
+                [StreamId, NotFoundOffset, First, Next, Result]
+            ),
+            case Result of
+                {iterator, _} -> Iterator;
+                end_of_manifest -> end_of_manifest
             end;
         _ ->
+            ?LOG_DEBUG(
+                "refresh_iterator for stream '~ts': not_found_offset=~b"
+                " manifest=undefined result=end_of_manifest",
+                [StreamId, NotFoundOffset]
+            ),
             end_of_manifest
     end.
 

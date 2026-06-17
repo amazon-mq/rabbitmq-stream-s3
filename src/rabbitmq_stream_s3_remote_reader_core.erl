@@ -79,6 +79,7 @@ and transitions immediately if available, or signals that more data is needed.
     hits_since_last_miss = 0 :: non_neg_integer(),
     %% Retry state
     retry_delay :: pos_integer(),
+    pool_busy_delay = 25 :: pos_integer(),
 
     %% Current fragment
     fragment_ref :: #fragment_ref{},
@@ -192,7 +193,10 @@ step(State, {read, Offset, Bytes, Hint}) ->
     State1 = State#state{pending = #pending{offset = Offset, bytes = Bytes, hint = Hint}},
     try_serve(State1);
 step(State0, {data, _RequestId, Fragment, Data, DoneOrContinue}) ->
-    State1 = State0#state{retry_delay = (State0#state.cfg)#cfg.min_retry_delay_ms},
+    State1 = State0#state{
+        retry_delay = (State0#state.cfg)#cfg.min_retry_delay_ms,
+        pool_busy_delay = 25
+    },
     State2 = remove_request_if_done(Fragment, DoneOrContinue, State1),
     State3 = add_data(Fragment, Data, State2),
     {State4, Effects1} = maybe_start_requests(State3),
@@ -227,15 +231,26 @@ step(
     State = State0#state{retry_delay = NextDelay, requests_in_flight = #{}},
     {State, [{set_timer, RetryDelay}]};
 step(
+    #state{pool_busy_delay = Delay} = State0,
+    {request_error, _RequestId, _Fragment, pool_busy}
+) ->
+    %% Pool is growing — a connection becomes available once its TLS handshake
+    %% completes (fast on same-region S3, but not instant). Use a mild backoff
+    %% (25, 50, 100, 200, 400, 500, 500...) starting low to catch the connection
+    %% as soon as it is ready, doubling up to a 500ms cap so we don't spin if the
+    %% pool cannot grow (e.g. S3 unreachable).
+    NextDelay = min(Delay * 2, 500),
+    State = State0#state{pool_busy_delay = NextDelay, requests_in_flight = #{}},
+    {State, [{set_timer, Delay}]};
+step(
     #state{cfg = #cfg{max_retry_delay_ms = MaxDelay}} = State0,
     {request_error, _RequestId, _Fragment, Reason}
 ) when
     Reason =:= timeout;
     Reason =:= stream_error;
-    Reason =:= connection_error;
-    Reason =:= pool_busy
+    Reason =:= connection_error
 ->
-    %% Transient error. Retry with current delay.
+    %% Transient error. Retry with exponential backoff.
     RetryDelay = State0#state.retry_delay,
     NextDelay = min(RetryDelay * 2, MaxDelay),
     State = State0#state{retry_delay = NextDelay, requests_in_flight = #{}},
