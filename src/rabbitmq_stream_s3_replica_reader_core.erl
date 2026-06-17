@@ -95,7 +95,10 @@ testable without mocks or timing.
     | cancel_persist_timer
     | {resubmit_transfer, reference(), stream_id(), directory(), fragment_meta()}
     | {resubmit_transfer_delayed, reference(), stream_id(), directory(), fragment_meta(), term()}
-    | reinitialize.
+    | reinitialize
+    %% Stop the reader: the stream's metadata node was deleted, so there is
+    %% nothing left to persist to.
+    | stop.
 
 %% ------------------------------------------------------------------
 %% API
@@ -226,7 +229,7 @@ transfer_failed(Ref, Reason, #state{cfg = Cfg} = State) ->
 persist_complete(
     Revision,
     #state{
-        cfg = Cfg,
+        cfg = #cfg{persist_interval_ms = PersistInterval} = Cfg,
         persisting_manifest = CommittingManifest,
         in_persist_count = Committed,
         since_persist = N
@@ -268,7 +271,20 @@ persist_complete(
     case State2#state.since_persist > 0 of
         true ->
             {State3, CommitEffects} = maybe_start_persist(State2),
-            {State3, Effects1 ++ CommitEffects};
+            %% If the remainder is below the persist threshold, maybe_start_persist
+            %% produces no start_persist. We emitted cancel_persist_timer above, so
+            %% without re-arming here the remainder would sit unpersisted until the
+            %% next publish: await_offset waiters block, the range table stalls, and
+            %% local retention cannot reclaim those segments. Re-arm so tick/1 flushes
+            %% it. Mirrors the same guard in drain_completions/1.
+            TimerEffects =
+                case CommitEffects of
+                    [] ->
+                        [{start_persist_timer, PersistInterval}];
+                    _ ->
+                        []
+                end,
+            {State3, Effects1 ++ CommitEffects ++ TimerEffects};
         false ->
             {State2, Effects1}
     end.
@@ -277,6 +293,25 @@ persist_complete(
 persist_failed(conflict, State) ->
     %% Khepri conflict. The shell must re-resolve the manifest externally
     %% and re-init the core. We signal this by returning a special effect.
+    {State#state{persist_in_flight = false}, [reinitialize]};
+persist_failed(not_found, #state{last_persisted_manifest = #manifest{revision = Rev}} = State) when
+    Rev > 0
+->
+    %% not_found with a non-zero expected revision means the stream's metadata
+    %% node was deleted out from under this persist (the queue was removed; the
+    %% node is removed by Khepri's keep-while condition). The stream is gone, so
+    %% the reader has nothing left to do: stop. Retrying would re-PUT an orphan
+    %% manifest forever, and reinitializing could resurrect the deleted stream
+    %% (an empty manifest resolves to revision 0, whose create-if-absent put
+    %% would re-create the node). Rev is the ExpectedRevision the failed put
+    %% used: start_persist takes it from last_persisted_manifest.revision, and a
+    %% non-zero value can only come from a prior successful upload.
+    {State#state{persist_in_flight = false}, [stop]};
+persist_failed(not_found, State) ->
+    %% Revision 0 is a first-ever persist, which uses a create-if-absent
+    %% condition and cannot legitimately return not_found. If we somehow reach
+    %% here, do not stop a possibly-live new stream and do not fall through to
+    %% the retry-forever path below: reinitialize once to re-resolve.
     {State#state{persist_in_flight = false}, [reinitialize]};
 persist_failed(_Reason, #state{cfg = Cfg} = State0) ->
     %% S3 or transient error. Retry the persist.
@@ -406,8 +441,11 @@ retention_complete(Edit, #state{manifest = Manifest0} = State0) ->
     {State2, PersistEffects}.
 
 -doc """
-A retention evaluation failed (e.g. group download failed). Clear the flag
-so the next persist_complete can re-trigger evaluation.
+A retention evaluation finished without producing an edit: it either failed
+(group download crashed or timed out) or found nothing to remove. Either way,
+clear the in-flight flag so the next persist_complete can re-trigger
+evaluation. Failures are counted by the shell; the core does not distinguish
+them here because both outcomes mean the same thing to the core.
 """.
 -spec retention_failed(term(), state()) -> {state(), [core_effect()]}.
 retention_failed(_Reason, State) ->

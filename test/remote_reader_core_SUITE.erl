@@ -30,6 +30,7 @@ all() ->
         aimd_shrink_on_miss,
         exponential_backoff_caps_at_max,
         fatal_error_emits_stop,
+        fatal_error_reports_reason_before_stop,
         multi_chunk_data_accumulation,
         prefetch_next_fragment_triggered,
         fragment_transition_without_prefetch_awaits,
@@ -340,14 +341,28 @@ exponential_backoff_caps_at_max(_Config) ->
     ok.
 
 fatal_error_emits_stop(_Config) ->
-    %% An unknown error reason emits the stop effect.
+    %% A non-retryable error reports the reason (for log + metric) and then
+    %% stops. The report effect must precede stop so the shutdown is not silent.
     FragRef = frag_ref(0, 1_000_000, 42),
     Iterator = mock_iterator([{0, 1_000_000, 42}]),
     {S0, _} = init(stream_id(), FragRef, 64, Iterator),
     {_S1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
         S0, {request_error, make_ref(), 0, {unexpected, boom}}
     ),
-    ?assertEqual([stop], Effects).
+    ?assertEqual([{fatal_error, {unexpected, boom}}, stop], Effects).
+
+fatal_error_reports_reason_before_stop(_Config) ->
+    %% The real-world trigger: a 403 AccessDenied (e.g. credential/policy
+    %% change) mid-read. The reason must be carried in the report effect so
+    %% the shell can log it and bump the fatal-error metric, rather than the
+    %% reader stopping silently.
+    FragRef = frag_ref(0, 1_000_000, 42),
+    Iterator = mock_iterator([{0, 1_000_000, 42}]),
+    {S0, _} = init(stream_id(), FragRef, 64, Iterator),
+    {_S1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
+        S0, {request_error, make_ref(), 0, access_denied}
+    ),
+    ?assertEqual([{fatal_error, access_denied}, stop], Effects).
 
 multi_chunk_data_accumulation(_Config) ->
     %% Data arrives in 3 chunks (continue, continue, done). Read served after all arrive.

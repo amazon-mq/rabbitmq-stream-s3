@@ -94,19 +94,20 @@ returned by the functional core module.
 -define(C_LOCAL_LOG_AHEAD_RECOVERIES, 19).
 -define(C_BYTES_DRAINED, 20).
 -define(C_BYTES_PERSISTED, 21).
+-define(C_REMOTE_TIER_RETENTION_FAILURES, 22).
 %% Counters above; gauges below. The macro ?NODE_COUNTERS filters by
 %% type, and seshat requires counter indexes to be 1..N sequential. Add
 %% new counters before this divider and renumber the gauges that follow.
--define(C_TRANSFERS_IN_FLIGHT, 22).
--define(C_LAST_PERSIST_TIMESTAMP_MS, 23).
--define(C_MANIFEST_FIRST_OFFSET, 24).
--define(C_MANIFEST_NEXT_OFFSET, 25).
--define(C_MANIFEST_FIRST_TIMESTAMP_MS, 26).
--define(C_REMOTE_BYTES, 27).
--define(C_REMOTE_MESSAGES, 28).
--define(C_BYTES_IN_ASSEMBLY, 29).
--define(C_BYTES_IN_TRANSFER, 30).
--define(C_BYTES_IN_PERSIST, 31).
+-define(C_TRANSFERS_IN_FLIGHT, 23).
+-define(C_LAST_PERSIST_TIMESTAMP_MS, 24).
+-define(C_MANIFEST_FIRST_OFFSET, 25).
+-define(C_MANIFEST_NEXT_OFFSET, 26).
+-define(C_MANIFEST_FIRST_TIMESTAMP_MS, 27).
+-define(C_REMOTE_BYTES, 28).
+-define(C_REMOTE_MESSAGES, 29).
+-define(C_BYTES_IN_ASSEMBLY, 30).
+-define(C_BYTES_IN_TRANSFER, 31).
+-define(C_BYTES_IN_PERSIST, 32).
 
 -define(STREAM_COUNTERS, [
     {transfers_completed, ?C_TRANSFERS_COMPLETED, counter,
@@ -151,6 +152,9 @@ returned by the functional core module.
     {bytes_persisted_total, ?C_BYTES_PERSISTED, counter,
         "Cumulative bytes whose fragment manifest update has succeeded (each persist "
         "covers one or more uploaded fragments)"},
+    {remote_tier_retention_failures, ?C_REMOTE_TIER_RETENTION_FAILURES, counter,
+        "Number of remote tier retention evaluations that failed (crashed or timed "
+        "out). Distinct from evaluations that ran and found nothing to remove."},
     {transfers_in_flight, ?C_TRANSFERS_IN_FLIGHT, gauge,
         "Fragments cut and submitted to the governor that have not yet completed"},
     {last_persist_timestamp_ms, ?C_LAST_PERSIST_TIMESTAMP_MS, gauge,
@@ -243,7 +247,10 @@ returned by the functional core module.
     %% S3 DELETE until the manifest persist that records their removal
     %% completes. This eliminates the race where a reader sees a stale
     %% manifest pointing to already-deleted objects (issue #166).
-    deferred_deletions = [] :: [#fragment_ref{} | #group_ref{}]
+    deferred_deletions = [] :: [#fragment_ref{} | #group_ref{}],
+    %% Set when the core asks to shut down (the stream's metadata node was
+    %% deleted). The handler that executed the effect returns {stop, normal}.
+    stopping = false :: boolean()
 }).
 
 -doc "Start a remote replica reader for the given stream.".
@@ -481,9 +488,29 @@ handle_info(
     {retention_result, unchanged},
     #state{core = Core0, retention_mon = Mon, retention_timer = TRef} = State0
 ) ->
+    %% Evaluation ran and found nothing to remove: not a failure, not counted.
     demonitor(Mon, [flush]),
     _ = cancel_timer(TRef),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:retention_failed(unchanged, Core0),
+    {noreply,
+        execute_effects(Effects, State0#state{
+            core = Core,
+            retention_mon = undefined,
+            retention_pid = undefined,
+            retention_timer = undefined
+        })};
+handle_info(
+    {retention_result, {failed, Reason}},
+    #state{core = Core0, retention_mon = Mon, retention_timer = TRef} = State0
+) ->
+    %% The async retention task caught a crash and reported it as a failure
+    %% (distinct from unchanged, which means it ran and found nothing). The
+    %% task already logged the crash with a stack trace; record the failure
+    %% as a metric so it is visible separately from no-op evaluations.
+    demonitor(Mon, [flush]),
+    _ = cancel_timer(TRef),
+    inc(State0, ?C_REMOTE_TIER_RETENTION_FAILURES, 1),
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:retention_failed(Reason, Core0),
     {noreply,
         execute_effects(Effects, State0#state{
             core = Core,
@@ -510,6 +537,7 @@ handle_info(
     ?LOG_WARNING("~ts retention evaluation task timed out, killing", [StreamId]),
     exit(Pid, kill),
     demonitor(Mon, [flush]),
+    inc(State0, ?C_REMOTE_TIER_RETENTION_FAILURES, 1),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:retention_failed(timeout, Core0),
     {noreply,
         execute_effects(Effects, State0#state{
@@ -560,10 +588,11 @@ handle_info({persist_result, {error, Reason}}, #state{core = Core0, persist_mon 
     demonitor(Mon, [flush]),
     State1 = on_persist_failed(Reason, State0),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_failed(Reason, Core0),
-    {noreply,
+    maybe_stop(
         execute_effects(Effects, State1#state{
             core = Core, persist_mon = undefined, persist_pid = undefined
-        })};
+        })
+    );
 handle_info(
     {'DOWN', Mon, process, _, Reason},
     #state{persist_mon = Mon, core = Core0, cfg = #cfg{stream = StreamId}} = State0
@@ -571,10 +600,14 @@ handle_info(
     ?LOG_WARNING("~ts commit task crashed: ~p", [StreamId, Reason]),
     State1 = on_persist_failed(Reason, State0),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_failed(Reason, Core0),
-    {noreply,
+    %% Route through maybe_stop/1 like the {persist_result, {error, _}} handler:
+    %% persist_failed/2 can return a stop effect, and a crashed persist task
+    %% must honour it rather than leaving the reader marked stopping but alive.
+    maybe_stop(
         execute_effects(Effects, State1#state{
             core = Core, persist_mon = undefined, persist_pid = undefined
-        })};
+        })
+    );
 handle_info(
     {'DOWN', Mon, process, _, Reason},
     #state{group_mon = Mon, core = Core0, cfg = #cfg{stream = StreamId}} = State0
@@ -592,6 +625,7 @@ handle_info(
 ) ->
     ?LOG_WARNING("~ts retention evaluation task crashed: ~p", [StreamId, Reason]),
     _ = cancel_timer(TRef),
+    inc(State0, ?C_REMOTE_TIER_RETENTION_FAILURES, 1),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:retention_failed(Reason, Core0),
     {noreply,
         execute_effects(Effects, State0#state{
@@ -937,10 +971,23 @@ execute_effect(reinitialize, #state{cfg = #cfg{stream = StreamId}} = State0) ->
         %% so the objects must remain. The new writer will re-evaluate
         %% retention and delete them after its own persist.
         deferred_deletions = []
-    }).
+    });
+execute_effect(stop, State) ->
+    %% The stream's metadata node was deleted (the queue was removed). Mark the
+    %% reader for shutdown; the handler that ran this effect returns
+    %% {stop, normal} via maybe_stop/1.
+    State#state{stopping = true}.
 
 cancel_timer(undefined) -> ok;
 cancel_timer(Ref) -> erlang:cancel_timer(Ref).
+
+%% Return the gen_server result for a handler, honouring a stop requested by
+%% the core (e.g. on stream deletion). transient restart means a normal stop
+%% is not restarted by the supervisor.
+maybe_stop(#state{stopping = true} = State) ->
+    {stop, normal, State};
+maybe_stop(State) ->
+    {noreply, State}.
 
 %% ------------------------------------------------------------------
 %% Retention
@@ -1026,7 +1073,7 @@ maybe_spawn_group_retention(
                     ?LOG_WARNING(
                         "Retention evaluation crashed: ~p:~p~n~p", [Class, Reason, Stack]
                     ),
-                    unchanged
+                    {failed, {Class, Reason}}
             end,
         Self ! {retention_result, Result}
     end),

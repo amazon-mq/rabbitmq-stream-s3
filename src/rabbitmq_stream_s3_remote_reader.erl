@@ -38,6 +38,7 @@ synchronous feedback is generated.
 -define(C_READ_DURATION_MS, 5).
 -define(C_READ, 6).
 -define(C_TOTAL_REQUESTS, 7).
+-define(C_FATAL_ERRORS, 8).
 -define(COUNTER_KEY, {rabbitmq_stream_s3_remote_reader, counter}).
 -define(COUNTERS, [
     {buffer_hit, ?C_BUFFER_HIT, counter, "Number of reads served from the buffer"},
@@ -47,7 +48,9 @@ synchronous feedback is generated.
         "Current number of in-flight async requests"},
     {read_duration_ms, ?C_READ_DURATION_MS, counter, "Total milliseconds spent in read calls"},
     {read, ?C_READ, counter, "Number of read/4,5 calls"},
-    {remote_reader_total_requests, ?C_TOTAL_REQUESTS, counter, "Number of S3 requests initiated"}
+    {remote_reader_total_requests, ?C_TOTAL_REQUESTS, counter, "Number of S3 requests initiated"},
+    {remote_reader_fatal_errors, ?C_FATAL_ERRORS, counter,
+        "Number of remote readers stopped by a non-retryable S3 error"}
 ]).
 -define(READ_SIZE_BUCKETS, [
     48, 128, 512, 2_048, 8_192, 32_768, 131_072, 524_288, 2_097_152, 8_388_608, infinity
@@ -392,6 +395,13 @@ execute_effect(
         Core0, {iterator_refreshed, Result}
     ),
     execute_effects(Effects, State1#state{core = Core1});
+execute_effect({fatal_error, Reason}, #state{stream = StreamId} = State) ->
+    counters:add(counter(), ?C_FATAL_ERRORS, 1),
+    ?LOG_WARNING(
+        "remote_reader for stream ~ts stopping on non-retryable S3 error: ~tp",
+        [StreamId, Reason]
+    ),
+    State;
 execute_effect(stop, State) ->
     State#state{stopping = true}.
 

@@ -34,6 +34,7 @@ have a way to form a barrier. To assert the results of retention we use the
 -include_lib("stdlib/include/assert.hrl").
 -include_lib("rabbitmq_ct_helpers/include/rabbit_assert.hrl").
 -include_lib("rabbitmq_stream_s3/include/rabbitmq_stream_s3.hrl").
+-include_lib("rabbit/include/rabbit_khepri.hrl").
 
 -import(rabbitmq_stream_s3_test_helpers, [
     start_writer/2,
@@ -75,7 +76,9 @@ groups() ->
             local_ahead_discards_manifest,
             stream_deletion_cleans_remote_tier,
             stream_deletion_during_active_upload,
+            persist_not_found_stops_reader,
             discover_attaches_to_existing_writer,
+            on_init_writer_tolerates_already_started,
             remote_retention_deletes_fragments,
             remote_retention_on_update,
             remote_retention_survives_multiple_persist_cycles,
@@ -160,6 +163,33 @@ registry_lifecycle(Config) ->
         rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}),
         1000
     ).
+
+on_init_writer_tolerates_already_started(Config) ->
+    %% Regression. The writer init hook starts the replica reader,
+    %% which is registered by {StreamId, node()} rather than by writer pid. If
+    %% a reader already exists for the stream on this node (discover/0 ran
+    %% first, or a prior incarnation has not terminated), start_child returns
+    %% {error, {already_started, _}}. The hook must tolerate that instead of a
+    %% badmatch crashing osiris_log:init/2.
+    StreamId = ?config(stream_id, Config),
+    Writer = start_writer(Config, #{}),
+    %% The hook already started and registered the reader.
+    ?assertMatch(
+        Pid when is_pid(Pid),
+        rabbitmq_stream_s3_registry:whereis_name({StreamId, node()})
+    ),
+    #{shared := Shared, dir := Dir} = gen_batch_server:call(Writer, get_reader_context),
+    Counter = osiris_counters:fetch({osiris_writer, StreamId}),
+    HookConfig = (?config(writer_cfg, Config))#{
+        shared => Shared,
+        dir => Dir,
+        counter => Counter,
+        remote_config => #{persist_threshold => 1}
+    },
+    %% Re-invoke the writer init hook against the already-running reader.
+    %% Before this fix it exited with {badmatch, {error, {already_started, _}}}.
+    Result = rabbitmq_stream_s3_hooks:on_init(writer, Writer, HookConfig),
+    ?assertMatch(#{retention := _}, Result).
 
 uploads_fragments(Config) ->
     StreamId = ?config(stream_id, Config),
@@ -502,6 +532,44 @@ stream_deletion_during_active_upload(Config) ->
     end,
 
     %% Registry is cleaned up.
+    ?assertEqual(undefined, rabbitmq_stream_s3_registry:whereis_name({StreamId, node()})).
+
+persist_not_found_stops_reader(Config) ->
+    %% When the stream's Khepri metadata node is deleted (as the keep-while
+    %% condition does when the queue is removed), an in-flight persist's db:put
+    %% returns not_found. For an established stream (expected revision > 0) the
+    %% reader must stop cleanly rather than retry forever or resurrect the
+    %% deleted stream.
+    StreamId = ?config(stream_id, Config),
+    Writer = start_writer(Config, #{}, #{fragment_target_size => 500}),
+    Record = binary:copy(<<"D">>, 600),
+    %% First persist: establishes the metadata node at a revision > 0.
+    osiris_writer:write(Writer, Record),
+    flush_writer(Writer),
+    await_offset(Config, 1),
+    ReaderPid = rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}),
+    ?assert(is_pid(ReaderPid)),
+    ?assertMatch({ok, #{revision := R}} when R > 0, rabbitmq_stream_s3_db:get(StreamId)),
+    %% Delete the metadata node out from under the reader.
+    ok = khepri:delete(
+        rabbitmq_metadata, ?RABBITMQ_KHEPRI_ROOT_PATH([rabbitmq_stream_s3, StreamId])
+    ),
+    ?awaitMatch({error, not_found}, rabbitmq_stream_s3_db:get(StreamId), 1000),
+    ReaderMon = monitor(process, ReaderPid),
+    %% Force another persist. db:put now hits the deleted node -> not_found.
+    lists:foreach(
+        fun(_) ->
+            osiris_writer:write(Writer, Record),
+            flush_writer(Writer)
+        end,
+        lists:seq(1, 5)
+    ),
+    receive
+        {'DOWN', ReaderMon, process, ReaderPid, Reason} ->
+            ?assertEqual(normal, Reason)
+    after 5000 ->
+        ct:fail("reader did not stop after a not_found persist")
+    end,
     ?assertEqual(undefined, rabbitmq_stream_s3_registry:whereis_name({StreamId, node()})).
 
 discover_attaches_to_existing_writer(Config) ->

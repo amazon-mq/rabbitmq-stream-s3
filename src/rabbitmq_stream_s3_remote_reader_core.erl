@@ -29,6 +29,7 @@ returns a new state plus a list of effects describing what should happen next.
 - `{set_timer, Duration}` - schedule a retry timer
 - `{refresh_iterator, Offset}` - rebuild iterator past the given offset
 - `{observe, Kind, ReadSize}` - report a notable read-path event for metrics
+- `{fatal_error, Reason}` - a non-retryable error is stopping the reader; report it (log + metric) before `stop`
 - `stop` - shut down the remote reader
 
 ## Design
@@ -123,6 +124,7 @@ and transitions immediately if available, or signals that more data is needed.
     | {set_timer, pos_integer()}
     | {refresh_iterator, osiris:offset()}
     | {observe, observe_kind(), pos_integer()}
+    | {fatal_error, term()}
     | stop.
 
 -type read_result() ::
@@ -238,8 +240,13 @@ step(
     NextDelay = min(RetryDelay * 2, MaxDelay),
     State = State0#state{retry_delay = NextDelay, requests_in_flight = #{}},
     {State, [{set_timer, RetryDelay}]};
-step(State0, {request_error, _RequestId, _Fragment, _Fatal}) ->
-    {State0, [stop]};
+step(State0, {request_error, _RequestId, _Fragment, Reason}) ->
+    %% Non-retryable error (e.g. 403 AccessDenied, an unexpected status). Report
+    %% the reason before stopping so an operator can answer "why did this
+    %% consumer's remote read stop?". Without this the shutdown is silent: the
+    %% API layer's per-status counters tick, but nothing ties a stopped reader
+    %% to a cause. The report effect must precede `stop`.
+    {State0, [{fatal_error, Reason}, stop]};
 step(State0, retry) ->
     {State1, Effects} = maybe_start_requests(State0),
     {State2, Effects2} = try_serve(State1),
@@ -438,10 +445,25 @@ next_fragment_offset(#state{iterator = Iterator}) ->
         _ -> end_of_manifest
     end.
 
-goto_next_fragment(#state{stream = StreamId, next = Next0, iterator = Iterator0} = State) ->
+goto_next_fragment(
+    #state{
+        stream = StreamId,
+        next = Next0,
+        iterator = Iterator0,
+        fragment_ref = #fragment_ref{offset = CurrentOffset}
+    } = State
+) ->
     Iterator = advance_iterator(Iterator0),
     case Next0 of
         {#fragment_ref{offset = NextOffset, uid = NextUid} = NextFragRef, Buffer} ->
+            %% Forward navigation must be strictly increasing. A fragment
+            %% iterator that mispositions (for example descending into a group
+            %% at the wrong offset) can hand back an earlier fragment, which
+            %% would deliver out-of-order or duplicate offsets to the consumer
+            %% with no other signal. Assert the invariant here so such a bug is
+            %% a loud crash at the transition rather than silent data corruption
+            %% downstream, and so any future iterator regression fails fast.
+            ?assert(NextOffset > CurrentOffset),
             Key = rabbitmq_stream_s3:fragment_key(StreamId, NextOffset, NextUid),
             State#state{
                 start_pos = ?SEGMENT_HEADER_B,
