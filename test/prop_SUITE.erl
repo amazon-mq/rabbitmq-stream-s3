@@ -26,6 +26,7 @@ all() ->
         truncate_edit_advances_first_offset,
         truncate_edit_shrinks_total_size,
         sequence_of_edits_maintains_invariants,
+        retention_cycles_preserve_accounting,
         %% Fragment assembly properties
         assembly_size_is_sum_of_chunks,
         assembly_offsets_are_bounded,
@@ -160,6 +161,130 @@ prop_sequence_of_edits_maintains_invariants() ->
                 Final#manifest.next_offset >= Final#manifest.first_offset
         end
     ).
+
+%% =========================================================================
+%% Manifest retention properties
+%% =========================================================================
+
+retention_cycles_preserve_accounting(_Config) ->
+    rabbit_ct_proper_helpers:run_proper(
+        fun prop_retention_cycles_preserve_accounting/0, [], 500
+    ).
+
+%% Property: across any sequence of remote-retention cycles (max_bytes and
+%% max_age, in any order) against a manifest containing a group, the accounting
+%% stays consistent with an independent model of which fragments survive:
+%%   - no fragment is deleted twice (idempotent across cycles);
+%%   - deletions are always an oldest-contiguous prefix (never a middle hole);
+%%   - total_size equals the sum of surviving fragment sizes (never drifts or
+%%     goes negative);
+%%   - first_offset equals the oldest survivor and never regresses;
+%%   - next_offset is unchanged by retention.
+%% A group object is immutable, so re-reading it must not re-process already
+%% removed children -- the regression this guards (see manifest_SUITE).
+prop_retention_cycles_preserve_accounting() ->
+    ?FORALL(
+        {TreeSpec, Frags, Schedule},
+        gen_ret_scenario(),
+        begin
+            {M0, GetGroup} = rabbitmq_stream_s3_test_helpers:build_manifest(TreeSpec),
+            check_ret_cycles(Schedule, M0, GetGroup, Frags, M0#manifest.first_offset)
+        end
+    ).
+
+%% Fold the schedule, applying each retention cycle and checking the invariants
+%% against the live-fragment model (a list of {Offset, Size, LastTs}).
+check_ret_cycles([], _M, _GetGroup, _Live, _PrevFirst) ->
+    true;
+check_ret_cycles([{Specs, Now} | Rest], M, GetGroup, Live, PrevFirst) ->
+    case rabbitmq_stream_s3_manifest:evaluate_remote_retention(M, Specs, Now, GetGroup) of
+        unchanged ->
+            check_ret_cycles(Rest, M, GetGroup, Live, PrevFirst);
+        {Edit, Refs} ->
+            DelOffs = [O || #fragment_ref{offset = O} <- Refs],
+            LiveOffs = [O || {O, _, _} <- Live],
+            M1 = rabbitmq_stream_s3_manifest:apply_edit(Edit, M),
+            Live1 = [F || {O, _, _} = F <- Live, not lists:member(O, DelOffs)],
+            SurvOffs = [O || {O, _, _} <- Live1],
+            ExpSize = lists:sum([S || {_, S, _} <- Live1]),
+            Checks = [
+                %% No fragment deleted twice, this cycle or in a prior one.
+                lists:all(fun(O) -> lists:member(O, LiveOffs) end, DelOffs),
+                length(DelOffs) =:= length(lists:usort(DelOffs)),
+                %% Deletions are an oldest-contiguous prefix.
+                is_oldest_prefix(DelOffs, SurvOffs),
+                %% total_size tracks the surviving fragments exactly.
+                M1#manifest.total_size =:= ExpSize,
+                M1#manifest.total_size >= 0,
+                %% first_offset is the oldest survivor and never regresses.
+                first_offset_ok(M1, SurvOffs),
+                M1#manifest.first_offset >= PrevFirst,
+                %% Retention never moves next_offset.
+                M1#manifest.next_offset =:= M#manifest.next_offset
+            ],
+            case lists:all(fun(B) -> B end, Checks) of
+                true ->
+                    check_ret_cycles(Rest, M1, GetGroup, Live1, M1#manifest.first_offset);
+                false ->
+                    false
+            end
+    end.
+
+is_oldest_prefix([], _SurvOffs) -> true;
+is_oldest_prefix(_DelOffs, []) -> true;
+is_oldest_prefix(DelOffs, SurvOffs) -> lists:max(DelOffs) < lists:min(SurvOffs).
+
+first_offset_ok(M, []) -> M#manifest.first_offset =:= M#manifest.next_offset;
+first_offset_ok(M, SurvOffs) -> M#manifest.first_offset =:= lists:min(SurvOffs).
+
+%% Generate a manifest with a leading group of G fragments followed by R
+%% trailing root fragments (offsets 0,100,..., last_ts strictly increasing),
+%% plus a schedule of retention cycles to apply. The leading group is what
+%% exercises partial-then-further group consumption across cycles.
+gen_ret_scenario() ->
+    ?LET(
+        {G, R},
+        {integer(3, 6), integer(1, 3)},
+        ?LET(
+            Sizes,
+            vector(G + R, integer(50, 500)),
+            begin
+                N = G + R,
+                Frags = [
+                    {I * 100, lists:nth(I + 1, Sizes), (I + 1) * 1000}
+                 || I <- lists:seq(0, N - 1)
+                ],
+                GroupFrags = lists:sublist(Frags, G),
+                RootFrags = lists:nthtail(G, Frags),
+                TreeSpec =
+                    [{group, [frag_spec(F) || F <- GroupFrags]}] ++
+                        [frag_spec(F) || F <- RootFrags],
+                Total = lists:sum(Sizes),
+                MaxTs = N * 1000,
+                ?LET(
+                    Schedule,
+                    gen_ret_schedule(Total, MaxTs),
+                    {TreeSpec, Frags, Schedule}
+                )
+            end
+        )
+    ).
+
+frag_spec({Off, Size, LastTs}) ->
+    {fragment, #{
+        offset => Off, size => Size, first_ts => LastTs, last_ts => LastTs, uid => Off + 1
+    }}.
+
+gen_ret_schedule(Total, MaxTs) ->
+    ?LET(K, integer(2, 6), vector(K, gen_ret_step(Total, MaxTs))).
+
+%% A step is either a max_bytes target (any size, applied at Now = 0) or a
+%% max_age cutoff expressed as Now with a zero max-age (cutoff = Now).
+gen_ret_step(Total, MaxTs) ->
+    frequency([
+        {1, ?LET(T, integer(0, Total), {[{max_bytes, T}], 0})},
+        {1, ?LET(Now, integer(0, MaxTs + 2000), {[{max_age, 0}], Now})}
+    ]).
 
 %% =========================================================================
 %% Replica reader core: rebalancing
