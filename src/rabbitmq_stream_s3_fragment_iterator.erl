@@ -30,9 +30,15 @@ as it descends into branches.
     index :: non_neg_integer(),
     stack :: [{binary(), non_neg_integer()}],
     get_group_fun :: get_group_fun(),
-    %% The manifest's first_offset. Used to skip deleted entries when
-    %% descending into groups after partial retention.
-    first_offset :: osiris:offset()
+    %% The offset to position at, at every level of the tree: the caller's
+    %% requested offset clamped up to the manifest's first_offset. The clamp
+    %% serves two roles at once. It positions descent at the requested offset
+    %% (so a read starting mid-group lands on the right child, not the group's
+    %% first child), and the first_offset floor skips leading entries that
+    %% retention has deleted (whose objects are gone). Reusing one value at
+    %% every level is correct because the iterator only moves forward: a group
+    %% entirely after this offset resolves to its first child (index 0).
+    start_offset :: osiris:offset()
 }).
 
 -opaque iterator() :: #iterator{}.
@@ -42,13 +48,14 @@ Create an iterator positioned at the entry containing or following `Offset`.
 """.
 -spec init(#manifest{}, osiris:offset(), get_group_fun()) -> iterator().
 init(#manifest{entries = Entries, first_offset = FirstOffset}, Offset, GetGroupFun) ->
-    Idx = find_start_index(Entries, Offset),
+    StartOffset = max(Offset, FirstOffset),
+    Idx = find_start_index(Entries, StartOffset),
     #iterator{
         entries = Entries,
         index = Idx,
         stack = [],
         get_group_fun = GetGroupFun,
-        first_offset = FirstOffset
+        start_offset = StartOffset
     }.
 
 -doc """
@@ -110,13 +117,13 @@ descend(
         index = Idx,
         stack = Stack,
         get_group_fun = GetGroupFun,
-        first_offset = FirstOffset
+        start_offset = StartOffset
     } = It,
     GroupRef
 ) ->
     case GetGroupFun(GroupRef) of
         {ok, ChildEntries} ->
-            ChildIdx = find_start_index(ChildEntries, FirstOffset),
+            ChildIdx = find_start_index(ChildEntries, StartOffset),
             It1 = It#iterator{
                 entries = ChildEntries,
                 index = ChildIdx,

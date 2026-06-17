@@ -32,6 +32,10 @@ all() ->
         all_refs_with_groups,
         descend_skips_retained_entries,
         descend_skips_retained_entries_kilo_group,
+        init_mid_group_positions_at_requested_offset,
+        init_between_group_children_positions_at_containing_child,
+        init_mid_kilo_group_positions_at_requested_offset,
+        mid_group_descent_respects_retention_floor,
         init_at_group_boundary,
         group_fetch_failed_mid_traversal,
         empty_group_ascends_immediately,
@@ -384,6 +388,104 @@ descend_skips_retained_entries_kilo_group(_Config) ->
     {ok, #fragment_ref{offset = 400, uid = 16#b4}, It6} =
         rabbitmq_stream_s3_fragment_iterator:next(It5),
     ?assertEqual(end_of_manifest, rabbitmq_stream_s3_fragment_iterator:next(It6)).
+
+init_mid_group_positions_at_requested_offset(_Config) ->
+    %% Regression for the mid-group descent bug (R2-1). A read starting inside
+    %% a group, above the group's first child, must land on the child that
+    %% contains the requested offset, not the group's first child. Here
+    %% first_offset = 0 (nothing retained) and init is at offset 200 over a
+    %% group [F0, F100, F200, F300]: the first result must be F200. The bug
+    %% descended at first_offset (0) and returned F0, then F100, ... —
+    %% delivering already-seen, out-of-order fragments to the consumer.
+    {Manifest, GetGroup} = build_manifest([
+        {group, [
+            {fragment, #{offset => 0, uid => 16#a0}},
+            {fragment, #{offset => 100, uid => 16#a1}},
+            {fragment, #{offset => 200, uid => 16#a2}},
+            {fragment, #{offset => 300, uid => 16#a3}}
+        ]},
+        {fragment, #{offset => 400, uid => 16#a4}}
+    ]),
+    %% Precondition that distinguishes this from the retention tests: the
+    %% requested offset (200) is strictly above first_offset (0).
+    ?assertEqual(0, Manifest#manifest.first_offset),
+    It0 = rabbitmq_stream_s3_fragment_iterator:init(Manifest, 200, GetGroup),
+    {ok, #fragment_ref{offset = 200, uid = 16#a2}, It1} =
+        rabbitmq_stream_s3_fragment_iterator:next(It0),
+    {ok, #fragment_ref{offset = 300, uid = 16#a3}, It2} =
+        rabbitmq_stream_s3_fragment_iterator:next(It1),
+    {ok, #fragment_ref{offset = 400, uid = 16#a4}, It3} =
+        rabbitmq_stream_s3_fragment_iterator:next(It2),
+    ?assertEqual(end_of_manifest, rabbitmq_stream_s3_fragment_iterator:next(It3)).
+
+init_between_group_children_positions_at_containing_child(_Config) ->
+    %% Requested offset 250 falls between F200 and F300; it must resolve to
+    %% F200 (the child whose range contains 250), exercising the
+    %% partition_point/saturating_decr path for a non-boundary offset.
+    {Manifest, GetGroup} = build_manifest([
+        {group, [
+            {fragment, #{offset => 0, uid => 16#a0}},
+            {fragment, #{offset => 100, uid => 16#a1}},
+            {fragment, #{offset => 200, uid => 16#a2}},
+            {fragment, #{offset => 300, uid => 16#a3}}
+        ]},
+        {fragment, #{offset => 400, uid => 16#a4}}
+    ]),
+    It0 = rabbitmq_stream_s3_fragment_iterator:init(Manifest, 250, GetGroup),
+    {ok, #fragment_ref{offset = 200, uid = 16#a2}, It1} =
+        rabbitmq_stream_s3_fragment_iterator:next(It0),
+    {ok, #fragment_ref{offset = 300, uid = 16#a3}, _} =
+        rabbitmq_stream_s3_fragment_iterator:next(It1).
+
+init_mid_kilo_group_positions_at_requested_offset(_Config) ->
+    %% Nested case: the requested offset must steer find_start_index correctly
+    %% at *every* level. init at 200 over
+    %% [KiloGroup([Group([F0,F100]), Group([F200,F300])]), F400] must descend
+    %% the kilo-group to its *second* child group and then to F200. The bug
+    %% (descend at first_offset = 0) picked the first group and returned F0.
+    {Manifest, GetGroup} = build_manifest([
+        {kilo_group, [
+            {group, [
+                {fragment, #{offset => 0, uid => 16#b0}},
+                {fragment, #{offset => 100, uid => 16#b1}}
+            ]},
+            {group, [
+                {fragment, #{offset => 200, uid => 16#b2}},
+                {fragment, #{offset => 300, uid => 16#b3}}
+            ]}
+        ]},
+        {fragment, #{offset => 400, uid => 16#b4}}
+    ]),
+    ?assertEqual(0, Manifest#manifest.first_offset),
+    It0 = rabbitmq_stream_s3_fragment_iterator:init(Manifest, 200, GetGroup),
+    {ok, #fragment_ref{offset = 200, uid = 16#b2}, It1} =
+        rabbitmq_stream_s3_fragment_iterator:next(It0),
+    {ok, #fragment_ref{offset = 300, uid = 16#b3}, It2} =
+        rabbitmq_stream_s3_fragment_iterator:next(It1),
+    {ok, #fragment_ref{offset = 400, uid = 16#b4}, It3} =
+        rabbitmq_stream_s3_fragment_iterator:next(It2),
+    ?assertEqual(end_of_manifest, rabbitmq_stream_s3_fragment_iterator:next(It3)).
+
+mid_group_descent_respects_retention_floor(_Config) ->
+    %% Retention and mid-group descent combined: first_offset = 100 (F0 gone)
+    %% and the requested offset is 250. The clamp is max(250, 100) = 250, so
+    %% the first result is F200. The bug descended at first_offset (100) and
+    %% returned F100 — below where the consumer asked to start.
+    {Manifest0, GetGroup} = build_manifest([
+        {group, [
+            {fragment, #{offset => 0, uid => 16#c0}},
+            {fragment, #{offset => 100, uid => 16#c1}},
+            {fragment, #{offset => 200, uid => 16#c2}},
+            {fragment, #{offset => 300, uid => 16#c3}}
+        ]},
+        {fragment, #{offset => 400, uid => 16#c4}}
+    ]),
+    Manifest = Manifest0#manifest{first_offset = 100, first_timestamp = 100},
+    It0 = rabbitmq_stream_s3_fragment_iterator:init(Manifest, 250, GetGroup),
+    {ok, #fragment_ref{offset = 200, uid = 16#c2}, It1} =
+        rabbitmq_stream_s3_fragment_iterator:next(It0),
+    {ok, #fragment_ref{offset = 300, uid = 16#c3}, _} =
+        rabbitmq_stream_s3_fragment_iterator:next(It1).
 
 init_at_group_boundary(_Config) ->
     %% Init at offset that is exactly the first offset of a group entry.
