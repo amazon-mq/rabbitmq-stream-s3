@@ -36,6 +36,7 @@ lives here. Callers use these functions instead of calling
     task_retry_delay_exponent/0,
     verbose_logging/0,
     segment_upload_timeout/0,
+    upload_retry_delay_ms/0,
     retention_task_timeout/0,
     tick_timeout_milliseconds/0,
     max_transfer_bytes_per_sec/0,
@@ -160,6 +161,13 @@ verbose_logging() ->
 segment_upload_timeout() ->
     application:get_env(?APP, segment_upload_timeout, 45_000).
 
+%% Delay before retrying a fragment upload that failed with a non-transient
+%% error. The upload pipeline stalls at the failed offset until the retry
+%% succeeds, so this bounds how often a persistently failing upload is retried.
+-spec upload_retry_delay_ms() -> non_neg_integer().
+upload_retry_delay_ms() ->
+    application:get_env(?APP, upload_retry_delay_ms, 1000).
+
 -spec retention_task_timeout() -> non_neg_integer().
 retention_task_timeout() ->
     application:get_env(?APP, retention_task_timeout, 60_000).
@@ -213,6 +221,7 @@ defaults_test_() ->
         ?_assertEqual(2, task_retry_delay_exponent()),
         ?_assertEqual(false, verbose_logging()),
         ?_assertEqual(45_000, segment_upload_timeout()),
+        ?_assertEqual(1000, upload_retry_delay_ms()),
         ?_assertEqual(60_000, retention_task_timeout()),
         ?_assertEqual(5000, tick_timeout_milliseconds()),
         ?_assertEqual(false, verify_crc_on_read()),

@@ -94,6 +94,7 @@ testable without mocks or timing.
     | {start_persist_timer, non_neg_integer()}
     | cancel_persist_timer
     | {resubmit_transfer, reference(), stream_id(), directory(), fragment_meta()}
+    | {resubmit_transfer_delayed, reference(), stream_id(), directory(), fragment_meta(), term()}
     | reinitialize.
 
 %% ------------------------------------------------------------------
@@ -203,14 +204,22 @@ transfer_complete(Ref, Uid, #state{pending_completions = PC} = State0) ->
 
 -spec transfer_failed(reference(), term(), state()) -> {state(), [core_effect()]}.
 transfer_failed(Ref, Reason, #state{cfg = Cfg} = State) ->
+    Meta = get_meta(Ref, State),
     case is_retriable(Reason) of
         true ->
-            Meta = get_meta(Ref, State),
+            %% Transient error. Retry immediately.
             {State, [{resubmit_transfer, Ref, Cfg#cfg.stream, Cfg#cfg.dir, Meta}]};
         false ->
-            %% Fatal: remove from queue, accept gap, drain subsequent.
-            State1 = remove_in_flight(Ref, State),
-            drain_completions(State1)
+            %% A confirmed fragment must never be abandoned. Dropping it would
+            %% let drain_completions advance next_offset over the subsequent
+            %% (already durable) fragments, past a range that is not durable in
+            %% S3. The manifest would then claim that range as tiered, the
+            %% local-tier cleanup (which keys off next_offset) would free the
+            %% only remaining copy, and the result is a silent, permanent hole
+            %% in the middle of the stream (see issue #206). Instead, keep the
+            %% fragment at its place in the queue and retry it with a backoff
+            %% delay, stalling the pipeline until it is durable.
+            {State, [{resubmit_transfer_delayed, Ref, Cfg#cfg.stream, Cfg#cfg.dir, Meta, Reason}]}
     end.
 
 -spec persist_complete(rabbitmq_stream_s3_db:revision(), state()) -> {state(), [core_effect()]}.
@@ -479,6 +488,9 @@ apply_fragment(
                     first_last_timestamp = LastTs
                 };
             _ ->
+                %% Belt-and-suspenders guard for the invariant that protects
+                %% next_offset from advancing past a non-durable range.
+                assert_contiguous(Manifest0#manifest.next_offset, FirstOffset),
                 Edit
         end,
     Manifest = rabbitmq_stream_s3_manifest:apply_edit(Edit1, Manifest0),
@@ -623,10 +635,21 @@ get_meta(Ref, #state{in_flight = Q}) ->
 get_meta_from_queue(Ref, [{Ref, Meta} | _]) -> Meta;
 get_meta_from_queue(Ref, [_ | Rest]) -> get_meta_from_queue(Ref, Rest).
 
--spec remove_in_flight(reference(), state()) -> state().
-remove_in_flight(Ref, #state{in_flight = Q} = State) ->
-    Q1 = queue:from_list([E || {R, _} = E <- queue:to_list(Q), R =/= Ref]),
-    State#state{in_flight = Q1}.
+%% A fragment must begin exactly where the manifest currently ends.
+%% Appending a non-contiguous fragment would advance next_offset past a
+%% range that was never made durable in S3, producing a silent, permanent
+%% hole in the stream (issue #206). Fail loudly instead: on restart the
+%% reader re-resolves the durable manifest rather than recording the gap.
+-spec assert_contiguous(osiris:offset(), osiris:offset()) -> ok.
+assert_contiguous(NextOffset, NextOffset) ->
+    ok;
+assert_contiguous(NextOffset, FragmentFirstOffset) ->
+    erlang:error(
+        {non_contiguous_fragment, #{
+            manifest_next_offset => NextOffset,
+            fragment_first_offset => FragmentFirstOffset
+        }}
+    ).
 
 -spec is_retriable(term()) -> boolean().
 is_retriable({http, 500}) -> true;

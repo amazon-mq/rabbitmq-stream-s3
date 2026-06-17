@@ -455,6 +455,12 @@ handle_info({transfer_result, Ref, {error, Reason}}, #state{core = Core0} = Stat
     State1 = on_transfer_result(Ref, {error, Reason}, State0),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(Ref, Reason, Core0),
     {noreply, execute_effects(Effects, State1#state{core = Core})};
+handle_info({retry_transfer, Ref, Dir, Meta}, #state{cfg = #cfg{stream = StreamId}} = State) ->
+    %% A previously failed fragment upload is being retried after its backoff
+    %% delay. The in-flight gauges were already restored when the delayed
+    %% resubmit effect was executed, so only re-submit the upload here.
+    submit_upload(Ref, Dir, StreamId, Meta),
+    {noreply, State};
 handle_info({group_upload_result, {ok, Uid}}, #state{core = Core0, group_mon = Mon} = State0) ->
     demonitor(Mon, [flush]),
     State1 = on_group_upload_completed(State0),
@@ -816,31 +822,30 @@ execute_effects([Effect | Rest], State0) ->
 
 execute_effect({submit_transfer, Ref, _StreamId, Dir, Meta}, #state{cfg = Cfg} = State0) ->
     StreamId = Cfg#cfg.stream,
-    Size = maps:get(size, Meta),
-    Self = self(),
-    Fun = fun() ->
-        case upload_fragment(Dir, StreamId, Meta) of
-            {ok, Uid} -> {ok, Uid};
-            {error, _} = Err -> Err
-        end
-    end,
-    rabbitmq_stream_s3_governor:submit(Fun, Size, Self, Ref),
-    on_transfer_submitted(Ref, Size, State0);
+    submit_upload(Ref, Dir, StreamId, Meta),
+    on_transfer_submitted(Ref, maps:get(size, Meta), State0);
 execute_effect({resubmit_transfer, Ref, _StreamId, Dir, Meta}, #state{cfg = Cfg} = State0) ->
     StreamId = Cfg#cfg.stream,
-    Size = maps:get(size, Meta),
-    Self = self(),
-    Fun = fun() ->
-        case upload_fragment(Dir, StreamId, Meta) of
-            {ok, Uid} -> {ok, Uid};
-            {error, _} = Err -> Err
-        end
-    end,
-    rabbitmq_stream_s3_governor:submit(Fun, Size, Self, Ref),
+    submit_upload(Ref, Dir, StreamId, Meta),
     %% on_transfer_result already decremented the gauges and removed Ref
     %% from transfer_sizes. Restore them so the eventual completion is
     %% accounted for correctly.
-    on_transfer_submitted(Ref, Size, State0);
+    on_transfer_submitted(Ref, maps:get(size, Meta), State0);
+execute_effect(
+    {resubmit_transfer_delayed, Ref, _StreamId, Dir, Meta, Reason}, #state{cfg = Cfg} = State0
+) ->
+    StreamId = Cfg#cfg.stream,
+    Delay = rabbitmq_stream_s3_config:upload_retry_delay_ms(),
+    ?LOG_WARNING(
+        "~ts fragment upload at offset ~b failed with non-transient error ~p; "
+        "retrying in ~bms. The upload pipeline and local-tier cleanup are "
+        "stalled at this offset until the fragment is durable in S3.",
+        [StreamId, maps:get(first_offset, Meta), Reason, Delay]
+    ),
+    erlang:send_after(Delay, self(), {retry_transfer, Ref, Dir, Meta}),
+    %% on_transfer_result already decremented the gauges. Restore them: the
+    %% fragment is still pending and its bytes are still in the pipeline.
+    on_transfer_submitted(Ref, maps:get(size, Meta), State0);
 execute_effect(
     {upload_group, StreamId, Kind, Entries, _Pos, _Len},
     State0
@@ -1395,6 +1400,14 @@ dec(#state{metrics = Cnt}, Idx, N) when is_integer(N), N > 0 ->
     counters:sub(Cnt, Idx, N);
 dec(_, _, _) ->
     ok.
+
+%% Submit a fragment upload to the governor. Shared by the initial submit
+%% and the immediate/delayed retry paths.
+submit_upload(Ref, Dir, StreamId, Meta) ->
+    Self = self(),
+    Size = maps:get(size, Meta),
+    Fun = fun() -> upload_fragment(Dir, StreamId, Meta) end,
+    rabbitmq_stream_s3_governor:submit(Fun, Size, Self, Ref).
 
 %% Called from execute_effect/2 for {submit_transfer, ...}.
 on_transfer_submitted(Ref, Size, #state{transfer_sizes = Sizes} = State) ->
