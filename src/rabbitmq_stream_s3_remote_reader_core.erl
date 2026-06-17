@@ -235,7 +235,7 @@ step(
     {request_error, _RequestId, _Fragment, pool_busy}
 ) ->
     %% Pool is growing — a connection will be ready within ~100-200ms (TLS
-    %% handshake time). Use a mild backoff (100, 200, 500, 500...) so we
+    %% handshake time). Use a mild backoff (100, 200, 400, 500, 500...) so we
     %% don't spin if the pool cannot grow (e.g., S3 unreachable), but stay
     %% fast enough to catch the connection as soon as it's ready.
     NextDelay = min(Delay * 2, 500),
