@@ -1427,14 +1427,23 @@ prop_find_fragment_timestamp() ->
             end,
             WithinRange = lists:all(
                 fun({Offset, FTs, LTs}) ->
-                    Ts = FTs + (LTs - FTs) div 2,
-                    FindFragment(Ts) =:= Offset
+                    %% A timestamp anywhere within a fragment, including both
+                    %% boundaries, resolves to that fragment. The last_ts case
+                    %% is the boundary one: the chunk at last_ts lives in this
+                    %% fragment, so the seek must not advance to the next.
+                    Mid = FTs + (LTs - FTs) div 2,
+                    FindFragment(FTs) =:= Offset andalso
+                        FindFragment(Mid) =:= Offset andalso
+                        FindFragment(LTs) =:= Offset
                 end,
                 Fragments
             ),
             InGap = lists:all(
                 fun({{_O1, _FTs1, LTs1}, {O2, FTs2, _LTs2}}) ->
-                    case LTs1 < FTs2 of
+                    %% Only meaningful when a timestamp lies strictly between the
+                    %% two fragments. Such a timestamp snaps to the later
+                    %% fragment, the right-boundary preference for timestamps.
+                    case LTs1 + 1 < FTs2 of
                         false ->
                             true;
                         true ->
