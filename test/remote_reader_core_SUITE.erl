@@ -722,27 +722,33 @@ observe_effects_emitted_for_hit_miss_and_transition(_Config) ->
     ?assert(is_integer(TransReadSize) andalso TransReadSize > 0).
 
 pool_busy_backoff_capped_at_500(_Config) ->
-    %% pool_busy means the pool is growing (a TLS handshake is in progress), so
-    %% it uses a mild backoff that doubles from 100ms and caps at 500ms, not the
-    %% network-error exponential sequence.
+    %% pool_busy means the pool is growing (a connection's TLS handshake is in
+    %% progress), so it uses a mild backoff that doubles from 25ms and caps at
+    %% 500ms, not the network-error exponential sequence.
     FragRef = frag_ref(0, 1_000_000, 42),
     Iterator = mock_iterator([{0, 1_000_000, 42}]),
     {S0, _} = init(stream_id(), FragRef, 64, Iterator),
-    {S1, [{set_timer, 100}]} = rabbitmq_stream_s3_remote_reader_core:step(
+    {S1, [{set_timer, 25}]} = rabbitmq_stream_s3_remote_reader_core:step(
         S0, {request_error, make_ref(), 0, pool_busy}
     ),
-    {S2, [{set_timer, 200}]} = rabbitmq_stream_s3_remote_reader_core:step(
+    {S2, [{set_timer, 50}]} = rabbitmq_stream_s3_remote_reader_core:step(
         S1, {request_error, make_ref(), 0, pool_busy}
     ),
-    {S3, [{set_timer, 400}]} = rabbitmq_stream_s3_remote_reader_core:step(
+    {S3, [{set_timer, 100}]} = rabbitmq_stream_s3_remote_reader_core:step(
         S2, {request_error, make_ref(), 0, pool_busy}
     ),
-    {S4, [{set_timer, 500}]} = rabbitmq_stream_s3_remote_reader_core:step(
+    {S4, [{set_timer, 200}]} = rabbitmq_stream_s3_remote_reader_core:step(
         S3, {request_error, make_ref(), 0, pool_busy}
     ),
-    %% Capped: stays at 500.
-    {_S5, [{set_timer, 500}]} = rabbitmq_stream_s3_remote_reader_core:step(
+    {S5, [{set_timer, 400}]} = rabbitmq_stream_s3_remote_reader_core:step(
         S4, {request_error, make_ref(), 0, pool_busy}
+    ),
+    {S6, [{set_timer, 500}]} = rabbitmq_stream_s3_remote_reader_core:step(
+        S5, {request_error, make_ref(), 0, pool_busy}
+    ),
+    %% Capped: stays at 500.
+    {_S7, [{set_timer, 500}]} = rabbitmq_stream_s3_remote_reader_core:step(
+        S6, {request_error, make_ref(), 0, pool_busy}
     ),
     ok.
 
@@ -751,14 +757,14 @@ pool_busy_delay_resets_on_data(_Config) ->
     FragRef = frag_ref(0, 1_000_000, 42),
     Iterator = mock_iterator([{0, 1_000_000, 42}]),
     {S0, _} = init(stream_id(), FragRef, 64, Iterator),
-    %% Escalate the pool_busy delay: 100, 200, 400.
-    {S1, [{set_timer, 100}]} = rabbitmq_stream_s3_remote_reader_core:step(
+    %% Escalate the pool_busy delay: 25, 50, 100.
+    {S1, [{set_timer, 25}]} = rabbitmq_stream_s3_remote_reader_core:step(
         S0, {request_error, make_ref(), 0, pool_busy}
     ),
-    {S2, [{set_timer, 200}]} = rabbitmq_stream_s3_remote_reader_core:step(
+    {S2, [{set_timer, 50}]} = rabbitmq_stream_s3_remote_reader_core:step(
         S1, {request_error, make_ref(), 0, pool_busy}
     ),
-    {S3, [{set_timer, 400}]} = rabbitmq_stream_s3_remote_reader_core:step(
+    {S3, [{set_timer, 100}]} = rabbitmq_stream_s3_remote_reader_core:step(
         S2, {request_error, make_ref(), 0, pool_busy}
     ),
     %% Retry, then data arrives successfully.
@@ -767,8 +773,8 @@ pool_busy_delay_resets_on_data(_Config) ->
     {S5, _} = rabbitmq_stream_s3_remote_reader_core:step(
         S4, {data, make_ref(), 0, Data, done}
     ),
-    %% The next pool_busy starts back at 100ms.
-    {_S6, [{set_timer, 100}]} = rabbitmq_stream_s3_remote_reader_core:step(
+    %% The next pool_busy starts back at 25ms.
+    {_S6, [{set_timer, 25}]} = rabbitmq_stream_s3_remote_reader_core:step(
         S5, {request_error, make_ref(), 0, pool_busy}
     ),
     ok.
@@ -781,16 +787,16 @@ pool_busy_backoff_independent_of_network_errors(_Config) ->
     FragRef = frag_ref(0, 1_000_000, 42),
     Iterator = mock_iterator([{0, 1_000_000, 42}]),
     {S0, _} = init(stream_id(), FragRef, 64, Iterator),
-    %% pool_busy uses its own 100ms start.
-    {S1, [{set_timer, 100}]} = rabbitmq_stream_s3_remote_reader_core:step(
+    %% pool_busy uses its own 25ms start.
+    {S1, [{set_timer, 25}]} = rabbitmq_stream_s3_remote_reader_core:step(
         S0, {request_error, make_ref(), 0, pool_busy}
     ),
     %% A network error still starts at the 1000ms minimum, unaffected.
     {S2, [{set_timer, 1000}]} = rabbitmq_stream_s3_remote_reader_core:step(
         S1, {request_error, make_ref(), 0, slow_down}
     ),
-    %% pool_busy continues from 200ms, not reset by the network error.
-    {S3, [{set_timer, 200}]} = rabbitmq_stream_s3_remote_reader_core:step(
+    %% pool_busy continues from 50ms, not reset by the network error.
+    {S3, [{set_timer, 50}]} = rabbitmq_stream_s3_remote_reader_core:step(
         S2, {request_error, make_ref(), 0, pool_busy}
     ),
     %% The network backoff likewise continues from 2000ms.
