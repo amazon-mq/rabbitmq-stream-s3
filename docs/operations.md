@@ -88,6 +88,14 @@ stream_s3.persist_interval_ms = 2000
 # When unlimited, the governor does not pace transfers. Set to a fraction
 # of instance bandwidth on managed deployments to avoid contention with
 # other traffic. Default: unlimited.
+#
+# The ceiling is a long-run average. A single transfer larger than the
+# internal burst allowance (a fragment can exceed its target size when a
+# large chunk lands at the end) is still admitted, on credit, and the
+# governor throttles subsequent transfers to repay it; it never stalls.
+# The `governor_oversized_admissions` metric counts such transfers: a
+# persistently climbing value means the configured rate is low relative
+# to fragment sizes.
 stream_s3.max_transfer_bytes_per_sec = unlimited
 ```
 
