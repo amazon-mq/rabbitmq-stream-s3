@@ -17,7 +17,12 @@ all() ->
         partial_group_consumption_basic,
         partial_group_max_bytes_does_not_regress_first_offset,
         partial_group_max_age_no_negative_total_size,
-        partial_then_full_consumption_removes_group
+        partial_then_full_consumption_removes_group,
+        kilo_group_max_age_partial,
+        kilo_group_max_bytes,
+        kilo_group_full_consumption,
+        mega_group_retention,
+        multi_tier_idempotent
     ].
 
 init_per_suite(Config) -> Config.
@@ -89,6 +94,73 @@ partial_then_full_consumption_removes_group(_Config) ->
     ?assertEqual([200, 300], fragment_offsets(Refs2)),
     ?assertEqual(1, length(group_refs(Refs2))).
 
+%% A kilo-group (a group of groups) where max_age expires the first inner group
+%% wholly and the second inner group partially. Retention must descend two
+%% levels: delete the wholly-consumed inner group object plus the expired leaf
+%% fragments, leave the kilo-group entry in place, and advance first_offset to
+%% the oldest survivor.
+kilo_group_max_age_partial(_Config) ->
+    {M0, GetGroup} = kilo_manifest(),
+    %% last_ts are 1000..4000 for the kilo's fragments, 5000 for the trailing
+    %% root fragment. Cutoff = 9000 - 5500 = 3500 expires F0..F2, keeps F3, F4.
+    {Refs, M1} = run_cycle(M0, [{max_age, 5500}], 9000, GetGroup),
+    ?assertEqual([0, 100, 200], fragment_offsets(Refs)),
+    %% Exactly the first inner group object is deleted (it is wholly consumed).
+    ?assertEqual(1, length(group_refs(Refs))),
+    ?assertEqual(300, M1#manifest.first_offset),
+    ?assertEqual(2 * ?SZ, M1#manifest.total_size),
+    %% The kilo-group entry survives, so the two root entries remain.
+    ?assertEqual(2 * ?ENTRY_B, byte_size(M1#manifest.entries)).
+
+%% max_bytes across a kilo-group: the size to remove is computed by descending
+%% to leaves (group entries carry no size).
+kilo_group_max_bytes(_Config) ->
+    {M0, GetGroup} = kilo_manifest(),
+    %% total_size = 500. max_bytes 250 removes the oldest 250 bytes: F0, F1, F2.
+    {Refs, M1} = run_cycle(M0, [{max_bytes, 250}], 1000, GetGroup),
+    ?assertEqual([0, 100, 200], fragment_offsets(Refs)),
+    ?assertEqual(1, length(group_refs(Refs))),
+    ?assertEqual(300, M1#manifest.first_offset),
+    ?assertEqual(2 * ?SZ, M1#manifest.total_size).
+
+%% Expiring everything consumes the whole kilo-group and the trailing root
+%% fragment: both root entries are spliced and every nested object is deleted.
+kilo_group_full_consumption(_Config) ->
+    {M0, GetGroup} = kilo_manifest(),
+    {Refs, M1} = run_cycle(M0, [{max_age, 0}], 99999999, GetGroup),
+    ?assertEqual([0, 100, 200, 300, 400], fragment_offsets(Refs)),
+    %% The kilo-group object and both inner group objects are deleted.
+    ?assertEqual(3, length(group_refs(Refs))),
+    ?assertEqual(<<>>, M1#manifest.entries),
+    ?assertEqual(0, M1#manifest.total_size),
+    ?assertEqual(M0#manifest.next_offset, M1#manifest.first_offset).
+
+%% A three-level tree (mega-group of kilo-groups of groups) is handled to leaf
+%% granularity.
+mega_group_retention(_Config) ->
+    {M0, GetGroup} = mega_manifest(),
+    %% Remove just the oldest fragment by bytes (total 800, keep 700).
+    {Refs, M1} = run_cycle(M0, [{max_bytes, 700}], 1000, GetGroup),
+    ?assertEqual([0], fragment_offsets(Refs)),
+    ?assertEqual(100, M1#manifest.first_offset),
+    ?assertEqual(7 * ?SZ, M1#manifest.total_size).
+
+%% Multi-tier retention is idempotent across cycles: a second pass against the
+%% partially-consumed kilo-group does not re-delete the objects the first pass
+%% removed and keeps total_size and first_offset consistent.
+multi_tier_idempotent(_Config) ->
+    {M0, GetGroup} = kilo_manifest(),
+    {Refs1, M1} = run_cycle(M0, [{max_bytes, 350}], 1000, GetGroup),
+    ?assertEqual([0, 100], fragment_offsets(Refs1)),
+    ?assertEqual(200, M1#manifest.first_offset),
+    ?assertEqual(300, M1#manifest.total_size),
+    %% Second cycle removes only the next fragment; F0/F1 are not revisited.
+    {Refs2, M2} = run_cycle(M1, [{max_bytes, 250}], 1000, GetGroup),
+    ?assertEqual([200], fragment_offsets(Refs2)),
+    ?assertEqual(300, M2#manifest.first_offset),
+    ?assertEqual(200, M2#manifest.total_size),
+    ?assert(M2#manifest.first_offset >= M1#manifest.first_offset).
+
 %% ------------------------------------------------------------------
 %% Helpers
 %% ------------------------------------------------------------------
@@ -104,6 +176,42 @@ grouped_manifest() ->
             {fragment, #{offset => 100, size => ?SZ, last_ts => 2000, uid => 2}},
             {fragment, #{offset => 200, size => ?SZ, last_ts => 3000, uid => 3}},
             {fragment, #{offset => 300, size => ?SZ, last_ts => 4000, uid => 4}}
+        ]}
+    ]).
+
+%% Root = [kilo-group(group[F0,F1], group[F2,F3]), F4]. Fragments at offsets
+%% 0/100/200/300 nested two levels deep under the kilo-group, plus a trailing
+%% root fragment F4 at 400. last_ts 1000..5000, each 100 bytes (total 500).
+kilo_manifest() ->
+    rabbitmq_stream_s3_test_helpers:build_manifest([
+        {kilo_group, [
+            {group, [
+                {fragment, #{offset => 0, size => ?SZ, last_ts => 1000}},
+                {fragment, #{offset => 100, size => ?SZ, last_ts => 2000}}
+            ]},
+            {group, [
+                {fragment, #{offset => 200, size => ?SZ, last_ts => 3000}},
+                {fragment, #{offset => 300, size => ?SZ, last_ts => 4000}}
+            ]}
+        ]},
+        {fragment, #{offset => 400, size => ?SZ, last_ts => 5000}}
+    ]).
+
+%% Root = [mega-group(kilo-group(group[F0,F1], group[F2,F3]),
+%%                     kilo-group(group[F4,F5], group[F6,F7]))]. Eight fragments
+%% at offsets 0..700 nested three levels deep, each 100 bytes (total 800).
+mega_manifest() ->
+    Frag = fun(O) -> {fragment, #{offset => O, size => ?SZ}} end,
+    rabbitmq_stream_s3_test_helpers:build_manifest([
+        {mega_group, [
+            {kilo_group, [
+                {group, [Frag(0), Frag(100)]},
+                {group, [Frag(200), Frag(300)]}
+            ]},
+            {kilo_group, [
+                {group, [Frag(400), Frag(500)]},
+                {group, [Frag(600), Frag(700)]}
+            ]}
         ]}
     ]).
 
