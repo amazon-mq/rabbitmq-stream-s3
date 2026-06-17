@@ -95,19 +95,20 @@ returned by the functional core module.
 -define(C_BYTES_DRAINED, 20).
 -define(C_BYTES_PERSISTED, 21).
 -define(C_REMOTE_TIER_RETENTION_FAILURES, 22).
+-define(C_MANIFEST_RESOLUTION_FAILURES, 23).
 %% Counters above; gauges below. The macro ?NODE_COUNTERS filters by
 %% type, and seshat requires counter indexes to be 1..N sequential. Add
 %% new counters before this divider and renumber the gauges that follow.
--define(C_TRANSFERS_IN_FLIGHT, 23).
--define(C_LAST_PERSIST_TIMESTAMP_MS, 24).
--define(C_MANIFEST_FIRST_OFFSET, 25).
--define(C_MANIFEST_NEXT_OFFSET, 26).
--define(C_MANIFEST_FIRST_TIMESTAMP_MS, 27).
--define(C_REMOTE_BYTES, 28).
--define(C_REMOTE_MESSAGES, 29).
--define(C_BYTES_IN_ASSEMBLY, 30).
--define(C_BYTES_IN_TRANSFER, 31).
--define(C_BYTES_IN_PERSIST, 32).
+-define(C_TRANSFERS_IN_FLIGHT, 24).
+-define(C_LAST_PERSIST_TIMESTAMP_MS, 25).
+-define(C_MANIFEST_FIRST_OFFSET, 26).
+-define(C_MANIFEST_NEXT_OFFSET, 27).
+-define(C_MANIFEST_FIRST_TIMESTAMP_MS, 28).
+-define(C_REMOTE_BYTES, 29).
+-define(C_REMOTE_MESSAGES, 30).
+-define(C_BYTES_IN_ASSEMBLY, 31).
+-define(C_BYTES_IN_TRANSFER, 32).
+-define(C_BYTES_IN_PERSIST, 33).
 
 -define(STREAM_COUNTERS, [
     {transfers_completed, ?C_TRANSFERS_COMPLETED, counter,
@@ -130,7 +131,10 @@ returned by the functional core module.
     {manifests_resolved, ?C_MANIFESTS_RESOLVED, counter,
         "Number of times a non-empty manifest was resolved on startup"},
     {manifests_resolved_empty, ?C_MANIFESTS_RESOLVED_EMPTY, counter,
-        "Number of times an empty manifest was resolved on startup"},
+        "Number of times a genuinely empty manifest was resolved on startup (a new "
+        "stream, or one whose metadata node exists but that has not persisted a "
+        "manifest). A transient resolution failure no longer counts here: it retries "
+        "instead, see manifest_resolution_failures"},
     {fragments_deleted, ?C_FRAGMENTS_DELETED, counter,
         "Number of fragment objects deleted by remote tier retention"},
     {groups_deleted, ?C_GROUPS_DELETED, counter,
@@ -155,6 +159,10 @@ returned by the functional core module.
     {remote_tier_retention_failures, ?C_REMOTE_TIER_RETENTION_FAILURES, counter,
         "Number of remote tier retention evaluations that failed (crashed or timed "
         "out). Distinct from evaluations that ran and found nothing to remove."},
+    {manifest_resolution_failures, ?C_MANIFEST_RESOLUTION_FAILURES, counter,
+        "Number of times manifest resolution could not reach the metadata store or "
+        "object store and scheduled a retry, rather than treating the remote tier as "
+        "empty. A sustained non-zero rate means a stream cannot start tiering."},
     {transfers_in_flight, ?C_TRANSFERS_IN_FLIGHT, gauge,
         "Fragments cut and submitted to the governor that have not yet completed"},
     {last_persist_timestamp_ms, ?C_LAST_PERSIST_TIMESTAMP_MS, gauge,
@@ -436,22 +444,14 @@ handle_cast(
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_continue(resolve_manifest, #state{cfg = #cfg{stream = StreamId}} = State0) ->
-    Manifest = resolve_manifest(StreamId),
-    State1 = on_manifest_resolved(Manifest, State0),
-    {Core, _Effects} = rabbitmq_stream_s3_replica_reader_core:init(Manifest, State1#state.config),
-    State = start_reading(State1#state{core = Core}),
-    {noreply, State}.
+handle_continue(resolve_manifest, State0) ->
+    {noreply, resolve_and_start(State0)}.
 
 handle_info({osiris_offset, _Ref, _Offset}, State0) ->
     State = drain(State0),
     {noreply, State};
-handle_info(retry_resolve, #state{cfg = #cfg{stream = StreamId}} = State0) ->
-    Manifest = resolve_manifest(StreamId),
-    State1 = on_manifest_resolved(Manifest, State0),
-    {Core, _} = rabbitmq_stream_s3_replica_reader_core:init(Manifest, State1#state.config),
-    State = start_reading(State1#state{core = Core}),
-    {noreply, State};
+handle_info(retry_resolve, State0) ->
+    {noreply, resolve_and_start(State0)};
 handle_info({transfer_result, Ref, {ok, Uid}}, #state{core = Core0} = State0) ->
     State1 = on_transfer_result(Ref, ok, State0),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_complete(Ref, Uid, Core0),
@@ -957,11 +957,7 @@ execute_effect(cancel_persist_timer, #state{persist_timer = Ref} = State) ->
     State#state{persist_timer = undefined};
 execute_effect(reinitialize, #state{cfg = #cfg{stream = StreamId}} = State0) ->
     ?LOG_INFO("~ts reinitializing after commit conflict", [StreamId]),
-    Manifest = resolve_manifest(StreamId),
-    State = on_manifest_resolved(Manifest, State0),
-    {Core, _} = rabbitmq_stream_s3_replica_reader_core:init(Manifest, State#state.config),
-    start_reading(State#state{
-        core = Core,
+    State1 = State0#state{
         log = undefined,
         assembly = undefined,
         transfer_sizes = #{},
@@ -971,7 +967,8 @@ execute_effect(reinitialize, #state{cfg = #cfg{stream = StreamId}} = State0) ->
         %% so the objects must remain. The new writer will re-evaluate
         %% retention and delete them after its own persist.
         deferred_deletions = []
-    });
+    },
+    resolve_and_start(State1);
 execute_effect(stop, State) ->
     %% The stream's metadata node was deleted (the queue was removed). Mark the
     %% reader for shutdown; the handler that ran this effect returns
@@ -1107,29 +1104,91 @@ maybe_spawn_group_retention(_Manifest, _Retention, _Now, _StreamId, State) ->
 %% Reading
 %% ------------------------------------------------------------------
 
--spec resolve_manifest(stream_id()) -> #manifest{}.
+-spec resolve_manifest(stream_id()) -> {ok, #manifest{}} | {retry, term()}.
 resolve_manifest(StreamId) ->
     case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
         #manifest{} = M ->
-            %% Cache hit. Ensure revision is current from Khepri.
+            %% Cache hit: a real manifest. Refresh its revision from Khepri if
+            %% we can; a stale revision is caught by the persist CAS, so a
+            %% failed refresh just keeps the cached one.
             case catch rabbitmq_stream_s3_db:get(StreamId) of
-                {ok, #{revision := Rev}} -> M#manifest{revision = Rev};
-                _ -> M
+                {ok, #{revision := Rev}} -> {ok, M#manifest{revision = Rev}};
+                _ -> {ok, M}
             end;
         undefined ->
-            case catch rabbitmq_stream_s3_db:get(StreamId) of
-                {ok, #{uid := Uid, epoch := Epoch, revision := Rev}} ->
-                    Ref = #manifest_ref{epoch = Epoch, uid = Uid},
-                    Key = rabbitmq_stream_s3:manifest_key(StreamId, Ref),
-                    case rabbitmq_stream_s3_api:get(Key, #{}) of
-                        {ok, Data} ->
-                            (parse_manifest_root(Data))#manifest{revision = Rev};
-                        {error, _} ->
-                            #manifest{}
-                    end;
-                _ ->
-                    #manifest{}
-            end
+            resolve_manifest_from_store(StreamId)
+    end.
+
+%% Resolve the manifest from the metadata store and object store on a cache
+%% miss. An empty manifest is returned only when the stream is genuinely empty
+%% (no metadata node, or a node with no manifest object yet). A transient store
+%% or object-store error returns `{retry, Reason}` instead of an empty manifest:
+%% treating a hidden manifest as empty would make the writer re-tier from the
+%% local log and orphan the real remote objects (Local authority).
+-spec resolve_manifest_from_store(stream_id()) -> {ok, #manifest{}} | {retry, term()}.
+resolve_manifest_from_store(StreamId) ->
+    classify_store_result(catch rabbitmq_stream_s3_db:get(StreamId), StreamId).
+
+%% Decide what a metadata-store lookup means for manifest resolution. Split out
+%% (with classify_object_result/3) so the classification is unit-testable
+%% without a real store.
+-spec classify_store_result(term(), stream_id()) -> {ok, #manifest{}} | {retry, term()}.
+classify_store_result({ok, #{uid := Uid, epoch := Epoch, revision := Rev}}, StreamId) ->
+    Ref = #manifest_ref{epoch = Epoch, uid = Uid},
+    Key = rabbitmq_stream_s3:manifest_key(StreamId, Ref),
+    classify_object_result(rabbitmq_stream_s3_api:get(Key, #{}), Rev, Key);
+classify_store_result({error, not_found}, _StreamId) ->
+    %% No metadata node: a genuinely new stream. Empty is correct.
+    {ok, #manifest{}};
+classify_store_result({error, Reason}, _StreamId) ->
+    %% The metadata store errored. We cannot tell whether this stream is new or
+    %% has a manifest, so we must not assume empty.
+    {retry, {metadata_unavailable, Reason}};
+classify_store_result(Other, _StreamId) ->
+    %% A `catch`-ed exception from the store lookup.
+    {retry, {metadata_unavailable, Other}}.
+
+%% Decide what an object-store GET of the manifest object means, given the
+%% Khepri revision that referenced it.
+-spec classify_object_result(term(), non_neg_integer(), binary()) ->
+    {ok, #manifest{}} | {retry, term()}.
+classify_object_result({ok, Data}, Rev, _Key) ->
+    {ok, (parse_manifest_root(Data))#manifest{revision = Rev}};
+classify_object_result({error, not_found}, _Rev, _Key) ->
+    %% The metadata node exists but no manifest object does yet: a stream that
+    %% has not persisted a manifest. Empty is correct.
+    {ok, #manifest{}};
+classify_object_result({error, Reason}, _Rev, Key) ->
+    %% Khepri references a manifest at this revision but the object store could
+    %% not be read (a transient error, not a 404). Do not assume empty.
+    {retry, {manifest_object_fetch_failed, Key, Reason}}.
+
+%% Resolve the manifest and continue startup. On a transient resolution failure,
+%% log, count, and schedule a retry rather than starting with an empty manifest:
+%% proceeding empty would risk re-tiering over the real remote objects (Local
+%% authority). Reuses the existing `retry_resolve` self-message.
+-spec resolve_and_start(#state{}) -> #state{}.
+resolve_and_start(#state{cfg = #cfg{stream = StreamId}} = State0) ->
+    case resolve_manifest(StreamId) of
+        {ok, Manifest} ->
+            State1 = on_manifest_resolved(Manifest, State0),
+            {Core, _Effects} = rabbitmq_stream_s3_replica_reader_core:init(
+                Manifest, State1#state.config
+            ),
+            start_reading(State1#state{core = Core});
+        {retry, Reason} ->
+            %% Logged at WARNING (not ERROR) like the sibling init_data_reader
+            %% retry in start_reading: this retries once a second, so a
+            %% sustained store outage must not flood the log. The
+            %% manifest_resolution_failures counter is the alertable signal.
+            ?LOG_WARNING(
+                "~ts could not resolve its manifest (~p); retrying rather than "
+                "treating the remote tier as empty",
+                [StreamId, Reason]
+            ),
+            inc(State0, ?C_MANIFEST_RESOLUTION_FAILURES, 1),
+            erlang:send_after(1000, self(), retry_resolve),
+            State0
     end.
 
 -spec parse_manifest_root(binary()) -> #manifest{}.
@@ -1635,3 +1694,47 @@ on_remote_retention_deleted(Refs, StreamId, State) ->
     ),
     maps:foreach(fun(Idx, N) -> inc(State, Idx, N) end, Counts),
     ok.
+
+%% ------------------------------------------------------------------
+%% Tests
+%% ------------------------------------------------------------------
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+%% A transient metadata-store error must schedule a retry, not resolve empty.
+classify_store_result_transient_error_retries_test() ->
+    ?assertMatch(
+        {retry, {metadata_unavailable, timeout}},
+        classify_store_result({error, timeout}, <<"s">>)
+    ),
+    %% A caught exception (the `catch` returns a non-tuple or {'EXIT', _}).
+    ?assertMatch(
+        {retry, {metadata_unavailable, _}},
+        classify_store_result({'EXIT', {badarg, []}}, <<"s">>)
+    ).
+
+%% A genuinely absent metadata node resolves to an empty manifest.
+classify_store_result_not_found_is_empty_test() ->
+    ?assertEqual({ok, #manifest{}}, classify_store_result({error, not_found}, <<"s">>)).
+
+%% A transient object-store error (not a 404) must schedule a retry: Khepri
+%% references a manifest at this revision, so the tier is not empty.
+classify_object_result_transient_error_retries_test() ->
+    Key = <<"k">>,
+    ?assertEqual(
+        {retry, {manifest_object_fetch_failed, Key, slow_down}},
+        classify_object_result({error, slow_down}, 7, Key)
+    ).
+
+%% A 404 on the manifest object means it has not been written yet: empty.
+classify_object_result_not_found_is_empty_test() ->
+    ?assertEqual({ok, #manifest{}}, classify_object_result({error, not_found}, 7, <<"k">>)).
+
+%% A fetched manifest object parses and carries the Khepri revision.
+classify_object_result_ok_parses_with_revision_test() ->
+    Data = ?MANIFEST(0, 0, 0, 0, 0, <<>>),
+    {ok, Manifest} = classify_object_result({ok, Data}, 42, <<"k">>),
+    ?assertEqual(42, Manifest#manifest.revision).
+
+-endif.
