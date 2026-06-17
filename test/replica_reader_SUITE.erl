@@ -79,6 +79,8 @@ groups() ->
             persist_not_found_stops_reader,
             discover_attaches_to_existing_writer,
             on_init_writer_tolerates_already_started,
+            two_layer_supervision_structure,
+            duplicate_start_child_no_orphan_supervisor,
             remote_retention_deletes_fragments,
             remote_retention_on_update,
             remote_retention_survives_multiple_persist_cycles,
@@ -190,6 +192,66 @@ on_init_writer_tolerates_already_started(Config) ->
     %% Before this fix it exited with {badmatch, {error, {already_started, _}}}.
     Result = rabbitmq_stream_s3_hooks:on_init(writer, Writer, HookConfig),
     ?assertMatch(#{retention := _}, Result).
+
+two_layer_supervision_structure(Config) ->
+    %% The replica reader is supervised in two layers: the factory
+    %% (rabbitmq_stream_s3_replica_reader_sup) has one per-stream supervisor
+    %% (rabbitmq_stream_s3_stream_sup) child per stream, and the reader worker
+    %% lives under that per-stream supervisor. This isolates each stream's
+    %% restart budget.
+    StreamId = ?config(stream_id, Config),
+    _ = start_writer(Config, #{}),
+    ReaderPid = rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}),
+    ?assert(is_pid(ReaderPid)),
+
+    %% The factory's direct child is a supervisor, not the reader worker.
+    FactoryChildren = supervisor:which_children(rabbitmq_stream_s3_replica_reader_sup),
+    ?assertMatch([{_, _, supervisor, [rabbitmq_stream_s3_stream_sup]}], FactoryChildren),
+    [{_, StreamSupPid, supervisor, _}] = FactoryChildren,
+    ?assert(is_pid(StreamSupPid)),
+    ?assertNotEqual(ReaderPid, StreamSupPid),
+
+    %% The reader worker lives one level down, under the per-stream supervisor.
+    StreamSupChildren = supervisor:which_children(StreamSupPid),
+    ?assertMatch(
+        [{rabbitmq_stream_s3_replica_reader, ReaderPid, worker, _}],
+        StreamSupChildren
+    ).
+
+duplicate_start_child_no_orphan_supervisor(Config) ->
+    %% A second start_child for a stream that already has a registered reader
+    %% returns {error, {already_started, Pid}} with the existing reader pid,
+    %% and does not leave an orphaned per-stream supervisor under the factory.
+    StreamId = ?config(stream_id, Config),
+    Writer = start_writer(Config, #{}),
+    ReaderPid = rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}),
+    ?assert(is_pid(ReaderPid)),
+    [_] = supervisor:which_children(rabbitmq_stream_s3_replica_reader_sup),
+
+    %% Build a config equivalent to what the writer hook would pass, and try to
+    %% start a second reader for the same stream.
+    #{shared := Shared, dir := Dir} = gen_batch_server:call(Writer, get_reader_context),
+    Counter = osiris_counters:fetch({osiris_writer, StreamId}),
+    DupConfig = #{
+        stream => StreamId,
+        writer_pid => Writer,
+        dir => iolist_to_binary(Dir),
+        shared => Shared,
+        counter => Counter,
+        reference => StreamId,
+        epoch => 1,
+        persist_threshold => 1
+    },
+    ?assertEqual(
+        {error, {already_started, ReaderPid}},
+        rabbitmq_stream_s3_replica_reader_sup:start_child(DupConfig)
+    ),
+
+    %% The factory still has exactly one per-stream supervisor: the duplicate
+    %% start did not leak an orphan.
+    ?assertMatch([_], supervisor:which_children(rabbitmq_stream_s3_replica_reader_sup)),
+    %% The original reader is untouched and still registered.
+    ?assertEqual(ReaderPid, rabbitmq_stream_s3_registry:whereis_name({StreamId, node()})).
 
 uploads_fragments(Config) ->
     StreamId = ?config(stream_id, Config),
