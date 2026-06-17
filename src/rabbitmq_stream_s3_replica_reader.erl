@@ -452,6 +452,15 @@ handle_info({osiris_offset, _Ref, _Offset}, State0) ->
     {noreply, State};
 handle_info(retry_resolve, State0) ->
     {noreply, resolve_and_start(State0)};
+handle_info({transfer_result, Ref, _Result}, State0) when
+    not is_map_key(Ref, State0#state.transfer_sizes)
+->
+    %% Stale result from a transfer submitted before a manifest recovery reset
+    %% the in-flight queue (see handle_local_log_ahead/3). The fragment is no
+    %% longer tracked by the shell or the core, so feeding it to the core would
+    %% crash get_meta or, for a success, append a non-contiguous orphan that
+    %% trips assert_contiguous. Drop it.
+    {noreply, State0};
 handle_info({transfer_result, Ref, {ok, Uid}}, #state{core = Core0} = State0) ->
     State1 = on_transfer_result(Ref, ok, State0),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_complete(Ref, Uid, Core0),
@@ -460,8 +469,23 @@ handle_info({transfer_result, Ref, {ok, Uid}}, #state{core = Core0} = State0) ->
     {noreply, State3};
 handle_info({transfer_result, Ref, {error, Reason}}, #state{core = Core0} = State0) ->
     State1 = on_transfer_result(Ref, {error, Reason}, State0),
-    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(Ref, Reason, Core0),
-    {noreply, execute_effects(Effects, State1#state{core = Core})};
+    case local_log_ahead(State1) of
+        {true, LocalFirst, NextOffset} ->
+            %% Local retention trimmed past the manifest's next_offset, so the
+            %% segment backing the stalled fragment is permanently gone and no
+            %% retry can ever make it durable. Without this the core would keep
+            %% the fragment at the head of the in-flight queue and retry it
+            %% forever (issue #225), wedging the manifest and making the bulk of
+            %% the stream inaccessible. Recover the same way start_reading0/1
+            %% does at reader init: discard the remote manifest and restart from
+            %% the local log's first offset, accepting the lost range.
+            {noreply, handle_local_log_ahead(LocalFirst, NextOffset, Reason, State1)};
+        false ->
+            {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(
+                Ref, Reason, Core0
+            ),
+            {noreply, execute_effects(Effects, State1#state{core = Core})}
+    end;
 handle_info({retry_transfer, Ref, Dir, Meta}, #state{cfg = #cfg{stream = StreamId}} = State) ->
     %% A previously failed fragment upload is being retried after its backoff
     %% delay. The in-flight gauges were already restored when the delayed
@@ -1278,6 +1302,58 @@ start_reading0(
             %% Retry immediately (same pattern as osiris_log:init_offset_reader).
             start_reading(State1#state{core = Core, log = undefined, assembly = undefined})
     end.
+
+%% Whether the live local log has been trimmed past the manifest's next_offset.
+%% When true, the segment backing the stalled head fragment is permanently gone
+%% (user retention outran the upload), so no upload retry can ever succeed.
+%% next_offset is the only offset that can be stalled at the head of the
+%% in-flight queue: the contiguity invariant (assert_contiguous/2) guarantees
+%% every uploaded fragment begins exactly where the manifest ends, so the head
+%% fragment's first offset equals next_offset. Comparing against next_offset is
+%% therefore equivalent to comparing against the stalled fragment's offset, and
+%% mirrors the check start_reading0/1 makes against StartOffset at reader init.
+-spec local_log_ahead(#state{}) ->
+    {true, osiris:offset(), osiris:offset()} | false.
+local_log_ahead(#state{cfg = #cfg{shared = Shared}, core = Core}) ->
+    NextOffset = (rabbitmq_stream_s3_replica_reader_core:manifest(Core))#manifest.next_offset,
+    LocalFirst = osiris_log_shared:first_chunk_id(Shared),
+    case LocalFirst > NextOffset of
+        true -> {true, LocalFirst, NextOffset};
+        false -> false
+    end.
+
+%% Recover from a permanently-trimmed segment by re-resolving the manifest and
+%% restarting the read. The manifest is still stalled at next_offset, so
+%% start_reading0/1 re-opens the data reader there, hits its offset_out_of_range
+%% branch (LocalFirst > StartOffset), and performs the manifest discard, the
+%% jump to LocalFirst, and the recovery-counter increment. Resetting the
+%% in-flight bookkeeping here (matching the reinitialize effect) abandons the
+%% transfers that were queued behind the stall; their late results are dropped
+%% by the stale-Ref clause of handle_info/2. The fragments they uploaded are
+%% left in S3 for orphan garbage collection. resolve_and_start/1 handles a
+%% transient resolution failure by scheduling a retry, so recovery is not lost
+%% to a store blip.
+-spec handle_local_log_ahead(osiris:offset(), osiris:offset(), term(), #state{}) -> #state{}.
+handle_local_log_ahead(
+    LocalFirst, NextOffset, Reason, #state{cfg = #cfg{stream = StreamId}} = State0
+) ->
+    ?LOG_WARNING(
+        "~ts fragment upload at offset ~b failed because its segment was "
+        "deleted by stream retention (~p). The local log first offset (~b) is "
+        "ahead of the manifest next offset (~b), so the range is gone from both "
+        "tiers. Discarding the remote manifest and restarting from the local "
+        "log first offset; the trimmed range will not be available in the "
+        "remote tier.",
+        [StreamId, NextOffset, Reason, LocalFirst, NextOffset]
+    ),
+    resolve_and_start(State0#state{
+        log = undefined,
+        assembly = undefined,
+        transfer_sizes = #{},
+        persist_pending_bytes = 0,
+        persisting_bytes = 0,
+        deferred_deletions = []
+    }).
 
 -spec drain(#state{}) -> #state{}.
 drain(#state{log = undefined} = State) ->
