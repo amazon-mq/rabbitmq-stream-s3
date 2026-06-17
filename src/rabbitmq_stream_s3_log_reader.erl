@@ -797,7 +797,12 @@ find_fragment(Entries, Spec, GetGroup) ->
             {offset, Offset} ->
                 fun(?ENTRY(O, _FTs, _LTs, _K, _Sz, _Uid, _)) -> Offset >= O end;
             {timestamp, Ts} ->
-                fun(?ENTRY(_O, _FTs, LTs, _K, _Sz, _Uid, _)) -> Ts >= LTs end
+                %% Strict, like the chunk-level predicate in
+                %% `find_index_position/2'. A fragment whose last_ts equals Ts
+                %% contains the chunk at that timestamp, so it must not be
+                %% skipped. Compare Osiris, which treats a segment as too old
+                %% only when Ts is strictly greater than its end timestamp.
+                fun(?ENTRY(_O, _FTs, LTs, _K, _Sz, _Uid, _)) -> Ts > LTs end
         end,
     Idx0 = rabbitmq_stream_s3_array:partition_point(
         PartitionPredicate,
@@ -984,6 +989,44 @@ find_fragment_test() ->
     ?assertEqual(40, FindFragment2({timestamp, Ts - 2000 + 50})),
     %% Offset and timestamp assertions on flat fragment lists are omitted here;
     %% they are covered by the property-based tests in unit_SUITE.
+    ok.
+
+find_fragment_timestamp_boundary_test() ->
+    %% A flat fragment list (no group), so this isolates fragment selection.
+    %% Each fragment owns 100 offsets and a 1000-unit timestamp span, with a
+    %% gap between fragments so the boundary case is unambiguous.
+    Size = 200,
+    Fragments = [
+        %% {Offset, FirstTs, LastTs}
+        {0, 1000, 2000},
+        {100, 2100, 3000},
+        {200, 3100, 4000}
+    ],
+    Entries = <<
+        ?ENTRY(O, FTs, LTs, ?MANIFEST_KIND_FRAGMENT, Size, N)
+     || {N, {O, FTs, LTs}} <- lists:enumerate(0, Fragments)
+    >>,
+    NoGroup = fun(_) -> error(unexpected_group_fetch) end,
+    FindFragment2 = fun(Spec) ->
+        #fragment_ref{offset = FoundOffset} = find_fragment(Entries, Spec, NoGroup),
+        FoundOffset
+    end,
+    %% A timestamp strictly inside a fragment resolves to that fragment.
+    ?assertEqual(0, FindFragment2({timestamp, 1500})),
+    ?assertEqual(100, FindFragment2({timestamp, 2500})),
+    %% A timestamp in the gap above a fragment snaps to the later fragment,
+    %% matching the right-boundary preference Osiris uses for timestamps.
+    ?assertEqual(100, FindFragment2({timestamp, 2050})),
+    %% Timestamps before the first and after the last fragment clamp to the ends.
+    ?assertEqual(0, FindFragment2({timestamp, 500})),
+    ?assertEqual(200, FindFragment2({timestamp, 5000})),
+    %% The boundary case. A timestamp equal to a fragment's last_ts must resolve
+    %% to that fragment, since the chunk at that timestamp is the fragment's last
+    %% chunk and lives there. Selecting the next fragment skips it. This mirrors
+    %% Osiris, whose segment search treats a segment as too old only when the
+    %% timestamp is strictly greater than the segment's end timestamp.
+    ?assertEqual(0, FindFragment2({timestamp, 2000})),
+    ?assertEqual(100, FindFragment2({timestamp, 3000})),
     ok.
 
 find_index_position_test() ->
