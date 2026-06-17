@@ -16,6 +16,7 @@ testable without mocks or timing.
     init/2,
     manifest/1,
     persisted_manifest/1,
+    rebalance_in_flight/1,
     format_state/1,
     fragment_cut/2,
     transfer_complete/3,
@@ -144,6 +145,16 @@ manifest(#state{manifest = Manifest}) ->
 -spec persisted_manifest(state()) -> #manifest{}.
 persisted_manifest(#state{last_persisted_manifest = Manifest}) ->
     Manifest.
+
+-doc """
+Whether a root rebalance (factoring leading entries into a group object) is in
+flight. The shell consults this before evaluating remote retention, since both
+rewrite the manifest's leading entries and must not run concurrently (Single
+mutator).
+""".
+-spec rebalance_in_flight(state()) -> boolean().
+rebalance_in_flight(#state{rebalance_in_flight = Flag}) ->
+    Flag.
 
 -spec format_state(state()) -> map().
 format_state(#state{
@@ -437,8 +448,13 @@ retention_complete(Edit, #state{manifest = Manifest0} = State0) ->
         since_persist = State0#state.since_persist + 1,
         edits_since_persist = [Edit | State0#state.edits_since_persist]
     },
-    {State2, PersistEffects} = maybe_start_persist(State1),
-    {State2, PersistEffects}.
+    %% Retention is now clear, so a rebalance deferred while it was in flight
+    %% can proceed. Re-check rebalance before persist (the same order as
+    %% drain_completions and group_upload_complete); the retention edit just
+    %% shrank the root, so this usually finds nothing to do.
+    {State2, RebalanceEffects} = maybe_start_rebalance(State1),
+    {State3, PersistEffects} = maybe_start_persist(State2),
+    {State3, RebalanceEffects ++ PersistEffects}.
 
 -doc """
 A retention evaluation finished without producing an edit: it either failed
@@ -448,8 +464,12 @@ evaluation. Failures are counted by the shell; the core does not distinguish
 them here because both outcomes mean the same thing to the core.
 """.
 -spec retention_failed(term(), state()) -> {state(), [core_effect()]}.
-retention_failed(_Reason, State) ->
-    {State#state{retention_in_flight = false}, []}.
+retention_failed(_Reason, State0) ->
+    %% Retention cleared without changing the manifest. A rebalance may have
+    %% been deferred while it was in flight; re-check it now that the flag is
+    %% clear so an oversized root does not wait for the next drain to compact.
+    %% Persist is left to the subsequent tick or drain, as before.
+    maybe_start_rebalance(State0#state{retention_in_flight = false}).
 
 %% ------------------------------------------------------------------
 %% Internal
@@ -589,6 +609,12 @@ start_persist(
 %% exceed the threshold for any kind, emit an upload_group effect.
 -spec maybe_start_rebalance(state()) -> {state(), [core_effect()]}.
 maybe_start_rebalance(#state{rebalance_in_flight = true} = State) ->
+    {State, []};
+maybe_start_rebalance(#state{retention_in_flight = true} = State) ->
+    %% A remote retention evaluation is in flight. It rewrites the same
+    %% leading entries a rebalance would factor out, so the two must never run
+    %% concurrently (Single mutator). Defer: the rebalance is re-checked when
+    %% retention completes (retention_complete) and on the next drain.
     {State, []};
 maybe_start_rebalance(#state{cfg = Cfg, manifest = Manifest} = State) ->
     case needs_rebalance(Manifest#manifest.entries, Cfg#cfg.rebalance_threshold) of

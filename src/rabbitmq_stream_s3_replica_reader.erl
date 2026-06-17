@@ -1023,16 +1023,35 @@ update_counter(Cnt, FstOff, NumSegLeft) ->
 maybe_evaluate_remote_retention(_Manifest, [], _StreamId, State) ->
     State;
 maybe_evaluate_remote_retention(Manifest, Retention, StreamId, #state{core = Core0} = State) ->
-    inc(State, ?C_REMOTE_TIER_RETENTION_EVALUATIONS, 1),
-    Now = erlang:system_time(millisecond),
-    %% First try without group download (handles fragments-only case synchronously).
-    case rabbitmq_stream_s3_manifest:evaluate_remote_retention(Manifest, Retention, Now) of
-        unchanged ->
-            %% No leading fragments to remove. If the first entry is a group,
-            %% spawn an async task to download it and evaluate retention within.
-            maybe_spawn_group_retention(Manifest, Retention, Now, StreamId, State);
-        {Edit, Refs} ->
-            on_remote_retention(Edit, Refs, StreamId, Core0, State)
+    case rabbitmq_stream_s3_replica_reader_core:rebalance_in_flight(Core0) of
+        true ->
+            %% A rebalance is rewriting the manifest's leading entries. Remote
+            %% retention rewrites the same prefix, so evaluating it now would
+            %% compute an edit against a manifest the rebalance is about to
+            %% change, and applying it would race the rebalance over that
+            %% prefix (Single mutator). Skip; retention is re-evaluated by the
+            %% next persist_complete once the rebalance has finished. This
+            %% guards the manual CLI trigger; the automatic post-persist path
+            %% is already gated by persist_complete.
+            ?LOG_DEBUG(
+                "~ts skipping remote retention evaluation: rebalance in flight",
+                [StreamId]
+            ),
+            State;
+        false ->
+            inc(State, ?C_REMOTE_TIER_RETENTION_EVALUATIONS, 1),
+            Now = erlang:system_time(millisecond),
+            %% First try without group download (handles the fragments-only
+            %% case synchronously).
+            case rabbitmq_stream_s3_manifest:evaluate_remote_retention(Manifest, Retention, Now) of
+                unchanged ->
+                    %% No leading fragments to remove. If the first entry is a
+                    %% group, spawn an async task to download it and evaluate
+                    %% retention within.
+                    maybe_spawn_group_retention(Manifest, Retention, Now, StreamId, State);
+                {Edit, Refs} ->
+                    on_remote_retention(Edit, Refs, StreamId, Core0, State)
+            end
     end.
 
 %% Handle a retention result (synchronous fragments-only case or async completion).

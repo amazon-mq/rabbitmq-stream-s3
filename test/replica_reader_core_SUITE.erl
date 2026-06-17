@@ -76,6 +76,9 @@ all() ->
         tick_fires_at_exact_interval_boundary,
         retention_and_rebalance_same_persist_cycle,
         persist_complete_defers_retention_during_rebalance,
+        rebalance_deferred_while_retention_in_flight,
+        retention_complete_rechecks_deferred_rebalance,
+        retention_failed_rechecks_deferred_rebalance,
         retention_deletes_all_entries,
         new_fragment_after_empty_manifest
     ].
@@ -1306,6 +1309,96 @@ persist_complete_defers_retention_during_rebalance(_Config) ->
     %% Complete that persist. NOW retention should be emitted.
     {_S7, FinalEffects} = rabbitmq_stream_s3_replica_reader_core:persist_complete(2, S6),
     ?assertMatch([_ | _], [E || {evaluate_retention, _, _} = E <- FinalEffects]).
+
+rebalance_deferred_while_retention_in_flight(_Config) ->
+    %% The mirror of persist_complete_defers_retention_during_rebalance: a
+    %% remote retention evaluation is in flight when a drain reaches the
+    %% rebalance threshold. maybe_start_rebalance must defer, because retention
+    %% and rebalance rewrite the same leading entries (Single mutator). No
+    %% upload_group is emitted and rebalance_in_flight stays false.
+    Threshold = 4,
+    {S0, _} = init_core(#{rebalance_threshold => Threshold, persist_threshold => 100}),
+    %% Apply Threshold - 1 fragments (below the rebalance threshold).
+    S1 = lists:foldl(
+        fun(I, Acc) ->
+            cut_and_complete(Acc, I * 100, (I + 1) * 100, 1000 + I)
+        end,
+        S0,
+        lists:seq(0, Threshold - 2)
+    ),
+    %% A remote retention evaluation is now in flight.
+    S2 = rabbitmq_stream_s3_replica_reader_core:retention_started(S1),
+    %% The Threshold-th completion would reach the rebalance threshold on drain.
+    {S3, Effects} = cut_and_complete_effects(
+        S2, (Threshold - 1) * 100, Threshold * 100, 2000
+    ),
+    ?assertEqual([], [E || {upload_group, _, _, _, _, _} = E <- Effects]),
+    #{rebalance_in_flight := false} =
+        rabbitmq_stream_s3_replica_reader_core:format_state(S3).
+
+retention_complete_rechecks_deferred_rebalance(_Config) ->
+    %% A rebalance deferred while retention was in flight must be re-checked
+    %% once the retention edit is applied. Here the root stays oversized after
+    %% retention removes one entry, so the rebalance fires.
+    Threshold = 4,
+    {S0, _} = init_core(#{rebalance_threshold => Threshold, persist_threshold => 100}),
+    %% Retention is in flight from the start, so the drains below defer the
+    %% rebalance rather than starting it.
+    S1 = rabbitmq_stream_s3_replica_reader_core:retention_started(S0),
+    %% Apply Threshold + 1 fragments. Rebalance is deferred the whole time.
+    S2 = lists:foldl(
+        fun(I, Acc) ->
+            cut_and_complete(Acc, I * 100, (I + 1) * 100, 1000 + I)
+        end,
+        S1,
+        lists:seq(0, Threshold)
+    ),
+    #{rebalance_in_flight := false} =
+        rabbitmq_stream_s3_replica_reader_core:format_state(S2),
+    %% Retention removes the first entry, leaving Threshold fragments: still
+    %% oversized. retention_complete clears the flag and re-checks rebalance.
+    RetEdit = #edit{
+        first_offset = 100,
+        first_timestamp = 100 * 1000,
+        first_last_timestamp = 199 * 1000,
+        next_offset = undefined,
+        size = -64_000_000,
+        entries = <<>>,
+        pos = 0,
+        len = ?ENTRY_B
+    },
+    {S3, Effects} = rabbitmq_stream_s3_replica_reader_core:retention_complete(RetEdit, S2),
+    ?assertMatch(
+        [{upload_group, <<"stream">>, ?MANIFEST_KIND_GROUP, _, 0, _}],
+        [E || {upload_group, _, _, _, _, _} = E <- Effects]
+    ),
+    #{rebalance_in_flight := true} =
+        rabbitmq_stream_s3_replica_reader_core:format_state(S3).
+
+retention_failed_rechecks_deferred_rebalance(_Config) ->
+    %% A retention evaluation that deferred a rebalance fails without changing
+    %% the manifest. The deferred rebalance must still be re-checked so an
+    %% oversized root does not wait for the next drain to compact.
+    Threshold = 4,
+    {S0, _} = init_core(#{rebalance_threshold => Threshold, persist_threshold => 100}),
+    S1 = rabbitmq_stream_s3_replica_reader_core:retention_started(S0),
+    %% Apply Threshold fragments while retention is in flight: rebalance defers.
+    S2 = lists:foldl(
+        fun(I, Acc) ->
+            cut_and_complete(Acc, I * 100, (I + 1) * 100, 1000 + I)
+        end,
+        S1,
+        lists:seq(0, Threshold - 1)
+    ),
+    #{rebalance_in_flight := false} =
+        rabbitmq_stream_s3_replica_reader_core:format_state(S2),
+    {S3, Effects} = rabbitmq_stream_s3_replica_reader_core:retention_failed(timeout, S2),
+    ?assertMatch(
+        [{upload_group, <<"stream">>, ?MANIFEST_KIND_GROUP, _, 0, _}],
+        [E || {upload_group, _, _, _, _, _} = E <- Effects]
+    ),
+    #{rebalance_in_flight := true} =
+        rabbitmq_stream_s3_replica_reader_core:format_state(S3).
 
 retention_deletes_all_entries(_Config) ->
     %% Retention removes all entries. Manifest becomes empty.
