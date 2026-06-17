@@ -1813,4 +1813,44 @@ classify_object_result_ok_parses_with_revision_test() ->
     {ok, Manifest} = classify_object_result({ok, Data}, 42, <<"k">>),
     ?assertEqual(42, Manifest#manifest.revision).
 
+%% Build a minimal state whose live local log first offset and manifest
+%% next_offset are set to the given values, for exercising local_log_ahead/1.
+local_log_ahead_state(LocalFirst, NextOffset) ->
+    Shared = osiris_log_shared:new(),
+    ok = osiris_log_shared:set_first_chunk_id(Shared, LocalFirst),
+    Opts = #{stream => <<"s">>, dir => <<"/tmp">>, epoch => 1, reference => <<"s">>},
+    {Core, _} = rabbitmq_stream_s3_replica_reader_core:init(
+        #manifest{next_offset = NextOffset}, Opts
+    ),
+    #state{cfg = #cfg{stream = <<"s">>, shared = Shared}, core = Core, config = Opts}.
+
+%% The local log trimmed past next_offset: the stalled segment is permanently
+%% gone, so recovery must fire.
+local_log_ahead_true_when_local_past_next_test() ->
+    ?assertMatch(
+        {true, 100, 10}, local_log_ahead(local_log_ahead_state(100, 10))
+    ).
+
+%% The local log first offset equals next_offset: the segment is still present
+%% (or the failure is a transient roll). Must not recover; retry instead.
+local_log_ahead_false_when_equal_test() ->
+    ?assertEqual(false, local_log_ahead(local_log_ahead_state(10, 10))).
+
+%% The manifest is ahead of the local log (normal steady state). Must not
+%% recover.
+local_log_ahead_false_when_local_behind_test() ->
+    ?assertEqual(false, local_log_ahead(local_log_ahead_state(5, 10))).
+
+%% A transfer result for a reference the shell no longer tracks (e.g. a
+%% transfer abandoned by a manifest recovery) must be dropped without touching
+%% the core, which would otherwise crash get_meta on the unknown reference or
+%% append a non-contiguous orphan. The state is returned unchanged.
+stale_transfer_result_dropped_test() ->
+    State = #state{transfer_sizes = #{}},
+    Ref = make_ref(),
+    ?assertEqual({noreply, State}, handle_info({transfer_result, Ref, {ok, 1}}, State)),
+    ?assertEqual(
+        {noreply, State}, handle_info({transfer_result, Ref, {error, boom}}, State)
+    ).
+
 -endif.
