@@ -1220,6 +1220,16 @@ resolve_and_start(#state{cfg = #cfg{stream = StreamId}} = State0) ->
             State0
     end.
 
+%% Build the empty manifest the local-log-ahead recovery (the `reset` operation)
+%% installs at the local floor. first_offset = next_offset = LocalFirst so an
+%% empty manifest (Frag = empty) carries f = n, as the Coverage and Accounting
+%% invariants require, and so first_offset only moves forward: it feeds the
+%% first_offset counter and GC. See the Reset safety invariant in
+%% docs/invariants.md.
+-spec reset_manifest(osiris:offset(), rabbitmq_stream_s3_db:revision()) -> #manifest{}.
+reset_manifest(LocalFirst, Revision) ->
+    #manifest{first_offset = LocalFirst, next_offset = LocalFirst, revision = Revision}.
+
 -spec parse_manifest_root(binary()) -> #manifest{}.
 parse_manifest_root(?MANIFEST(FirstOffset, NextOffset, FirstTs, FirstLastTs, TotalSize, Entries)) ->
     #manifest{
@@ -1296,9 +1306,7 @@ start_reading0(
             ),
             inc(State1, ?C_LOCAL_LOG_AHEAD_RECOVERIES, 1),
             delete_manifest_objects(StreamId, Manifest),
-            FreshManifest = #manifest{
-                next_offset = LocalFirst, revision = Manifest#manifest.revision
-            },
+            FreshManifest = reset_manifest(LocalFirst, Manifest#manifest.revision),
             {Core1, _} = rabbitmq_stream_s3_replica_reader_core:init(
                 FreshManifest, State1#state.config
             ),
@@ -1876,5 +1884,17 @@ stale_transfer_result_dropped_test() ->
 close_log_without_open_log_is_noop_test() ->
     State = #state{log = undefined},
     ?assertEqual(State, close_log(State)).
+
+%% The reset installs an empty manifest carrying f = n = the local floor, so an
+%% empty manifest satisfies Coverage and Accounting and first_offset only moves
+%% forward (Reset safety invariant).
+reset_manifest_carries_floor_as_first_and_next_test() ->
+    LocalFirst = 149324677,
+    M = reset_manifest(LocalFirst, 7),
+    ?assertEqual(LocalFirst, M#manifest.first_offset),
+    ?assertEqual(LocalFirst, M#manifest.next_offset),
+    ?assertEqual(M#manifest.first_offset, M#manifest.next_offset),
+    ?assertEqual(<<>>, M#manifest.entries),
+    ?assertEqual(7, M#manifest.revision).
 
 -endif.
