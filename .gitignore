@@ -24,3 +24,6 @@ rabbitmq_stream_s3.d
 tla/*/states/
 tla/*/*.dot
 tla/*/MC_TTrace_*
+
+# CSE security scanner artifacts (auto-added by cse init)
+.security-scan/
