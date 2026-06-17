@@ -73,6 +73,7 @@ Understand enough to modify the plugin or diagnose issues in the code.
 6. [upload-path.md](./upload-path.md): remote replica reader lifecycle (startup, drain, seal, upload, broadcast)
 7. [read-path.md](./read-path.md): offset resolution, local/remote routing, fragment iterator, prefetch
 8. [manifest.md](./manifest.md): tree structure, binary entry format, rebalancing, concurrency control
+9. [invariants.md](./invariants.md): the invariants the plugin depends on, indexed by subsystem
 
 ### Deep dive
 
