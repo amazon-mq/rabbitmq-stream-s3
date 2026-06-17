@@ -34,13 +34,18 @@ with no pacing.
 -define(C_SUBMISSIONS_RECEIVED, 1).
 -define(C_TASKS_IN_FLIGHT, 2).
 -define(C_PENDING_SUBMISSIONS, 3).
+-define(C_OVERSIZED_ADMISSIONS, 4).
 -define(COUNTERS, [
     {governor_submissions_received, ?C_SUBMISSIONS_RECEIVED, counter,
         "Total transfer submissions received by the governor"},
     {governor_tasks_in_flight, ?C_TASKS_IN_FLIGHT, gauge,
         "Number of transfer tasks currently executing"},
     {governor_pending_submissions, ?C_PENDING_SUBMISSIONS, gauge,
-        "Number of submissions queued waiting for token-bucket capacity"}
+        "Number of submissions queued waiting for token-bucket capacity"},
+    {governor_oversized_admissions, ?C_OVERSIZED_ADMISSIONS, counter,
+        "Transfers admitted whose size exceeded the token-bucket burst (admitted "
+        "on credit, driving the bucket into debt). A persistently climbing value "
+        "means the configured burst is smaller than typical fragments"}
 ]).
 -define(COUNTER_KEY, {?MODULE, counter}).
 
@@ -144,6 +149,7 @@ dispatch(Item, #state{bucket = unlimited} = State) ->
 dispatch({_Fun, Size, _ReplyTo, _Ref} = Item, #state{bucket = Bucket0} = State) ->
     case rabbitmq_stream_s3_token_bucket:request(Size, Bucket0) of
         {ok, Bucket} ->
+            count_oversized(Size, Bucket0),
             spawn_task(Item),
             State#state{bucket = Bucket};
         {insufficient, _, _} ->
@@ -164,6 +170,7 @@ drain_pending(#state{pending = Pending0, bucket = Bucket0} = State) ->
         {value, {_Fun, Size, _ReplyTo, _Ref} = Item} ->
             case rabbitmq_stream_s3_token_bucket:request(Size, Bucket0) of
                 {ok, Bucket} ->
+                    count_oversized(Size, Bucket0),
                     spawn_task(Item),
                     Pending = queue:drop(Pending0),
                     set(?C_PENDING_SUBMISSIONS, queue:len(Pending)),
@@ -192,6 +199,17 @@ spawn_task({Fun, _Size, ReplyTo, Ref}) ->
 
 schedule_refill() ->
     erlang:send_after(?REFILL_INTERVAL_MS, self(), refill).
+
+%% Count an admitted transfer whose size exceeds the bucket's burst. Such a
+%% transfer is admitted on credit (the bucket goes into debt) rather than
+%% deadlocking. Bucket0 is the pre-request bucket; burst is invariant across
+%% request/2 so reading it here is correct.
+count_oversized(Size, Bucket) ->
+    #{burst := Burst} = rabbitmq_stream_s3_token_bucket:info(Bucket),
+    case Size > Burst of
+        true -> inc(?C_OVERSIZED_ADMISSIONS, 1);
+        false -> ok
+    end.
 
 %% ------------------------------------------------------------------
 %% Counters
@@ -275,9 +293,27 @@ pacing_delays_when_exhausted_test() ->
     end,
     gen_server:stop(Pid).
 
+%% A transfer larger than the burst must not deadlock the governor. It is
+%% admitted on credit (the bucket goes into debt), and a smaller transfer
+%% queued behind it must still complete once the debt is repaid. Before the
+%% fix the oversized item at the head of the queue blocked everything forever.
+oversized_transfer_does_not_deadlock_test() ->
+    %% rate 1000 B/s, burst 1000 B; transfer of 5000 B exceeds burst.
+    {ok, Pid} = start_link(#{rate => 1000, burst => 1000}),
+    Self = self(),
+    RefBig = make_ref(),
+    RefSmall = make_ref(),
+    submit(fun() -> {ok, big} end, 5000, Self, RefBig),
+    submit(fun() -> {ok, small} end, 100, Self, RefSmall),
+    %% Debt of ~4000 tokens repays at 1000 B/s, so the small item clears in
+    %% ~4-5s. Generous timeout; the point is that it completes at all.
+    Results = collect_results([RefBig, RefSmall], 15000),
+    ?assertEqual({ok, big}, maps:get(RefBig, Results)),
+    ?assertEqual({ok, small}, maps:get(RefSmall, Results)),
+    gen_server:stop(Pid).
+
 collect_results(Refs, Timeout) ->
     collect_results(Refs, Timeout, #{}).
-
 collect_results([], _Timeout, Acc) ->
     Acc;
 collect_results([Ref | Rest], Timeout, Acc) ->
