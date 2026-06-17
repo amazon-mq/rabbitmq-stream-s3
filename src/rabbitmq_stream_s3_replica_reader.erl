@@ -661,12 +661,15 @@ handle_info(
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(_Reason, #state{
-    cfg = #cfg{stream = StreamId},
-    persist_mon = Mon,
-    persist_pid = CommitPid,
-    metrics_id = MetricsId
-}) ->
+terminate(
+    _Reason,
+    #state{
+        cfg = #cfg{stream = StreamId},
+        persist_mon = Mon,
+        persist_pid = CommitPid,
+        metrics_id = MetricsId
+    } = State
+) ->
     %% Kill any in-flight commit task to prevent orphaned Khepri writes.
     %% An orphaned write advances the revision, causing conflicts for the
     %% next incarnation of this replica reader.
@@ -677,6 +680,9 @@ terminate(_Reason, #state{
             demonitor(Mon, [flush]),
             exit(CommitPid, kill)
     end,
+    %% Close the open data reader so its segment file descriptors are released
+    %% promptly rather than at process teardown.
+    _ = close_log(State),
     ok = delete_metrics(MetricsId),
     rabbitmq_stream_s3_registry:unregister_name({StreamId, node()}),
     rabbitmq_stream_s3_manifest:evict_group_cache(StreamId),
@@ -981,8 +987,7 @@ execute_effect(cancel_persist_timer, #state{persist_timer = Ref} = State) ->
     State#state{persist_timer = undefined};
 execute_effect(reinitialize, #state{cfg = #cfg{stream = StreamId}} = State0) ->
     ?LOG_INFO("~ts reinitializing after commit conflict", [StreamId]),
-    State1 = State0#state{
-        log = undefined,
+    State1 = (close_log(State0))#state{
         assembly = undefined,
         transfer_sizes = #{},
         persist_pending_bytes = 0,
@@ -1226,6 +1231,20 @@ parse_manifest_root(?MANIFEST(FirstOffset, NextOffset, FirstTs, FirstLastTs, Tot
         entries = Entries
     }.
 
+%% Close the open osiris data reader, if any, and clear it from the state.
+%% The osiris_log state holds open file descriptors to local segment files.
+%% Abandoning it (setting log = undefined) without closing leaks those
+%% descriptors: when retention then unlinks the segments, the kernel cannot
+%% reclaim the disk space until the descriptors are closed. Every path that
+%% restarts the reader (manifest reinitialize, trimmed-segment recovery) must
+%% close the old log first.
+-spec close_log(#state{}) -> #state{}.
+close_log(#state{log = undefined} = State) ->
+    State;
+close_log(#state{log = Log} = State) ->
+    ok = osiris_log:close(Log),
+    State#state{log = undefined}.
+
 -spec start_reading(#state{}) -> #state{}.
 start_reading(
     #state{
@@ -1300,7 +1319,7 @@ start_reading0(
             ),
             %% Retention deleted the segment between listing and opening.
             %% Retry immediately (same pattern as osiris_log:init_offset_reader).
-            start_reading(State1#state{core = Core, log = undefined, assembly = undefined})
+            start_reading((close_log(State1))#state{core = Core, assembly = undefined})
     end.
 
 %% Whether the live local log has been trimmed past the manifest's next_offset.
@@ -1346,8 +1365,7 @@ handle_local_log_ahead(
         "remote tier.",
         [StreamId, NextOffset, Reason, LocalFirst, NextOffset]
     ),
-    resolve_and_start(State0#state{
-        log = undefined,
+    resolve_and_start((close_log(State0))#state{
         assembly = undefined,
         transfer_sizes = #{},
         persist_pending_bytes = 0,
@@ -1852,5 +1870,11 @@ stale_transfer_result_dropped_test() ->
     ?assertEqual(
         {noreply, State}, handle_info({transfer_result, Ref, {error, boom}}, State)
     ).
+
+%% close_log/1 is a no-op when there is no open data reader, so the restart
+%% paths can call it unconditionally.
+close_log_without_open_log_is_noop_test() ->
+    State = #state{log = undefined},
+    ?assertEqual(State, close_log(State)).
 
 -endif.
