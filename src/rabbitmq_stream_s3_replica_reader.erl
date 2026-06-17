@@ -600,10 +600,14 @@ handle_info(
     ?LOG_WARNING("~ts commit task crashed: ~p", [StreamId, Reason]),
     State1 = on_persist_failed(Reason, State0),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_failed(Reason, Core0),
-    {noreply,
+    %% Route through maybe_stop/1 like the {persist_result, {error, _}} handler:
+    %% persist_failed/2 can return a stop effect, and a crashed persist task
+    %% must honour it rather than leaving the reader marked stopping but alive.
+    maybe_stop(
         execute_effects(Effects, State1#state{
             core = Core, persist_mon = undefined, persist_pid = undefined
-        })};
+        })
+    );
 handle_info(
     {'DOWN', Mon, process, _, Reason},
     #state{group_mon = Mon, core = Core0, cfg = #cfg{stream = StreamId}} = State0
