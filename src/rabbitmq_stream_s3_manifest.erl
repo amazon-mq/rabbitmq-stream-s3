@@ -344,7 +344,17 @@ maybe_eval_group_retention(#manifest{entries = Entries} = Manifest, Specs, Now, 
     end.
 
 %% Evaluate retention on fragment entries within a group.
-eval_group_entries(Manifest, GroupEntries, GroupRef, Specs, Now) ->
+%%
+%% A group object is immutable, so after an earlier cycle partially consumed
+%% this group it still lists the children those cycles already removed. Skip
+%% that already-consumed prefix (children below the manifest's first_offset)
+%% before evaluating. Otherwise retention re-counts and re-deletes them and
+%% double-subtracts their sizes from total_size on every subsequent cycle,
+%% which drifts total_size below the true durable size (silently disabling
+%% max_bytes retention) or negative (crashing the persist under max_age), and
+%% regresses first_offset below the real data floor.
+eval_group_entries(Manifest, GroupEntries0, GroupRef, Specs, Now) ->
+    GroupEntries = drop_consumed_children(GroupEntries0, Manifest#manifest.first_offset),
     NumToRemove = eval_group_retention_specs(
         GroupEntries, Manifest#manifest.total_size, Specs, Now
     ),
@@ -357,6 +367,22 @@ eval_group_entries(Manifest, GroupEntries, GroupRef, Specs, Now) ->
                 Manifest, GroupEntries, GroupRef, NumToRemove, NumGroupEntries
             )
     end.
+
+%% Drop the leading group children whose offset is below first_offset: an
+%% earlier retention cycle already removed them, but they remain in the
+%% immutable group object.
+drop_consumed_children(GroupEntries, FirstOffset) ->
+    Skip = consumed_prefix_bytes(GroupEntries, FirstOffset, 0),
+    binary:part(GroupEntries, Skip, byte_size(GroupEntries) - Skip).
+
+consumed_prefix_bytes(
+    <<Offset:64/unsigned, _FTs:64/signed, _LTs:64/signed, _K:8, _Sz:40, _Uid:32, Rest/binary>>,
+    FirstOffset,
+    Acc
+) when Offset < FirstOffset ->
+    consumed_prefix_bytes(Rest, FirstOffset, Acc + ?ENTRY_B);
+consumed_prefix_bytes(_Entries, _FirstOffset, Acc) ->
+    Acc.
 
 eval_group_retention_specs(GroupEntries, ManifestTotalSize, Specs, Now) ->
     lists:foldl(
