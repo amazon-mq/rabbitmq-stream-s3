@@ -576,7 +576,7 @@ read_header(#remote{shared = Shared, next_offset = NextOffset} = Remote) ->
         true ->
             read_header1(Remote);
         false ->
-            ?LOG_WARNING(
+            ?LOG_DEBUG(
                 "Remote read_header returning end_of_stream:"
                 " next_offset=~b last_chunk_id=~b committed_chunk_id=~b",
                 [NextOffset, LastChunkId, CommittedChunkId],
