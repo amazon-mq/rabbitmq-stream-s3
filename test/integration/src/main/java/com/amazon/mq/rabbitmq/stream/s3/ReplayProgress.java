@@ -3,10 +3,9 @@ package com.amazon.mq.rabbitmq.stream.s3;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Helpers for tracking independent per-consumer progress during a fan-out
- * replay, where every consumer reads the whole stream on its own. The slowest
- * consumer gates completion; the sum is reported for an aggregate throughput
- * view.
+ * Helpers for tracking independent per-consumer progress during a fan-out replay, where every
+ * consumer reads the whole stream on its own. The slowest consumer gates completion; the sum is
+ * reported for an aggregate throughput view.
  */
 final class ReplayProgress {
 

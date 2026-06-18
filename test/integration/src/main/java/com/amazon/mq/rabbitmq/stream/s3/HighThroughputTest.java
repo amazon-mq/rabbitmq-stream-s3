@@ -466,10 +466,7 @@ public class HighThroughputTest implements Runnable {
 
     LOG.info(
         "Replay complete: slowest consumer {} messages in {}s ({}% of {})",
-        min,
-        elapsedSec,
-        expectedMessages > 0 ? min * 100 / expectedMessages : 0,
-        expectedMessages);
+        min, elapsedSec, expectedMessages > 0 ? min * 100 / expectedMessages : 0, expectedMessages);
     LOG.info("  Per-consumer: {}", ReplayProgress.format(counts));
 
     // Every consumer must independently reach the threshold.
