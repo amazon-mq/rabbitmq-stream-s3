@@ -453,8 +453,16 @@ delete(Keys, Opts) when is_list(Keys) andalso is_map(Opts) ->
         <<"x-amz-checksum-crc32">> => base64:encode(<<(erlang:crc32(Data)):32/unsigned>>)
     },
     case request(<<"POST">>, <<"/?delete=">>, Headers, Data, Opts) of
-        {ok, #{status := 200}} ->
-            ok;
+        {ok, #{status := 200, body := Body}} ->
+            %% A DeleteObjects request can return 200 while reporting per-key
+            %% failures in the body. Treating that as a clean success leaks the
+            %% objects silently, so surface any per-key errors to the caller.
+            case decode_delete_errors(Body) of
+                [] ->
+                    ok;
+                Errors ->
+                    {error, {delete_errors, Errors}}
+            end;
         {ok, #{status := Status} = Other} ->
             log_unexpected_status(?FUNCTION_NAME, Status),
             {error, Other};
@@ -547,6 +555,34 @@ decode_list_bucket_result(Data) ->
         {[], 0, undefined},
         Result
     ).
+
+%% Extracts the per-key `<Error>` entries from a DeleteObjects 200 response.
+%% Returns `[{Key, Code}]`, empty when every key was deleted. A body that does
+%% not parse as a DeleteResult is treated as a clean success, matching the prior
+%% behaviour of accepting any 200, rather than reporting phantom failures.
+-spec decode_delete_errors(binary()) -> [{key(), binary()}].
+decode_delete_errors(Body) ->
+    try xmerl_scan:string(binary_to_list(Body), [{allow_entities, false}]) of
+        {#xmlElement{name = 'DeleteResult', content = Content}, _} ->
+            [
+                {child_text('Key', ErrContent), child_text('Code', ErrContent)}
+             || #xmlElement{name = 'Error', content = ErrContent} <- Content
+            ];
+        _ ->
+            []
+    catch
+        _:_ ->
+            []
+    end.
+
+-spec child_text(atom(), [term()]) -> binary().
+child_text(Name, Content) ->
+    case lists:keyfind(Name, #xmlElement.name, Content) of
+        #xmlElement{content = [#xmlText{value = Value}]} ->
+            list_to_binary(Value);
+        _ ->
+            <<>>
+    end.
 
 log_unexpected_status(Function, Status) ->
     ?LOG_DEBUG("~ts unexpected HTTP status ~b", [Function, Status]).
@@ -1623,6 +1659,35 @@ delete_many_body_test() ->
         <<"<?xml version=\"1.0\"?><Delete><Object><Key>foo&amp;bar.txt</Key></Object></Delete>">>,
         delete_many_body([<<"foo&bar.txt">>])
     ),
+    ok.
+
+decode_delete_errors_test() ->
+    %% A clean delete: every key reported under <Deleted>, no <Error>.
+    AllOk =
+        <<
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            "<DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+            "<Deleted><Key>a</Key></Deleted><Deleted><Key>b</Key></Deleted>"
+            "</DeleteResult>"
+        >>,
+    ?assertEqual([], decode_delete_errors(AllOk)),
+    %% A partial failure: one key deleted, one reported under <Error>.
+    Partial =
+        <<
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            "<DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+            "<Deleted><Key>a</Key></Deleted>"
+            "<Error><Key>b</Key><Code>AccessDenied</Code><Message>Access Denied</Message></Error>"
+            "</DeleteResult>"
+        >>,
+    ?assertEqual([{<<"b">>, <<"AccessDenied">>}], decode_delete_errors(Partial)),
+    %% A well-formed but unexpected root is treated as success, matching the
+    %% prior behaviour of accepting any 200. A malformed body falls to the same
+    %% empty result via the catch, but is not asserted here because xmerl logs a
+    %% fatal report on unparseable input.
+    Unexpected =
+        <<"<?xml version=\"1.0\" encoding=\"UTF-8\"?><Other><Key>a</Key></Other>">>,
+    ?assertEqual([], decode_delete_errors(Unexpected)),
     ok.
 
 sign_test() ->

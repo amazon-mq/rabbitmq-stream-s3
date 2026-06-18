@@ -34,10 +34,13 @@ for batched deletion. The task exits when the listing is exhausted.
 
 -define(C_OBJECTS_DELETED, 1).
 -define(C_STREAMS_DELETED, 2).
+-define(C_OBJECTS_DELETE_FAILED, 3).
 -define(COUNTERS, [
     {objects_deleted, ?C_OBJECTS_DELETED, counter,
-        "Total individual objects deleted via the reaper (retention or stream deletion)"},
-    {streams_deleted, ?C_STREAMS_DELETED, counter, "Streams whose deletion task ran to completion"}
+        "Individual objects confirmed deleted via the reaper (retention or stream deletion)"},
+    {streams_deleted, ?C_STREAMS_DELETED, counter, "Streams whose deletion task ran to completion"},
+    {objects_delete_failed, ?C_OBJECTS_DELETE_FAILED, counter,
+        "Individual objects the reaper could not confirm deleted, left for orphan GC"}
 ]).
 -define(COUNTER_KEY, {?MODULE, counter}).
 
@@ -85,13 +88,40 @@ collect(Ops) ->
 delete_batched([]) ->
     ok;
 delete_batched(Keys) when length(Keys) =< ?MAX_BATCH ->
-    inc(?C_OBJECTS_DELETED, length(Keys)),
-    rabbitmq_stream_s3_api:delete(Keys, #{timeout => ?DELETE_TIMEOUT_MS});
+    delete_batch(Keys);
 delete_batched(Keys) ->
     {Batch, Rest} = lists:split(?MAX_BATCH, Keys),
-    inc(?C_OBJECTS_DELETED, length(Batch)),
-    _ = rabbitmq_stream_s3_api:delete(Batch, #{timeout => ?DELETE_TIMEOUT_MS}),
+    delete_batch(Batch),
     delete_batched(Rest).
+
+%% Count only objects S3 confirms deleted. A DeleteObjects request can return a
+%% 200 while reporting per-key failures, and the whole request can fail outright;
+%% in both cases the unconfirmed objects are left for orphan GC, so they must not
+%% inflate the deleted counter.
+delete_batch(Batch) ->
+    N = length(Batch),
+    case rabbitmq_stream_s3_api:delete(Batch, #{timeout => ?DELETE_TIMEOUT_MS}) of
+        ok ->
+            inc(?C_OBJECTS_DELETED, N);
+        {error, {delete_errors, Errors}} ->
+            Failed = length(Errors),
+            inc(?C_OBJECTS_DELETED, N - Failed),
+            inc(?C_OBJECTS_DELETE_FAILED, Failed),
+            %% A delete failure is a routine transient (throttling, a transient
+            %% S3 error) and orphan GC reclaims what we miss, so this is info, not
+            %% a warning. The objects_delete_failed counter is the alertable signal.
+            ?LOG_INFO(
+                "Reaper could not delete ~b of ~b objects; leaving them for GC. "
+                "First failures: ~p",
+                [Failed, N, lists:sublist(Errors, 5)]
+            );
+        {error, Reason} ->
+            inc(?C_OBJECTS_DELETE_FAILED, N),
+            ?LOG_INFO(
+                "Reaper delete request for ~b objects failed: ~p; leaving them for GC",
+                [N, Reason]
+            )
+    end.
 
 list_and_delete(StreamId) ->
     Prefix = rabbitmq_stream_s3:stream_prefix(StreamId),
