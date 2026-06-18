@@ -199,7 +199,8 @@ These metrics decompose disk-resident bytes by their position in the upload pipe
 | Metric                              | Type    | Description                                                       |
 |-------------------------------------|---------|-------------------------------------------------------------------|
 | `rabbitmq_stream_s3_manifests_resolved`                | counter | Times a non-empty manifest was resolved on startup                |
-| `rabbitmq_stream_s3_manifests_resolved_empty`          | counter | Times an empty manifest was resolved on startup                   |
+| `rabbitmq_stream_s3_manifests_resolved_empty`          | counter | Times a genuinely empty manifest was resolved on startup          |
+| `rabbitmq_stream_s3_manifest_resolution_failures`      | counter | Resolutions that hit a transient store or object error and were retried instead of resolving empty |
 | `rabbitmq_stream_s3_local_log_ahead_recoveries`        | counter | Times the replica reader discarded the remote manifest because the local log was ahead (e.g. retention deleted un-uploaded data) |
 
 #### Retention
@@ -208,6 +209,7 @@ These metrics decompose disk-resident bytes by their position in the upload pipe
 |-----------------------------------------|---------|-------------------------------------------------------------------|
 | `rabbitmq_stream_s3_local_tier_retention_evaluations`      | counter | Local tier retention evaluations                                  |
 | `rabbitmq_stream_s3_remote_tier_retention_evaluations`     | counter | Remote tier retention evaluations                                 |
+| `rabbitmq_stream_s3_remote_tier_retention_failures`        | counter | Remote tier retention evaluations that failed                     |
 | `rabbitmq_stream_s3_fragments_deleted`                     | counter | Fragment objects deleted by remote retention                      |
 | `rabbitmq_stream_s3_groups_deleted`                        | counter | Group objects deleted by remote retention                         |
 | `rabbitmq_stream_s3_kilo_groups_deleted`                   | counter | Kilo-group objects deleted by remote retention                    |
@@ -220,6 +222,7 @@ Owned by `rabbitmq_stream_s3_governor`. Single counter set per node, no per-stre
 | Metric                              | Type    | Description                                                       |
 |-------------------------------------|---------|-------------------------------------------------------------------|
 | `rabbitmq_stream_s3_governor_submissions_received`     | counter | Total transfer submissions received                               |
+| `rabbitmq_stream_s3_governor_oversized_admissions`     | counter | Transfers admitted on credit because they exceed the burst allowance; a persistently climbing value means the configured rate is low relative to fragment sizes |
 | `rabbitmq_stream_s3_governor_tasks_in_flight`          | gauge   | Transfer tasks currently executing                                |
 | `rabbitmq_stream_s3_governor_pending_submissions`      | gauge   | Submissions queued waiting for token-bucket capacity              |
 
@@ -229,8 +232,17 @@ Owned by `rabbitmq_stream_s3_reaper`.
 
 | Metric                              | Type    | Description                                                       |
 |-------------------------------------|---------|-------------------------------------------------------------------|
-| `rabbitmq_stream_s3_objects_deleted`                   | counter | S3 objects deleted via the reaper (retention or stream deletion)  |
+| `rabbitmq_stream_s3_objects_deleted`                   | counter | S3 objects confirmed deleted via the reaper (retention or stream deletion) |
+| `rabbitmq_stream_s3_objects_delete_failed`             | counter | Objects the reaper could not confirm deleted (a DeleteObjects partial or whole-request failure); left for orphan GC |
 | `rabbitmq_stream_s3_streams_deleted`                   | counter | Streams whose deletion task ran to completion                     |
+
+### Manifest replica (per-node)
+
+Owned by `rabbitmq_stream_s3_manifest_replica`.
+
+| Metric                              | Type    | Description                                                       |
+|-------------------------------------|---------|-------------------------------------------------------------------|
+| `rabbitmq_stream_s3_resyncs_requested`                | counter | Re-syncs a replica requested after a manifest broadcast gap or epoch mismatch |
 
 ### S3 API (per-node)
 
@@ -323,11 +335,10 @@ Owned by `rabbitmq_stream_s3_remote_reader`. One counter set per node, summed ac
 | `rabbitmq_stream_s3_buffer_miss`                       | counter | Reads that had to await async data                                |
 | `rabbitmq_stream_s3_fragment_transition`               | counter | Number of transitions between fragments                           |
 | `rabbitmq_stream_s3_requests_in_flight`                | gauge   | Async requests currently executing                                |
-| `rabbitmq_stream_s3_await_duration_ms`                 | counter | Total ms spent awaiting async data                                |
-| `rabbitmq_stream_s3_await`                             | counter | Number of awaits                                                  |
 | `rabbitmq_stream_s3_read_duration_ms`                  | counter | Total ms spent in `read/4,5` calls                                |
 | `rabbitmq_stream_s3_read`                              | counter | Number of reads                                                   |
 | `rabbitmq_stream_s3_remote_reader_total_requests`      | counter | S3 requests initiated                                             |
+| `rabbitmq_stream_s3_remote_reader_fatal_errors`        | counter | Remote readers stopped by a non-retryable S3 error                |
 
 ### Read size histogram
 

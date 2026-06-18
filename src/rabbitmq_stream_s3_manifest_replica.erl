@@ -32,10 +32,20 @@ No heartbeat or reconnection mechanism is needed because:
 -behaviour(gen_server).
 
 -include("include/rabbitmq_stream_s3.hrl").
+-include("include/logging.hrl").
+-include_lib("kernel/include/logger.hrl").
 
 -define(TABLE, rabbitmq_stream_s3_manifest_cache).
 
+-define(C_RESYNCS_REQUESTED, 1).
+-define(COUNTERS, [
+    {resyncs_requested, ?C_RESYNCS_REQUESTED, counter,
+        "Re-syncs a manifest replica requested after a broadcast gap or epoch mismatch"}
+]).
+-define(COUNTER_KEY, {?MODULE, counter}).
+
 -export([start_link/0]).
+-export([init_counters/0]).
 -export([
     get_manifest/1,
     get_range/1,
@@ -259,10 +269,33 @@ write_manifest(StreamId, Manifest) ->
     ets:insert(?TABLE, {StreamId, Manifest}).
 
 request_resync(StreamId, WriterNode) ->
+    inc(?C_RESYNCS_REQUESTED, 1),
+    ?LOG_INFO(
+        "Manifest replica for stream ~ts detected a broadcast gap or epoch "
+        "mismatch; requesting a re-sync from writer node ~p",
+        [StreamId, WriterNode],
+        #{domain => ?RMQLOG_DOMAIN_STREAM_S3}
+    ),
     gen_server:cast(
         {via, rabbitmq_stream_s3_registry, {StreamId, WriterNode}},
         {resync, node()}
     ).
+
+%% ------------------------------------------------------------------
+%% Counters
+%% ------------------------------------------------------------------
+
+-spec init_counters() -> ok.
+init_counters() ->
+    Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?COUNTERS, #{module => ?MODULE}),
+    persistent_term:put(?COUNTER_KEY, Cnt),
+    ok.
+
+inc(Idx, N) ->
+    case persistent_term:get(?COUNTER_KEY, undefined) of
+        undefined -> ok;
+        Cnt -> counters:add(Cnt, Idx, N)
+    end.
 
 maybe_evaluate_retention(
     StreamId,

@@ -157,13 +157,24 @@ discover_child({_Id, Pid, worker, [osiris_writer]}) when is_pid(Pid) ->
     try
         attach_writer(Pid)
     catch
-        _:_ -> ok
+        Class:Reason ->
+            ?LOG_WARNING(
+                "Failed to attach tiering to discovered writer ~p: ~ts:~p. "
+                "This stream will not tier until its writer restarts",
+                [Pid, Class, Reason],
+                #{domain => ?RMQLOG_DOMAIN_STREAM_S3}
+            )
     end;
 discover_child({_Id, Pid, worker, [osiris_replica]}) when is_pid(Pid) ->
     try
         attach_replica(Pid)
     catch
-        _:_ -> ok
+        Class:Reason ->
+            ?LOG_WARNING(
+                "Failed to attach tiering to discovered replica ~p: ~ts:~p",
+                [Pid, Class, Reason],
+                #{domain => ?RMQLOG_DOMAIN_STREAM_S3}
+            )
     end;
 discover_child(_) ->
     ok.
@@ -187,9 +198,18 @@ attach_writer(Pid) ->
         retention => UserRetention
     },
     case rabbitmq_stream_s3_replica_reader_sup:start_child(Config) of
-        {ok, _} -> ok;
-        {error, {already_started, _}} -> ok;
-        {error, _} -> ok
+        {ok, _} ->
+            ok;
+        {error, {already_started, _}} ->
+            ok;
+        {error, Reason} ->
+            ?LOG_WARNING(
+                "Failed to attach tiering reader to discovered writer for "
+                "stream ~ts: ~p. This stream will not tier until its writer "
+                "restarts",
+                [StreamId, Reason],
+                #{domain => ?RMQLOG_DOMAIN_STREAM_S3}
+            )
     end,
     %% Inject the local retention function into the running writer.
     %% The hook in on_retention_updated/2 prepends {'fun', ...} automatically.
