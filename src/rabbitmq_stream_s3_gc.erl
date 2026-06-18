@@ -23,7 +23,7 @@ signal without Khepri restructuring).
 -include("include/logging.hrl").
 -include_lib("kernel/include/logger.hrl").
 
--export([run/0, run/1, run_stream/2]).
+-export([run/0, run/1, run_stream/2, run_stream/3]).
 
 -type mode() :: dry_run | delete.
 -type config() :: #{mode => mode()}.
@@ -70,6 +70,22 @@ run_stream(StreamId, Config) when is_binary(StreamId), is_map(Config) ->
             {ok, Findings};
         skip ->
             {ok, []}
+    end.
+
+-doc """
+Run garbage collection scoped to a single stream identified by its vhost and
+queue name. Resolves the stream id, then delegates to `run_stream/2`.
+""".
+-spec run_stream(rabbit_types:vhost(), binary(), config()) ->
+    {ok, [finding()]} | {error, {not_found, binary()}}.
+run_stream(VHost, QueueName, Config) when
+    is_binary(VHost), is_binary(QueueName), is_map(Config)
+->
+    case rabbitmq_stream_s3_replica_reader:resolve_stream_id(VHost, QueueName) of
+        {ok, StreamId} ->
+            run_stream(StreamId, Config);
+        {error, _} = Err ->
+            Err
     end.
 
 make_handler(dry_run) ->

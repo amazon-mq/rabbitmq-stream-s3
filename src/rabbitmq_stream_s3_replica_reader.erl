@@ -21,6 +21,7 @@ returned by the functional core module.
 -export([evaluate_local_retention/1, evaluate_local_retention/2]).
 -export([evaluate_remote_retention/1, evaluate_remote_retention/2]).
 -export([force_fragment_cut/1, force_fragment_cut/2]).
+-export([resolve_stream_id/2]).
 -export([identity_formatter/1]).
 -export([counter_fields/0, init_counters/0]).
 -export([
@@ -728,11 +729,22 @@ call(StreamId, Msg) ->
     end.
 
 call(VHost, QueueName, Msg) ->
+    case resolve_stream_id(VHost, QueueName) of
+        {ok, StreamId} ->
+            call(StreamId, Msg);
+        {error, _} = Err ->
+            Err
+    end.
+
+-doc "Resolve a vhost and queue name to the internal stream id.".
+-spec resolve_stream_id(rabbit_types:vhost(), binary()) ->
+    {ok, stream_id()} | {error, {not_found, binary()}}.
+resolve_stream_id(VHost, QueueName) ->
     QName = rabbit_misc:r(VHost, queue, QueueName),
     case rabbit_amqqueue:lookup(QName) of
         {ok, Q} ->
             #{name := StreamId} = amqqueue:get_type_state(Q),
-            call(iolist_to_binary(StreamId), Msg);
+            {ok, iolist_to_binary(StreamId)};
         {error, not_found} ->
             {error, {not_found, QueueName}}
     end.
