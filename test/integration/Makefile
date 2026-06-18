@@ -49,7 +49,11 @@ cleanup: package
 
 CONTENT_VERIFY_DURATION ?= 300
 CONTENT_VERIFY_PRODUCERS ?= 1
-CONTENT_VERIFY_MAX_LENGTH_BYTES ?= 500000000
+# This must exceed the peak un-uploaded backlog: when the publisher outruns the
+# S3 upload, local retention trims un-uploaded segments once the backlog crosses
+# this bound, which discards confirmed-but-not-yet-uploaded data and makes the
+# replay phase report spurious gaps. See issue #233.
+CONTENT_VERIFY_MAX_LENGTH_BYTES ?= 8000000000
 CONTENT_VERIFY_REPLAY_CONSUMERS ?= 4
 
 content-verification: package
