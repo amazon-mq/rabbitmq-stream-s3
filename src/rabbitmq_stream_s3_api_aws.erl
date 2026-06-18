@@ -289,10 +289,19 @@ range.
 get_range(Key, Range, Opts) when is_binary(Key) andalso is_map(Opts) ->
     Headers = #{<<"range">> => range_specifier(Range)},
     case request(<<"GET">>, key_to_path(Key), Headers, <<>>, Opts) of
-        %% HTTP Range requests must return 206 if only a partial range is served,
-        %% according to the RFC.
-        {ok, #{status := Status, body := Data}} when Status =:= 200 orelse Status =:= 206 ->
+        {ok, #{status := 206, body := Data}} ->
             {ok, Data};
+        {ok, #{status := 200, body := Data}} ->
+            %% A Range request must be answered with 206 Partial Content. An
+            %% intermediary or a non-conformant store can ignore the Range
+            %% header and answer 200 with the full object. Returning that whole
+            %% body as the requested range would feed the caller bytes from the
+            %% wrong offset, so slice the range out of the full object here.
+            ?LOG_DEBUG(
+                "~ts received 200 for a Range request, slicing ~p from the full object for key ~ts",
+                [?FUNCTION_NAME, Range, Key]
+            ),
+            slice_range(Range, Data);
         {ok, #{status := 404}} ->
             {error, not_found};
         {ok, #{status := Status} = Other} ->
@@ -1531,6 +1540,29 @@ range_specifier(SuffixLen) when is_integer(SuffixLen) andalso SuffixLen < 0 ->
     %% integer_to_binary/1 will format the '-' for us.
     <<"bytes=", (integer_to_binary(SuffixLen))/binary>>.
 
+%% Extracts the bytes a Range request asked for out of a full-object body, used
+%% to recover when a store answers a Range request with 200 instead of 206. The
+%% slice mirrors what a conformant 206 would have returned, clamping the end to
+%% the object size as S3 does. A range starting at or beyond the object size is
+%% unsatisfiable.
+-spec slice_range(rabbitmq_stream_s3_api:range_spec(), binary()) ->
+    {ok, binary()}
+    | {error, {range_not_satisfiable, rabbitmq_stream_s3_api:range_spec(), non_neg_integer()}}.
+slice_range({StartByte, undefined}, Data) when StartByte < byte_size(Data) ->
+    {ok, binary:part(Data, StartByte, byte_size(Data) - StartByte)};
+slice_range({StartByte, EndByte}, Data) when
+    is_integer(EndByte) andalso StartByte =< EndByte andalso StartByte < byte_size(Data)
+->
+    Len = min(EndByte + 1, byte_size(Data)) - StartByte,
+    {ok, binary:part(Data, StartByte, Len)};
+slice_range(SuffixLen, Data) when
+    is_integer(SuffixLen) andalso SuffixLen < 0 andalso byte_size(Data) > 0
+->
+    Len = min(-SuffixLen, byte_size(Data)),
+    {ok, binary:part(Data, byte_size(Data) - Len, Len)};
+slice_range(Range, Data) ->
+    {error, {range_not_satisfiable, Range, byte_size(Data)}}.
+
 %% See <https://github.com/rabbitmq/khepri/blob/0ebcf6918248729a9a975969afdde15b4ff98493/src/khepri_utils.erl#L50-L69>
 -spec start_timeout_window(Timeout) -> Timestamp | none when
     Timeout :: timeout(),
@@ -1648,6 +1680,27 @@ range_spec_test() ->
     ?assertEqual(<<"bytes=-5">>, range_specifier(-5)),
     ?assertEqual(<<"bytes=10-20">>, range_specifier({10, 20})),
     ?assertEqual(<<"bytes=100-">>, range_specifier({100, undefined})),
+    ok.
+
+slice_range_test() ->
+    Data = <<"0123456789">>,
+    %% Start-to-end: every spec form recovers exactly what a 206 would return.
+    ?assertEqual({ok, <<"3456789">>}, slice_range({3, undefined}, Data)),
+    ?assertEqual({ok, Data}, slice_range({0, undefined}, Data)),
+    %% Absolute, inclusive range.
+    ?assertEqual({ok, <<"345">>}, slice_range({3, 5}, Data)),
+    ?assertEqual({ok, <<"0">>}, slice_range({0, 0}, Data)),
+    %% An end past the object is clamped to the object size, as S3 does.
+    ?assertEqual({ok, <<"789">>}, slice_range({7, 100}, Data)),
+    %% Suffix range: the last N bytes, clamped to the whole object.
+    ?assertEqual({ok, <<"789">>}, slice_range(-3, Data)),
+    ?assertEqual({ok, Data}, slice_range(-100, Data)),
+    %% A range starting at or beyond the object size is unsatisfiable.
+    ?assertEqual(
+        {error, {range_not_satisfiable, {10, undefined}, 10}}, slice_range({10, undefined}, Data)
+    ),
+    ?assertEqual({error, {range_not_satisfiable, {12, 15}, 10}}, slice_range({12, 15}, Data)),
+    ?assertEqual({error, {range_not_satisfiable, -3, 0}}, slice_range(-3, <<>>)),
     ok.
 
 delete_many_body_test() ->
