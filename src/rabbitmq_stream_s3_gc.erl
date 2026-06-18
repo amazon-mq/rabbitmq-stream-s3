@@ -26,7 +26,7 @@ signal without Khepri restructuring).
 -export([run/0, run/1, run_stream/2, run_stream/3]).
 
 -type mode() :: dry_run | delete.
--type config() :: #{mode => mode()}.
+-type config() :: #{mode => mode(), writer_epoch => non_neg_integer()}.
 -type reason() :: below_first_offset | stale_epoch.
 -type finding() :: #{stream_id := stream_id(), key := rabbitmq_stream_s3:key(), reason := reason()}.
 
@@ -58,7 +58,7 @@ orphaned fragments without a full cross-stream sweep.
 -spec run_stream(stream_id(), config()) -> {ok, [finding()]}.
 run_stream(StreamId, Config) when is_binary(StreamId), is_map(Config) ->
     Mode = maps:get(mode, Config, dry_run),
-    case build_stream_lookup(StreamId) of
+    case build_stream_lookup(StreamId, Config) of
         {ok, Lookup} ->
             Prefix = rabbitmq_stream_s3:stream_prefix(StreamId),
             Fun = make_handler(Mode),
@@ -118,25 +118,60 @@ build_lookup(Streams) ->
         Streams
     ).
 
-build_stream_lookup(StreamId) ->
-    case rabbitmq_stream_s3_db:get(StreamId) of
-        {ok, #{epoch := Epoch}} ->
-            %% Read first_offset from the manifest record directly rather than
-            %% via get_range/1, which reports `empty` whenever the entries array
-            %% is empty. A manifest reset (the caller of run_stream/2) installs
-            %% exactly such an empty manifest with first_offset at the local
-            %% floor, and that floor is precisely what the orphaned fragments
-            %% sit below. Using get_range/1 here would skip the stream and
-            %% reclaim nothing.
-            case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
-                #manifest{first_offset = FirstOffset} ->
-                    {ok, #{StreamId => #{epoch => Epoch, first_offset => FirstOffset}}};
-                undefined ->
+build_stream_lookup(StreamId, Config) ->
+    %% Read the committed epoch with a strongly consistent (quorum-requiring)
+    %% read, not the default low-latency local read. The sweep deletes data
+    %% objects below a floor taken from the local just-reset manifest, which sits
+    %% above the committed floor. A deposed writer that read stale local state
+    %% would delete a successor's live fragments in that gap. A consistent read
+    %% makes a deposed minority writer, which cannot reach a quorum, fail closed
+    %% and skip. When the caller supplies its own writer epoch (the reset path),
+    %% additionally require the committed epoch to equal it, so a deposed writer
+    %% that can still reach a quorum also skips.
+    case rabbitmq_stream_s3_db:get_consistent(StreamId) of
+        {ok, #{epoch := CommittedEpoch}} ->
+            case epoch_permits_sweep(CommittedEpoch, Config) of
+                true ->
+                    %% Read first_offset from the manifest record directly rather
+                    %% than via get_range/1, which reports `empty` whenever the
+                    %% entries array is empty. A manifest reset (the caller of
+                    %% run_stream/2) installs exactly such an empty manifest with
+                    %% first_offset at the local floor, and that floor is precisely
+                    %% what the orphaned fragments sit below. Using get_range/1
+                    %% here would skip the stream and reclaim nothing.
+                    case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
+                        #manifest{first_offset = FirstOffset} ->
+                            {ok, #{
+                                StreamId => #{epoch => CommittedEpoch, first_offset => FirstOffset}
+                            }};
+                        undefined ->
+                            skip
+                    end;
+                false ->
+                    ?LOG_INFO(
+                        "GC for stream ~ts skipped: writer epoch ~p is behind the "
+                        "committed epoch ~p, this writer has been deposed",
+                        [StreamId, maps:get(writer_epoch, Config, undefined), CommittedEpoch]
+                    ),
                     skip
             end;
-        {error, _} ->
+        {error, Reason} ->
+            ?LOG_INFO(
+                "GC for stream ~ts skipped: could not read committed metadata "
+                "with quorum (~p); not sweeping",
+                [StreamId, Reason]
+            ),
             skip
     end.
+
+%% On the reset path the caller pins its writer epoch, and the sweep is permitted
+%% only when the committed epoch exactly equals it, confirming this writer is the
+%% current committed one and has not been superseded. On the operator CLI path no
+%% writer epoch is pinned, and the consistent read alone is the guard.
+epoch_permits_sweep(CommittedEpoch, #{writer_epoch := WriterEpoch}) ->
+    CommittedEpoch =:= WriterEpoch;
+epoch_permits_sweep(_CommittedEpoch, _Config) ->
+    true.
 
 list_and_classify(_Prefix, done, _Lookup, _Fun, Acc) ->
     lists:reverse(Acc);
@@ -254,6 +289,26 @@ parse_key_group_test() ->
 parse_key_kilo_group_test() ->
     Key = <<"rabbitmq/stream/s/metadata/00000000000000001000.aabbccdd.kgroup">>,
     ?assertEqual({data, <<"s">>, 1000}, parse_key(Key)).
+
+%% The operator CLI path supplies no writer epoch, so the consistent read is the
+%% only guard and the sweep is permitted.
+epoch_permits_sweep_no_writer_epoch_test() ->
+    ?assert(epoch_permits_sweep(7, #{mode => delete})).
+
+%% The reset path pins the writer epoch. The sweep proceeds only when the
+%% committed epoch matches, i.e. this writer is still the committed authority.
+epoch_permits_sweep_matching_epoch_test() ->
+    ?assert(epoch_permits_sweep(7, #{mode => delete, writer_epoch => 7})).
+
+%% A successor has committed a higher epoch: this writer is deposed, skip.
+epoch_permits_sweep_deposed_writer_test() ->
+    ?assertNot(epoch_permits_sweep(8, #{mode => delete, writer_epoch => 7})).
+
+%% A writer that has not yet committed at its own epoch (committed epoch is the
+%% predecessor's) also skips, since below its raised floor could be the
+%% predecessor's committed data.
+epoch_permits_sweep_uncommitted_writer_test() ->
+    ?assertNot(epoch_permits_sweep(6, #{mode => delete, writer_epoch => 7})).
 
 parse_key_mega_group_test() ->
     Key = <<"rabbitmq/stream/s/metadata/00000000000000005000.aabbccdd.mgroup">>,
