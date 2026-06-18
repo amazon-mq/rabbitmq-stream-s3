@@ -25,6 +25,13 @@ public class ContentVerificationTest implements Runnable {
 
   private static final Logger LOG = LoggerFactory.getLogger(ContentVerificationTest.class);
 
+  // Caps the number of individual gap boundaries logged across the replay so a
+  // pathological run cannot flood the log. The count of gaps is always exact;
+  // only the per-gap detail lines are capped.
+  private static final int MAX_GAP_DETAIL_LOGS = 20;
+
+  private final AtomicLong gapDetailLogs = new AtomicLong(0);
+
   @CommandLine.Mixin private ClusterOptions cluster;
 
   @CommandLine.Option(
@@ -261,11 +268,17 @@ public class ContentVerificationTest implements Runnable {
     // and is the last offset every consumer must reach.
     com.rabbitmq.stream.StreamStats stats = env.queryStreamStats(cluster.stream);
     long endOffset = stats.committedOffset();
+    // The readable floor at replay start. Remote-tier retention advances this as
+    // it trims old data from S3, so capturing it here (and again at the end) lets
+    // us tell whether retention moved the floor during replay, which would
+    // legitimately skew per-consumer counts and produce a leading gap.
+    long firstOffsetAtStart = stats.firstOffset();
 
     LOG.info(
-        "Replay: {} consumers each reading first..{}, timeout={}s",
+        "Replay: {} consumers each reading first..{}, firstOffset={} at start, timeout={}s",
         replayConsumers,
         endOffset,
+        firstOffsetAtStart,
         replayTimeoutSeconds);
 
     AtomicLong outOfOrder = new AtomicLong(0);
@@ -277,10 +290,29 @@ public class ContentVerificationTest implements Runnable {
     AtomicLong[] counts = new AtomicLong[replayConsumers];
     long[] lastSeq = new long[replayConsumers];
     boolean[] finished = new boolean[replayConsumers];
+    // Diagnostics: the first (offset, sequence) each consumer actually delivered.
+    // If consumers disagree on count because they started at different readable
+    // floors, these differ; if they all started at the same floor, they match.
+    long[] firstOffsetSeen = new long[replayConsumers];
+    long[] firstSeqSeen = new long[replayConsumers];
+    // Diagnostics: per-consumer gap shape. The total skipped count alone cannot
+    // tell a single contiguous block from many scattered holes; the number of
+    // distinct gap events and the offset span between the first and last gap
+    // can. One event spanning a narrow offset range is a contiguous block (e.g.
+    // a retention or segment boundary); many events across a wide span are
+    // scattered losses. Each index is touched by exactly one consumer thread,
+    // like lastSeq, so plain arrays are safe.
+    long[] gapEventCount = new long[replayConsumers];
+    long[] firstGapOffset = new long[replayConsumers];
+    long[] lastGapOffset = new long[replayConsumers];
     for (int i = 0; i < replayConsumers; i++) {
       counts[i] = new AtomicLong(0);
     }
     java.util.Arrays.fill(lastSeq, -1);
+    java.util.Arrays.fill(firstOffsetSeen, -1);
+    java.util.Arrays.fill(firstSeqSeen, -1);
+    java.util.Arrays.fill(firstGapOffset, -1);
+    java.util.Arrays.fill(lastGapOffset, -1);
 
     // One count-down per consumer; the replay is done when all consumers have
     // reached the tail.
@@ -316,8 +348,29 @@ public class ContentVerificationTest implements Runnable {
                           if (seq < 0 || seq >= maxSequence) {
                             corruptMessages.incrementAndGet();
                           } else {
+                            // Record the first delivery so we can tell whether
+                            // consumers started at the same readable floor.
+                            if (firstOffsetSeen[consumerIdx] < 0) {
+                              firstOffsetSeen[consumerIdx] = off;
+                              firstSeqSeen[consumerIdx] = seq;
+                              LOG.info(
+                                  "  Consumer {} first delivery: offset={} seq={}",
+                                  consumerIdx,
+                                  off,
+                                  seq);
+                            }
                             verifySequence(
-                                consumerIdx, seq, lastSeq, confirmed, duplicates, outOfOrder, gaps);
+                                consumerIdx,
+                                off,
+                                seq,
+                                lastSeq,
+                                confirmed,
+                                duplicates,
+                                outOfOrder,
+                                gaps,
+                                gapEventCount,
+                                firstGapOffset,
+                                lastGapOffset);
                           }
                         }
 
@@ -401,14 +454,45 @@ public class ContentVerificationTest implements Runnable {
     LOG.info(
         "Integrity: corrupt={} duplicates={} gaps={} out-of-order={}", corrupt, dups, gap, ooo);
 
+    // Diagnostics: did the readable floor advance during replay, and did the
+    // consumers start at the same place? A floor that moved (firstOffset at end
+    // > at start) means remote-tier retention trimmed data mid-replay, which
+    // legitimately explains both a leading gap and a per-consumer count
+    // disagreement.
+    long firstOffsetAtEnd = env.queryStreamStats(cluster.stream).firstOffset();
+    LOG.info(
+        "Diagnostics: firstOffset {} at replay start -> {} at replay end (delta={})",
+        firstOffsetAtStart,
+        firstOffsetAtEnd,
+        firstOffsetAtEnd - firstOffsetAtStart);
+    for (int i = 0; i < replayConsumers; i++) {
+      LOG.info(
+          "  Consumer {} first delivery: offset={} seq={} (total read={})",
+          i,
+          firstOffsetSeen[i],
+          firstSeqSeen[i],
+          counts[i].get());
+    }
+    // Gap shape per consumer. Few events over a narrow offset span point to a
+    // boundary artifact; many events over a wide span point to scattered loss.
+    for (int i = 0; i < replayConsumers; i++) {
+      long span = (firstGapOffset[i] < 0) ? 0 : (lastGapOffset[i] - firstGapOffset[i]);
+      LOG.info(
+          "  Consumer {} gap shape: events={} firstGapOffset={} lastGapOffset={} offsetSpan={}",
+          i,
+          gapEventCount[i],
+          firstGapOffset[i],
+          lastGapOffset[i],
+          span);
+    }
+
     // Fan-out consistency: every consumer subscribed at 'first' and read to the
     // same tail, so they must all observe the same number of messages. The
     // consumers subscribe in a tight loop with no reads in between, so retention
     // cannot advance the readable start between them and skew the counts. A
     // divergence therefore means a consumer saw a different view of the log.
     if (min != max) {
-      LOG.error(
-          "REPLAY FAILED: consumers disagree on message count (min={} max={})", min, max);
+      LOG.error("REPLAY FAILED: consumers disagree on message count (min={} max={})", min, max);
       System.exit(1);
     }
     if (min == 0) {
@@ -444,12 +528,16 @@ public class ContentVerificationTest implements Runnable {
   // sequence may be missing or repeated within a consumer's full-stream replay.
   private void verifySequence(
       int consumerIdx,
+      long offset,
       long seq,
       long[] lastSeq,
       ConfirmedSequences confirmed,
       AtomicLong duplicates,
       AtomicLong outOfOrder,
-      AtomicLong gaps) {
+      AtomicLong gaps,
+      long[] gapEventCount,
+      long[] firstGapOffset,
+      long[] lastGapOffset) {
     long prev = lastSeq[consumerIdx];
     if (prev >= 0) {
       if (seq == prev) {
@@ -468,6 +556,28 @@ public class ContentVerificationTest implements Runnable {
         long skipped = confirmed.countInRange(prev + 1, seq - 1);
         if (skipped > 0) {
           gaps.addAndGet(skipped);
+          // Record the gap shape. The event count and the offset span between
+          // the first and last gap distinguish a single contiguous block (one
+          // event, narrow span: a retention or segment boundary) from many
+          // scattered holes (many events, wide span: real loss). These are
+          // exact regardless of how many detail lines are logged below.
+          gapEventCount[consumerIdx]++;
+          if (firstGapOffset[consumerIdx] < 0) {
+            firstGapOffset[consumerIdx] = offset;
+          }
+          lastGapOffset[consumerIdx] = offset;
+          // Log individual boundaries up to a cap so the log shows concrete
+          // examples without flooding. The cap only bounds these detail lines;
+          // the counts and span recorded above remain exact.
+          if (gapDetailLogs.getAndIncrement() < MAX_GAP_DETAIL_LOGS) {
+            LOG.warn(
+                "  Consumer {} gap: prevSeq={} -> seq={} ({} confirmed skipped) at offset={}",
+                consumerIdx,
+                prev,
+                seq,
+                skipped,
+                offset);
+          }
         }
       }
     }

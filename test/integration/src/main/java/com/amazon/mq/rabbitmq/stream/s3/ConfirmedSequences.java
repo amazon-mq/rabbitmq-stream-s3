@@ -4,17 +4,15 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLongArray;
 
 /**
- * A thread-safe, lazily-grown bitset over message sequence numbers recording
- * which sequences the broker confirmed.
+ * A thread-safe, lazily-grown bitset over message sequence numbers recording which sequences the
+ * broker confirmed.
  *
- * <p>The producer assigns a sequence to every send but only some are confirmed;
- * unconfirmed sends leave holes in the sequence space. Replay verification uses
- * this to distinguish a real gap (a confirmed sequence that was never delivered)
- * from an expected hole (an unconfirmed sequence).
+ * <p>The producer assigns a sequence to every send but only some are confirmed; unconfirmed sends
+ * leave holes in the sequence space. Replay verification uses this to distinguish a real gap (a
+ * confirmed sequence that was never delivered) from an expected hole (an unconfirmed sequence).
  *
- * <p>Storage is paged and allocated on demand, so memory tracks the sequence
- * range actually used rather than a preallocated maximum, keeping it bounded
- * regardless of run length.
+ * <p>Storage is paged and allocated on demand, so memory tracks the sequence range actually used
+ * rather than a preallocated maximum, keeping it bounded regardless of run length.
  */
 final class ConfirmedSequences {
 
@@ -63,9 +61,9 @@ final class ConfirmedSequences {
   }
 
   /**
-   * Counts confirmed sequences in the inclusive range [from, to]. Used to size a
-   * gap: the number of confirmed sequences a consumer skipped over. Gap ranges
-   * are small, so a per-bit scan is adequate.
+   * Counts confirmed sequences in the inclusive range [from, to]. Used to size a gap: the number of
+   * confirmed sequences a consumer skipped over. Gap ranges are small, so a per-bit scan is
+   * adequate.
    */
   long countInRange(long from, long to) {
     long lo = Math.max(0, from);
