@@ -23,7 +23,7 @@ signal without Khepri restructuring).
 -include("include/logging.hrl").
 -include_lib("kernel/include/logger.hrl").
 
--export([run/0, run/1]).
+-export([run/0, run/1, run_stream/2]).
 
 -type mode() :: dry_run | delete.
 -type config() :: #{mode => mode()}.
@@ -48,6 +48,29 @@ run(Config) when is_map(Config) ->
     Findings = list_and_classify(<<"rabbitmq/stream/">>, start, Lookup, Fun, []),
     ?LOG_INFO("GC ~ts complete: ~b dangling object(s)", [Mode, length(Findings)]),
     {ok, Findings}.
+
+-doc """
+Run garbage collection scoped to a single stream. Only lists objects under the
+stream's S3 prefix and classifies them against the stream's current epoch and
+first_offset. Used by the replica reader after a manifest reset to reclaim
+orphaned fragments without a full cross-stream sweep.
+""".
+-spec run_stream(stream_id(), config()) -> {ok, [finding()]}.
+run_stream(StreamId, Config) when is_binary(StreamId), is_map(Config) ->
+    Mode = maps:get(mode, Config, dry_run),
+    case build_stream_lookup(StreamId) of
+        {ok, Lookup} ->
+            Prefix = rabbitmq_stream_s3:stream_prefix(StreamId),
+            Fun = make_handler(Mode),
+            Findings = list_and_classify(Prefix, start, Lookup, Fun, []),
+            ?LOG_INFO(
+                "GC ~ts for stream ~ts complete: ~b dangling object(s)",
+                [Mode, StreamId, length(Findings)]
+            ),
+            {ok, Findings};
+        skip ->
+            {ok, []}
+    end.
 
 make_handler(dry_run) ->
     fun(Finding, Acc) ->
@@ -78,6 +101,26 @@ build_lookup(Streams) ->
         #{},
         Streams
     ).
+
+build_stream_lookup(StreamId) ->
+    case rabbitmq_stream_s3_db:get(StreamId) of
+        {ok, #{epoch := Epoch}} ->
+            %% Read first_offset from the manifest record directly rather than
+            %% via get_range/1, which reports `empty` whenever the entries array
+            %% is empty. A manifest reset (the caller of run_stream/2) installs
+            %% exactly such an empty manifest with first_offset at the local
+            %% floor, and that floor is precisely what the orphaned fragments
+            %% sit below. Using get_range/1 here would skip the stream and
+            %% reclaim nothing.
+            case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
+                #manifest{first_offset = FirstOffset} ->
+                    {ok, #{StreamId => #{epoch => Epoch, first_offset => FirstOffset}}};
+                undefined ->
+                    skip
+            end;
+        {error, _} ->
+            skip
+    end.
 
 list_and_classify(_Prefix, done, _Lookup, _Fun, Acc) ->
     lists:reverse(Acc);

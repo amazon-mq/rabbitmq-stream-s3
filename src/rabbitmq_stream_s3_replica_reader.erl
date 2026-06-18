@@ -763,19 +763,10 @@ register_replica(
             State#state{replicas = Replicas#{Node => MonRef}}
     end.
 
-delete_manifest_objects(StreamId, Manifest) ->
+gc_stream_async(StreamId) ->
     spawn(fun() ->
         logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
-        GetGroupFun = fun(GroupRef) ->
-            Key = rabbitmq_stream_s3:group_key(StreamId, GroupRef),
-            case rabbitmq_stream_s3_api:get(Key) of
-                {ok, Data} -> {ok, Data};
-                {error, _} = Err -> Err
-            end
-        end,
-        Refs = rabbitmq_stream_s3_fragment_iterator:all_refs(Manifest, GetGroupFun),
-        Keys = [rabbitmq_stream_s3:ref_key(StreamId, Ref) || Ref <- Refs],
-        rabbitmq_stream_s3_reaper:delete_objects(StreamId, Keys)
+        rabbitmq_stream_s3_gc:run_stream(StreamId, #{mode => delete})
     end),
     ok.
 
@@ -1305,12 +1296,12 @@ start_reading0(
                 [StreamId, LocalFirst, StartOffset]
             ),
             inc(State1, ?C_LOCAL_LOG_AHEAD_RECOVERIES, 1),
-            delete_manifest_objects(StreamId, Manifest),
             FreshManifest = reset_manifest(LocalFirst, Manifest#manifest.revision),
             {Core1, _} = rabbitmq_stream_s3_replica_reader_core:init(
                 FreshManifest, State1#state.config
             ),
             ok = rabbitmq_stream_s3_manifest_replica:put_manifest(StreamId, FreshManifest),
+            gc_stream_async(StreamId),
             start_reading(State1#state{core = Core1});
         {error, Reason} ->
             ?LOG_WARNING(

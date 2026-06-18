@@ -174,9 +174,17 @@ fragment_key(StreamId, Offset, Uid) when
 stream_data_key(StreamId, Filename) when is_binary(StreamId) andalso is_binary(Filename) ->
     <<"rabbitmq/stream/", StreamId/binary, "/data/", Filename/binary>>.
 
+-doc """
+Returns the S3 key prefix under which all of a stream's objects live.
+
+Includes the trailing slash so the prefix ends on a path boundary. This is
+required for correctness: stream IDs derive from user-controlled vhost and
+queue names, so one stream ID can be a textual prefix of another. Without the
+delimiter, a LIST on this prefix could match a sibling stream's objects.
+""".
 -spec stream_prefix(stream_id()) -> key().
 stream_prefix(StreamId) when is_binary(StreamId) ->
-    <<"rabbitmq/stream/", StreamId/binary>>.
+    <<"rabbitmq/stream/", StreamId/binary, "/">>.
 
 -doc "Extracts the first offset from a segment filename".
 -spec segment_file_offset(file:filename_all()) -> osiris:offset().
