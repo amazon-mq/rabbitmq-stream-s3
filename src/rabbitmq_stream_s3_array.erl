@@ -125,20 +125,23 @@ The partition point is where the array 'turns' from the predicate returning
 array split so that the predicate would continue to return `true` and then
 eventually `false`.
 
-If the predicate returns only `true` then this function returns `0`. If the
-predicate only returns `false` then this function returns the length of the
-array.
+If the predicate returns only `true` then this function returns the length of
+the array. If the predicate only returns `false` then this function returns `0`.
 
 The partition function may never return `true`, or may never return `false` but
 if it returns both, it must never return `false` at an index lesser than an
 index where it returns `true`. Otherwise the index returned by this function
 is meaningless.
 
-For a simplified example:
+For simplified examples:
 
 ```erlang
 > partition_point(fun is_odd/1, [1,3,5,7,2,4,6,8]).
 4
+> partition_point(fun is_odd/1, [2, 4, 6, 8]).
+0
+> partition_point(fun is_odd/1, [1, 3, 5]).
+3
 ```
 
 The partition point is where inserting an odd element would keep the list split
