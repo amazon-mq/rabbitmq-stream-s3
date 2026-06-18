@@ -744,7 +744,7 @@ resolve_stream_id(VHost, QueueName) ->
     case rabbit_amqqueue:lookup(QName) of
         {ok, Q} ->
             #{name := StreamId} = amqqueue:get_type_state(Q),
-            {ok, iolist_to_binary(StreamId)};
+            {ok, rabbitmq_stream_s3:ensure_stream_id(StreamId)};
         {error, not_found} ->
             {error, {not_found, QueueName}}
     end.
