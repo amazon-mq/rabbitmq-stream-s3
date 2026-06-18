@@ -4,6 +4,9 @@
 -module(rabbitmq_stream_s3_sup).
 -behaviour(supervisor).
 
+-include("include/logging.hrl").
+-include_lib("kernel/include/logger.hrl").
+
 -export([start_link/0]).
 -export([init/1]).
 
@@ -15,8 +18,31 @@ init([]) ->
     ok = rabbitmq_stream_s3_api:init(),
     application:set_env(osiris, log_hooks, rabbitmq_stream_s3_hooks),
     application:set_env(osiris, log_reader, rabbitmq_stream_s3_log_reader),
-    catch rabbitmq_stream_s3_prometheus_collector:register(),
-    catch rabbitmq_stream_s3_db:setup(),
+    try
+        rabbitmq_stream_s3_prometheus_collector:register()
+    catch
+        RegClass:RegReason ->
+            ?LOG_WARNING(
+                "Could not register the Prometheus collector: ~ts:~p. "
+                "Tiered storage metrics will not be exposed on this node",
+                [RegClass, RegReason],
+                #{domain => ?RMQLOG_DOMAIN_STREAM_S3}
+            )
+    end,
+    %% A failed setup disables the trigger that cleans up a deleted stream's
+    %% remote objects. The plugin still tiers without it, so log loudly and carry
+    %% on rather than crashing the supervisor; orphan GC remains the backstop.
+    try
+        ok = rabbitmq_stream_s3_db:setup()
+    catch
+        Class:Reason ->
+            ?LOG_WARNING(
+                "Stream deletion cleanup could not be set up: ~ts:~p. Remote tier "
+                "objects for deleted streams will need GC or manual cleanup",
+                [Class, Reason],
+                #{domain => ?RMQLOG_DOMAIN_STREAM_S3}
+            )
+    end,
     rabbitmq_stream_s3_registry:init(),
     rabbitmq_stream_s3_manifest:init(),
     SupFlags = #{strategy => one_for_one, intensity => 3, period => 5},
