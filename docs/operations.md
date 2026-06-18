@@ -504,6 +504,13 @@ rabbitmq-streams stream_s3_gc --formatter json
 rabbitmq-streams stream_s3_gc --mode delete
 ```
 
+Pass a stream name to restrict GC to a single stream, which lists only that stream's S3 prefix instead of sweeping every stream:
+
+```bash
+rabbitmq-streams stream_s3_gc my-stream --vhost /
+rabbitmq-streams stream_s3_gc my-stream --mode delete
+```
+
 See [Garbage collection](#garbage-collection) below for the mechanism and safety guarantees.
 
 ### Inspect a replica reader

@@ -21,6 +21,7 @@ returned by the functional core module.
 -export([evaluate_local_retention/1, evaluate_local_retention/2]).
 -export([evaluate_remote_retention/1, evaluate_remote_retention/2]).
 -export([force_fragment_cut/1, force_fragment_cut/2]).
+-export([resolve_stream_id/2]).
 -export([identity_formatter/1]).
 -export([counter_fields/0, init_counters/0]).
 -export([
@@ -728,11 +729,22 @@ call(StreamId, Msg) ->
     end.
 
 call(VHost, QueueName, Msg) ->
+    case resolve_stream_id(VHost, QueueName) of
+        {ok, StreamId} ->
+            call(StreamId, Msg);
+        {error, _} = Err ->
+            Err
+    end.
+
+-doc "Resolve a vhost and queue name to the internal stream id.".
+-spec resolve_stream_id(rabbit_types:vhost(), binary()) ->
+    {ok, stream_id()} | {error, {not_found, binary()}}.
+resolve_stream_id(VHost, QueueName) ->
     QName = rabbit_misc:r(VHost, queue, QueueName),
     case rabbit_amqqueue:lookup(QName) of
         {ok, Q} ->
             #{name := StreamId} = amqqueue:get_type_state(Q),
-            call(iolist_to_binary(StreamId), Msg);
+            {ok, iolist_to_binary(StreamId)};
         {error, not_found} ->
             {error, {not_found, QueueName}}
     end.
@@ -763,19 +775,10 @@ register_replica(
             State#state{replicas = Replicas#{Node => MonRef}}
     end.
 
-delete_manifest_objects(StreamId, Manifest) ->
+gc_stream_async(StreamId) ->
     spawn(fun() ->
         logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
-        GetGroupFun = fun(GroupRef) ->
-            Key = rabbitmq_stream_s3:group_key(StreamId, GroupRef),
-            case rabbitmq_stream_s3_api:get(Key) of
-                {ok, Data} -> {ok, Data};
-                {error, _} = Err -> Err
-            end
-        end,
-        Refs = rabbitmq_stream_s3_fragment_iterator:all_refs(Manifest, GetGroupFun),
-        Keys = [rabbitmq_stream_s3:ref_key(StreamId, Ref) || Ref <- Refs],
-        rabbitmq_stream_s3_reaper:delete_objects(StreamId, Keys)
+        rabbitmq_stream_s3_gc:run_stream(StreamId, #{mode => delete})
     end),
     ok.
 
@@ -1305,12 +1308,12 @@ start_reading0(
                 [StreamId, LocalFirst, StartOffset]
             ),
             inc(State1, ?C_LOCAL_LOG_AHEAD_RECOVERIES, 1),
-            delete_manifest_objects(StreamId, Manifest),
             FreshManifest = reset_manifest(LocalFirst, Manifest#manifest.revision),
             {Core1, _} = rabbitmq_stream_s3_replica_reader_core:init(
                 FreshManifest, State1#state.config
             ),
             ok = rabbitmq_stream_s3_manifest_replica:put_manifest(StreamId, FreshManifest),
+            gc_stream_async(StreamId),
             start_reading(State1#state{core = Core1});
         {error, Reason} ->
             ?LOG_WARNING(
