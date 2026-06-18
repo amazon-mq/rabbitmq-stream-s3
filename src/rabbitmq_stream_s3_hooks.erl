@@ -34,7 +34,7 @@ Both: appends the local retention function.
 """.
 -spec on_init(writer | acceptor, pid(), osiris_log:config()) -> osiris_log:config().
 on_init(writer, Pid, #{name := Name, dir := Dir, shared := Shared, counter := Counter} = Config) ->
-    StreamId = iolist_to_binary(Name),
+    StreamId = rabbitmq_stream_s3:ensure_stream_id(Name),
     RemoteConfig = maps:get(remote_config, Config, #{}),
     Reference = maps:get(reference, Config, undefined),
     Epoch = maps:get(epoch, Config, 0),
@@ -80,7 +80,7 @@ on_init(writer, Pid, #{name := Name, dir := Dir, shared := Shared, counter := Co
     end,
     append_retention(StreamId, Config);
 on_init(acceptor, _Pid, #{name := Name, leader_pid := LeaderPid, counter := Counter} = Config) ->
-    StreamId = iolist_to_binary(Name),
+    StreamId = rabbitmq_stream_s3:ensure_stream_id(Name),
     WriterNode = node(LeaderPid),
     gen_server:cast(
         {via, rabbitmq_stream_s3_registry, {StreamId, WriterNode}},
@@ -91,7 +91,7 @@ on_init(acceptor, _Pid, #{name := Name, leader_pid := LeaderPid, counter := Coun
     rabbitmq_stream_s3_manifest_replica:register_replica_context(StreamId, Dir, Shared, Counter),
     append_retention(StreamId, Config);
 on_init(acceptor, _Pid, #{name := Name, counter := Counter} = Config) ->
-    StreamId = iolist_to_binary(Name),
+    StreamId = rabbitmq_stream_s3:ensure_stream_id(Name),
     Shared = maps:get(shared, Config),
     Dir = maps:get(dir, Config),
     rabbitmq_stream_s3_manifest_replica:register_replica_context(StreamId, Dir, Shared, Counter),
@@ -105,7 +105,7 @@ reader of the new user spec (if one exists locally).
 """.
 -spec on_retention_updated([osiris:retention_spec()], map()) -> [osiris:retention_spec()].
 on_retention_updated(Retention, #{name := Name}) ->
-    StreamId = iolist_to_binary(Name),
+    StreamId = rabbitmq_stream_s3:ensure_stream_id(Name),
     case rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}) of
         undefined -> ok;
         Pid -> gen_server:cast(Pid, {retention_updated, Retention})
@@ -121,7 +121,7 @@ management UI reports only the local segment window as the message count.
 """.
 -spec on_retention_evaluated(counters:counters_ref(), map()) -> ok.
 on_retention_evaluated(Cnt, #{name := Name}) ->
-    StreamId = iolist_to_binary(Name),
+    StreamId = rabbitmq_stream_s3:ensure_stream_id(Name),
     case rabbitmq_stream_s3_manifest_replica:get_range(StreamId) of
         {RemoteFirst, _} ->
             LocalFirst = counters:get(Cnt, ?C_OSIRIS_LOG_FIRST_OFFSET),
@@ -182,7 +182,7 @@ discover_child(_) ->
 attach_writer(Pid) ->
     #{name := Name, dir := Dir, shared := Shared, reference := Reference} =
         osiris_util:get_reader_context(Pid),
-    StreamId = iolist_to_binary(Name),
+    StreamId = rabbitmq_stream_s3:ensure_stream_id(Name),
     %% Seshat registers writer counters under {osiris_writer, Reference}.
     Counter = osiris_counters:fetch({osiris_writer, Reference}),
     #{epoch := Epoch} = osiris_counters:overview({osiris_writer, Reference}),
@@ -218,7 +218,7 @@ attach_writer(Pid) ->
 attach_replica(Pid) ->
     #{name := Name, dir := Dir, shared := Shared, reference := Reference} =
         osiris_util:get_reader_context(Pid),
-    StreamId = iolist_to_binary(Name),
+    StreamId = rabbitmq_stream_s3:ensure_stream_id(Name),
     %% Seshat registers replica counters under {osiris_replica, Reference}.
     Counter = osiris_counters:fetch({osiris_replica, Reference}),
     rabbitmq_stream_s3_manifest_replica:register_replica_context(StreamId, Dir, Shared, Counter),

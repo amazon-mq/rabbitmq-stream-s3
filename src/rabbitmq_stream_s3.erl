@@ -72,6 +72,7 @@ efficiently using the `rabbitmq_stream_s3_array` module.
 -export([
     uid/0,
     format_uid/1,
+    ensure_stream_id/1,
     offset_filename/2,
     ref_key/2,
     manifest_key/2,
@@ -91,6 +92,24 @@ efficiently using the `rabbitmq_stream_s3_array` module.
 uid() ->
     <<Uid:32/unsigned>> = crypto:strong_rand_bytes(4),
     Uid.
+
+-doc """
+Converts an `osiris:name()` (binary or string) to a `stream_id()` binary.
+
+In practice, stream names are always binaries by the time they reach this
+plugin (see `rabbit_stream_queue:stream_name/1` which produces a base64url
+binary). This function provides defense-in-depth: if a list were to arrive,
+it handles Unicode correctly rather than silently truncating codepoints > 255
+as `iolist_to_binary/1` would.
+""".
+-spec ensure_stream_id(osiris:name()) -> stream_id().
+ensure_stream_id(Name) when is_binary(Name) ->
+    Name;
+ensure_stream_id(Name) when is_list(Name) ->
+    case unicode:characters_to_binary(Name) of
+        Bin when is_binary(Bin) -> Bin;
+        _ -> error({invalid_stream_name, Name})
+    end.
 
 -doc "Formats a UID as human-readable text".
 -spec format_uid(uid()) -> <<_:64>>.
@@ -227,5 +246,26 @@ fragment_key_offset_test() ->
     ?assertEqual(0, fragment_key_offset(fragment_key(StreamId, 0, 16#deadbeef))),
     ?assertEqual(1234, fragment_key_offset(fragment_key(StreamId, 1234, 16#deadbeef))),
     ok.
+
+ensure_stream_id_binary_passthrough_test() ->
+    %% Binary stream IDs (the normal case) pass through unchanged.
+    ?assertEqual(<<"my-stream">>, ensure_stream_id(<<"my-stream">>)).
+
+ensure_stream_id_ascii_list_test() ->
+    %% ASCII list (Latin-1 subset) converts correctly.
+    ?assertEqual(<<"hello">>, ensure_stream_id("hello")).
+
+ensure_stream_id_unicode_list_test() ->
+    %% Non-ASCII Unicode list: snowman (U+2603).
+    %% This would be silently corrupted by iolist_to_binary/1.
+    ?assertEqual(<<"☃"/utf8>>, ensure_stream_id([16#2603])),
+    %% Pirate flag is a grapheme cluster: U+1F3F4 U+200D U+2620 U+FE0F
+    PirateFlag = [16#1F3F4, 16#200D, 16#2620, 16#FE0F],
+    Expected = unicode:characters_to_binary(PirateFlag),
+    ?assertEqual(Expected, ensure_stream_id(PirateFlag)).
+
+ensure_stream_id_invalid_test() ->
+    %% A list that is not a valid Unicode character list raises.
+    ?assertError({invalid_stream_name, _}, ensure_stream_id([16#D800])).
 
 -endif.
