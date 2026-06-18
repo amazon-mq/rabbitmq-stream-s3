@@ -809,7 +809,7 @@ find_position(Spec, #manifest{} = Manifest, StreamId) ->
     %% Download the index from the fragment to find the exact chunk position.
     IdxStartPos = ?SEGMENT_HEADER_B + Size,
     case index_data(StreamId, FragmentOffset, Uid, IdxStartPos) of
-        {ok, IndexData} ->
+        {ok, IndexData} when byte_size(IndexData) >= ?INDEX_RECORD_B ->
             {ChunkId, _, FragPos} = find_index_position(IndexData, Spec),
             %% Position within the fragment object (after the 8-byte header).
             Position = ?SEGMENT_HEADER_B + FragPos,
@@ -825,6 +825,18 @@ find_position(Spec, #manifest{} = Manifest, StreamId) ->
                 fragment_ref = FragRef,
                 iterator = Iterator1
             }};
+        {ok, IndexData} ->
+            %% The index region read back with fewer than one full record, for
+            %% example a truncated or partially written fragment object.
+            %% Resolving a position from it would crash the reader on an empty
+            %% array, so fail loudly and let the caller surface the error.
+            ?LOG_WARNING(
+                "Empty or truncated index for stream '~ts' fragment ~b (~b bytes);"
+                " cannot resolve a remote position",
+                [StreamId, FragmentOffset, byte_size(IndexData)],
+                ?DOMAIN
+            ),
+            {error, {empty_index, FragmentOffset}};
         {error, _} = Err ->
             Err
     end.
@@ -1123,6 +1135,17 @@ find_index_position_test() ->
     ?assertEqual(60 * 20, FindPosition({timestamp, Ts + 1000})),
     %% For timestamps, though, we prefer the later chunk ID. Chunk 60, not 40:
     ?assertEqual(60, FindPosition({timestamp, Ts - 60 * 20 + 50})),
+    ok.
+
+find_index_position_empty_index_test() ->
+    %% An index that reads back with fewer than one full record (a truncated or
+    %% partially written fragment object) has nothing to resolve, and
+    %% find_index_position/2 crashes on it in both the offset and timestamp
+    %% paths. find_position/3 therefore guards on
+    %% byte_size(IndexData) >= ?INDEX_RECORD_B and returns {error, _} rather
+    %% than letting this reach the reader.
+    ?assertError(_, find_index_position(<<>>, {offset, 0})),
+    ?assertError(_, find_index_position(<<>>, {timestamp, 0})),
     ok.
 
 -endif.
