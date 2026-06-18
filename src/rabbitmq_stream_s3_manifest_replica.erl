@@ -38,9 +38,12 @@ No heartbeat or reconnection mechanism is needed because:
 -define(TABLE, rabbitmq_stream_s3_manifest_cache).
 
 -define(C_RESYNCS_REQUESTED, 1).
+-define(C_SYNCS_REJECTED, 2).
 -define(COUNTERS, [
     {resyncs_requested, ?C_RESYNCS_REQUESTED, counter,
-        "Re-syncs a manifest replica requested after a broadcast gap or epoch mismatch"}
+        "Re-syncs a manifest replica requested after a broadcast gap or epoch mismatch"},
+    {syncs_rejected, ?C_SYNCS_REJECTED, counter,
+        "Syncs a manifest replica dropped because they were older than the cached epoch or sequence"}
 ]).
 -define(COUNTER_KEY, {?MODULE, counter}).
 
@@ -168,8 +171,8 @@ handle_call({put_manifest, StreamId, Manifest}, _From, State) ->
     write_manifest(StreamId, Manifest),
     {reply, ok, State};
 handle_call({sync, StreamId, Seq, Epoch, Manifest, WriterNode}, _From, #state{seqs = Seqs} = State) ->
-    write_manifest(StreamId, Manifest),
-    {reply, ok, State#state{seqs = Seqs#{StreamId => {Seq, Epoch, WriterNode}}}};
+    Seqs1 = maybe_apply_sync(StreamId, Seq, Epoch, Manifest, WriterNode, Seqs),
+    {reply, ok, State#state{seqs = Seqs1}};
 handle_call(
     {apply_edits, StreamId, Edits, Seq, Epoch, WriterNode}, _From, #state{seqs = Seqs} = State
 ) ->
@@ -228,8 +231,8 @@ handle_cast({apply_edit, StreamId, Edit}, State) ->
     end,
     {noreply, State};
 handle_cast({sync, StreamId, Seq, Epoch, Manifest, WriterNode}, #state{seqs = Seqs} = State) ->
-    write_manifest(StreamId, Manifest),
-    {noreply, State#state{seqs = Seqs#{StreamId => {Seq, Epoch, WriterNode}}}};
+    Seqs1 = maybe_apply_sync(StreamId, Seq, Epoch, Manifest, WriterNode, Seqs),
+    {noreply, State#state{seqs = Seqs1}};
 handle_cast({apply_edits, StreamId, Edits, Seq, Epoch, WriterNode}, #state{seqs = Seqs} = State) ->
     case maps:get(StreamId, Seqs, undefined) of
         {LastSeq, Epoch, _} when Seq =:= LastSeq + 1 ->
@@ -267,6 +270,43 @@ terminate(_Reason, _State) ->
 
 write_manifest(StreamId, Manifest) ->
     ets:insert(?TABLE, {StreamId, Manifest}).
+
+%% A sync is a full manifest reset tagged with the writer's epoch and sequence.
+%% Casts from different writer nodes can be reordered, so a delayed sync from a
+%% deposed writer can arrive after a newer writer's sync. Applying it would roll
+%% the cache's epoch and sequence backward (an Epoch monotonicity violation) and
+%% re-pin the stream to the old writer node, serving a stale manifest until the
+%% next gap triggers a re-sync. Drop any sync that is not at least as new as
+%% what is recorded, comparing epoch first and then sequence so a higher epoch
+%% always wins regardless of where its sequence restarted.
+maybe_apply_sync(StreamId, Seq, Epoch, Manifest, WriterNode, Seqs) ->
+    Recorded = maps:get(StreamId, Seqs, undefined),
+    case is_stale_sync(Epoch, Seq, Recorded) of
+        true ->
+            {Seq0, Epoch0, _} = Recorded,
+            inc(?C_SYNCS_REJECTED, 1),
+            ?LOG_INFO(
+                "Manifest replica for stream ~ts dropped a stale sync "
+                "(epoch ~b seq ~b from node ~p) behind the cached epoch ~b seq ~b",
+                [StreamId, Epoch, Seq, WriterNode, Epoch0, Seq0],
+                #{domain => ?RMQLOG_DOMAIN_STREAM_S3}
+            ),
+            Seqs;
+        false ->
+            write_manifest(StreamId, Manifest),
+            Seqs#{StreamId => {Seq, Epoch, WriterNode}}
+    end.
+
+%% A sync is stale only when an entry is already recorded and the incoming
+%% (epoch, seq) is strictly older. Epoch dominates sequence so a higher epoch is
+%% never stale even if its sequence restarted below the deposed writer's.
+-spec is_stale_sync(
+    non_neg_integer(), non_neg_integer(), {non_neg_integer(), non_neg_integer(), node()} | undefined
+) -> boolean().
+is_stale_sync(_Epoch, _Seq, undefined) ->
+    false;
+is_stale_sync(Epoch, Seq, {Seq0, Epoch0, _}) ->
+    {Epoch, Seq} < {Epoch0, Seq0}.
 
 request_resync(StreamId, WriterNode) ->
     inc(?C_RESYNCS_REQUESTED, 1),
@@ -326,3 +366,24 @@ maybe_evaluate_retention(
     _StreamId, _OldManifest = #manifest{}, _NewManifest = #manifest{}, #state{}
 ) ->
     ok.
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+is_stale_sync_test() ->
+    Node = node(),
+    %% Nothing recorded yet: a first sync is never stale.
+    ?assertNot(is_stale_sync(5, 10, undefined)),
+    %% Same writer making forward progress, and an idempotent duplicate.
+    ?assertNot(is_stale_sync(5, 11, {10, 5, Node})),
+    ?assertNot(is_stale_sync(5, 10, {10, 5, Node})),
+    %% A delayed same-epoch sync that arrived out of order is stale.
+    ?assert(is_stale_sync(5, 9, {10, 5, Node})),
+    %% A higher epoch always wins, even when its sequence restarted lower.
+    ?assertNot(is_stale_sync(6, 1, {10, 5, Node})),
+    %% A delayed sync from a deposed lower-epoch writer is stale, even with a
+    %% higher sequence than the new writer has reached.
+    ?assert(is_stale_sync(5, 10, {1, 6, Node})),
+    ok.
+
+-endif.

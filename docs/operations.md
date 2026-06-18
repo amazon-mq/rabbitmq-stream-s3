@@ -243,6 +243,7 @@ Owned by `rabbitmq_stream_s3_manifest_replica`.
 | Metric                              | Type    | Description                                                       |
 |-------------------------------------|---------|-------------------------------------------------------------------|
 | `rabbitmq_stream_s3_resyncs_requested`                | counter | Re-syncs a replica requested after a manifest broadcast gap or epoch mismatch |
+| `rabbitmq_stream_s3_syncs_rejected`                   | counter | Syncs a replica dropped because they were older than the cached epoch or sequence |
 
 ### S3 API (per-node)
 
