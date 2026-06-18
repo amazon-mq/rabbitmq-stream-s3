@@ -775,10 +775,14 @@ register_replica(
             State#state{replicas = Replicas#{Node => MonRef}}
     end.
 
-gc_stream_async(StreamId) ->
+gc_stream_async(StreamId, WriterEpoch) ->
     spawn(fun() ->
         logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
-        rabbitmq_stream_s3_gc:run_stream(StreamId, #{mode => delete})
+        %% Pass this writer's epoch so the sweep skips when a consistent read of
+        %% the committed epoch shows this writer has been deposed. Runs in the
+        %% spawned task, not the reader, so the quorum-requiring read cannot stall
+        %% the reader on a partition.
+        rabbitmq_stream_s3_gc:run_stream(StreamId, #{mode => delete, writer_epoch => WriterEpoch})
     end),
     ok.
 
@@ -1278,7 +1282,8 @@ start_reading0(
         cfg = #cfg{
             writer_pid = WriterPid,
             fragment_target_size = TargetSize,
-            stream = StreamId
+            stream = StreamId,
+            epoch = Epoch
         },
         core = Core
     } = State
@@ -1313,7 +1318,7 @@ start_reading0(
                 FreshManifest, State1#state.config
             ),
             ok = rabbitmq_stream_s3_manifest_replica:put_manifest(StreamId, FreshManifest),
-            gc_stream_async(StreamId),
+            gc_stream_async(StreamId, Epoch),
             start_reading(State1#state{core = Core1});
         {error, Reason} ->
             ?LOG_WARNING(

@@ -28,6 +28,10 @@ writer cannot make progress anymore.
 
 -define(PATH(StreamId), ?RABBITMQ_KHEPRI_ROOT_PATH([rabbitmq_stream_s3, StreamId])).
 -define(STREAM_QUEUE_DELETION_TRIGGER_ID, rabbitmq_stream_s3_db_sq_deletion).
+%% Bounds a consistent read so it cannot block indefinitely waiting for a quorum
+%% that will not form (for example on a minority partition); timing out there
+%% surfaces as an error, which a fail-closed caller treats as "skip".
+-define(CONSISTENT_READ_TIMEOUT_MS, 30_000).
 
 -doc """
 Version number of a manifest object.
@@ -46,7 +50,7 @@ Zero indicates that the manifest has not been created yet.
 
 -export([setup/0]).
 
--export([get/1, list/0, count/0, put/5, queue_path/1]).
+-export([get/1, get_consistent/1, list/0, count/0, put/5, queue_path/1]).
 
 -define(C_SPROC_TRIGGERS, 1).
 -define(C_GETS, 2).
@@ -114,12 +118,29 @@ handle_queue_deletion(#{path := ?PATH(StreamId)}) ->
     %% be a node of a replica either.
     ok = rabbitmq_stream_s3_reaper:delete_stream(StreamId).
 
--doc "Gets the latest-known manifest root UID and revision.".
+-doc "Gets the latest-known manifest root UID and revision with a low-latency local read.".
 -spec get(stream_id()) -> {ok, entry()} | {error, not_found | any()}.
 get(StreamId) ->
+    do_get(StreamId, #{}).
+
+-doc """
+Gets the latest-known manifest root UID and revision with a strongly consistent,
+quorum-requiring read.
+
+Unlike get/1, a low-latency local read that can return stale state, this fails
+when the node cannot reach a quorum (for example on a minority partition).
+Callers that must fail closed when this node is not the committed authority rely
+on that. Bounded by a timeout so it cannot block indefinitely on a quorum that
+will not form.
+""".
+-spec get_consistent(stream_id()) -> {ok, entry()} | {error, not_found | any()}.
+get_consistent(StreamId) ->
+    do_get(StreamId, #{favor => consistency, timeout => ?CONSISTENT_READ_TIMEOUT_MS}).
+
+do_get(StreamId, Options) ->
     counters:add(counter(), ?C_GETS, 1),
     Path = ?PATH(StreamId),
-    case rabbit_khepri:adv_get(Path) of
+    case rabbit_khepri:adv_get(Path, Options) of
         {ok, #{Path := #{data := {Uid, Epoch}, payload_version := Revision}}} ->
             {ok, #{uid => Uid, epoch => Epoch, revision => Revision}};
         {error, ?khepri_error(node_not_found, _Props)} ->
