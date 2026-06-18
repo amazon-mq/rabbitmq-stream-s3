@@ -99,8 +99,8 @@ Converts an `osiris:name()` (binary or string) to a `stream_id()` binary.
 In practice, stream names are always binaries by the time they reach this
 plugin (see `rabbit_stream_queue:stream_name/1` which produces a base64url
 binary). This function provides defense-in-depth: if a list were to arrive,
-it handles Unicode correctly rather than silently truncating codepoints > 255
-as `iolist_to_binary/1` would.
+it handles Unicode correctly rather than crashing with `badarg` on any
+codepoint > 255 as `iolist_to_binary/1` would.
 """.
 -spec ensure_stream_id(osiris:name()) -> stream_id().
 ensure_stream_id(Name) when is_binary(Name) ->
