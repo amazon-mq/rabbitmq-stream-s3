@@ -452,6 +452,15 @@ handle_info({osiris_offset, _Ref, _Offset}, State0) ->
     {noreply, State};
 handle_info(retry_resolve, State0) ->
     {noreply, resolve_and_start(State0)};
+handle_info({transfer_result, Ref, _Result}, State0) when
+    not is_map_key(Ref, State0#state.transfer_sizes)
+->
+    %% Stale result from a transfer submitted before a manifest recovery reset
+    %% the in-flight queue (see handle_local_log_ahead/3). The fragment is no
+    %% longer tracked by the shell or the core, so feeding it to the core would
+    %% crash get_meta or, for a success, append a non-contiguous orphan that
+    %% trips assert_contiguous. Drop it.
+    {noreply, State0};
 handle_info({transfer_result, Ref, {ok, Uid}}, #state{core = Core0} = State0) ->
     State1 = on_transfer_result(Ref, ok, State0),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_complete(Ref, Uid, Core0),
@@ -460,8 +469,23 @@ handle_info({transfer_result, Ref, {ok, Uid}}, #state{core = Core0} = State0) ->
     {noreply, State3};
 handle_info({transfer_result, Ref, {error, Reason}}, #state{core = Core0} = State0) ->
     State1 = on_transfer_result(Ref, {error, Reason}, State0),
-    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(Ref, Reason, Core0),
-    {noreply, execute_effects(Effects, State1#state{core = Core})};
+    case local_log_ahead(State1) of
+        {true, LocalFirst, NextOffset} ->
+            %% Local retention trimmed past the manifest's next_offset, so the
+            %% segment backing the stalled fragment is permanently gone and no
+            %% retry can ever make it durable. Without this the core would keep
+            %% the fragment at the head of the in-flight queue and retry it
+            %% forever (issue #225), wedging the manifest and making the bulk of
+            %% the stream inaccessible. Recover the same way start_reading0/1
+            %% does at reader init: discard the remote manifest and restart from
+            %% the local log's first offset, accepting the lost range.
+            {noreply, handle_local_log_ahead(LocalFirst, NextOffset, Reason, State1)};
+        false ->
+            {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(
+                Ref, Reason, Core0
+            ),
+            {noreply, execute_effects(Effects, State1#state{core = Core})}
+    end;
 handle_info({retry_transfer, Ref, Dir, Meta}, #state{cfg = #cfg{stream = StreamId}} = State) ->
     %% A previously failed fragment upload is being retried after its backoff
     %% delay. The in-flight gauges were already restored when the delayed
@@ -637,12 +661,15 @@ handle_info(
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(_Reason, #state{
-    cfg = #cfg{stream = StreamId},
-    persist_mon = Mon,
-    persist_pid = CommitPid,
-    metrics_id = MetricsId
-}) ->
+terminate(
+    _Reason,
+    #state{
+        cfg = #cfg{stream = StreamId},
+        persist_mon = Mon,
+        persist_pid = CommitPid,
+        metrics_id = MetricsId
+    } = State
+) ->
     %% Kill any in-flight commit task to prevent orphaned Khepri writes.
     %% An orphaned write advances the revision, causing conflicts for the
     %% next incarnation of this replica reader.
@@ -653,6 +680,9 @@ terminate(_Reason, #state{
             demonitor(Mon, [flush]),
             exit(CommitPid, kill)
     end,
+    %% Close the open data reader so its segment file descriptors are released
+    %% promptly rather than at process teardown.
+    _ = close_log(State),
     ok = delete_metrics(MetricsId),
     rabbitmq_stream_s3_registry:unregister_name({StreamId, node()}),
     rabbitmq_stream_s3_manifest:evict_group_cache(StreamId),
@@ -957,8 +987,7 @@ execute_effect(cancel_persist_timer, #state{persist_timer = Ref} = State) ->
     State#state{persist_timer = undefined};
 execute_effect(reinitialize, #state{cfg = #cfg{stream = StreamId}} = State0) ->
     ?LOG_INFO("~ts reinitializing after commit conflict", [StreamId]),
-    State1 = State0#state{
-        log = undefined,
+    State1 = (close_log(State0))#state{
         assembly = undefined,
         transfer_sizes = #{},
         persist_pending_bytes = 0,
@@ -1191,6 +1220,16 @@ resolve_and_start(#state{cfg = #cfg{stream = StreamId}} = State0) ->
             State0
     end.
 
+%% Build the empty manifest the local-log-ahead recovery (the `reset` operation)
+%% installs at the local floor. first_offset = next_offset = LocalFirst so an
+%% empty manifest (Frag = empty) carries f = n, as the Coverage and Accounting
+%% invariants require, and so first_offset only moves forward: it feeds the
+%% first_offset counter and GC. See the Reset safety invariant in
+%% docs/invariants.md.
+-spec reset_manifest(osiris:offset(), rabbitmq_stream_s3_db:revision()) -> #manifest{}.
+reset_manifest(LocalFirst, Revision) ->
+    #manifest{first_offset = LocalFirst, next_offset = LocalFirst, revision = Revision}.
+
 -spec parse_manifest_root(binary()) -> #manifest{}.
 parse_manifest_root(?MANIFEST(FirstOffset, NextOffset, FirstTs, FirstLastTs, TotalSize, Entries)) ->
     #manifest{
@@ -1201,6 +1240,20 @@ parse_manifest_root(?MANIFEST(FirstOffset, NextOffset, FirstTs, FirstLastTs, Tot
         total_size = TotalSize,
         entries = Entries
     }.
+
+%% Close the open osiris data reader, if any, and clear it from the state.
+%% The osiris_log state holds open file descriptors to local segment files.
+%% Abandoning it (setting log = undefined) without closing leaks those
+%% descriptors: when retention then unlinks the segments, the kernel cannot
+%% reclaim the disk space until the descriptors are closed. Every path that
+%% restarts the reader (manifest reinitialize, trimmed-segment recovery) must
+%% close the old log first.
+-spec close_log(#state{}) -> #state{}.
+close_log(#state{log = undefined} = State) ->
+    State;
+close_log(#state{log = Log} = State) ->
+    ok = osiris_log:close(Log),
+    State#state{log = undefined}.
 
 -spec start_reading(#state{}) -> #state{}.
 start_reading(
@@ -1253,9 +1306,7 @@ start_reading0(
             ),
             inc(State1, ?C_LOCAL_LOG_AHEAD_RECOVERIES, 1),
             delete_manifest_objects(StreamId, Manifest),
-            FreshManifest = #manifest{
-                next_offset = LocalFirst, revision = Manifest#manifest.revision
-            },
+            FreshManifest = reset_manifest(LocalFirst, Manifest#manifest.revision),
             {Core1, _} = rabbitmq_stream_s3_replica_reader_core:init(
                 FreshManifest, State1#state.config
             ),
@@ -1276,8 +1327,59 @@ start_reading0(
             ),
             %% Retention deleted the segment between listing and opening.
             %% Retry immediately (same pattern as osiris_log:init_offset_reader).
-            start_reading(State1#state{core = Core, log = undefined, assembly = undefined})
+            start_reading((close_log(State1))#state{core = Core, assembly = undefined})
     end.
+
+%% Whether the live local log has been trimmed past the manifest's next_offset.
+%% When true, the segment backing the stalled head fragment is permanently gone
+%% (user retention outran the upload), so no upload retry can ever succeed.
+%% next_offset is the only offset that can be stalled at the head of the
+%% in-flight queue: the contiguity invariant (assert_contiguous/2) guarantees
+%% every uploaded fragment begins exactly where the manifest ends, so the head
+%% fragment's first offset equals next_offset. Comparing against next_offset is
+%% therefore equivalent to comparing against the stalled fragment's offset, and
+%% mirrors the check start_reading0/1 makes against StartOffset at reader init.
+-spec local_log_ahead(#state{}) ->
+    {true, osiris:offset(), osiris:offset()} | false.
+local_log_ahead(#state{cfg = #cfg{shared = Shared}, core = Core}) ->
+    NextOffset = (rabbitmq_stream_s3_replica_reader_core:manifest(Core))#manifest.next_offset,
+    LocalFirst = osiris_log_shared:first_chunk_id(Shared),
+    case LocalFirst > NextOffset of
+        true -> {true, LocalFirst, NextOffset};
+        false -> false
+    end.
+
+%% Recover from a permanently-trimmed segment by re-resolving the manifest and
+%% restarting the read. The manifest is still stalled at next_offset, so
+%% start_reading0/1 re-opens the data reader there, hits its offset_out_of_range
+%% branch (LocalFirst > StartOffset), and performs the manifest discard, the
+%% jump to LocalFirst, and the recovery-counter increment. Resetting the
+%% in-flight bookkeeping here (matching the reinitialize effect) abandons the
+%% transfers that were queued behind the stall; their late results are dropped
+%% by the stale-Ref clause of handle_info/2. The fragments they uploaded are
+%% left in S3 for orphan garbage collection. resolve_and_start/1 handles a
+%% transient resolution failure by scheduling a retry, so recovery is not lost
+%% to a store blip.
+-spec handle_local_log_ahead(osiris:offset(), osiris:offset(), term(), #state{}) -> #state{}.
+handle_local_log_ahead(
+    LocalFirst, NextOffset, Reason, #state{cfg = #cfg{stream = StreamId}} = State0
+) ->
+    ?LOG_WARNING(
+        "~ts fragment upload at offset ~b failed because its segment was "
+        "deleted by stream retention (~p). The local log first offset (~b) is "
+        "ahead of the manifest next offset (~b), so the range is gone from both "
+        "tiers. Discarding the remote manifest and restarting from the local "
+        "log first offset; the trimmed range will not be available in the "
+        "remote tier.",
+        [StreamId, NextOffset, Reason, LocalFirst, NextOffset]
+    ),
+    resolve_and_start((close_log(State0))#state{
+        assembly = undefined,
+        transfer_sizes = #{},
+        persist_pending_bytes = 0,
+        persisting_bytes = 0,
+        deferred_deletions = []
+    }).
 
 -spec drain(#state{}) -> #state{}.
 drain(#state{log = undefined} = State) ->
@@ -1736,5 +1838,63 @@ classify_object_result_ok_parses_with_revision_test() ->
     Data = ?MANIFEST(0, 0, 0, 0, 0, <<>>),
     {ok, Manifest} = classify_object_result({ok, Data}, 42, <<"k">>),
     ?assertEqual(42, Manifest#manifest.revision).
+
+%% Build a minimal state whose live local log first offset and manifest
+%% next_offset are set to the given values, for exercising local_log_ahead/1.
+local_log_ahead_state(LocalFirst, NextOffset) ->
+    Shared = osiris_log_shared:new(),
+    ok = osiris_log_shared:set_first_chunk_id(Shared, LocalFirst),
+    Opts = #{stream => <<"s">>, dir => <<"/tmp">>, epoch => 1, reference => <<"s">>},
+    {Core, _} = rabbitmq_stream_s3_replica_reader_core:init(
+        #manifest{next_offset = NextOffset}, Opts
+    ),
+    #state{cfg = #cfg{stream = <<"s">>, shared = Shared}, core = Core, config = Opts}.
+
+%% The local log trimmed past next_offset: the stalled segment is permanently
+%% gone, so recovery must fire.
+local_log_ahead_true_when_local_past_next_test() ->
+    ?assertMatch(
+        {true, 100, 10}, local_log_ahead(local_log_ahead_state(100, 10))
+    ).
+
+%% The local log first offset equals next_offset: the segment is still present
+%% (or the failure is a transient roll). Must not recover; retry instead.
+local_log_ahead_false_when_equal_test() ->
+    ?assertEqual(false, local_log_ahead(local_log_ahead_state(10, 10))).
+
+%% The manifest is ahead of the local log (normal steady state). Must not
+%% recover.
+local_log_ahead_false_when_local_behind_test() ->
+    ?assertEqual(false, local_log_ahead(local_log_ahead_state(5, 10))).
+
+%% A transfer result for a reference the shell no longer tracks (e.g. a
+%% transfer abandoned by a manifest recovery) must be dropped without touching
+%% the core, which would otherwise crash get_meta on the unknown reference or
+%% append a non-contiguous orphan. The state is returned unchanged.
+stale_transfer_result_dropped_test() ->
+    State = #state{transfer_sizes = #{}},
+    Ref = make_ref(),
+    ?assertEqual({noreply, State}, handle_info({transfer_result, Ref, {ok, 1}}, State)),
+    ?assertEqual(
+        {noreply, State}, handle_info({transfer_result, Ref, {error, boom}}, State)
+    ).
+
+%% close_log/1 is a no-op when there is no open data reader, so the restart
+%% paths can call it unconditionally.
+close_log_without_open_log_is_noop_test() ->
+    State = #state{log = undefined},
+    ?assertEqual(State, close_log(State)).
+
+%% The reset installs an empty manifest carrying f = n = the local floor, so an
+%% empty manifest satisfies Coverage and Accounting and first_offset only moves
+%% forward (Reset safety invariant).
+reset_manifest_carries_floor_as_first_and_next_test() ->
+    LocalFirst = 149324677,
+    M = reset_manifest(LocalFirst, 7),
+    ?assertEqual(LocalFirst, M#manifest.first_offset),
+    ?assertEqual(LocalFirst, M#manifest.next_offset),
+    ?assertEqual(M#manifest.first_offset, M#manifest.next_offset),
+    ?assertEqual(<<>>, M#manifest.entries),
+    ?assertEqual(7, M#manifest.revision).
 
 -endif.
