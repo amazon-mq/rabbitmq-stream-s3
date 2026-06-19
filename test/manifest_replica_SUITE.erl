@@ -376,8 +376,12 @@ retention_and_append_in_same_broadcast(_Config) ->
 %% broadcast. The buggy writer sent the *live* manifest (which already contains
 %% that edit) tagged with the *lagging* seq. The replica caches an edit it was
 %% never told about, then the deferred broadcast re-delivers the same edit
-%% in-sequence and the replica applies it a second time. No gap is ever observed
-%% so no self-healing resync fires: the divergence is silent and permanent.
+%% in-sequence and the replica applies it a second time. No gap is ever
+%% observed, so the sequence guard does not fire. apply_edit/2's
+%% append-position assertion is the backstop: it rejects the duplicate (the
+%% replica's array already contains the edit) and requests a resync, so the
+%% silent permanent divergence this characterized is now caught. The test pins
+%% both the historical shape and that backstop.
 sync_live_manifest_then_broadcast_double_applies(_Config) ->
     {Manifest0, _} = build_manifest([
         {fragment, #{offset => 0, size => 1000}}
@@ -408,20 +412,33 @@ sync_live_manifest_then_broadcast_double_applies(_Config) ->
     ?assertEqual(LiveManifest, rabbitmq_stream_s3_manifest_replica:get_manifest(Good)),
 
     %% Buggy writer: sync the *live* manifest (already contains Edit) at the
-    %% lagging seq 0, then the deferred broadcast delivers Edit again at seq 1.
+    %% lagging seq 0, then the deferred broadcast re-delivers Edit at seq 1.
+    %% The duplicate is in-sequence, so the seq guard does not catch it - but
+    %% apply_edit/2's append-position assertion does: the replica's array
+    %% already contains Edit, so the append no longer lands at the array end.
+    %% The replica rejects the edit, leaves its manifest untouched, and requests
+    %% a resync rather than silently double-applying (the old corruption this
+    %% test used to characterize).
+    rabbitmq_stream_s3_registry:init(),
+    Self = self(),
+    WriterPid = spawn_link(fun() -> fake_writer(Self) end),
     Bad = <<"stream-c1-bad">>,
+    yes = rabbitmq_stream_s3_registry:register_name({Bad, node()}, WriterPid),
     ok = rabbitmq_stream_s3_manifest_replica:sync(Bad, 0, 1, LiveManifest),
-    %% In-sequence (1 = 0 + 1), so no gap is detected and Edit is applied a
-    %% second time onto a manifest that already reflects it.
-    ok = rabbitmq_stream_s3_manifest_replica:apply_edits(Bad, [Edit], 1, 1),
-    Corrupt = rabbitmq_stream_s3_manifest_replica:get_manifest(Bad),
-
-    %% The double-apply corrupts the replica. The offset-50 fragment is
-    %% duplicated in the ordered entries array (a consumer binary-searching it
-    %% gets wrong/duplicate results) and total_size is double-counted.
-    ?assertEqual(3 * ?ENTRY_B, byte_size(Corrupt#manifest.entries)),
-    ?assertEqual(5000, Corrupt#manifest.total_size),
-    ?assertNotEqual(LiveManifest, Corrupt).
+    ?assertEqual(
+        {error, apply_failed},
+        rabbitmq_stream_s3_manifest_replica:apply_edits(Bad, [Edit], 1, 1)
+    ),
+    %% No corruption: the cached manifest is exactly the one that was synced;
+    %% the duplicate fragment was not spliced in or double-counted.
+    ?assertEqual(LiveManifest, rabbitmq_stream_s3_manifest_replica:get_manifest(Bad)),
+    receive
+        {resync_received, Node} -> ?assertEqual(node(), Node)
+    after 1000 -> ct:fail("resync request not received by writer")
+    end,
+    rabbitmq_stream_s3_registry:unregister_name({Bad, node()}),
+    unlink(WriterPid),
+    exit(WriterPid, kill).
 
 %% Characterization of the manifest-reset propagation bug. Demonstrates *why* a
 %% writer that resets its manifest (local-log-ahead recovery: it discards the
@@ -434,8 +451,11 @@ sync_live_manifest_then_broadcast_double_applies(_Config) ->
 %%
 %% A reset leaves broadcast_seq unchanged, so the writer's next edit arrives
 %% in-sequence relative to the replica's pre-reset seq. If the reset was not
-%% synced, the replica still holds the old manifest and splices the new edit
-%% onto a manifest the writer has already thrown away.
+%% synced, the replica still holds the old manifest. apply_edit/2's
+%% append-position assertion is the backstop: the post-reset edit is built
+%% against the fresh manifest, so it no longer matches the stale array and is
+%% rejected, triggering a resync instead of splicing onto a manifest the writer
+%% has already thrown away.
 manifest_reset_requires_resync(_Config) ->
     {OldManifest, _} = build_manifest([
         {fragment, #{offset => 0, size => 1000}},
@@ -458,15 +478,31 @@ manifest_reset_requires_resync(_Config) ->
 
     %% Buggy writer: resets locally but never syncs the replica. The replica
     %% keeps OldManifest at seq 0; the post-reset edit arrives in-sequence at
-    %% seq 1 and is spliced onto the discarded manifest.
+    %% seq 1. The seq guard does not catch it, but apply_edit/2's
+    %% append-position assertion does: the post-reset append is built against
+    %% the fresh (empty) manifest, so Pos no longer matches the stale array.
+    %% The replica rejects the edit, keeps OldManifest, and requests a resync
+    %% (which would then deliver the fresh manifest) rather than splicing onto
+    %% the discarded manifest (the old corruption this test used to
+    %% characterize).
+    rabbitmq_stream_s3_registry:init(),
+    Self = self(),
+    WriterPid = spawn_link(fun() -> fake_writer(Self) end),
     Bad = <<"stream-reset-bad">>,
+    yes = rabbitmq_stream_s3_registry:register_name({Bad, node()}, WriterPid),
     ok = rabbitmq_stream_s3_manifest_replica:sync(Bad, 0, 1, OldManifest),
-    ok = rabbitmq_stream_s3_manifest_replica:apply_edits(Bad, [PostResetEdit], 1, 1),
-    Corrupt = rabbitmq_stream_s3_manifest_replica:get_manifest(Bad),
-    %% The replica now lists the stale offset-0 and offset-50 fragments (gone
-    %% from both tiers) alongside the new one, out of order: [100, 0, 50].
-    ?assertEqual(3 * ?ENTRY_B, byte_size(Corrupt#manifest.entries)),
-    ?assertEqual(6000, Corrupt#manifest.total_size),
+    ?assertEqual(
+        {error, apply_failed},
+        rabbitmq_stream_s3_manifest_replica:apply_edits(Bad, [PostResetEdit], 1, 1)
+    ),
+    ?assertEqual(OldManifest, rabbitmq_stream_s3_manifest_replica:get_manifest(Bad)),
+    receive
+        {resync_received, RNode} -> ?assertEqual(node(), RNode)
+    after 1000 -> ct:fail("resync request not received by writer")
+    end,
+    rabbitmq_stream_s3_registry:unregister_name({Bad, node()}),
+    unlink(WriterPid),
+    exit(WriterPid, kill),
 
     %% Fixed writer: propagates the reset with a full sync (at the unchanged
     %% broadcast_seq) before the next edit. The replica drops OldManifest,
@@ -481,7 +517,7 @@ manifest_reset_requires_resync(_Config) ->
     ?assertEqual(100, Converged#manifest.first_offset),
     ?assertEqual(150, Converged#manifest.next_offset),
     ?assertEqual(3000, Converged#manifest.total_size),
-    ?assertNotEqual(Corrupt, Converged).
+    ?assertNotEqual(OldManifest, Converged).
 
 fake_writer(TestPid) ->
     receive
