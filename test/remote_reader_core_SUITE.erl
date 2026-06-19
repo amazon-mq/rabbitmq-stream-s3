@@ -40,6 +40,7 @@ all() ->
         retry_resets_delay_on_success,
         read_larger_than_buffer_awaits,
         header_overread_capped_at_index_boundary,
+        tail_header_overread_below_guard_serves_remaining,
         next_fragment_404_triggers_refresh_iterator,
         prefetch_404_full_recovery,
         deadline_expired_replies_error_timeout,
@@ -573,6 +574,35 @@ header_overread_capped_at_index_boundary(_Config) ->
     ?assertMatch([{reply, {ok, _}}], Replies),
     [{reply, {ok, ResultData}}] = Replies,
     ?assertEqual(108, byte_size(ResultData)).
+
+tail_header_overread_below_guard_serves_remaining(_Config) ->
+    %% Regression: a small final chunk at the fragment tail must still be
+    %% served. The consumer over-reads a chunk header at the last chunk's
+    %% boundary; when the remaining chunk data (plus index) is smaller than the
+    %% over-read size, the read overshoots the buffered end. Because all chunk
+    %% data is buffered (EndPos >= IdxStartPos), the core must cap at the index
+    %% boundary and serve the remaining bytes, not await data that will never
+    %% arrive (which hung the consumer until timeout).
+    %%
+    %% FragSize = 500, SEGMENT_HEADER_B = 8, so IdxStartPos = 508. Fill the full
+    %% chunk-data region (EndPos = 508). Read at offset 460 (a last-chunk
+    %% boundary leaving 48 bytes of chunk data) for a 64-byte header over-read:
+    %% 460 + 64 = 524 > EndPos = 508, so the over-read branch fires. With the
+    %% old `Offset + 64 =< EndPos` guard this awaited (524 > 508); now it serves
+    %% the 48 remaining bytes (508 - 460).
+    FragSize = 500,
+    FragRef = frag_ref(0, FragSize, 42),
+    Iterator = mock_iterator([{0, FragSize, 42}]),
+    {S0, _} = init(stream_id(), FragRef, 8, Iterator),
+    Data = binary:copy(<<0>>, FragSize),
+    {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {data, make_ref(), 0, Data, done}),
+    {_S2, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
+        S1, {read, 460, 64, chunk_boundary}
+    ),
+    Replies = [E || {reply, _} = E <- Effects],
+    ?assertMatch([{reply, {ok, _}}], Replies),
+    [{reply, {ok, ResultData}}] = Replies,
+    ?assertEqual(48, byte_size(ResultData)).
 
 next_fragment_404_triggers_refresh_iterator(_Config) ->
     %% Prefetch of next fragment returns 404. When the consumer reads past
