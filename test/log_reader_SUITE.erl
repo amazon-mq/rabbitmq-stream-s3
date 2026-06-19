@@ -370,7 +370,21 @@ offset_spec_at_tier_boundary(Config) ->
 
     ReaderCfg = reader_config(Writer, Config),
     #{shared := Shared} = ReaderCfg,
-    ?awaitMatch(F when F > 0, osiris_log_shared:first_chunk_id(Shared), 1000),
+    %% Wait for local retention to fully settle before capturing the tier
+    %% boundary. Retention removes segment files and advances the shared
+    %% first_chunk_id atomic independently, and the file deletion can land
+    %% before the atomic update: a barrier on the segment list alone (or on
+    %% first_chunk_id > 0) can observe a single remaining segment while the
+    %% atomic still holds the previous, lower floor. Capturing first_chunk_id
+    %% then records a stale boundary that a later resolution contradicts (the
+    %% atomic has since advanced), routing a below-floor offset to the remote
+    %% tier and failing the assertions. Wait until exactly one segment remains
+    %% *and* first_chunk_id has caught up to that segment's first offset.
+    ?awaitMatch(
+        {[Seg], Seg},
+        {list_segment_offsets(Config), osiris_log_shared:first_chunk_id(Shared)},
+        5000
+    ),
 
     FirstChunkId = osiris_log_shared:first_chunk_id(Shared),
     ?assert(FirstChunkId > 0),
