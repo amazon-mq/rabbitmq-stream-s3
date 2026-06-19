@@ -26,6 +26,7 @@ file-system operations. Use that in non-unit tests.
     stream_put/3,
     stream_data/2,
     stream_finish/2,
+    stream_abort/1,
     delete/1,
     delete/2,
     list/1,
@@ -70,6 +71,16 @@ file-system operations. Use that in non-unit tests.
     {ok, async_state()} | {error, any()}.
 -callback stream_data(async_state(), iodata()) -> async_state().
 -callback stream_finish(async_state(), non_neg_integer()) -> ok | {error, any()}.
+-doc """
+Abandon an in-progress streaming PUT that will not be finished.
+
+Called when the caller fails between stream_put/3 and a successful
+stream_finish/2 (for example a source read error while streaming the body).
+stream_finish/2 releases the request's resources on its own paths; this
+releases them when finish is never reached. The partially-sent upload does not
+become a committed object, so it leaves at most an orphan for GC.
+""".
+-callback stream_abort(async_state()) -> ok.
 -doc """
 Delete the given key or all of the listed keys from the remote tier.
 
@@ -229,6 +240,13 @@ stream_finish({StartTs, BackendState}, Crc32) ->
     Ms = rabbitmq_stream_s3_util:elapsed_ms(StartTs),
     rabbitmq_stream_s3_histogram:observe({?MODULE, request_duration, write}, Ms),
     Result.
+
+-spec stream_abort(async_state()) -> ok.
+stream_abort({StartTs, BackendState}) ->
+    ok = (backend()):stream_abort(BackendState),
+    Ms = rabbitmq_stream_s3_util:elapsed_ms(StartTs),
+    rabbitmq_stream_s3_histogram:observe({?MODULE, request_duration, write}, Ms),
+    ok.
 
 -doc #{equiv => delete(Keys, #{})}.
 -spec delete(key() | [key()]) -> ok | {error, any()}.

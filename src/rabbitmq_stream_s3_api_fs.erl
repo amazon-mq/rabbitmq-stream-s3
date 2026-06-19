@@ -21,6 +21,7 @@ associated file in that folder.
     stream_put/3,
     stream_data/2,
     stream_finish/2,
+    stream_abort/1,
     delete/2,
     list/3,
     match_async/3,
@@ -212,6 +213,15 @@ stream_finish({Fd, Crc}, Crc32) ->
         Crc32 -> ok;
         _ -> {error, {checksum_mismatch, #{expected => Crc32, actual => Crc}}}
     end.
+
+-spec stream_abort(async_state()) -> ok.
+stream_abort({Fd, _Crc}) ->
+    %% Release the open file descriptor that stream_put/3 acquired. The partial
+    %% file is left on disk as an orphan (it is never referenced by a persisted
+    %% manifest), matching the real backend where an aborted PUT writes no
+    %% committed object.
+    _ = file:close(Fd),
+    ok.
 
 -spec get_stream_data(StreamName) ->
     {ok, Manifest, [FragmentFile]} | {error, not_found}
