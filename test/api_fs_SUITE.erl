@@ -15,6 +15,7 @@ all() ->
         put_and_get,
         get_not_found,
         delete_key,
+        get_range_variants,
         list_keys,
         stream_put
     ].
@@ -36,6 +37,28 @@ put_and_get(_Config) ->
 
 get_not_found(_Config) ->
     ?assertEqual({error, not_found}, rabbitmq_stream_s3_api_fs:get(<<"no/such/key">>, #{})).
+
+get_range_variants(_Config) ->
+    Key = <<"test/get_range.bin">>,
+    %% 10 bytes: 0123456789
+    ok = rabbitmq_stream_s3_api_fs:put(Key, <<"0123456789">>, #{}),
+    %% Explicit [start, end] inclusive.
+    ?assertEqual({ok, <<"234">>}, rabbitmq_stream_s3_api_fs:get_range(Key, {2, 4}, #{})),
+    %% Open-ended [start, eof).
+    ?assertEqual({ok, <<"789">>}, rabbitmq_stream_s3_api_fs:get_range(Key, {7, undefined}, #{})),
+    %% Suffix: last N bytes.
+    ?assertEqual({ok, <<"89">>}, rabbitmq_stream_s3_api_fs:get_range(Key, -2, #{})),
+    %% Suffix larger than the object returns the whole object (S3 semantics),
+    %% not a crash on a negative offset.
+    ?assertEqual({ok, <<"0123456789">>}, rabbitmq_stream_s3_api_fs:get_range(Key, -100, #{})),
+    %% A range starting at or beyond the object size is unsatisfiable: 416,
+    %% returned promptly rather than crashing the worker.
+    ?assertMatch(
+        {error, #{status := 416}}, rabbitmq_stream_s3_api_fs:get_range(Key, {10, 20}, #{})
+    ),
+    ?assertMatch(
+        {error, #{status := 416}}, rabbitmq_stream_s3_api_fs:get_range(Key, {99, undefined}, #{})
+    ).
 
 delete_key(_Config) ->
     Key = <<"test/delete_me.bin">>,

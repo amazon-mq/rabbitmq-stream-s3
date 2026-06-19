@@ -75,17 +75,28 @@ get_range(Key, RangeSpec, Opts) ->
         FilePath = key_to_path(Key),
         case file:read_file_info(FilePath) of
             {ok, #file_info{size = FileSize}} ->
-                {ok, Fd} = file:open(FilePath, [read, binary]),
-                {Location, Number} = range_spec_to_location_number(FileSize, RangeSpec),
-                Result =
-                    case file:pread(Fd, Location, Number) of
-                        {ok, Data} ->
-                            {ok, Data};
-                        eof ->
-                            {ok, <<>>}
-                    end,
-                ok = file:close(Fd),
-                Result;
+                case range_spec_to_location_number(FileSize, RangeSpec) of
+                    not_satisfiable ->
+                        %% Mirror S3: a range that starts at or beyond the object
+                        %% size is answered with 416 (api_aws surfaces a
+                        %% non-special-cased status as #{status => _}). The
+                        %% previous code fell through to a negative pread offset
+                        %% or length, which returned {error, einval} and crashed
+                        %% the worker on the {ok,_}|eof case_clause, blocking the
+                        %% caller for the full timeout instead.
+                        {error, #{status => 416, headers => []}};
+                    {Location, Number} ->
+                        {ok, Fd} = file:open(FilePath, [read, binary]),
+                        Result =
+                            case file:pread(Fd, Location, Number) of
+                                {ok, Data} ->
+                                    {ok, Data};
+                                eof ->
+                                    {ok, <<>>}
+                            end,
+                        ok = file:close(Fd),
+                        Result
+                end;
             {error, enoent} ->
                 {error, not_found}
         end
@@ -310,12 +321,18 @@ with_timeout(Timeout, Fun) ->
 range_spec_to_location_number(FileSize, SuffixRange) when
     is_integer(SuffixRange), SuffixRange < 0
 ->
-    Location = FileSize + SuffixRange,
-    {Location, -SuffixRange};
+    %% bytes=-N (suffix): the last N bytes. S3 returns the whole object when
+    %% N >= size rather than erroring, so clamp the start at 0 instead of
+    %% letting FileSize + SuffixRange go negative (which crashed pread).
+    Location = max(0, FileSize + SuffixRange),
+    {Location, FileSize - Location};
 range_spec_to_location_number(FileSize, SuffixRange) when is_integer(SuffixRange) ->
     Location = 0,
     Number = min(SuffixRange, FileSize),
     {Location, Number};
+range_spec_to_location_number(FileSize, {StartByte, _}) when StartByte >= FileSize ->
+    %% A range starting at or beyond the object is unsatisfiable: S3 answers 416.
+    not_satisfiable;
 range_spec_to_location_number(FileSize, {StartByte, EndByte}) ->
     Number =
         case EndByte of
