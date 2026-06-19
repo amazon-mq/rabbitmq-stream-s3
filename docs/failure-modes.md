@@ -114,6 +114,28 @@ Discarding remote manifest and restarting.
 
 ---
 
+## Lost transfer result (stalled upload pipeline)
+
+**Trigger.** A fragment transfer is submitted to the governor but no `{transfer_result, ...}` ever comes back. Three ways this happens:
+
+- The governor process crashes while the submission is still in its in-memory `pending` queue. The governor is supervised on its own and restarts with an empty `pending` queue, so the submission is lost. The `pending` queue is only non-empty when a finite `stream_s3.max_transfer_bytes_per_sec` is throttling, so this trigger requires a rate limit. In-flight tasks run in unlinked processes that outlive a governor restart and still deliver their results.
+- The spawned upload task is killed externally (for example by the OOM killer) before it replies. The task's exception handling only converts errors raised inside the upload function; an external kill produces no result.
+- The result message is otherwise lost.
+
+**Impact assessment.** Without recovery, the affected reader's in-flight queue head never drains, so `next_offset` is pinned, await-offset waiters never return, and local retention cannot reclaim the affected segments. The stream's remote tier stops advancing while the local log keeps growing. If local retention then trims past the pinned `next_offset`, the reader takes the local-log-ahead recovery path and the un-uploaded range is lost from both tiers. The failure is otherwise silent.
+
+**Detection.**
+
+- `rabbitmq_stream_s3_transfers_in_flight` stays elevated with no matching `rate(rabbitmq_stream_s3_transfers_completed[5m])`.
+- `transfer_deadlines_armed` in the replica reader's `format_state` shows armed deadlines that do not clear.
+- Logs: `~ts no result for an in-flight fragment transfer within the transfer deadline ... Resubmitting to keep the upload pipeline live.`
+
+**Mitigation.** None required: recovery is automatic.
+
+**Resolution.** Each submitted transfer arms a reader-side deadline (`stream_s3.transfer_deadline_ms`, default four times `segment_upload_timeout`). On expiry the reader resubmits the transfer under the same reference through the normal retry path, recovering from a dropped `pending` item, an externally killed task, or a lost message with one mechanism. The deadline is generous so a healthy but slow upload (including time queued behind the token bucket) is not resubmitted spuriously; a spurious resubmit is harmless because the reference is reused, the first result to arrive is accounted and the duplicate is discarded, and the losing upload's object becomes an orphan that GC reclaims. If local retention has already trimmed past the stalled offset by the time the deadline fires, the reader instead takes the local-log-ahead recovery path (see "Segment deleted before upload").
+
+---
+
 ## Persist conflict (deposed writer races new writer)
 
 **Trigger.** Two replica readers attempt to update the same stream's manifest in Khepri. Possible during partition-induced leader elections.

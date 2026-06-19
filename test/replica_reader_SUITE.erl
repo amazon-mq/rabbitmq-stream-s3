@@ -71,6 +71,7 @@ groups() ->
             retention_reclaims_uploaded_segments,
             message_count_reflects_remote_tier,
             resumes_after_restart,
+            lost_transfer_result_recovered_by_deadline,
             large_record_cuts_immediately,
             seed_log_uploads_deterministic,
             local_ahead_discards_manifest,
@@ -140,6 +141,7 @@ end_per_testcase(_TestCase, Config) ->
     %% Clean up any per-test app env overrides.
     application:unset_env(rabbitmq_stream_s3, fragment_target_size),
     application:unset_env(rabbitmq_stream_s3, persist_threshold),
+    application:unset_env(rabbitmq_stream_s3, transfer_deadline_ms),
     Config.
 
 %% ------------------------------------------------------------------
@@ -443,6 +445,83 @@ large_record_cuts_immediately(Config) ->
     %% One record, one chunk, one fragment.
     ok = await_offset(StreamId, 1),
     ?assertEqual([0], list_fragment_offsets(Config)).
+
+%% Regression for the governor-transfer-liveness issue: a submitted transfer
+%% whose result never comes back (governor crash dropping a queued submission,
+%% an externally killed upload task, or a lost message) must not pin the
+%% in-flight queue head forever. The reader arms a per-transfer deadline and,
+%% on expiry, resubmits under the same reference so the pipeline stays live.
+%%
+%% The test stands a controllable process in for the governor. It drops the
+%% first submission of each reference (simulating a lost result) and serves the
+%% resubmission normally. Without the reader-side deadline, await_offset would
+%% hang on the dropped first submission.
+lost_transfer_result_recovered_by_deadline(Config) ->
+    StreamId = ?config(stream_id, Config),
+    %% Short deadline so the resubmit happens quickly. Correctness does not
+    %% depend on the value (a spurious early resubmit is safe); this only keeps
+    %% the test fast.
+    application:set_env(rabbitmq_stream_s3, transfer_deadline_ms, 300),
+
+    Self = self(),
+    ok = supervisor:terminate_child(rabbitmq_stream_s3_sup, rabbitmq_stream_s3_governor),
+    Interceptor = spawn(fun() -> governor_interceptor(Self, #{}) end),
+    true = register(rabbitmq_stream_s3_governor, Interceptor),
+
+    try
+        %% One 2000-byte record with a 1000-byte target cuts exactly one
+        %% fragment, hence exactly one transfer reference.
+        Writer = start_writer(Config, #{}, #{fragment_target_size => 1000}),
+        osiris_writer:write(Writer, binary:copy(<<"L">>, 2000)),
+        flush_writer(Writer),
+
+        %% Returns only because the deadline fired and the resubmission was
+        %% served. Generous timeout: 300ms deadline + a fast FS upload.
+        ok = rabbitmq_stream_s3_test_helpers:await_offset(StreamId, 1, 5000),
+        ?assertEqual([0], list_fragment_offsets(Config)),
+
+        %% Confirm the same reference was submitted twice: dropped, then served.
+        receive
+            {interceptor_resubmitted, _Ref} -> ok
+        after 5000 ->
+            ct:fail("governor interceptor never received a resubmission")
+        end
+    after
+        catch unregister(rabbitmq_stream_s3_governor),
+        catch exit(Interceptor, kill),
+        %% Restore the real governor for subsequent tests.
+        {ok, _} = supervisor:restart_child(
+            rabbitmq_stream_s3_sup, rabbitmq_stream_s3_governor
+        )
+    end.
+
+%% Stand-in for the governor process. Speaks the same cast protocol
+%% (gen_server:cast wraps the request in {'$gen_cast', _}). Drops the first
+%% submission of each reference (no reply, simulating a lost transfer_result)
+%% and serves every later submission of a reference it has already seen by
+%% running the upload closure and replying, exactly as the governor does.
+governor_interceptor(Test, Seen) ->
+    receive
+        {'$gen_cast', {submit, Fun, _Size, ReplyTo, Ref}} ->
+            case maps:is_key(Ref, Seen) of
+                false ->
+                    governor_interceptor(Test, Seen#{Ref => dropped});
+                true ->
+                    _ = spawn(fun() ->
+                        Result =
+                            try
+                                Fun()
+                            catch
+                                C:R -> {error, {C, R}}
+                            end,
+                        ReplyTo ! {transfer_result, Ref, Result}
+                    end),
+                    Test ! {interceptor_resubmitted, Ref},
+                    governor_interceptor(Test, Seen)
+            end;
+        _Other ->
+            governor_interceptor(Test, Seen)
+    end.
 
 seed_log_uploads_deterministic(Config) ->
     %% Seed: 2 segments, 3 chunks each, 200 bytes payload per chunk.

@@ -37,6 +37,7 @@ lives here. Callers use these functions instead of calling
     verbose_logging/0,
     segment_upload_timeout/0,
     upload_retry_delay_ms/0,
+    transfer_deadline_ms/0,
     retention_task_timeout/0,
     tick_timeout_milliseconds/0,
     max_transfer_bytes_per_sec/0,
@@ -168,6 +169,29 @@ segment_upload_timeout() ->
 upload_retry_delay_ms() ->
     application:get_env(?APP, upload_retry_delay_ms, 1000).
 
+%% Deadline for a submitted fragment transfer to report a result back to the
+%% replica reader. The reader submits each transfer to the per-node governor
+%% and waits for a `{transfer_result, Ref, _}` message. That message can fail
+%% to arrive: the governor can crash while the submission sits in its pending
+%% queue (only reachable under a finite rate limit), the spawned task can be
+%% killed externally (e.g. by the OOM killer) before it replies, or the
+%% message can otherwise be lost. None of those produce a result, so without a
+%% deadline the in-flight queue head never drains, `next_offset` is pinned, and
+%% the stream's uploads stall silently and permanently. On expiry the reader
+%% resubmits the transfer under the same reference (see the transfer_deadline
+%% handling in rabbitmq_stream_s3_replica_reader).
+%%
+%% The default is a generous multiple of segment_upload_timeout so a healthy
+%% but slow upload (including time spent queued behind the governor's token
+%% bucket) is never resubmitted spuriously. A spurious early resubmit is safe
+%% regardless: the resubmit reuses the same reference, the core accounts the
+%% first result to arrive and drops the duplicate, and the losing upload's S3
+%% object becomes an orphan that GC reclaims. Correctness does not depend on
+%% the value; only efficiency does.
+-spec transfer_deadline_ms() -> non_neg_integer().
+transfer_deadline_ms() ->
+    application:get_env(?APP, transfer_deadline_ms, segment_upload_timeout() * 4).
+
 -spec retention_task_timeout() -> non_neg_integer().
 retention_task_timeout() ->
     application:get_env(?APP, retention_task_timeout, 60_000).
@@ -222,6 +246,7 @@ defaults_test_() ->
         ?_assertEqual(false, verbose_logging()),
         ?_assertEqual(45_000, segment_upload_timeout()),
         ?_assertEqual(1000, upload_retry_delay_ms()),
+        ?_assertEqual(180_000, transfer_deadline_ms()),
         ?_assertEqual(60_000, retention_task_timeout()),
         ?_assertEqual(5000, tick_timeout_milliseconds()),
         ?_assertEqual(false, verify_crc_on_read()),
