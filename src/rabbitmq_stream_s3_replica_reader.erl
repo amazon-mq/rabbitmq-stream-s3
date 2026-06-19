@@ -789,6 +789,29 @@ register_replica(
             State#state{replicas = Replicas#{Node => MonRef}}
     end.
 
+%% Force every registered replica to drop its cached manifest and adopt the
+%% given one via a full sync, tagged with the current broadcast_seq. Used after
+%% a manifest reset (local-log-ahead recovery), which discards the writer's
+%% manifest without advancing broadcast_seq: subsequent broadcasts continue at
+%% broadcast_seq + 1 and stay in sequence relative to this sync. Casts to a
+%% given node are FIFO from this process, so each replica observes the sync
+%% before the next apply_edits.
+-spec sync_all_replicas(#manifest{}, #state{}) -> ok.
+sync_all_replicas(
+    Manifest,
+    #state{
+        replicas = Replicas,
+        broadcast_seq = Seq,
+        cfg = #cfg{stream = StreamId, epoch = Epoch}
+    }
+) ->
+    maps:foreach(
+        fun(Node, _MonRef) ->
+            rabbitmq_stream_s3_manifest_replica:sync(StreamId, Seq, Epoch, Manifest, Node)
+        end,
+        Replicas
+    ).
+
 gc_stream_async(StreamId, WriterEpoch) ->
     spawn(fun() ->
         logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
@@ -1345,6 +1368,14 @@ start_reading0(
                 FreshManifest, State1#state.config
             ),
             ok = rabbitmq_stream_s3_manifest_replica:put_manifest(StreamId, FreshManifest),
+            %% Propagate the reset to replicas. The reset discards the writer's
+            %% manifest and installs a fresh one at the local floor, but leaves
+            %% broadcast_seq unchanged. Replicas still hold the pre-reset
+            %% manifest at their last broadcast seq; without this resync the
+            %% next broadcast would land in-sequence and splice an edit onto a
+            %% manifest the writer has already discarded, corrupting every
+            %% replica (the same silent divergence as an unsynced register).
+            ok = sync_all_replicas(FreshManifest, State1),
             gc_stream_async(StreamId, Epoch),
             start_reading(State1#state{core = Core1});
         {error, Reason} ->
