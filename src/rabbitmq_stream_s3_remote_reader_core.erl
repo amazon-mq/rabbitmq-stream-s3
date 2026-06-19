@@ -395,11 +395,27 @@ try_read(#state{end_pos = EndPos} = State, Offset, Bytes) when
 ->
     %% Not enough data buffered.
     IdxStartPos = ?SEGMENT_HEADER_B + (State#state.fragment_ref)#fragment_ref.size,
-    case EndPos >= IdxStartPos andalso Offset + 64 =< EndPos of
+    case EndPos >= IdxStartPos of
         true ->
-            %% Header over-read: cap at index boundary.
+            %% All chunk data is buffered (the index region, which follows the
+            %% chunk data, has started), so nothing more is coming for a read
+            %% within the chunk-data range: this is the consumer over-reading a
+            %% chunk header at the fragment tail. Cap the read at the index
+            %% boundary and serve the remaining chunk data.
+            %%
+            %% The only read that overshoots EndPos is the header over-read,
+            %% which read_header1/1 always issues at a chunk boundary, so
+            %% IdxStartPos - Offset is the full last chunk (>= CHUNK_HEADER_B +
+            %% FilterSize) and read_header2/2 has enough to parse. A previous
+            %% `Offset + 64 =< EndPos` guard additionally required 64 bytes
+            %% available; a final chunk plus index totalling fewer than 64 bytes
+            %% failed it, so the reader awaited data that would never arrive and
+            %% the consumer hung. (The 64 was also arbitrary: the over-read is
+            %% CHUNK_HEADER_B + MAX_FILTER_SIZE bytes, not 64.)
             try_read(State, Offset, EndPos - Offset);
         false ->
+            %% Chunk data is still streaming in (EndPos has not reached the
+            %% index boundary). Wait for more, unless the fragment 404'd.
             case State of
                 #state{current_not_found = true} ->
                     {not_found_check_range, State};
