@@ -23,7 +23,8 @@ all() ->
         rapid_edits_with_gap_then_resync,
         stale_edit_after_resync_ignored,
         retention_and_append_in_same_broadcast,
-        sync_live_manifest_then_broadcast_double_applies
+        sync_live_manifest_then_broadcast_double_applies,
+        manifest_reset_requires_resync
     ].
 
 init_per_suite(Config) ->
@@ -421,6 +422,66 @@ sync_live_manifest_then_broadcast_double_applies(_Config) ->
     ?assertEqual(3 * ?ENTRY_B, byte_size(Corrupt#manifest.entries)),
     ?assertEqual(5000, Corrupt#manifest.total_size),
     ?assertNotEqual(LiveManifest, Corrupt).
+
+%% Characterization of the manifest-reset propagation bug. Demonstrates *why* a
+%% writer that resets its manifest (local-log-ahead recovery: it discards the
+%% remote manifest and restarts at the local floor) must propagate the reset to
+%% replicas with a full sync, not just locally. Like the live-manifest case,
+%% there is no deterministic writer-side regression test here: triggering the
+%% reset on a writer while a replica is attached needs peer-node lifecycle
+%% orchestration in the integration suite (tracked as coverage debt). This test
+%% pins the replica-side consequence at the boundary where corruption happens.
+%%
+%% A reset leaves broadcast_seq unchanged, so the writer's next edit arrives
+%% in-sequence relative to the replica's pre-reset seq. If the reset was not
+%% synced, the replica still holds the old manifest and splices the new edit
+%% onto a manifest the writer has already thrown away.
+manifest_reset_requires_resync(_Config) ->
+    {OldManifest, _} = build_manifest([
+        {fragment, #{offset => 0, size => 1000}},
+        {fragment, #{offset => 50, size => 2000}}
+    ]),
+    %% The fresh manifest the writer installs at the local floor (offset 100):
+    %% empty, first_offset = next_offset = 100.
+    FreshManifest = #manifest{first_offset = 100, next_offset = 100},
+    %% The first edit after the reset: a fragment uploaded at the new floor.
+    PostResetEdit = #edit{
+        first_offset = 100,
+        first_timestamp = 1000,
+        first_last_timestamp = 1100,
+        next_offset = 150,
+        size = 3000,
+        entries = ?ENTRY(100, 1000, 1100, ?MANIFEST_KIND_FRAGMENT, 3000, 7),
+        pos = 0,
+        len = 0
+    },
+
+    %% Buggy writer: resets locally but never syncs the replica. The replica
+    %% keeps OldManifest at seq 0; the post-reset edit arrives in-sequence at
+    %% seq 1 and is spliced onto the discarded manifest.
+    Bad = <<"stream-reset-bad">>,
+    ok = rabbitmq_stream_s3_manifest_replica:sync(Bad, 0, 1, OldManifest),
+    ok = rabbitmq_stream_s3_manifest_replica:apply_edits(Bad, [PostResetEdit], 1, 1),
+    Corrupt = rabbitmq_stream_s3_manifest_replica:get_manifest(Bad),
+    %% The replica now lists the stale offset-0 and offset-50 fragments (gone
+    %% from both tiers) alongside the new one, out of order: [100, 0, 50].
+    ?assertEqual(3 * ?ENTRY_B, byte_size(Corrupt#manifest.entries)),
+    ?assertEqual(6000, Corrupt#manifest.total_size),
+
+    %% Fixed writer: propagates the reset with a full sync (at the unchanged
+    %% broadcast_seq) before the next edit. The replica drops OldManifest,
+    %% adopts FreshManifest, then applies the edit onto it.
+    Good = <<"stream-reset-good">>,
+    ok = rabbitmq_stream_s3_manifest_replica:sync(Good, 0, 1, OldManifest),
+    ok = rabbitmq_stream_s3_manifest_replica:sync(Good, 0, 1, FreshManifest),
+    ok = rabbitmq_stream_s3_manifest_replica:apply_edits(Good, [PostResetEdit], 1, 1),
+    Converged = rabbitmq_stream_s3_manifest_replica:get_manifest(Good),
+    %% Only the post-reset fragment, first_offset advanced to the new floor.
+    ?assertEqual(?ENTRY_B, byte_size(Converged#manifest.entries)),
+    ?assertEqual(100, Converged#manifest.first_offset),
+    ?assertEqual(150, Converged#manifest.next_offset),
+    ?assertEqual(3000, Converged#manifest.total_size),
+    ?assertNotEqual(Corrupt, Converged).
 
 fake_writer(TestPid) ->
     receive
