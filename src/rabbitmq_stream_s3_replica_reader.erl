@@ -1102,17 +1102,7 @@ execute_effect(cancel_persist_timer, #state{persist_timer = Ref} = State) ->
     State#state{persist_timer = undefined};
 execute_effect(reinitialize, #state{cfg = #cfg{stream = StreamId}} = State0) ->
     ?LOG_INFO("~ts reinitializing after commit conflict", [StreamId]),
-    State1 = (close_log(cancel_all_transfer_deadlines(State0)))#state{
-        assembly = undefined,
-        transfer_sizes = #{},
-        persist_pending_bytes = 0,
-        persisting_bytes = 0,
-        %% Discard deferred deletions: the retention edit was not persisted,
-        %% so the objects must remain. The new writer will re-evaluate
-        %% retention and delete them after its own persist.
-        deferred_deletions = []
-    },
-    resolve_and_start(State1);
+    resolve_and_start(reset_for_recovery(State0));
 execute_effect(stop, State) ->
     %% The stream's metadata node was deleted (the queue was removed). Mark the
     %% reader for shutdown; the handler that ran this effect returns
@@ -1529,13 +1519,7 @@ handle_local_log_ahead(
         "remote tier.",
         [StreamId, NextOffset, Reason, LocalFirst, NextOffset]
     ),
-    resolve_and_start((close_log(cancel_all_transfer_deadlines(State0)))#state{
-        assembly = undefined,
-        transfer_sizes = #{},
-        persist_pending_bytes = 0,
-        persisting_bytes = 0,
-        deferred_deletions = []
-    }).
+    resolve_and_start(reset_for_recovery(State0)).
 
 -spec drain(#state{}) -> #state{}.
 drain(#state{log = undefined} = State) ->
@@ -1814,14 +1798,6 @@ cancel_transfer_deadline(Ref, #state{transfer_deadlines = Deadlines} = State) ->
             State
     end.
 
-%% Cancel every outstanding liveness deadline. Used by the manifest-recovery
-%% reset paths (reinitialize, local-log-ahead) that abandon all in-flight
-%% transfers; the abandoned transfers' late results and any late deadline
-%% messages are dropped by the stale-Ref / Token guards.
-cancel_all_transfer_deadlines(#state{transfer_deadlines = Deadlines} = State) ->
-    maps:foreach(fun(_Ref, {TimerRef, _Token}) -> erlang:cancel_timer(TimerRef) end, Deadlines),
-    State#state{transfer_deadlines = #{}}.
-
 %% Called from execute_effect/2 for {submit_transfer, ...}.
 on_transfer_submitted(Ref, Size, #state{transfer_sizes = Sizes} = State) ->
     inc_gauge(State, ?C_TRANSFERS_IN_FLIGHT, 1),
@@ -1963,6 +1939,25 @@ return_persisting_bytes(
     #state{persisting_bytes = Snapshot, persist_pending_bytes = Pending} = State
 ) ->
     State#state{persisting_bytes = 0, persist_pending_bytes = Pending + Snapshot}.
+
+%% Reset all in-flight bookkeeping for a manifest-recovery restart, returning
+%% the cleared state for the caller to re-resolve via resolve_and_start/1.
+-spec reset_for_recovery(#state{}) -> #state{}.
+reset_for_recovery(#state{transfer_deadlines = Deadlines0} = State0) ->
+    set(State0, ?C_TRANSFERS_IN_FLIGHT, 0),
+    set(State0, ?C_BYTES_IN_ASSEMBLY, 0),
+    set(State0, ?C_BYTES_IN_TRANSFER, 0),
+    set(State0, ?C_BYTES_IN_PERSIST, 0),
+    maps:foreach(fun(_Ref, {TimerRef, _Token}) -> erlang:cancel_timer(TimerRef) end, Deadlines0),
+    State1 = close_log(State0),
+    State1#state{
+        assembly = undefined,
+        transfer_deadlines = #{},
+        transfer_sizes = #{},
+        persist_pending_bytes = 0,
+        persisting_bytes = 0,
+        deferred_deletions = []
+    }.
 
 on_manifest_resolved(#manifest{next_offset = 0}, State) ->
     inc(State, ?C_MANIFESTS_RESOLVED_EMPTY, 1),
