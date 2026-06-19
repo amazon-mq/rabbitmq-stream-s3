@@ -159,8 +159,16 @@ delete(Keys, Opts) when is_list(Keys) andalso is_map(Opts) ->
         Result = lists:filtermap(
             fun(K) ->
                 case file:delete(key_to_path(K)) of
-                    ok -> false;
-                    Error -> {true, {K, Error}}
+                    ok ->
+                        false;
+                    %% S3 DeleteObject/DeleteObjects is idempotent: deleting a
+                    %% key that does not exist succeeds (204 / no per-key error).
+                    %% Mirror that here so the FS backend does not diverge and
+                    %% report a spurious error for an already-absent key.
+                    {error, enoent} ->
+                        false;
+                    Error ->
+                        {true, {K, Error}}
                 end
             end,
             Keys

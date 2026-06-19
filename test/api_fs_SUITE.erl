@@ -16,6 +16,7 @@ all() ->
         get_not_found,
         delete_key,
         get_range_variants,
+        delete_missing_key_is_idempotent,
         list_keys,
         stream_put
     ].
@@ -65,6 +66,17 @@ delete_key(_Config) ->
     ok = rabbitmq_stream_s3_api_fs:put(Key, <<"data">>, #{}),
     ?assertEqual({ok, <<"data">>}, rabbitmq_stream_s3_api_fs:get(Key, #{})),
     ok = rabbitmq_stream_s3_api_fs:delete([Key], #{}),
+    ?assertEqual({error, not_found}, rabbitmq_stream_s3_api_fs:get(Key, #{})).
+
+delete_missing_key_is_idempotent(_Config) ->
+    %% S3 DeleteObject is idempotent (204 for an absent key). The FS backend
+    %% must match so it does not report a spurious error for a key that was
+    %% never written or was already deleted.
+    ?assertEqual(ok, rabbitmq_stream_s3_api_fs:delete([<<"no/such/key.bin">>], #{})),
+    %% A mix of present and absent keys still succeeds and removes the present one.
+    Key = <<"test/delete_mixed.bin">>,
+    ok = rabbitmq_stream_s3_api_fs:put(Key, <<"data">>, #{}),
+    ok = rabbitmq_stream_s3_api_fs:delete([<<"no/such/key2.bin">>, Key], #{}),
     ?assertEqual({error, not_found}, rabbitmq_stream_s3_api_fs:get(Key, #{})).
 
 list_keys(_Config) ->
