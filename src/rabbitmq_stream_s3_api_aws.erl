@@ -119,6 +119,14 @@ Called "HTTP Verb" in S3 docs. "GET", "PUT", "HEAD", "POST", "DELETE", etc..
     data => [binary()],
     pending_bytes => non_neg_integer(),
     timeout => timeout(),
+    %% Present for get_range_async/3: the byte range the request asked for. Kept
+    %% so a non-conformant 200 (full object) response can be sliced down to the
+    %% requested range, mirroring the synchronous get_range/3 recovery.
+    range => rabbitmq_stream_s3_api:range_spec(),
+    %% Set when a Range request was answered with 200 (full object). The body is
+    %% buffered in full and sliced to `range` at fin instead of being forwarded
+    %% incrementally (forwarding would deliver bytes at the wrong offset).
+    slice_full => rabbitmq_stream_s3_api:range_spec(),
     %% Timer reference for request timeout. Set when a `timeout` is given in
     %% request opts. Cancelled and flushed in `finish_async/1`.
     timer_ref => reference()
@@ -315,7 +323,14 @@ get_range(Key, Range, Opts) when is_binary(Key) andalso is_map(Opts) ->
     {ok, async_req(), async_state()} | {error, any()}.
 get_range_async(Key, Range, Opts) when is_binary(Key) andalso is_map(Opts) ->
     Headers = #{<<"range">> => range_specifier(Range)},
-    request_async(<<"GET">>, key_to_path(Key), Headers, <<>>, Opts).
+    case request_async(<<"GET">>, key_to_path(Key), Headers, <<>>, Opts) of
+        {ok, StreamRef, State} ->
+            %% Keep the requested range so handle_async/3 can recover if the
+            %% store ignores the Range header and answers 200 (full object).
+            {ok, StreamRef, State#{range => Range}};
+        {error, _} = Err ->
+            Err
+    end.
 
 -doc "Uploads the given `Data` as an object at key `Key`".
 -spec put(key(), iodata(), request_opts()) -> ok | {error, any()}.
@@ -686,8 +701,26 @@ handle_async(
 ) ->
     case Status of
         200 ->
-            State = State0#{data => [], pending_bytes => 0},
-            {continue, State};
+            case State0 of
+                #{range := Range} ->
+                    %% A Range request answered with 200 means the store (or an
+                    %% intermediary) ignored the Range header and is sending the
+                    %% full object. The body cannot be forwarded incrementally as
+                    %% the requested range: the bytes would land at the wrong
+                    %% offset in the caller's buffer. Buffer the whole object and
+                    %% slice the range out at fin, mirroring get_range/3. The
+                    %% extra buffering only applies to this non-conformant case.
+                    ?LOG_DEBUG(
+                        "~ts received 200 for a Range request; buffering the full "
+                        "object to slice ~p",
+                        [?FUNCTION_NAME, Range]
+                    ),
+                    State = State0#{data => [], pending_bytes => 0, slice_full => Range},
+                    {continue, State};
+                _ ->
+                    State = State0#{data => [], pending_bytes => 0},
+                    {continue, State}
+            end;
         206 ->
             State = State0#{data => [], pending_bytes => 0},
             {continue, State};
@@ -720,6 +753,38 @@ handle_async(
 ) ->
     finish_async(State),
     {done, {error, Reason}};
+handle_async(
+    {gun_data, Conn, StreamRef, nofin, Data},
+    StreamRef,
+    #{
+        conn := Conn,
+        stream_ref := StreamRef,
+        slice_full := _,
+        pending_bytes := PendingBytes0,
+        data := PendingData0
+    } = State0
+) ->
+    %% Slicing a full-object 200 response: buffer every frame and never forward
+    %% partial data (the bytes would land at the wrong offset). The buffer is
+    %% sliced to the requested range at fin.
+    State = State0#{
+        data := [Data | PendingData0],
+        pending_bytes := PendingBytes0 + byte_size(Data)
+    },
+    {continue, State};
+handle_async(
+    {gun_data, Conn, StreamRef, fin, Data},
+    StreamRef,
+    #{conn := Conn, stream_ref := StreamRef, slice_full := Range, data := Data0} = State
+) ->
+    finish_async(State),
+    FullObject = iolist_to_binary(lists:reverse(Data0, [Data])),
+    case slice_range(Range, FullObject) of
+        {ok, Sliced} ->
+            {data, Sliced, done};
+        {error, _} = Err ->
+            {done, Err}
+    end;
 handle_async(
     {gun_data, Conn, StreamRef, nofin, Data},
     StreamRef,
@@ -1702,6 +1767,47 @@ slice_range_test() ->
     ?assertEqual({error, {range_not_satisfiable, {12, 15}, 10}}, slice_range({12, 15}, Data)),
     ?assertEqual({error, {range_not_satisfiable, -3, 0}}, slice_range(-3, <<>>)),
     ok.
+
+%% A Range request answered with 200 (full object) must enter slice mode so the
+%% body is buffered and sliced, not forwarded incrementally at the wrong offset.
+async_range_200_enters_slice_mode_test() ->
+    C = self(),
+    R = make_ref(),
+    State0 = #{conn => C, stream_ref => R, range => {3, 5}},
+    {continue, S} = handle_async({gun_response, C, R, nofin, 200, []}, R, State0),
+    ?assertEqual({3, 5}, maps:get(slice_full, S)),
+    ?assertEqual([], maps:get(data, S)),
+    ?assertEqual(0, maps:get(pending_bytes, S)).
+
+%% A conformant 206 streams normally: no slice mode, data forwarded as it
+%% arrives.
+async_range_206_streams_normally_test() ->
+    C = self(),
+    R = make_ref(),
+    State0 = #{conn => C, stream_ref => R, range => {3, 5}},
+    {continue, S} = handle_async({gun_response, C, R, nofin, 206, []}, R, State0),
+    ?assertNot(maps:is_key(slice_full, S)).
+
+%% A 200 to a non-range request (e.g. an upload) is normal and must not enter
+%% slice mode.
+async_non_range_200_no_slice_test() ->
+    C = self(),
+    R = make_ref(),
+    State0 = #{conn => C, stream_ref => R},
+    {continue, S} = handle_async({gun_response, C, R, nofin, 200, []}, R, State0),
+    ?assertNot(maps:is_key(slice_full, S)).
+
+%% In slice mode, body frames are buffered (prepended) and never forwarded; the
+%% slice happens at fin.
+async_slice_mode_buffers_data_test() ->
+    C = self(),
+    R = make_ref(),
+    State0 = #{
+        conn => C, stream_ref => R, slice_full => {3, 5}, data => [<<"01">>], pending_bytes => 2
+    },
+    {continue, S} = handle_async({gun_data, C, R, nofin, <<"23">>}, R, State0),
+    ?assertEqual([<<"23">>, <<"01">>], maps:get(data, S)),
+    ?assertEqual(4, maps:get(pending_bytes, S)).
 
 delete_many_body_test() ->
     ?assertEqual(
