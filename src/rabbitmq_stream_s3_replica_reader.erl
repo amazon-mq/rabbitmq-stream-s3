@@ -1605,7 +1605,6 @@ drain(
     {ok, rabbitmq_stream_s3:uid()} | {error, term()}.
 upload_fragment(Dir, StreamId, Meta) ->
     Uid = rabbitmq_stream_s3:uid(),
-    Spans = maps:get(spans, Meta),
     Size = maps:get(size, Meta),
     NumChunks = maps:get(num_chunks, Meta),
     FirstOffset = maps:get(first_offset, Meta),
@@ -1616,15 +1615,57 @@ upload_fragment(Dir, StreamId, Meta) ->
 
     maybe
         {ok, Stream0} ?= rabbitmq_stream_s3_api:stream_put(Key, ContentLength, #{}),
-        Header = <<"OSIF", ?FRAGMENT_VERSION:32/unsigned>>,
-        Stream1 = rabbitmq_stream_s3_api:stream_data(Stream0, Header),
-        Crc0 = erlang:crc32(Header),
-        {ok, Stream2, Crc1} ?= stream_spans(Stream1, Crc0, Dir, Spans),
-        IdxRecords = maps:get(index_records, Meta),
-        Stream3 = rabbitmq_stream_s3_api:stream_data(Stream2, IdxRecords),
-        Crc = erlang:crc32(Crc1, IdxRecords),
+        %% From here Stream0 owns a pooled connection and the active-request
+        %% gauge (acquired by stream_put). stream_finish releases them on its
+        %% own paths, but if streaming the body fails first (e.g. a segment was
+        %% deleted by local retention between the drain and this pread, so the
+        %% open/pread returns an error) stream_finish is never reached and both
+        %% would leak. stream_body/3 aborts the request on any such failure, so
+        %% by the time it returns {ok, ...} the only remaining release is the
+        %% stream_finish below.
+        {ok, Stream3, Crc} ?= stream_body(Stream0, Dir, Meta),
         ok ?= rabbitmq_stream_s3_api:stream_finish(Stream3, Crc),
         {ok, Uid}
+    end.
+
+%% Stream the fragment header, segment-span bodies, and index records into the
+%% open PUT identified by Stream0. Returns the final stream handle and CRC ready
+%% for stream_finish, or {error, _} after aborting the request (releasing the
+%% connection and active-request gauge that stream_put acquired). Every failure
+%% here happens before stream_finish, so aborting is unconditionally correct and
+%% cannot double-release.
+-spec stream_body(
+    rabbitmq_stream_s3_api:async_state(),
+    directory(),
+    rabbitmq_stream_s3_fragment_assembly:fragment_meta()
+) ->
+    {ok, rabbitmq_stream_s3_api:async_state(), non_neg_integer()} | {error, term()}.
+stream_body(Stream0, Dir, Meta) ->
+    Spans = maps:get(spans, Meta),
+    IdxRecords = maps:get(index_records, Meta),
+    Header = <<"OSIF", ?FRAGMENT_VERSION:32/unsigned>>,
+    Result =
+        try
+            Stream1 = rabbitmq_stream_s3_api:stream_data(Stream0, Header),
+            Crc0 = erlang:crc32(Header),
+            case stream_spans(Stream1, Crc0, Dir, Spans) of
+                {ok, Stream2, Crc1} ->
+                    Stream3 = rabbitmq_stream_s3_api:stream_data(Stream2, IdxRecords),
+                    Crc = erlang:crc32(Crc1, IdxRecords),
+                    {ok, Stream3, Crc};
+                {error, _} = Err ->
+                    Err
+            end
+        catch
+            Class:Reason ->
+                {error, {upload_body_crashed, Class, Reason}}
+        end,
+    case Result of
+        {ok, _, _} ->
+            Result;
+        {error, _} = Error ->
+            rabbitmq_stream_s3_api:stream_abort(Stream0),
+            Error
     end.
 
 stream_spans(Stream, Crc, _Dir, []) ->

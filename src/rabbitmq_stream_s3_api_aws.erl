@@ -23,6 +23,7 @@ A wrapper around the AWS S3 HTTP API.
     stream_put/3,
     stream_data/2,
     stream_finish/2,
+    stream_abort/1,
     delete/2,
     list/3,
     match_async/3,
@@ -462,6 +463,17 @@ stream_finish(
 send_chunk(Conn, StreamRef, Chunk) when is_binary(Chunk) ->
     Size = byte_size(Chunk),
     gun:data(Conn, StreamRef, nofin, [integer_to_binary(Size, 16), <<"\r\n">>, Chunk, <<"\r\n">>]).
+
+-spec stream_abort(async_state()) -> ok.
+stream_abort(#{conn := Conn} = State) ->
+    %% The streaming PUT body was only partially sent, so this HTTP/1.1
+    %% connection is mid-request and cannot be reused. Close it (the pool's
+    %% 'DOWN' handler removes it and opens a replacement) and release the
+    %% active-request gauge without checking the connection back in. Mirrors
+    %% the timeout/cancel path; the half-sent PUT never reaches S3 as an
+    %% object, so nothing is left behind except an orphan at most.
+    gun:close(Conn),
+    finish_async_close(State).
 
 -doc "Deletes the given key or list of keys".
 -spec delete(key() | [key()], request_opts()) ->
