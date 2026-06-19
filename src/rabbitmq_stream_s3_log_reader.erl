@@ -217,7 +217,13 @@ resolve_remote_location(Offset, #{name := StreamId, shared := Shared}) when
             ),
             case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
                 undefined ->
-                    {local, next};
+                    %% No remote manifest is cached: a cold or not-yet-synced
+                    %% cache, or genuinely no remote tier. The requested offset
+                    %% is below the local floor, so emulate osiris_log and attach
+                    %% at the local first offset. Returning {local, next} here
+                    %% would attach at the tail and silently skip all local (and
+                    %% any remote) data the consumer asked for.
+                    {local, first};
                 #manifest{first_offset = FirstOffset} when Offset < FirstOffset ->
                     %% Emulate osiris_log's behavior: attach at the beginning
                     %% of the stream.
@@ -1053,6 +1059,30 @@ read(RemoteReader, Offset, Bytes, Hint, Attempt) ->
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
+
+%% A subscription by offset below the local floor, when no remote manifest is
+%% cached (a cold/not-yet-synced cache), must fall back to the local first
+%% offset, not the tail. Attaching at the tail ({local, next}) silently skips
+%% every record the consumer asked for.
+resolve_below_floor_cold_cache_falls_back_to_first_test_() ->
+    {setup,
+        fun() ->
+            {ok, Pid} = rabbitmq_stream_s3_manifest_replica:start_link(),
+            unlink(Pid),
+            Pid
+        end,
+        fun(Pid) -> gen_server:stop(Pid) end, fun(_) ->
+            Shared = osiris_log_shared:new(),
+            ok = osiris_log_shared:set_first_chunk_id(Shared, 100),
+            Config = #{name => <<"cold-stream">>, shared => Shared},
+            [
+                %% Below the local floor, cold cache: fall back to local first.
+                ?_assertEqual({local, first}, resolve_remote_location(5, Config)),
+                %% At/above the local floor: local reader at the offset (no
+                %% cache needed), unaffected by this change.
+                ?_assertEqual({local, 150}, resolve_remote_location(150, Config))
+            ]
+        end}.
 
 find_fragment_test() ->
     Ts = erlang:system_time(millisecond),
