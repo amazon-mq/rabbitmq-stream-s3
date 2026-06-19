@@ -34,6 +34,7 @@ all() ->
         persist_failed_not_found_zero_revision_reinitializes,
         persist_failed_transient_retries,
         transfer_failed_retriable_resubmits,
+        transfer_failed_status_map_retriable_resubmits,
         transfer_failed_fatal_retries_no_gap,
         fatal_failure_does_not_drain_subsequent,
         fatal_failure_retry_then_complete_no_gap,
@@ -304,7 +305,19 @@ persist_failed_transient_retries(_Config) ->
 transfer_failed_retriable_resubmits(_Config) ->
     {S0, _} = init_core(),
     {S1, Ref, _} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(0, 100), S0),
-    {_S2, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(Ref, {http, 503}, S1),
+    %% slow_down is the S3 API layer's term for a 503 (the real shape; the old
+    %% {http, 503} term was never constructed by any code).
+    {_S2, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(Ref, slow_down, S1),
+    ?assertMatch([{resubmit_transfer, Ref, _, _, _}], Effects).
+
+transfer_failed_status_map_retriable_resubmits(_Config) ->
+    %% A non-special-cased transient status arrives as #{status => _}; a 5xx
+    %% must be treated as retriable.
+    {S0, _} = init_core(),
+    {S1, Ref, _} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(0, 100), S0),
+    {_S2, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(
+        Ref, #{status => 504, headers => []}, S1
+    ),
     ?assertMatch([{resubmit_transfer, Ref, _, _, _}], Effects).
 
 transfer_failed_fatal_retries_no_gap(_Config) ->
@@ -858,9 +871,10 @@ group_upload_failed_retriable_retries(_Config) ->
         S0,
         lists:seq(0, Threshold - 1)
     ),
-    %% Retriable failure re-emits upload_group.
+    %% Retriable failure re-emits upload_group. internal_error is the API
+    %% layer's term for a 500 (the real shape).
     {_S2, Effects} = rabbitmq_stream_s3_replica_reader_core:group_upload_failed(
-        {http, 503}, S1
+        internal_error, S1
     ),
     UploadGroups = [E || {upload_group, _, _, _, _, _} = E <- Effects],
     ?assertMatch([_], UploadGroups).
@@ -875,9 +889,10 @@ group_upload_failed_fatal_abandons(_Config) ->
         S0,
         lists:seq(0, Threshold - 1)
     ),
-    %% Fatal failure abandons rebalance and allows persist to proceed.
+    %% Fatal failure abandons rebalance and allows persist to proceed. A 403
+    %% arrives as #{status => 403}; it is not in the retriable set.
     {_S2, Effects} = rabbitmq_stream_s3_replica_reader_core:group_upload_failed(
-        {http, 403}, S1
+        #{status => 403, headers => []}, S1
     ),
     %% No upload_group retry, but persist should fire (threshold met).
     UploadGroups = [E || {upload_group, _, _, _, _, _} = E <- Effects],
