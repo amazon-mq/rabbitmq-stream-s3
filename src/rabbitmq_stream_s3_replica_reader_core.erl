@@ -404,7 +404,12 @@ group_upload_complete(
     %% Check for recursive rebalancing (e.g. too many groups → kilo-group).
     {State2, RebalanceEffects} = maybe_start_rebalance(State1),
     {State3, PersistEffects} = maybe_start_persist(State2),
-    {State3, RebalanceEffects ++ PersistEffects}.
+    %% Re-arm the persist timer if this rebalance edit left the manifest below
+    %% the persist threshold and no persist/rebalance fired. Otherwise the edit
+    %% sits unpersisted until the next publish. Same guard as
+    %% drain_completions/1.
+    TimerEffects = rearm_persist_timer_if_pending(PersistEffects, State3),
+    {State3, RebalanceEffects ++ PersistEffects ++ TimerEffects}.
 
 -doc """
 A group upload failed. On retriable errors, re-emit the upload effect.
@@ -454,7 +459,12 @@ retention_complete(Edit, #state{manifest = Manifest0} = State0) ->
     %% shrank the root, so this usually finds nothing to do.
     {State2, RebalanceEffects} = maybe_start_rebalance(State1),
     {State3, PersistEffects} = maybe_start_persist(State2),
-    {State3, RebalanceEffects ++ PersistEffects}.
+    %% Re-arm the persist timer if the retention edit left the manifest below
+    %% the persist threshold and no persist/rebalance fired. Otherwise the edit
+    %% sits unpersisted until the next publish. Same guard as
+    %% drain_completions/1.
+    TimerEffects = rearm_persist_timer_if_pending(PersistEffects, State3),
+    {State3, RebalanceEffects ++ PersistEffects ++ TimerEffects}.
 
 -doc """
 A retention evaluation finished without producing an edit: it either failed
@@ -498,13 +508,7 @@ drain_completions(#state{in_flight = Q, pending_completions = PC} = State0) ->
                     %% a timer is running so the tick will flush them. Without
                     %% this, bytes can sit in the persist stage indefinitely
                     %% when publishing stops and the threshold is not met.
-                    TimerEffects =
-                        case CommitEffects of
-                            [] when State5#state.since_persist > 0 ->
-                                [{start_persist_timer, (State5#state.cfg)#cfg.persist_interval_ms}];
-                            _ ->
-                                []
-                        end,
+                    TimerEffects = rearm_persist_timer_if_pending(CommitEffects, State5),
                     {State5, Effects ++ RebalanceEffects ++ CommitEffects ++ TimerEffects}
             end;
         empty ->
@@ -557,6 +561,22 @@ apply_fragment(
         since_persist = N + 1,
         edits_since_persist = [Edit1 | Edits]
     }.
+
+%% Arm the persist timer when edits are pending (since_persist > 0) but no
+%% persist started, so an idle stream still flushes them via tick/1. Every
+%% edit-producing path needs this guard: drain_completions/1 (fragment
+%% appends), group_upload_complete/2 (rebalance edits), and retention_complete/2
+%% (retention edits). Without it, a completion that leaves the manifest below
+%% persist_threshold strands the edit unpersisted until the next publish, which
+%% on a low-throughput stream may never come (the uploaded fragments are then
+%% not durably referenced). The start_persist_timer effect replaces any running
+%% timer, so re-arming is idempotent.
+-spec rearm_persist_timer_if_pending([core_effect()], state()) -> [core_effect()].
+rearm_persist_timer_if_pending(PersistEffects, #state{since_persist = N, cfg = Cfg}) ->
+    case PersistEffects of
+        [] when N > 0 -> [{start_persist_timer, Cfg#cfg.persist_interval_ms}];
+        _ -> []
+    end.
 
 -spec maybe_start_persist(state()) -> {state(), [core_effect()]}.
 maybe_start_persist(#state{persist_in_flight = true} = State) ->
