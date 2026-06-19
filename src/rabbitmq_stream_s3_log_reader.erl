@@ -809,7 +809,8 @@ find_position(Spec, #manifest{} = Manifest, StreamId) ->
     %% Download the index from the fragment to find the exact chunk position.
     IdxStartPos = ?SEGMENT_HEADER_B + Size,
     case index_data(StreamId, FragmentOffset, Uid, IdxStartPos) of
-        {ok, IndexData} ->
+        {ok, IndexData} when byte_size(IndexData) >= ?INDEX_RECORD_B ->
+            warn_on_partial_index(StreamId, FragmentOffset, IndexData),
             {ChunkId, _, FragPos} = find_index_position(IndexData, Spec),
             %% Position within the fragment object (after the 8-byte header).
             Position = ?SEGMENT_HEADER_B + FragPos,
@@ -825,9 +826,52 @@ find_position(Spec, #manifest{} = Manifest, StreamId) ->
                 fragment_ref = FragRef,
                 iterator = Iterator1
             }};
+        {ok, IndexData} ->
+            %% The index region read back with fewer than one full record, for
+            %% example a truncated or partially written fragment object.
+            %% Resolving a position from it would crash the reader on an empty
+            %% array, so fail loudly and let the caller surface the error.
+            ?LOG_WARNING(
+                "Empty or truncated index for stream '~ts' fragment ~b (~b bytes);"
+                " cannot resolve a remote position",
+                [StreamId, FragmentOffset, byte_size(IndexData)],
+                ?DOMAIN
+            ),
+            {error, {empty_index, FragmentOffset}};
         {error, _} = Err ->
             Err
     end.
+
+%% A well-formed index is an exact multiple of the record size. A trailing
+%% partial record is a symptom of a truncated or partially written index
+%% object. Resolution against the complete prefix still yields a valid
+%% position and forward iteration recovers the unindexed tail chunk, so this
+%% is tolerated rather than rejected, but it must not pass silently.
+-spec warn_on_partial_index(stream_id(), osiris:offset(), binary()) -> ok.
+warn_on_partial_index(StreamId, FragmentOffset, IndexData) ->
+    case partial_index_bytes(IndexData) of
+        0 ->
+            ok;
+        Trailing ->
+            ?LOG_WARNING(
+                "Index for stream '~ts' fragment ~b is ~b bytes, not a multiple"
+                " of the ~b-byte record size; resolving against ~b complete"
+                " records, ignoring ~b trailing bytes",
+                [
+                    StreamId,
+                    FragmentOffset,
+                    byte_size(IndexData),
+                    ?INDEX_RECORD_B,
+                    byte_size(IndexData) div ?INDEX_RECORD_B,
+                    Trailing
+                ],
+                ?DOMAIN
+            )
+    end.
+
+-spec partial_index_bytes(binary()) -> non_neg_integer().
+partial_index_bytes(IndexData) ->
+    byte_size(IndexData) rem ?INDEX_RECORD_B.
 
 -doc """
 Finds the manifest entry which contains the requested offset or timestamp.
@@ -1123,6 +1167,33 @@ find_index_position_test() ->
     ?assertEqual(60 * 20, FindPosition({timestamp, Ts + 1000})),
     %% For timestamps, though, we prefer the later chunk ID. Chunk 60, not 40:
     ?assertEqual(60, FindPosition({timestamp, Ts - 60 * 20 + 50})),
+    ok.
+
+find_index_position_empty_index_test() ->
+    %% An index that reads back with fewer than one full record (a truncated or
+    %% partially written fragment object) has nothing to resolve, and
+    %% find_index_position/2 crashes on it in both the offset and timestamp
+    %% paths. find_position/3 therefore guards on
+    %% byte_size(IndexData) >= ?INDEX_RECORD_B and returns {error, _} rather
+    %% than letting this reach the reader.
+    ?assertError(_, find_index_position(<<>>, {offset, 0})),
+    ?assertError(_, find_index_position(<<>>, {timestamp, 0})),
+    ok.
+
+partial_index_bytes_test() ->
+    %% A well-formed index is an exact multiple of the record size.
+    ?assertEqual(0, partial_index_bytes(<<>>)),
+    ?assertEqual(0, partial_index_bytes(<<0:(?INDEX_RECORD_B * 8)>>)),
+    ?assertEqual(0, partial_index_bytes(<<0:(?INDEX_RECORD_B * 3 * 8)>>)),
+    %% A trailing partial record reports the leftover byte count, and
+    %% warn_on_partial_index/3 tolerates it rather than failing.
+    ?assertEqual(5, partial_index_bytes(<<0:((?INDEX_RECORD_B + 5) * 8)>>)),
+    ?assertEqual(
+        ok, warn_on_partial_index(<<"s1">>, 0, <<0:((?INDEX_RECORD_B + 5) * 8)>>)
+    ),
+    ?assertEqual(
+        ok, warn_on_partial_index(<<"s1">>, 0, <<0:(?INDEX_RECORD_B * 2 * 8)>>)
+    ),
     ok.
 
 -endif.
