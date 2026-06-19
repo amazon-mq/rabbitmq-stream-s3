@@ -107,16 +107,67 @@ make_handler(delete) ->
 build_lookup(Streams) ->
     maps:fold(
         fun(StreamId, #{epoch := Epoch}, Acc) ->
-            case rabbitmq_stream_s3_manifest_replica:get_range(StreamId) of
-                {FirstOffset, _NextOffset} ->
-                    Acc#{StreamId => #{epoch => Epoch, first_offset => FirstOffset}};
-                empty ->
+            case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
+                #manifest{entries = <<>>} ->
+                    %% Empty manifest: nothing in the remote tier to compare
+                    %% against (matches the prior get_range/1 `empty` skip).
+                    Acc;
+                #manifest{first_offset = FirstOffset} = Manifest ->
+                    Acc#{StreamId => lookup_entry(StreamId, Epoch, FirstOffset, Manifest)};
+                undefined ->
                     Acc
             end
         end,
         #{},
         Streams
     ).
+
+%% Build a per-stream lookup entry. Besides the epoch and first_offset used for
+%% the offset/epoch heuristics, it records the leading group's object key (the
+%% one group below first_offset that may still be referenced) and a skip-groups
+%% flag for the conservative multi-level case. See leading_group_info/2.
+-spec lookup_entry(stream_id(), osiris:epoch(), osiris:offset(), #manifest{}) -> map().
+lookup_entry(StreamId, Epoch, FirstOffset, Manifest) ->
+    {ReferencedGroupKey, SkipGroups} = leading_group_info(StreamId, Manifest),
+    #{
+        epoch => Epoch,
+        first_offset => FirstOffset,
+        referenced_group_key => ReferencedGroupKey,
+        skip_groups => SkipGroups
+    }.
+
+%% Determine which group object, if any, must be protected from offset-based GC,
+%% and whether group deletion must be skipped entirely for the stream.
+%%
+%% Only the first root entry can be a group that sits below first_offset while
+%% still being referenced: retention advances first_offset into the leading
+%% group on partial expiry, and every later root entry begins at or above that
+%% group's coverage end. A leading level-1 group contains only fragments, so
+%% protecting that single object is sufficient (its expired fragment children
+%% are reclaimed correctly by the offset heuristic). A leading kilo-/mega-group
+%% contains nested groups whose own leading child can also straddle the floor as
+%% a separate object; identifying those requires descending the tree, so we
+%% conservatively skip all group deletion for such streams. This is rare: a
+%% kilo-group needs ~1024 groups (~1M fragments).
+-spec leading_group_info(stream_id(), #manifest{}) ->
+    {rabbitmq_stream_s3:key() | none, boolean()}.
+leading_group_info(_StreamId, #manifest{entries = <<>>}) ->
+    {none, false};
+leading_group_info(StreamId, #manifest{entries = Entries}) ->
+    ?ENTRY(Offset, _FirstTs, _LastTs, Kind, _Size, Uid, _Rest) = Entries,
+    case Kind of
+        ?MANIFEST_KIND_FRAGMENT ->
+            {none, false};
+        ?MANIFEST_KIND_GROUP ->
+            Key = rabbitmq_stream_s3:group_key(
+                StreamId, #group_ref{offset = Offset, kind = Kind, uid = Uid}
+            ),
+            {Key, false};
+        _ ->
+            %% Kilo-/mega-group: nested referenced leading groups cannot be
+            %% cheaply identified. Conservatively skip group deletion.
+            {none, true}
+    end.
 
 build_stream_lookup(StreamId, Config) ->
     %% Read the committed epoch with a strongly consistent (quorum-requiring)
@@ -140,9 +191,11 @@ build_stream_lookup(StreamId, Config) ->
                     %% what the orphaned fragments sit below. Using get_range/1
                     %% here would skip the stream and reclaim nothing.
                     case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
-                        #manifest{first_offset = FirstOffset} ->
+                        #manifest{first_offset = FirstOffset} = Manifest ->
                             {ok, #{
-                                StreamId => #{epoch => CommittedEpoch, first_offset => FirstOffset}
+                                StreamId => lookup_entry(
+                                    StreamId, CommittedEpoch, FirstOffset, Manifest
+                                )
                             }};
                         undefined ->
                             skip
@@ -209,6 +262,13 @@ classify(Key, Lookup) ->
                 _ ->
                     skip
             end;
+        {group, StreamId, Offset} ->
+            case Lookup of
+                #{StreamId := #{first_offset := FirstOffset} = Info} when Offset < FirstOffset ->
+                    classify_group(StreamId, Key, Info);
+                _ ->
+                    skip
+            end;
         {manifest, StreamId, Epoch} ->
             case Lookup of
                 #{StreamId := #{epoch := CurrentEpoch}} when Epoch < CurrentEpoch ->
@@ -225,6 +285,19 @@ classify(Key, Lookup) ->
             skip
     end.
 
+%% A group object below first_offset is an orphan and safe to delete unless it
+%% is the manifest's referenced leading group, or the stream is in conservative
+%% skip-groups mode (a leading kilo-/mega-group whose nested referenced groups
+%% cannot be cheaply identified). See leading_group_info/2.
+-spec classify_group(stream_id(), rabbitmq_stream_s3:key(), map()) ->
+    {ok, finding()} | skip.
+classify_group(_StreamId, _Key, #{skip_groups := true}) ->
+    skip;
+classify_group(_StreamId, Key, #{referenced_group_key := Key}) ->
+    skip;
+classify_group(StreamId, Key, _Info) ->
+    {ok, #{stream_id => StreamId, key => Key, reason => below_first_offset}}.
+
 %% Parse an S3 key into its components.
 %%
 %% Fragment keys: rabbitmq/stream/<StreamId>/data/<offset>.<uid>.fragment
@@ -232,6 +305,7 @@ classify(Key, Lookup) ->
 %% Manifest keys: rabbitmq/stream/<StreamId>/metadata/root.<epoch>.<uid>.manifest
 -spec parse_key(rabbitmq_stream_s3:key()) ->
     {data, stream_id(), osiris:offset()}
+    | {group, stream_id(), osiris:offset()}
     | {manifest, stream_id(), osiris:epoch()}
     | unknown.
 parse_key(<<"rabbitmq/stream/", Rest/binary>>) ->
@@ -262,8 +336,12 @@ parse_metadata_filename(StreamId, Filename) ->
         [OffsetBin, _Uid, Kind] when
             Kind =:= <<"group">> orelse Kind =:= <<"kgroup">> orelse Kind =:= <<"mgroup">>
         ->
-            %% Group objects have the same offset-based safety as fragments.
-            {data, StreamId, binary_to_integer(OffsetBin)};
+            %% Unlike fragments, a group object spans a multi-fragment range, so
+            %% offset-below-first_offset alone does not prove it is dead (a
+            %% partially-expired leading group is still referenced). classify/2
+            %% checks it against the referenced leading group; see
+            %% leading_group_info/2.
+            {group, StreamId, binary_to_integer(OffsetBin)};
         _ ->
             unknown
     end.
@@ -284,11 +362,11 @@ parse_key_fragment_zero_test() ->
 
 parse_key_group_test() ->
     Key = <<"rabbitmq/stream/s/metadata/00000000000000000500.aabbccdd.group">>,
-    ?assertEqual({data, <<"s">>, 500}, parse_key(Key)).
+    ?assertEqual({group, <<"s">>, 500}, parse_key(Key)).
 
 parse_key_kilo_group_test() ->
     Key = <<"rabbitmq/stream/s/metadata/00000000000000001000.aabbccdd.kgroup">>,
-    ?assertEqual({data, <<"s">>, 1000}, parse_key(Key)).
+    ?assertEqual({group, <<"s">>, 1000}, parse_key(Key)).
 
 %% The operator CLI path supplies no writer epoch, so the consistent read is the
 %% only guard and the sweep is permitted.
@@ -312,11 +390,100 @@ epoch_permits_sweep_uncommitted_writer_test() ->
 
 parse_key_mega_group_test() ->
     Key = <<"rabbitmq/stream/s/metadata/00000000000000005000.aabbccdd.mgroup">>,
-    ?assertEqual({data, <<"s">>, 5000}, parse_key(Key)).
+    ?assertEqual({group, <<"s">>, 5000}, parse_key(Key)).
 
 parse_key_manifest_test() ->
     Key = <<"rabbitmq/stream/my_stream/metadata/root.3.aabb0011.manifest">>,
     ?assertEqual({manifest, <<"my_stream">>, 3}, parse_key(Key)).
+
+%% Helpers for the classify/leading-group tests.
+group_entry(Offset, Kind, Uid) ->
+    ?ENTRY(Offset, 0, 0, Kind, 0, Uid).
+
+fragment_entry(Offset, Uid) ->
+    ?ENTRY(Offset, 0, 0, ?MANIFEST_KIND_FRAGMENT, 0, Uid).
+
+%% A fragment below first_offset is always dead and deletable (unchanged
+%% behaviour).
+classify_fragment_below_floor_deletes_test() ->
+    Lookup = #{<<"s">> => #{first_offset => 100, epoch => 1}},
+    Key = <<"rabbitmq/stream/s/data/00000000000000000050.0000002a.fragment">>,
+    ?assertMatch({ok, #{reason := below_first_offset}}, classify(Key, Lookup)).
+
+%% The leading group recorded as referenced must be protected even though its
+%% offset is below first_offset (the partial-expiry case).
+classify_referenced_leading_group_skipped_test() ->
+    StreamId = <<"s">>,
+    Uid = 16#aabbccdd,
+    LeadingKey = rabbitmq_stream_s3:group_key(
+        StreamId, #group_ref{offset = 50, kind = ?MANIFEST_KIND_GROUP, uid = Uid}
+    ),
+    Lookup = #{
+        StreamId => #{
+            first_offset => 100,
+            epoch => 1,
+            referenced_group_key => LeadingKey,
+            skip_groups => false
+        }
+    },
+    ?assertEqual(skip, classify(LeadingKey, Lookup)).
+
+%% A different group below first_offset (not the referenced leading one) is an
+%% orphan and deletable.
+classify_other_below_floor_group_deletes_test() ->
+    StreamId = <<"s">>,
+    LeadingKey = rabbitmq_stream_s3:group_key(
+        StreamId, #group_ref{offset = 50, kind = ?MANIFEST_KIND_GROUP, uid = 16#aabbccdd}
+    ),
+    Lookup = #{
+        StreamId => #{
+            first_offset => 100,
+            epoch => 1,
+            referenced_group_key => LeadingKey,
+            skip_groups => false
+        }
+    },
+    OtherKey = <<"rabbitmq/stream/s/metadata/00000000000000000010.00000099.group">>,
+    ?assertMatch({ok, #{reason := below_first_offset}}, classify(OtherKey, Lookup)).
+
+%% In conservative skip-groups mode (leading kilo-/mega-group) no group is
+%% deleted, but fragments still are.
+classify_skip_groups_mode_skips_all_groups_test() ->
+    StreamId = <<"s">>,
+    Lookup = #{
+        StreamId => #{
+            first_offset => 100,
+            epoch => 1,
+            referenced_group_key => none,
+            skip_groups => true
+        }
+    },
+    GroupKey = <<"rabbitmq/stream/s/metadata/00000000000000000010.00000099.group">>,
+    ?assertEqual(skip, classify(GroupKey, Lookup)),
+    FragKey = <<"rabbitmq/stream/s/data/00000000000000000010.00000099.fragment">>,
+    ?assertMatch({ok, #{reason := below_first_offset}}, classify(FragKey, Lookup)).
+
+%% leading_group_info: empty manifest and a leading fragment protect nothing.
+leading_group_info_none_test() ->
+    ?assertEqual({none, false}, leading_group_info(<<"s">>, #manifest{entries = <<>>})),
+    Frag = fragment_entry(0, 1),
+    ?assertEqual(
+        {none, false}, leading_group_info(<<"s">>, #manifest{entries = Frag})
+    ).
+
+%% leading_group_info: a leading level-1 group is protected by key.
+leading_group_info_group_test() ->
+    StreamId = <<"s">>,
+    Entries = group_entry(50, ?MANIFEST_KIND_GROUP, 16#aabbccdd),
+    Expected = rabbitmq_stream_s3:group_key(
+        StreamId, #group_ref{offset = 50, kind = ?MANIFEST_KIND_GROUP, uid = 16#aabbccdd}
+    ),
+    ?assertEqual({Expected, false}, leading_group_info(StreamId, #manifest{entries = Entries})).
+
+%% leading_group_info: a leading kilo-group triggers conservative skip.
+leading_group_info_kilo_group_skips_test() ->
+    Entries = group_entry(50, ?MANIFEST_KIND_KILO_GROUP, 16#aabbccdd),
+    ?assertEqual({none, true}, leading_group_info(<<"s">>, #manifest{entries = Entries})).
 
 parse_key_manifest_epoch_zero_test() ->
     Key = <<"rabbitmq/stream/s/metadata/root.0.aabb0011.manifest">>,
@@ -342,7 +509,7 @@ parse_key_roundtrip_group_test() ->
     StreamId = <<"__vhost_stream_123">>,
     Ref = #group_ref{offset = 999, kind = ?MANIFEST_KIND_GROUP, uid = 16#11223344},
     Key = rabbitmq_stream_s3:group_key(StreamId, Ref),
-    ?assertEqual({data, StreamId, 999}, parse_key(Key)).
+    ?assertEqual({group, StreamId, 999}, parse_key(Key)).
 
 classify_fragment_below_first_offset_test() ->
     Lookup = #{<<"s">> => #{epoch => 5, first_offset => 200}},
