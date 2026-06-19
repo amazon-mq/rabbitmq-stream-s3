@@ -22,7 +22,15 @@ all() ->
         kilo_group_max_bytes,
         kilo_group_full_consumption,
         mega_group_retention,
-        multi_tier_idempotent
+        multi_tier_idempotent,
+        apply_edit_appends_in_order,
+        apply_edit_truncates_from_front,
+        apply_edit_rejects_stale_append,
+        apply_edit_rejects_gap_append,
+        apply_edit_rejects_unaligned_pos,
+        apply_edit_rejects_out_of_bounds_replace,
+        apply_edit_rejects_nonzero_pos_truncate,
+        apply_edit_rejects_negative_total_size
     ].
 
 init_per_suite(Config) -> Config.
@@ -162,8 +170,132 @@ multi_tier_idempotent(_Config) ->
     ?assert(M2#manifest.first_offset >= M1#manifest.first_offset).
 
 %% ------------------------------------------------------------------
+%% apply_edit/2 trust-boundary hardening
+%% ------------------------------------------------------------------
+%%
+%% apply_edit/2 raises on a structurally inconsistent edit so the replica cache
+%% can catch it and resync rather than silently corrupt its entries array or
+%% crash the per-node cache shared by every stream.
+
+apply_edit_appends_in_order(_Config) ->
+    M0 = mk_manifest([0], 100),
+    Edit = append_edit(1, 100, byte_size(M0#manifest.entries)),
+    M1 = rabbitmq_stream_s3_manifest:apply_edit(Edit, M0),
+    ?assertEqual(2 * ?ENTRY_B, byte_size(M1#manifest.entries)),
+    ?assertEqual(200, M1#manifest.total_size),
+    ?assertEqual(2, M1#manifest.next_offset).
+
+apply_edit_truncates_from_front(_Config) ->
+    M0 = mk_manifest([0, 1], 200),
+    Edit = #edit{
+        first_offset = 1,
+        first_timestamp = 10,
+        first_last_timestamp = 11,
+        next_offset = undefined,
+        size = -100,
+        entries = <<>>,
+        pos = 0,
+        len = ?ENTRY_B
+    },
+    M1 = rabbitmq_stream_s3_manifest:apply_edit(Edit, M0),
+    ?assertEqual(?ENTRY_B, byte_size(M1#manifest.entries)),
+    ?assertEqual(100, M1#manifest.total_size).
+
+%% The double-apply shape: an append whose Pos is short of the array end
+%% because this replica already applied it. Must be rejected, not spliced in.
+apply_edit_rejects_stale_append(_Config) ->
+    M0 = mk_manifest([0, 1], 200),
+    Stale = append_edit(2, 100, ?ENTRY_B),
+    ?assertError(_, rabbitmq_stream_s3_manifest:apply_edit(Stale, M0)).
+
+%% An append whose Pos is past the array end (this replica missed edits).
+apply_edit_rejects_gap_append(_Config) ->
+    M0 = mk_manifest([0], 100),
+    Ahead = append_edit(1, 100, 3 * ?ENTRY_B),
+    ?assertError(_, rabbitmq_stream_s3_manifest:apply_edit(Ahead, M0)).
+
+apply_edit_rejects_unaligned_pos(_Config) ->
+    M0 = mk_manifest([0], 100),
+    Edit = (append_edit(1, 100, 0))#edit{pos = 1},
+    ?assertError(_, rabbitmq_stream_s3_manifest:apply_edit(Edit, M0)).
+
+apply_edit_rejects_out_of_bounds_replace(_Config) ->
+    M0 = mk_manifest([0], 100),
+    Edit = #edit{
+        first_offset = 0,
+        first_timestamp = 0,
+        first_last_timestamp = 1,
+        next_offset = undefined,
+        size = 0,
+        entries = frag_entry(9),
+        pos = 0,
+        len = 2 * ?ENTRY_B
+    },
+    ?assertError(_, rabbitmq_stream_s3_manifest:apply_edit(Edit, M0)).
+
+apply_edit_rejects_nonzero_pos_truncate(_Config) ->
+    M0 = mk_manifest([0, 1], 200),
+    Edit = #edit{
+        first_offset = 0,
+        first_timestamp = 0,
+        first_last_timestamp = 1,
+        next_offset = undefined,
+        size = -100,
+        entries = <<>>,
+        pos = ?ENTRY_B,
+        len = ?ENTRY_B
+    },
+    ?assertError(_, rabbitmq_stream_s3_manifest:apply_edit(Edit, M0)).
+
+apply_edit_rejects_negative_total_size(_Config) ->
+    M0 = mk_manifest([0], 50),
+    Edit = #edit{
+        first_offset = 1,
+        first_timestamp = 10,
+        first_last_timestamp = 11,
+        next_offset = undefined,
+        size = -100,
+        entries = <<>>,
+        pos = 0,
+        len = ?ENTRY_B
+    },
+    ?assertError(_, rabbitmq_stream_s3_manifest:apply_edit(Edit, M0)).
+
+%% ------------------------------------------------------------------
 %% Helpers
 %% ------------------------------------------------------------------
+
+%% A fragment entry (?ENTRY_B bytes) at the given offset, 100 bytes of data.
+frag_entry(Offset) ->
+    FirstTs = Offset * 10,
+    LastTs = FirstTs + 1,
+    Uid = Offset + 1,
+    ?ENTRY(Offset, FirstTs, LastTs, ?MANIFEST_KIND_FRAGMENT, 100, Uid).
+
+%% A flat manifest of fragment entries at the given offsets.
+mk_manifest(Offsets, TotalSize) ->
+    Entries = iolist_to_binary([frag_entry(O) || O <- Offsets]),
+    #manifest{
+        first_offset = hd(Offsets),
+        first_timestamp = hd(Offsets) * 10,
+        first_last_timestamp = hd(Offsets) * 10 + 1,
+        next_offset = lists:last(Offsets) + 1,
+        total_size = TotalSize,
+        entries = Entries
+    }.
+
+%% An append edit adding one fragment at Offset with Size bytes, landing at Pos.
+append_edit(Offset, Size, Pos) ->
+    #edit{
+        first_offset = 0,
+        first_timestamp = 0,
+        first_last_timestamp = 1,
+        next_offset = Offset + 1,
+        size = Size,
+        entries = frag_entry(Offset),
+        pos = Pos,
+        len = 0
+    }.
 
 %% A manifest whose root is a single group of four fragments F1..F4 at offsets
 %% 0/100/200/300, each 100 bytes, last_ts 1000/2000/3000/4000. build_manifest's

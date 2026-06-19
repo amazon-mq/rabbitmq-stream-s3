@@ -180,17 +180,20 @@ handle_call(
         {LastSeq, Epoch, _} when Seq =:= LastSeq + 1 ->
             case ets:lookup(?TABLE, StreamId) of
                 [{_, Manifest0}] ->
-                    Manifest = lists:foldl(
-                        fun(Edit, Acc) -> rabbitmq_stream_s3_manifest:apply_edit(Edit, Acc) end,
-                        Manifest0,
-                        Edits
-                    ),
-                    write_manifest(StreamId, Manifest),
-                    maybe_evaluate_retention(StreamId, Manifest0, Manifest, State);
+                    case apply_edits_catching(StreamId, Edits, Manifest0) of
+                        {ok, Manifest} ->
+                            write_manifest(StreamId, Manifest),
+                            maybe_evaluate_retention(StreamId, Manifest0, Manifest, State),
+                            {reply, ok, State#state{
+                                seqs = Seqs#{StreamId => {Seq, Epoch, WriterNode}}
+                            }};
+                        {error, _} ->
+                            request_resync(StreamId, WriterNode),
+                            {reply, {error, apply_failed}, State}
+                    end;
                 [] ->
-                    ok
-            end,
-            {reply, ok, State#state{seqs = Seqs#{StreamId => {Seq, Epoch, WriterNode}}}};
+                    {reply, ok, State#state{seqs = Seqs#{StreamId => {Seq, Epoch, WriterNode}}}}
+            end;
         _ ->
             request_resync(StreamId, WriterNode),
             {reply, {error, gap}, State}
@@ -199,10 +202,14 @@ handle_call({apply_edit, StreamId, Edit}, _From, State) ->
     Reply =
         case ets:lookup(?TABLE, StreamId) of
             [{_, Manifest0}] ->
-                Manifest = rabbitmq_stream_s3_manifest:apply_edit(Edit, Manifest0),
-                write_manifest(StreamId, Manifest),
-                maybe_evaluate_retention(StreamId, Manifest0, Manifest, State),
-                ok;
+                case apply_edits_catching(StreamId, [Edit], Manifest0) of
+                    {ok, Manifest} ->
+                        write_manifest(StreamId, Manifest),
+                        maybe_evaluate_retention(StreamId, Manifest0, Manifest, State),
+                        ok;
+                    {error, _} = Err ->
+                        Err
+                end;
             [] ->
                 {error, not_found}
         end,
@@ -223,9 +230,16 @@ handle_cast({put_manifest, StreamId, Manifest}, State) ->
 handle_cast({apply_edit, StreamId, Edit}, State) ->
     case ets:lookup(?TABLE, StreamId) of
         [{_, Manifest0}] ->
-            Manifest = rabbitmq_stream_s3_manifest:apply_edit(Edit, Manifest0),
-            write_manifest(StreamId, Manifest),
-            maybe_evaluate_retention(StreamId, Manifest0, Manifest, State);
+            case apply_edits_catching(StreamId, [Edit], Manifest0) of
+                {ok, Manifest} ->
+                    write_manifest(StreamId, Manifest),
+                    maybe_evaluate_retention(StreamId, Manifest0, Manifest, State);
+                {error, _} ->
+                    %% No writer node on this path to resync from; keep the last
+                    %% good manifest and leave recovery to the next broadcast
+                    %% gap or sync.
+                    ok
+            end;
         [] ->
             ok
     end,
@@ -239,17 +253,26 @@ handle_cast({apply_edits, StreamId, Edits, Seq, Epoch, WriterNode}, #state{seqs 
             %% In sequence: apply edits.
             case ets:lookup(?TABLE, StreamId) of
                 [{_, Manifest0}] ->
-                    Manifest = lists:foldl(
-                        fun(Edit, Acc) -> rabbitmq_stream_s3_manifest:apply_edit(Edit, Acc) end,
-                        Manifest0,
-                        Edits
-                    ),
-                    write_manifest(StreamId, Manifest),
-                    maybe_evaluate_retention(StreamId, Manifest0, Manifest, State);
+                    case apply_edits_catching(StreamId, Edits, Manifest0) of
+                        {ok, Manifest} ->
+                            write_manifest(StreamId, Manifest),
+                            maybe_evaluate_retention(StreamId, Manifest0, Manifest, State),
+                            {noreply, State#state{
+                                seqs = Seqs#{StreamId => {Seq, Epoch, WriterNode}}
+                            }};
+                        {error, _} ->
+                            %% The edit is structurally inconsistent with this
+                            %% replica's manifest: it has diverged (or the edit
+                            %% is malformed). Don't apply a corrupt edit or crash
+                            %% the per-node cache shared by every stream - keep
+                            %% the last good manifest, leave the sequence
+                            %% unadvanced, and force a full resync.
+                            request_resync(StreamId, WriterNode),
+                            {noreply, State}
+                    end;
                 [] ->
-                    ok
-            end,
-            {noreply, State#state{seqs = Seqs#{StreamId => {Seq, Epoch, WriterNode}}}};
+                    {noreply, State#state{seqs = Seqs#{StreamId => {Seq, Epoch, WriterNode}}}}
+            end;
         _ ->
             %% Gap or epoch mismatch: request re-sync from writer.
             request_resync(StreamId, WriterNode),
@@ -270,6 +293,34 @@ terminate(_Reason, _State) ->
 
 write_manifest(StreamId, Manifest) ->
     ets:insert(?TABLE, {StreamId, Manifest}).
+
+%% Apply a batch of edits, catching any failure from apply_edit/2. apply_edit/2
+%% raises on a structurally inconsistent edit (a gap, a diverged replica, or a
+%% malformed edit). This per-node process owns the manifest cache for every
+%% stream on the node, so an uncaught crash here would destroy all of them;
+%% isolate the failure to the one stream instead and let the caller request a
+%% resync. The original manifest is returned untouched on failure (we never
+%% write a partially-applied or corrupt manifest).
+-spec apply_edits_catching(stream_id(), [#edit{}], #manifest{}) ->
+    {ok, #manifest{}} | {error, term()}.
+apply_edits_catching(StreamId, Edits, Manifest0) ->
+    try
+        {ok,
+            lists:foldl(
+                fun(Edit, Acc) -> rabbitmq_stream_s3_manifest:apply_edit(Edit, Acc) end,
+                Manifest0,
+                Edits
+            )}
+    catch
+        Class:Reason ->
+            ?LOG_WARNING(
+                "Manifest replica for stream ~ts could not apply an edit "
+                "(~ts:~p); keeping the last good manifest and resyncing",
+                [StreamId, Class, Reason],
+                #{domain => ?RMQLOG_DOMAIN_STREAM_S3}
+            ),
+            {error, {Class, Reason}}
+    end.
 
 %% A sync is a full manifest reset tagged with the writer's epoch and sequence.
 %% Casts from different writer nodes can be reordered, so a delayed sync from a

@@ -90,25 +90,45 @@ apply_edit(
         entries = Entries0
     } = Manifest0
 ) ->
+    Size0 = byte_size(Entries0),
+    %% apply_edit/2 is a trust boundary: on a replica it applies edits that
+    %% arrived over the network, and on the writer it applies edits the core
+    %% built. The branches below are not self-validating, so a malformed or
+    %% stale edit could splice at the wrong position and silently corrupt the
+    %% ordered entries array (the shape behind the #206/replica-divergence
+    %% bugs). Assert the structural invariants up front and fail loudly
+    %% instead: the replica caller (rabbitmq_stream_s3_manifest_replica)
+    %% catches this and forces a full resync rather than serving a corrupt
+    %% manifest, and on the writer it surfaces a bug rather than persisting
+    %% corruption. Entries are fixed-size records, so every offset and length
+    %% into the array must be entry-aligned and within bounds.
+    assert_edit_well_formed(Pos, Len, byte_size(EditEntries), Size0),
     Entries =
-        if
-            %% Pure insertion (append)
-            Pos =:= byte_size(Entries0) andalso Len =:= 0 ->
-                <<Entries0/binary, EditEntries/binary>>;
-            %% No-op (empty)
-            Len =:= 0 andalso EditEntries =:= <<>> ->
+        case {Len, EditEntries} of
+            %% Metadata-only edit (e.g. retention adjusting a group's leading
+            %% offsets): the entries array does not change.
+            {0, <<>>} ->
                 Entries0;
-            %% Pure deletion (truncate)
-            EditEntries =:= <<>> ->
-                %% We only truncate from the beginning. No hole punching.
+            %% Append. The new entries must land exactly at the end. A stale or
+            %% duplicate append (this replica already applied it, so its array
+            %% is longer) has Pos < Size0 and is rejected here - which is what
+            %% turns the silent double-apply corruption into a caught
+            %% inconsistency that triggers a resync.
+            {0, _} ->
+                ?assertEqual(Size0, Pos),
+                <<Entries0/binary, EditEntries/binary>>;
+            %% Pure deletion (truncate). We only truncate from the beginning;
+            %% no hole punching.
+            {_, <<>>} ->
                 ?assertEqual(0, Pos),
-                binary:part(Entries0, Len, byte_size(Entries0) - Len);
-            %% Replacement (for rebalancing)
-            true ->
+                binary:part(Entries0, Len, Size0 - Len);
+            %% Replacement (rebalancing): replace [Pos, Pos + Len) with the new
+            %% sub-array.
+            {_, _} ->
                 <<
                     (binary:part(Entries0, 0, Pos))/binary,
                     EditEntries/binary,
-                    (binary:part(Entries0, Pos + Len, byte_size(Entries0) - Pos - Len))/binary
+                    (binary:part(Entries0, Pos + Len, Size0 - Pos - Len))/binary
                 >>
         end,
     NextOffset =
@@ -118,14 +138,35 @@ apply_edit(
             _ when is_integer(EditNextOffset) ->
                 EditNextOffset
         end,
+    TotalSize = TotalSize0 + Size,
+    %% total_size is non-negative and serialised as a u70. A duplicate or
+    %% mis-applied retention edit (whose size delta is negative) would drive it
+    %% below zero; reject that here rather than let it crash serialisation on
+    %% the writer or poison max-bytes retention / metrics on a replica.
+    ?assert(TotalSize >= 0),
     Manifest0#manifest{
         first_offset = FirstOffset,
         first_timestamp = FirstTs,
         first_last_timestamp = FirstLastTs,
         next_offset = NextOffset,
-        total_size = TotalSize0 + Size,
+        total_size = TotalSize,
         entries = Entries
     }.
+
+%% Structural invariants common to every edit shape: offsets and lengths into
+%% the entries array are non-negative, entry-aligned, and within the array. A
+%% violation means the edit does not match this manifest (a gap, a diverged
+%% replica, or a malformed edit) and is raised so the caller can recover.
+-spec assert_edit_well_formed(
+    non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer()
+) -> ok.
+assert_edit_well_formed(Pos, Len, EditLen, Size0) ->
+    ?assert(Pos >= 0 andalso Len >= 0),
+    ?assertEqual(0, Pos rem ?ENTRY_B),
+    ?assertEqual(0, Len rem ?ENTRY_B),
+    ?assertEqual(0, EditLen rem ?ENTRY_B),
+    ?assert(Pos + Len =< Size0),
+    ok.
 
 -doc """
 Returns a function that downloads group objects from S3 and returns their
