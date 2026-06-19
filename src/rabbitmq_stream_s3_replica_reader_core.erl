@@ -739,4 +739,11 @@ assert_contiguous(NextOffset, FragmentFirstOffset) ->
 is_retriable({http, 500}) -> true;
 is_retriable({http, 503}) -> true;
 is_retriable(timeout) -> true;
+%% A reader-side transfer deadline: the governor never reported a result for a
+%% submitted transfer (lost message, externally killed task, or a queued
+%% submission dropped by a governor restart). The fragment was never made
+%% durable, so retrying immediately under the same reference is both safe and
+%% correct. See rabbitmq_stream_s3_config:transfer_deadline_ms/0 and the
+%% transfer_deadline handler in rabbitmq_stream_s3_replica_reader.
+is_retriable(transfer_deadline) -> true;
 is_retriable(_) -> false.

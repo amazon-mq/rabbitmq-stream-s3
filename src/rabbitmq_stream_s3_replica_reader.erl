@@ -232,6 +232,19 @@ returned by the functional core module.
     %% shell so we can attribute bytes_transferred and decrement
     %% transfers_in_flight when the result message arrives.
     transfer_sizes = #{} :: #{reference() => non_neg_integer()},
+    %% Per in-flight transfer, a deadline timer that fires if the governor
+    %% never reports a result. A submitted transfer can fail to report back if
+    %% the governor crashes while the submission sits in its pending queue
+    %% (only when a finite rate limit is configured), if the spawned task is
+    %% killed externally (e.g. by the OOM killer) before it replies, or if the
+    %% result message is otherwise lost. In every case the in-flight queue head
+    %% never drains and the stream's uploads stall silently and permanently. On
+    %% expiry the transfer is resubmitted under the same reference through the
+    %% core's retry path (see the {transfer_deadline, ...} handler). The map
+    %% value is {TimerRef, Token}: the Token disambiguates a live deadline from
+    %% a stale timer message that fired into the mailbox in the narrow window
+    %% before its timer was cancelled.
+    transfer_deadlines = #{} :: #{reference() => {reference(), reference()}},
     %% Bytes uploaded but not yet covered by a started persist. Moves to
     %% persisting_bytes when the next start_persist effect fires.
     persist_pending_bytes = 0 :: non_neg_integer(),
@@ -499,6 +512,49 @@ handle_info({transfer_result, Ref, {error, Reason}}, #state{core = Core0} = Stat
             ),
             {noreply, execute_effects(Effects, State1#state{core = Core})}
     end;
+handle_info({transfer_deadline, Ref, Token}, #state{core = Core0} = State0) ->
+    case maps:find(Ref, State0#state.transfer_deadlines) of
+        {ok, {_TimerRef, Token}} ->
+            %% The deadline elapsed with no result for this transfer. Treat it
+            %% exactly as a lost result: account the abandoned submission off
+            %% the pipeline gauges and drop its bookkeeping (as a real error
+            %% result would via on_transfer_result/3), then drive the core's
+            %% retry path to re-upload under the same Ref. If a late original
+            %% result and the resubmit both eventually complete, the second is
+            %% discarded by the stale-Ref clause above once the first has been
+            %% accounted for; the losing upload's object is left for orphan GC.
+            ?LOG_WARNING(
+                "~ts no result for an in-flight fragment transfer within the "
+                "transfer deadline. The governor may have lost the submission "
+                "(crash with a queued item), the upload task may have been "
+                "killed before replying, or the result message was lost. "
+                "Resubmitting to keep the upload pipeline live.",
+                [(State0#state.cfg)#cfg.stream]
+            ),
+            State1 = on_transfer_result(Ref, {error, transfer_deadline}, State0),
+            case local_log_ahead(State1) of
+                {true, LocalFirst, NextOffset} ->
+                    %% Local retention trimmed past next_offset while this
+                    %% transfer was stalled, so no resubmit can ever make the
+                    %% range durable. Recover the same way a permanent upload
+                    %% failure does (see the {error, Reason} clause).
+                    {noreply,
+                        handle_local_log_ahead(
+                            LocalFirst, NextOffset, transfer_deadline, State1
+                        )};
+                false ->
+                    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(
+                        Ref, transfer_deadline, Core0
+                    ),
+                    {noreply, execute_effects(Effects, State1#state{core = Core})}
+            end;
+        _ ->
+            %% Stale timer message: the result already arrived (the timer was
+            %% cancelled but had already fired into the mailbox), or a manifest
+            %% recovery reset the in-flight bookkeeping, or this Ref now tracks
+            %% a newer deadline with a different token. Ignore it.
+            {noreply, State0}
+    end;
 handle_info({retry_transfer, Ref, Dir, Meta}, #state{cfg = #cfg{stream = StreamId}} = State) ->
     %% A previously failed fragment upload is being retried after its backoff
     %% delay. The in-flight gauges were already restored when the delayed
@@ -708,11 +764,13 @@ format_state(#state{
     cfg = #cfg{stream = StreamId, fragment_target_size = Target},
     log = Log,
     assembly = Assembly,
-    core = Core
+    core = Core,
+    transfer_deadlines = Deadlines
 }) ->
     #{
         stream => StreamId,
         fragment_target_size => Target,
+        transfer_deadlines_armed => maps:size(Deadlines),
         core =>
             case Core of
                 undefined -> undefined;
@@ -1044,7 +1102,7 @@ execute_effect(cancel_persist_timer, #state{persist_timer = Ref} = State) ->
     State#state{persist_timer = undefined};
 execute_effect(reinitialize, #state{cfg = #cfg{stream = StreamId}} = State0) ->
     ?LOG_INFO("~ts reinitializing after commit conflict", [StreamId]),
-    State1 = (close_log(State0))#state{
+    State1 = (close_log(cancel_all_transfer_deadlines(State0)))#state{
         assembly = undefined,
         transfer_sizes = #{},
         persist_pending_bytes = 0,
@@ -1471,7 +1529,7 @@ handle_local_log_ahead(
         "remote tier.",
         [StreamId, NextOffset, Reason, LocalFirst, NextOffset]
     ),
-    resolve_and_start((close_log(State0))#state{
+    resolve_and_start((close_log(cancel_all_transfer_deadlines(State0)))#state{
         assembly = undefined,
         transfer_sizes = #{},
         persist_pending_bytes = 0,
@@ -1734,36 +1792,75 @@ submit_upload(Ref, Dir, StreamId, Meta) ->
     Fun = fun() -> upload_fragment(Dir, StreamId, Meta) end,
     rabbitmq_stream_s3_governor:submit(Fun, Size, Self, Ref).
 
+%% Arm the per-transfer liveness deadline. The timer message carries a fresh
+%% Token; on expiry the {transfer_deadline, ...} handler only acts if the
+%% Token still matches the one stored for Ref, which rules out acting on a
+%% timer that fired into the mailbox just before it was cancelled.
+arm_transfer_deadline(Ref, #state{transfer_deadlines = Deadlines} = State) ->
+    Token = make_ref(),
+    Deadline = rabbitmq_stream_s3_config:transfer_deadline_ms(),
+    TimerRef = erlang:send_after(Deadline, self(), {transfer_deadline, Ref, Token}),
+    State#state{transfer_deadlines = Deadlines#{Ref => {TimerRef, Token}}}.
+
+%% Cancel and forget the liveness deadline for a single transfer. cancel_timer
+%% does not remove an already-delivered message, so a stale deadline message
+%% may still arrive; the Token check in the handler discards it.
+cancel_transfer_deadline(Ref, #state{transfer_deadlines = Deadlines} = State) ->
+    case maps:take(Ref, Deadlines) of
+        {{TimerRef, _Token}, Deadlines1} ->
+            _ = erlang:cancel_timer(TimerRef),
+            State#state{transfer_deadlines = Deadlines1};
+        error ->
+            State
+    end.
+
+%% Cancel every outstanding liveness deadline. Used by the manifest-recovery
+%% reset paths (reinitialize, local-log-ahead) that abandon all in-flight
+%% transfers; the abandoned transfers' late results and any late deadline
+%% messages are dropped by the stale-Ref / Token guards.
+cancel_all_transfer_deadlines(#state{transfer_deadlines = Deadlines} = State) ->
+    maps:foreach(fun(_Ref, {TimerRef, _Token}) -> erlang:cancel_timer(TimerRef) end, Deadlines),
+    State#state{transfer_deadlines = #{}}.
+
 %% Called from execute_effect/2 for {submit_transfer, ...}.
 on_transfer_submitted(Ref, Size, #state{transfer_sizes = Sizes} = State) ->
     inc_gauge(State, ?C_TRANSFERS_IN_FLIGHT, 1),
     %% Pipeline stage 2: bytes enter the transfer phase (governor queue
     %% or in-flight S3 PUT). Decremented in on_transfer_result.
     inc_gauge(State, ?C_BYTES_IN_TRANSFER, Size),
-    State#state{transfer_sizes = Sizes#{Ref => Size}}.
+    %% Arm the liveness deadline for this transfer. on_transfer_submitted is
+    %% the single point at which a transfer becomes outstanding (initial submit
+    %% and every resubmit), and on_transfer_result is the single point at which
+    %% it stops being outstanding, so the deadline map stays in lockstep with
+    %% transfer_sizes. Ref is always absent here (a resubmit is preceded by
+    %% on_transfer_result, which removes it), so no prior timer is leaked.
+    arm_transfer_deadline(Ref, State#state{transfer_sizes = Sizes#{Ref => Size}}).
 
 %% Called from handle_info on transfer_result. Outcome is `ok' or
 %% `{error, Reason}'.
 on_transfer_result(Ref, Outcome, #state{transfer_sizes = Sizes} = State0) ->
     case maps:take(Ref, Sizes) of
         {Size, Sizes1} ->
-            dec(State0, ?C_TRANSFERS_IN_FLIGHT, 1),
-            dec(State0, ?C_BYTES_IN_TRANSFER, Size),
+            %% The transfer reported back (or a deadline is treating it as
+            %% reported): it is no longer outstanding, so cancel its liveness
+            %% deadline in lockstep with removing it from transfer_sizes.
+            State = cancel_transfer_deadline(Ref, State0#state{transfer_sizes = Sizes1}),
+            dec(State, ?C_TRANSFERS_IN_FLIGHT, 1),
+            dec(State, ?C_BYTES_IN_TRANSFER, Size),
             case Outcome of
                 ok ->
-                    inc(State0, ?C_TRANSFERS_COMPLETED, 1),
-                    inc(State0, ?C_BYTES_TRANSFERRED, Size),
+                    inc(State, ?C_TRANSFERS_COMPLETED, 1),
+                    inc(State, ?C_BYTES_TRANSFERRED, Size),
                     %% Stage 3: bytes are now waiting for a manifest
                     %% persist to confirm them.
-                    inc_gauge(State0, ?C_BYTES_IN_PERSIST, Size),
-                    Pending = State0#state.persist_pending_bytes + Size,
-                    State0#state{
-                        transfer_sizes = Sizes1,
+                    inc_gauge(State, ?C_BYTES_IN_PERSIST, Size),
+                    Pending = State#state.persist_pending_bytes + Size,
+                    State#state{
                         persist_pending_bytes = Pending
                     };
                 {error, _} ->
-                    inc(State0, ?C_TRANSFERS_FAILED, 1),
-                    State0#state{transfer_sizes = Sizes1}
+                    inc(State, ?C_TRANSFERS_FAILED, 1),
+                    State
             end;
         error ->
             %% Should not happen but be defensive.
