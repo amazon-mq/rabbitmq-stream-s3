@@ -186,7 +186,9 @@ attach_writer(Pid) ->
     %% Seshat registers writer counters under {osiris_writer, Reference}.
     Counter = osiris_counters:fetch({osiris_writer, Reference}),
     #{epoch := Epoch} = osiris_counters:overview({osiris_writer, Reference}),
-    UserRetention = user_retention_from_queue(Reference),
+    %% Start the replica reader with no remote retention: its authoritative
+    %% value is set just below by the update_retention/2 call, whose
+    %% on_retention_updated/2 hook casts the preserved policy to the reader.
     Config = #{
         stream => StreamId,
         writer_pid => Pid,
@@ -195,7 +197,7 @@ attach_writer(Pid) ->
         counter => Counter,
         reference => Reference,
         epoch => Epoch,
-        retention => UserRetention
+        retention => []
     },
     case rabbitmq_stream_s3_replica_reader_sup:start_child(Config) of
         {ok, _} ->
@@ -211,9 +213,14 @@ attach_writer(Pid) ->
                 #{domain => ?RMQLOG_DOMAIN_STREAM_S3}
             )
     end,
-    %% Inject the local retention function into the running writer.
-    %% The hook in on_retention_updated/2 prepends {'fun', ...} automatically.
-    osiris:update_retention(Pid, UserRetention).
+    %% Inject the local-tier retention fun into the running writer while
+    %% preserving its configured max-bytes/max-age policy. Updating via a
+    %% transform reads the writer's *current* spec, so discovery neither
+    %% re-reads the policy from the queue record (which can fail transiently and
+    %% would then wipe the live policy) nor clobbers it. osiris runs
+    %% on_retention_updated/2 on the result, which re-adds exactly one fun and
+    %% casts the preserved policy to the replica reader started above.
+    osiris:update_retention(Pid, retention_transform()).
 
 attach_replica(Pid) ->
     #{name := Name, dir := Dir, shared := Shared, reference := Reference} =
@@ -235,9 +242,25 @@ attach_replica(Pid) ->
         _ ->
             ok
     end,
-    %% Inject the local retention function into the running replica.
-    UserRetention = user_retention_from_queue(Reference),
-    osiris:update_retention(Pid, UserRetention).
+    %% Inject the local-tier retention fun into the running replica while
+    %% preserving its configured policy, via the same current-spec transform
+    %% as attach_writer/1.
+    osiris:update_retention(Pid, retention_transform()).
+
+%% Transform passed to osiris:update_retention/2 on discovery re-attach. It
+%% drops any local-tier retention fun from the stream's current spec and keeps
+%% the user's max-bytes/max-age policy. osiris then runs on_retention_updated/2
+%% on the result, which re-adds exactly one fun (so funs do not accumulate
+%% across repeated discovery) and casts the preserved policy to the replica
+%% reader. Reading the policy from the stream's own current spec is why
+%% discovery no longer depends on a queue-record lookup: a transient lookup
+%% failure used to be collapsed to [], which silently wiped the configured
+%% policy and stopped local-tier offload (filling local disk).
+-spec retention_transform() -> fun(([osiris:retention_spec()]) -> [osiris:retention_spec()]).
+retention_transform() ->
+    fun(CurrentSpec) ->
+        [Spec || Spec <- CurrentSpec, element(1, Spec) =/= 'fun']
+    end.
 
 local_retention_fun(StreamId) ->
     fun(IdxFiles) ->
@@ -247,23 +270,6 @@ local_retention_fun(StreamId) ->
             empty ->
                 {[], IdxFiles}
         end
-    end.
-
-%% Derive the user-configured retention spec from the queue record.
-%% This handles both queue arguments and operator policies.
-%% Returns [] if the queue record is unavailable (e.g. in tests without
-%% a running broker, or if the queue was deleted).
-user_retention_from_queue(Reference) ->
-    try rabbit_amqqueue:lookup(Reference) of
-        {ok, Q} ->
-            case rabbit_stream_queue:update_stream_conf(Q, #{}) of
-                #{retention := Retention} -> Retention;
-                _ -> []
-            end;
-        _ ->
-            []
-    catch
-        _:_ -> []
     end.
 
 -spec eval_local_retention(IdxFiles :: [filename()], osiris:offset()) ->
