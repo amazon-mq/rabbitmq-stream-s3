@@ -420,7 +420,17 @@ handle_cast(
             {noreply, State};
         false ->
             MonRef = monitor(process, {rabbitmq_stream_s3_manifest_replica, Node}),
-            Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(Core),
+            %% Sync the *persisted* manifest, not the live one. Seq is
+            %% broadcast_seq, which only advances when a {broadcast, _} effect
+            %% runs; it therefore lags any edit applied to the live manifest but
+            %% not yet broadcast. Pairing the live manifest with the lagging seq
+            %% makes the replica cache an edit it was never told about, and the
+            %% deferred broadcast then re-delivers that edit in-sequence so the
+            %% replica double-applies it (silent, unhealable divergence: no gap
+            %% is ever observed). persisted_manifest/1 is exactly the snapshot
+            %% consistent with broadcast_seq. Do not change this back to
+            %% manifest/1.
+            Manifest = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(Core),
             rabbitmq_stream_s3_manifest_replica:sync(StreamId, Seq, Epoch, Manifest, Node),
             {noreply, State#state{replicas = Replicas#{Node => MonRef}}}
     end;
@@ -439,7 +449,9 @@ handle_cast(
         cfg = #cfg{stream = StreamId, epoch = Epoch}
     } = State
 ) ->
-    Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(Core),
+    %% Persisted manifest, not live: it must be consistent with broadcast_seq
+    %% (Seq). See the register_acceptor handler.
+    Manifest = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(Core),
     rabbitmq_stream_s3_manifest_replica:sync(StreamId, Seq, Epoch, Manifest, Node),
     {noreply, State};
 handle_cast(_Msg, State) ->
@@ -770,7 +782,9 @@ register_replica(
             State;
         false ->
             MonRef = monitor(process, {rabbitmq_stream_s3_manifest_replica, Node}),
-            Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(Core),
+            %% Persisted manifest, not live: it must be consistent with
+            %% broadcast_seq (Seq). See the register_acceptor handler.
+            Manifest = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(Core),
             rabbitmq_stream_s3_manifest_replica:sync(StreamId, Seq, Epoch, Manifest, Node),
             State#state{replicas = Replicas#{Node => MonRef}}
     end.
@@ -960,7 +974,20 @@ execute_effect(
         persist_pending_bytes = 0
     };
 execute_effect({update_range, _FirstOffset, _NextOffset}, #state{cfg = Cfg, core = Core} = State) ->
-    Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(Core),
+    %% Publish the *persisted* manifest, not the live one. This effect is
+    %% emitted by persist_complete, and the cache + range table it updates gate
+    %% local retention (get_range reads next_offset). Persist runs in a spawned
+    %% task, so more completions can advance the live manifest past what is
+    %% durably committed in Khepri while the persist is in flight. Publishing
+    %% the live manifest here would let local retention reclaim segments
+    %% covering offsets that are not yet durable; a crash before the next
+    %% persist then loses those offsets from both tiers (the #206 durability
+    %% hole). persisted_manifest/1 is the manifest that was just committed; its
+    %% first/next offsets equal the _FirstOffset/_NextOffset this effect carries
+    %% by construction (persist_complete sets last_persisted_manifest and emits
+    %% these offsets in the same batch), so the carried offsets are redundant
+    %% and intentionally ignored. Do not change this back to manifest/1.
+    Manifest = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(Core),
     ok = rabbitmq_stream_s3_manifest_replica:put_manifest(Cfg#cfg.stream, Manifest),
     on_persist_completed(Manifest, State);
 execute_effect(
