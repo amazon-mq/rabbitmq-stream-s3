@@ -68,6 +68,7 @@ all() ->
         retention_edit_broadcast_on_persist_complete,
         retention_failed_clears_flag,
         pending_prefix_rewrite_reports_blocker,
+        retention_failed_rearms_persist,
         persist_failed_during_rebalance_retries_after,
         recursive_rebalance_three_levels_deep,
         multiple_persist_conflicts_reinitialize,
@@ -1115,18 +1116,48 @@ pending_prefix_rewrite_reports_blocker(_Config) ->
     ?assertEqual(rebalance, rabbitmq_stream_s3_replica_reader_core:pending_prefix_rewrite(S4)).
 
 retention_failed_clears_flag(_Config) ->
-    %% After retention_failed, persist should be unblocked.
+    %% After retention_failed clears the in-flight flag, a time-based tick can
+    %% persist again. Uses a persist_threshold above the pending count so the
+    %% persist is not count-triggered by retention_failed itself (that path is
+    %% covered by retention_failed_rearms_persist); here we pin that the flag is
+    %% cleared so the subsequent tick is no longer suppressed.
+    {S0, _} = init_core(#{persist_threshold => 3}),
+    %% Establish a persisted baseline: three fragments hit the threshold.
+    S1 = cut_and_complete(S0, 0, 100, 1001),
+    S2 = cut_and_complete(S1, 100, 200, 1002),
+    S3 = cut_and_complete(S2, 200, 300, 1003),
+    {S4, _} = rabbitmq_stream_s3_replica_reader_core:persist_complete(1, S3),
+    %% Mark retention started, then apply one fragment (since_persist = 1 < 3).
+    S5 = rabbitmq_stream_s3_replica_reader_core:retention_started(S4),
+    S6 = cut_and_complete(S5, 300, 400, 1004),
+    %% Retention fails. The threshold is not met, so no persist starts yet, but
+    %% the flag is cleared so a tick is no longer a no-op.
+    {S7, FailEffects} = rabbitmq_stream_s3_replica_reader_core:retention_failed(timeout, S6),
+    ?assertEqual([], [E || {start_persist, _, _, _, _, _} = E <- FailEffects]),
+    %% Tick should trigger persist (since_persist > 0, interval elapsed).
+    Now = erlang:system_time(millisecond) + 10000,
+    {_S8, Effects} = rabbitmq_stream_s3_replica_reader_core:tick(Now, S7),
+    Persists = [E || {start_persist, _, _, _, _, _} = E <- Effects],
+    ?assertMatch([_], Persists).
+
+retention_failed_rearms_persist(_Config) ->
+    %% A fragment that completes while retention is in flight has its persist
+    %% deferred and the one-shot persist timer it would rely on is consumed by a
+    %% no-op tick. retention_failed/2 must itself re-evaluate persist when it
+    %% clears the flag, otherwise the pending fragment is stranded unpersisted
+    %% on an idle stream until the next publish. This pins that retention_failed
+    %% emits the persist directly, without depending on a later tick.
     {S0, _} = init_core(#{persist_threshold => 1}),
     S1 = cut_and_complete(S0, 0, 100, 1001),
     {S2, _} = rabbitmq_stream_s3_replica_reader_core:persist_complete(1, S1),
-    %% Mark retention started, then apply a fragment.
+    %% Retention starts, then a fragment completes during the in-flight window.
     S3 = rabbitmq_stream_s3_replica_reader_core:retention_started(S2),
-    S4 = cut_and_complete(S3, 100, 200, 1002),
-    %% Retention fails. Persist should now be possible.
-    {S5, _} = rabbitmq_stream_s3_replica_reader_core:retention_failed(timeout, S4),
-    %% Tick should trigger persist (since_persist > 0, interval elapsed).
-    Now = erlang:system_time(millisecond) + 10000,
-    {_S6, Effects} = rabbitmq_stream_s3_replica_reader_core:tick(Now, S5),
+    {S4, DeferEffects} = cut_and_complete_effects(S3, 100, 200, 1002),
+    %% Persist was deferred while retention was in flight.
+    ?assertEqual([], [E || {start_persist, _, _, _, _, _} = E <- DeferEffects]),
+    %% Retention fails. With a pending fragment and threshold=1, persist must
+    %% start now, from retention_failed itself.
+    {_S5, Effects} = rabbitmq_stream_s3_replica_reader_core:retention_failed(timeout, S4),
     Persists = [E || {start_persist, _, _, _, _, _} = E <- Effects],
     ?assertMatch([_], Persists).
 
