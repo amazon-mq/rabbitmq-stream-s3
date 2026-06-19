@@ -1696,9 +1696,23 @@ stream_span(Stream0, Crc0, Fd, Pos, Remaining) ->
     ReadSize = min(Remaining, ?READ_BUFFER_SIZE),
     case file:pread(Fd, Pos, ReadSize) of
         {ok, Data} ->
-            Stream1 = rabbitmq_stream_s3_api:stream_data(Stream0, Data),
-            Crc1 = erlang:crc32(Crc0, Data),
-            stream_span(Stream1, Crc1, Fd, Pos + ReadSize, Remaining - ReadSize);
+            %% file:pread/3 on a raw file may return fewer bytes than requested:
+            %% a short read is permitted in raw mode. Advance Pos and Remaining
+            %% by the number of bytes actually read, never by ReadSize.
+            %% Advancing by ReadSize on a short read would skip the unread bytes,
+            %% so the streamed body would be shorter than the Content-Length
+            %% declared to stream_put/3 and S3 would reject the PUT (the
+            %% upload fails and retries rather than committing a corrupt object).
+            case byte_size(Data) of
+                0 ->
+                    %% A zero-byte read that is not eof would spin forever;
+                    %% treat it as an unexpected truncation.
+                    {error, {unexpected_eof, Pos, ReadSize}};
+                Got ->
+                    Stream1 = rabbitmq_stream_s3_api:stream_data(Stream0, Data),
+                    Crc1 = erlang:crc32(Crc0, Data),
+                    stream_span(Stream1, Crc1, Fd, Pos + Got, Remaining - Got)
+            end;
         eof ->
             {error, {unexpected_eof, Pos, ReadSize}};
         {error, _} = Err ->
