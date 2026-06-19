@@ -1194,16 +1194,48 @@ maybe_spawn_group_retention(_Manifest, _Retention, _Now, _StreamId, State) ->
 resolve_manifest(StreamId) ->
     case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
         #manifest{} = M ->
-            %% Cache hit: a real manifest. Refresh its revision from Khepri if
-            %% we can; a stale revision is caught by the persist CAS, so a
-            %% failed refresh just keeps the cached one.
-            case catch rabbitmq_stream_s3_db:get(StreamId) of
-                {ok, #{revision := Rev}} -> {ok, M#manifest{revision = Rev}};
-                _ -> {ok, M}
+            case classify_cache_result(M, catch rabbitmq_stream_s3_db:get(StreamId)) of
+                {ok, _} = Ok -> Ok;
+                resolve_from_store -> resolve_manifest_from_store(StreamId)
             end;
         undefined ->
             resolve_manifest_from_store(StreamId)
     end.
+
+%% Decide whether the locally cached manifest may be trusted on resolution
+%% (startup, promotion, reinitialize, recovery). Split out like
+%% classify_store_result/2 so the trust decision is unit-testable without a real
+%% metadata store.
+%%
+%% The cache may be trusted only when its revision already matches the
+%% authoritative Khepri revision. The previous code instead stamped the current
+%% revision onto the cached manifest unconditionally (M#manifest{revision =
+%% Rev}). That defeated the persist CAS: ExpectedRevision is taken from
+%% last_persisted_manifest.revision, so a stale cached manifest stamped with the
+%% current revision would pass the CAS, and the next persist would overwrite the
+%% committed manifest with stale content, regressing next_offset and skipping
+%% committed offsets. This is reachable on promotion and, most acutely, on
+%% reinitialize after a persist conflict, where another writer has already
+%% advanced the committed revision and this node's cache is known stale.
+%%
+%% A replica's cached revision tracks only its last full sync (broadcast edits
+%% do not bump it), so a promoted replica almost always falls through to the
+%% authoritative store resolution, which is correct. The writer's own node
+%% keeps a current cached revision (persist_complete stamps it), so its
+%% legitimate cache hits are still served without an object-store GET.
+-spec classify_cache_result(#manifest{}, term()) -> {ok, #manifest{}} | resolve_from_store.
+classify_cache_result(#manifest{revision = Rev} = M, {ok, #{revision := Rev}}) ->
+    %% Cache revision matches the committed revision: trust it.
+    {ok, M};
+classify_cache_result(#manifest{}, {ok, #{revision := _Stale}}) ->
+    %% Cache lags (or leads) the committed revision: resolve authoritatively.
+    resolve_from_store;
+classify_cache_result(#manifest{}, _MetadataUnavailable) ->
+    %% Metadata store unavailable: we cannot confirm the cache is current, so do
+    %% not trust it. resolve_manifest_from_store/1 returns {retry, _} on a
+    %% transient error rather than assuming the cache or an empty manifest
+    %% (Local authority).
+    resolve_from_store.
 
 %% Resolve the manifest from the metadata store and object store on a cache
 %% miss. An empty manifest is returned only when the stream is genuinely empty
@@ -1904,6 +1936,31 @@ classify_object_result_ok_parses_with_revision_test() ->
     Data = ?MANIFEST(0, 0, 0, 0, 0, <<>>),
     {ok, Manifest} = classify_object_result({ok, Data}, 42, <<"k">>),
     ?assertEqual(42, Manifest#manifest.revision).
+
+%% The cached manifest is trusted (and returned unchanged) only when its
+%% revision already matches the committed Khepri revision.
+classify_cache_result_current_revision_trusted_test() ->
+    M = #manifest{next_offset = 50, revision = 7},
+    ?assertEqual({ok, M}, classify_cache_result(M, {ok, #{revision => 7}})).
+
+%% A cache behind the committed revision must be discarded: trusting it and
+%% stamping the current revision would defeat the persist CAS and regress the
+%% committed manifest.
+classify_cache_result_stale_revision_resolves_from_store_test() ->
+    M = #manifest{next_offset = 50, revision = 7},
+    ?assertEqual(resolve_from_store, classify_cache_result(M, {ok, #{revision => 9}})).
+
+%% A cache ahead of the committed revision is equally untrustworthy.
+classify_cache_result_ahead_revision_resolves_from_store_test() ->
+    M = #manifest{next_offset = 50, revision = 9},
+    ?assertEqual(resolve_from_store, classify_cache_result(M, {ok, #{revision => 7}})).
+
+%% If the metadata store cannot be read, the cache cannot be confirmed current,
+%% so it must not be trusted.
+classify_cache_result_metadata_unavailable_resolves_from_store_test() ->
+    M = #manifest{next_offset = 50, revision = 7},
+    ?assertEqual(resolve_from_store, classify_cache_result(M, {error, timeout})),
+    ?assertEqual(resolve_from_store, classify_cache_result(M, {'EXIT', {badarg, []}})).
 
 %% Build a minimal state whose live local log first offset and manifest
 %% next_offset are set to the given values, for exercising local_log_ahead/1.
