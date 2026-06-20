@@ -68,7 +68,8 @@ groups() ->
             offset_spec_at_tier_boundary,
             remote_reader_restart_self_heals,
             become_local_stops_remote_reader,
-            read_retries_transient_remote_error
+            read_retries_transient_remote_error,
+            read_tolerates_slow_remote
         ]},
         {with_replica, [], [
             read_from_replica_node
@@ -164,6 +165,31 @@ read_retries_transient_remote_error(Config) ->
     %% The next remote fragment GET returns a transient error; the reader must
     %% retry and still deliver the full stream.
     ok = rabbitmq_stream_s3_api_fault:fail_next(get_range_async, StreamId, slow_down),
+
+    {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg),
+    ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),
+    Records = read_all(Reader0),
+    assert_sequential(Records, N).
+
+read_tolerates_slow_remote(Config) ->
+    %% A slow remote tier (latency on every fragment GET) must still deliver the
+    %% full, correct stream.
+    StreamId = ?config(stream_id, Config),
+    ok = application:set_env(
+        rabbitmq_stream_s3, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_fault
+    ),
+    ok = rabbitmq_stream_s3_api_fault:setup(),
+
+    Writer = start_writer(Config, #{fragment_target_size => 1000}),
+    N = 100,
+    write_sequential(Writer, N, 5),
+    ReaderCfg = reader_config(Writer, Config),
+    #{shared := Shared} = ReaderCfg,
+    ?awaitMatch([S] when S > 0, list_segment_offsets(Config), 1000),
+    ?awaitMatch(F when F > 0, osiris_log_shared:first_chunk_id(Shared), 1000),
+
+    %% Inject latency on every remote fragment GET.
+    ok = rabbitmq_stream_s3_api_fault:delay(get_range_async, StreamId, 20),
 
     {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg),
     ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),

@@ -16,6 +16,8 @@ specific operation. The control surface (minimal for now):
   trimmed-segment upload failure of issue #225 without a timing race.
 - `fail_next(Op, KeyPattern, Reason)` makes the next matching call to `Op`
   return `{error, Reason}` (e.g. `slow_down`, `not_found`, `timeout`).
+- `delay(Op, KeyPattern, Ms)` sleeps before every matching call to `Op`,
+  simulating slow S3 (cleared by `reset/0`).
 
 Operation is one of: get, get_range, get_range_async, put, stream_put. Key
 matching is a binary substring (`binary:match/2`). When the control table is
@@ -49,7 +51,8 @@ passthrough to the FS backend.
     block_once/2,
     await_blocked/2,
     release/2,
-    fail_next/3
+    fail_next/3,
+    delay/3
 ]).
 
 -define(TBL, ?MODULE).
@@ -101,6 +104,12 @@ fail_next(Op, KeyPat, Reason) ->
     true = ets:insert(?TBL, {{fail, Op}, KeyPat, Reason, 1}),
     ok.
 
+%% Sleep Ms before every matching call to Op (persists until reset/0).
+-spec delay(atom(), binary(), non_neg_integer()) -> ok.
+delay(Op, KeyPat, Ms) ->
+    true = ets:insert(?TBL, {{delay, Op}, KeyPat, Ms}),
+    ok.
+
 %%----------------------------------------------------------------------------
 %% Behaviour callbacks
 %%----------------------------------------------------------------------------
@@ -111,6 +120,7 @@ get_range(Key, RangeSpec, Opts) ->
     with_faults(get_range, Key, fun() -> ?FS:get_range(Key, RangeSpec, Opts) end).
 
 get_range_async(Key, RangeSpec, Opts) ->
+    maybe_delay(get_range_async, Key),
     maybe_block(get_range_async, Key),
     case maybe_fail(get_range_async, Key) of
         {error, Reason} ->
@@ -144,10 +154,24 @@ cancel_async(Req, State) -> ?FS:cancel_async(Req, State).
 %%----------------------------------------------------------------------------
 
 with_faults(Op, Key, Delegate) ->
+    maybe_delay(Op, Key),
     maybe_block(Op, Key),
     case maybe_fail(Op, Key) of
         {error, _} = Err -> Err;
         ok -> Delegate()
+    end.
+
+maybe_delay(Op, Key) ->
+    try ets:lookup(?TBL, {delay, Op}) of
+        [{_, KeyPat, Ms}] ->
+            case matches(KeyPat, Key) of
+                true -> timer:sleep(Ms);
+                false -> ok
+            end;
+        _ ->
+            ok
+    catch
+        error:badarg -> ok
     end.
 
 maybe_block(Op, Key) ->
