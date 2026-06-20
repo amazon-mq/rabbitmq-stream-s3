@@ -481,11 +481,25 @@ them here because both outcomes mean the same thing to the core.
 """.
 -spec retention_failed(term(), state()) -> {state(), [core_effect()]}.
 retention_failed(_Reason, State0) ->
-    %% Retention cleared without changing the manifest. A rebalance may have
-    %% been deferred while it was in flight; re-check it now that the flag is
-    %% clear so an oversized root does not wait for the next drain to compact.
-    %% Persist is left to the subsequent tick or drain, as before.
-    maybe_start_rebalance(State0#state{retention_in_flight = false}).
+    %% Retention cleared without changing the manifest. Mirror the wrap-up of
+    %% retention_complete/2 (minus the edit): re-check a rebalance deferred while
+    %% retention was in flight, then re-evaluate persist and re-arm the persist
+    %% timer.
+    %%
+    %% The timer re-arm is the important part. While retention_in_flight was
+    %% true, both maybe_start_persist and tick/2 were suppressed. A fragment that
+    %% completed during that window armed a one-shot persist timer, but the tick
+    %% that timer eventually drives is a no-op (still in flight) that consumes the
+    %% one-shot without rescheduling. If we do not re-arm here, that pending edit
+    %% is stranded unpersisted until the next publish: on an idle low-throughput
+    %% stream await_offset waiters block and local retention cannot reclaim the
+    %% segments. Every other flag-clearing path already re-arms; this was the one
+    %% exit that did not.
+    State1 = State0#state{retention_in_flight = false},
+    {State2, RebalanceEffects} = maybe_start_rebalance(State1),
+    {State3, PersistEffects} = maybe_start_persist(State2),
+    TimerEffects = rearm_persist_timer_if_pending(PersistEffects, State3),
+    {State3, RebalanceEffects ++ PersistEffects ++ TimerEffects}.
 
 %% ------------------------------------------------------------------
 %% Internal
