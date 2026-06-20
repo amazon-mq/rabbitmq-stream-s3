@@ -68,6 +68,16 @@ output(ok, _Opts) ->
 output({error, {not_found, _}}, _Opts) ->
     {error, 'Elixir.RabbitMQ.CLI.Core.ExitCodes':exit_software(),
         <<"Stream not found or replica reader not running on this node.">>};
+output({error, {in_progress, Blocker}}, _Opts) ->
+    {error, 'Elixir.RabbitMQ.CLI.Core.ExitCodes':exit_tempfail(),
+        erlang:iolist_to_binary(
+            io_lib:format(
+                "A manifest change (~ts) is already in progress for this stream; "
+                "remote retention evaluation cannot run concurrently. Try again "
+                "once it completes.",
+                [Blocker]
+            )
+        )};
 output({error, Reason}, _Opts) ->
     {error, 'Elixir.RabbitMQ.CLI.Core.ExitCodes':exit_software(),
         erlang:iolist_to_binary(io_lib:format("~tp", [Reason]))}.
