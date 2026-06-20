@@ -96,7 +96,8 @@ groups() ->
             stale_group_upload_result_is_ignored
         ]},
         {with_replica, [], [
-            replication_happy_path
+            replication_happy_path,
+            replication_survives_reader_restart
         ]}
     ].
 
@@ -1158,3 +1159,37 @@ replication_happy_path(Config) ->
 
     %% Replica has reclaimed uploaded segments (only current segment remains).
     ?awaitMatch([_], list_segment_offsets(Config, ReplicaNode), 1000).
+
+replication_survives_reader_restart(Config) ->
+    %% A writer-side replica reader that crashes is respawned by its supervisor
+    %% at the SAME epoch (the epoch is the writer's, and the writer is
+    %% untouched). The broadcast sequence number is the durable manifest
+    %% revision, so the new incarnation resumes the sequence where the previous
+    %% one left off and the replica keeps accepting its broadcasts. Were the
+    %% sequence an in-memory counter, it would restart at zero, the replica would
+    %% reject every post-restart sync and broadcast as stale, and its manifest
+    %% would freeze - the bug this guards against.
+    StreamId = ?config(stream_id, Config),
+    ReplicaNode = ?config(replica_node, Config),
+
+    {Writer, _ReplicaPids} = start_cluster(
+        Config, [ReplicaNode], #{max_segment_size_bytes => 500}, #{fragment_target_size => 1000}
+    ),
+
+    Record = binary:copy(<<"R">>, 300),
+    [osiris:write(Writer, undefined, I, Record) || I <- lists:seq(1, 10)],
+    ok = await_offset(StreamId, 5),
+    %% Replica caught up to the first batch.
+    ?awaitMatch({_, N} when N > 0, get_range(Config, ReplicaNode), 1000),
+    {_, N1} = get_range(Config, ReplicaNode),
+
+    %% Restart the writer-side replica reader at the same epoch.
+    ReaderPid = rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}),
+    ok = rabbitmq_stream_s3_replica_reader_sup:stop_child(ReaderPid),
+    _ = start_replica_reader(Writer, Config, #{fragment_target_size => 1000}),
+
+    %% Write more; the restarted reader uploads and broadcasts. The replica must
+    %% advance past N1 rather than freezing on stale-rejected broadcasts.
+    [osiris:write(Writer, undefined, I, Record) || I <- lists:seq(11, 30)],
+    ok = await_offset(StreamId, N1 + 5),
+    ?awaitMatch({_, N2} when N2 > N1, get_range(Config, ReplicaNode), 3000).
