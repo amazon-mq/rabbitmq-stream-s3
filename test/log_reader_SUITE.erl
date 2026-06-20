@@ -67,7 +67,8 @@ groups() ->
             read_detects_crc_corruption,
             offset_spec_at_tier_boundary,
             remote_reader_restart_self_heals,
-            become_local_stops_remote_reader
+            become_local_stops_remote_reader,
+            read_retries_transient_remote_error
         ]},
         {with_replica, [], [
             read_from_replica_node
@@ -114,6 +115,11 @@ init_per_testcase(TestCase, Config) ->
 end_per_testcase(_TestCase, Config) ->
     WriterCfg = ?config(writer_cfg, Config),
     catch osiris_writer:stop(WriterCfg),
+    %% Restore the default API backend if a test swapped in the fault backend.
+    application:set_env(
+        rabbitmq_stream_s3, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_fs
+    ),
+    catch rabbitmq_stream_s3_api_fault:reset(),
     Config.
 
 %% ------------------------------------------------------------------
@@ -134,6 +140,33 @@ read_from_remote_first(Config) ->
     {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg),
     ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),
 
+    Records = read_all(Reader0),
+    assert_sequential(Records, N).
+
+read_retries_transient_remote_error(Config) ->
+    %% A transient S3 error on a remote fragment GET must be retried, not
+    %% surfaced to the consumer: the read still delivers the full stream. The
+    %% fault backend injects one slow_down on the next fragment GET.
+    StreamId = ?config(stream_id, Config),
+    ok = application:set_env(
+        rabbitmq_stream_s3, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_fault
+    ),
+    ok = rabbitmq_stream_s3_api_fault:setup(),
+
+    Writer = start_writer(Config, #{fragment_target_size => 1000}),
+    N = 200,
+    write_sequential(Writer, N, 5),
+    ReaderCfg = reader_config(Writer, Config),
+    #{shared := Shared} = ReaderCfg,
+    ?awaitMatch([S] when S > 0, list_segment_offsets(Config), 1000),
+    ?awaitMatch(F when F > 0, osiris_log_shared:first_chunk_id(Shared), 1000),
+
+    %% The next remote fragment GET returns a transient error; the reader must
+    %% retry and still deliver the full stream.
+    ok = rabbitmq_stream_s3_api_fault:fail_next(get_range_async, StreamId, slow_down),
+
+    {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg),
+    ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),
     Records = read_all(Reader0),
     assert_sequential(Records, N).
 
