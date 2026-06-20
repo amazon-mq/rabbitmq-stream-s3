@@ -43,6 +43,7 @@ tier.
 -define(C_RESOLVE_LOCAL, 10).
 -define(C_RESOLVE_DURATION_MS, 11).
 -define(C_RESOLVE, 12).
+-define(C_REMOTE_READER_RESTART, 13).
 -define(COUNTERS, [
     {remote_init, ?C_REMOTE_INIT, counter, "Readers initialized in remote mode"},
     {local_init, ?C_LOCAL_INIT, counter, "Readers initialized in local mode"},
@@ -65,9 +66,16 @@ tier.
     {resolve_local, ?C_RESOLVE_LOCAL, counter, "Offset specs resolved to local tier"},
     {resolve_duration_ms, ?C_RESOLVE_DURATION_MS, counter,
         "Total milliseconds spent resolving offset specs"},
-    {resolve, ?C_RESOLVE, counter, "Number of offset spec resolutions"}
+    {resolve, ?C_RESOLVE, counter, "Number of offset spec resolutions"},
+    {remote_reader_restart, ?C_REMOTE_READER_RESTART, counter,
+        "Remote tier readers restarted after an unexpected exit"}
 ]).
 -define(COUNTER_KEY, {?MODULE, counter}).
+
+%% Bounded restart attempts when the remote reader exits unexpectedly within a
+%% single send_file/chunk_iterator pass, to avoid spinning on a poison chunk
+%% that crashes every fresh reader.
+-define(REMOTE_REINIT_ATTEMPTS, 3).
 
 -export([init_counters/0]).
 
@@ -108,7 +116,7 @@ tier.
 ]).
 
 %% Debugging, testing.
--export([mode/1]).
+-export([mode/1, remote_pid/1]).
 
 -ifdef(TEST).
 -export([find_fragment/3, find_index_position/2, resolve_remote_location/2]).
@@ -307,7 +315,31 @@ close_deferred(Local) -> osiris_log:close(Local).
 send_file(Socket, State, Callback) ->
     send_file(Socket, State, Callback, undefined).
 
-send_file(
+send_file(Socket, State, Callback, DeferredClose) ->
+    send_file(Socket, State, Callback, DeferredClose, ?REMOTE_REINIT_ATTEMPTS).
+
+send_file(Socket, State, Callback, DeferredClose, Attempt) ->
+    case send_file0(Socket, State, Callback, DeferredClose) of
+        {remote_reader_down, NextOffset} ->
+            close_deferred(DeferredClose),
+            restart_remote_send_file(Socket, State, Callback, NextOffset, Attempt);
+        Other ->
+            Other
+    end.
+
+restart_remote_send_file(_Socket, _State, _Callback, _NextOffset, Attempt) when
+    Attempt =< 0
+->
+    {error, remote_reader_unavailable};
+restart_remote_send_file(Socket, #?MODULE{config = Config}, Callback, NextOffset, Attempt) ->
+    case reinit_remote(NextOffset, Config) of
+        {ok, NewState} ->
+            send_file(Socket, NewState, Callback, undefined, Attempt - 1);
+        {error, _} = Err ->
+            Err
+    end.
+
+send_file0(
     Socket,
     #?MODULE{config = Config, mode = #remote{} = Remote0, verify_crc = VerifyCrc} = State0,
     Callback,
@@ -362,12 +394,15 @@ send_file(
                 {become_local, _} ->
                     close_deferred(DeferredClose),
                     counters:add(counter(), ?C_REMOTE_CLOSE, 1),
+                    rabbitmq_stream_s3_remote_reader:stop(Remote1#remote.pid),
                     case become_local_init(Remote1#remote.next_offset, Config) of
                         {ok, State} ->
                             send_file(Socket, State, Callback, undefined);
                         {error, _} = Err ->
                             Err
                     end;
+                {error, {remote_reader_down, _}} ->
+                    {remote_reader_down, Remote1#remote.next_offset};
                 end_of_stream ->
                     ?LOG_DEBUG(
                         "send_file: data read returned end_of_stream"
@@ -389,6 +424,7 @@ send_file(
         {become_local, _} ->
             close_deferred(DeferredClose),
             counters:add(counter(), ?C_REMOTE_CLOSE, 1),
+            rabbitmq_stream_s3_remote_reader:stop(Remote0#remote.pid),
             case become_local_init(Remote0#remote.next_offset, Config) of
                 {ok, State} ->
                     send_file(Socket, State, Callback, undefined);
@@ -398,10 +434,12 @@ send_file(
         {end_of_stream, Remote} ->
             close_deferred(DeferredClose),
             {end_of_stream, State0#?MODULE{mode = Remote}};
+        {error, {remote_reader_down, _}} ->
+            {remote_reader_down, Remote0#remote.next_offset};
         {error, timeout} = Err ->
             Err
     end;
-send_file(Socket, #?MODULE{mode = Local0} = State0, Callback, DeferredClose) ->
+send_file0(Socket, #?MODULE{mode = Local0} = State0, Callback, DeferredClose) ->
     case osiris_log:send_file(Socket, Local0, Callback) of
         {ok, Local} ->
             close_deferred(DeferredClose),
@@ -432,7 +470,29 @@ send_file(Socket, #?MODULE{mode = Local0} = State0, Callback, DeferredClose) ->
 chunk_iterator(State, Credit, PrevIter) ->
     chunk_iterator(State, Credit, PrevIter, undefined).
 
-chunk_iterator(
+chunk_iterator(State, Credit, PrevIter, DeferredClose) ->
+    chunk_iterator(State, Credit, PrevIter, DeferredClose, ?REMOTE_REINIT_ATTEMPTS).
+
+chunk_iterator(State, Credit, PrevIter, DeferredClose, Attempt) ->
+    case chunk_iterator0(State, Credit, PrevIter, DeferredClose) of
+        {remote_reader_down, NextOffset} ->
+            close_deferred(DeferredClose),
+            restart_remote_chunk_iterator(State, Credit, NextOffset, Attempt);
+        Other ->
+            Other
+    end.
+
+restart_remote_chunk_iterator(_State, _Credit, _NextOffset, Attempt) when Attempt =< 0 ->
+    {error, remote_reader_unavailable};
+restart_remote_chunk_iterator(#?MODULE{config = Config}, Credit, NextOffset, Attempt) ->
+    case reinit_remote(NextOffset, Config) of
+        {ok, NewState} ->
+            chunk_iterator(NewState, Credit, undefined, undefined, Attempt - 1);
+        {error, _} = Err ->
+            Err
+    end.
+
+chunk_iterator0(
     #?MODULE{config = Config, mode = #remote{} = Remote0, verify_crc = VerifyCrc} = State0,
     Credit,
     _PrevIter,
@@ -476,12 +536,15 @@ chunk_iterator(
                 {become_local, _} ->
                     close_deferred(DeferredClose),
                     counters:add(counter(), ?C_REMOTE_CLOSE, 1),
+                    rabbitmq_stream_s3_remote_reader:stop(Remote1#remote.pid),
                     case become_local_init(Remote1#remote.next_offset, Config) of
                         {ok, State} ->
                             chunk_iterator(State, Credit, undefined, undefined);
                         {error, _} = Err ->
                             Err
                     end;
+                {error, {remote_reader_down, _}} ->
+                    {remote_reader_down, Remote1#remote.next_offset};
                 end_of_stream ->
                     close_deferred(DeferredClose),
                     {end_of_stream, State0#?MODULE{mode = Remote1}};
@@ -491,6 +554,7 @@ chunk_iterator(
         {become_local, _} ->
             close_deferred(DeferredClose),
             counters:add(counter(), ?C_REMOTE_CLOSE, 1),
+            rabbitmq_stream_s3_remote_reader:stop(Remote0#remote.pid),
             case become_local_init(Remote0#remote.next_offset, Config) of
                 {ok, State} ->
                     chunk_iterator(State, Credit, undefined, undefined);
@@ -500,10 +564,12 @@ chunk_iterator(
         {end_of_stream, Remote} ->
             close_deferred(DeferredClose),
             {end_of_stream, State0#?MODULE{mode = Remote}};
+        {error, {remote_reader_down, _}} ->
+            {remote_reader_down, Remote0#remote.next_offset};
         {error, timeout} = Err ->
             Err
     end;
-chunk_iterator(#?MODULE{mode = Local0} = State0, Credit, PrevIter, DeferredClose) ->
+chunk_iterator0(#?MODULE{mode = Local0} = State0, Credit, PrevIter, DeferredClose) ->
     case osiris_log:chunk_iterator(Local0, Credit, PrevIter) of
         {ok, Header, Iter, Local} ->
             close_deferred(DeferredClose),
@@ -555,6 +621,10 @@ iterator_next(Local) ->
 mode(#?MODULE{mode = #remote{}}) -> remote;
 mode(#?MODULE{}) -> local.
 
+-spec remote_pid(#?MODULE{}) -> pid() | undefined.
+remote_pid(#?MODULE{mode = #remote{pid = Pid}}) -> Pid;
+remote_pid(#?MODULE{}) -> undefined.
+
 send(tcp, Socket, Data) ->
     gen_tcp:send(Socket, Data);
 send(ssl, Socket, Data) ->
@@ -571,7 +641,8 @@ send(ssl, Socket, Data) ->
     {ok, osiris_log:header_map(), #remote{}}
     | {become_local, osiris:offset()}
     | {end_of_stream, #remote{}}
-    | {error, timeout}.
+    | {error, timeout}
+    | {error, {remote_reader_down, term()}}.
 read_header(#remote{shared = Shared, next_offset = NextOffset} = Remote) ->
     LastChunkId = osiris_log_shared:last_chunk_id(Shared),
     CommittedChunkId = osiris_log_shared:committed_chunk_id(Shared),
@@ -610,6 +681,8 @@ read_header1(
             {become_local, Offset};
         end_of_stream ->
             {end_of_stream, Remote0};
+        {error, {remote_reader_down, _}} = Err ->
+            Err;
         {error, timeout} = Err ->
             Err
     end.
@@ -801,6 +874,19 @@ maybe_become_remote(Offset, #?MODULE{config = Config, mode = Local}) ->
         _ ->
             false
     end.
+
+%% The remote reader exited unexpectedly (a crash or an already-dead pid). Re-
+%% resolve the current offset and start a fresh reader so the subscription
+%% self-heals instead of wedging on the dead pid. The offset may now resolve to
+%% the local tier, in which case a local reader is returned.
+reinit_remote(NextOffset, Config) ->
+    counters:add(counter(), ?C_REMOTE_READER_RESTART, 1),
+    ?LOG_WARNING(
+        "Remote tier reader exited unexpectedly; restarting at offset ~b",
+        [NextOffset],
+        ?DOMAIN
+    ),
+    init_offset_reader(NextOffset, Config).
 
 -spec find_position(
     {offset, osiris:offset()} | {timestamp, osiris:timestamp()},
@@ -1015,7 +1101,8 @@ resolve_first(StreamId, FirstOffset) ->
     | {next_fragment, osiris:offset()}
     | {become_local, osiris:offset()}
     | end_of_stream
-    | {error, timeout}.
+    | {error, timeout}
+    | {error, {remote_reader_down, term()}}.
 read(RemoteReader, Offset, Bytes, Hint) ->
     read(RemoteReader, Offset, Bytes, Hint, 1).
 

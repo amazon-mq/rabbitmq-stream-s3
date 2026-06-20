@@ -90,6 +90,7 @@ synchronous feedback is generated.
 %% API
 -export([
     start/1,
+    stop/1,
     read/4,
     read/5,
     init_counters/0,
@@ -133,6 +134,12 @@ read_size_prometheus_format() ->
 start(Config) ->
     gen_server:start(?MODULE, Config, []).
 
+%% Asynchronous, fire-and-forget stop. The reader also monitors its consumer
+%% and stops on its own when the consumer exits; this reclaims it eagerly on a
+%% become_local transition so it does not linger for the consumer's lifetime.
+stop(Pid) ->
+    gen_server:cast(Pid, stop).
+
 %% The gen_server:call timeout must exceed PENDING_READ_DEADLINE_MS so the
 %% internal deadline always fires first and replies {error, timeout} to the
 %% caller. This avoids overlapping reads (caller times out, new read arrives
@@ -149,7 +156,14 @@ read(Server, Offset, Bytes, Hint, Timeout) ->
         try
             gen_server:call(Server, #read{offset = Offset, bytes = Bytes, hint = Hint}, Timeout)
         catch
-            exit:{timeout, _} -> {error, timeout}
+            exit:{timeout, _} ->
+                {error, timeout};
+            exit:Reason ->
+                %% The reader gen_server crashed or is already gone (noproc).
+                %% Surface a clean error so the caller can restart it, instead
+                %% of the exit propagating into and crashing the consumer
+                %% connection (which may serve many other subscriptions).
+                {error, {remote_reader_down, Reason}}
         end,
     Duration = rabbitmq_stream_s3_util:elapsed_ms(T0),
     counters:add(counter(), ?C_READ_DURATION_MS, Duration),
@@ -206,6 +220,8 @@ handle_call(
 handle_call(Request, From, State) ->
     {stop, {unknown_call, From, Request}, State}.
 
+handle_cast(stop, State) ->
+    {stop, normal, State};
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
