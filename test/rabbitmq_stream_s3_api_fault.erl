@@ -111,7 +111,18 @@ get_range(Key, RangeSpec, Opts) ->
     with_faults(get_range, Key, fun() -> ?FS:get_range(Key, RangeSpec, Opts) end).
 
 get_range_async(Key, RangeSpec, Opts) ->
-    with_faults(get_range_async, Key, fun() -> ?FS:get_range_async(Key, RangeSpec, Opts) end).
+    maybe_block(get_range_async, Key),
+    case maybe_fail(get_range_async, Key) of
+        {error, Reason} ->
+            %% Deliver the error on the async channel, mirroring how the FS
+            %% backend reports a result, so the reader's retry path engages (a
+            %% synchronous {error, _} return is a different, rarer path).
+            Req = make_ref(),
+            self() ! {'$async', Req, {done, {error, Reason}}},
+            {ok, Req, undefined};
+        ok ->
+            ?FS:get_range_async(Key, RangeSpec, Opts)
+    end.
 
 put(Key, Data, Opts) -> with_faults(put, Key, fun() -> ?FS:put(Key, Data, Opts) end).
 
