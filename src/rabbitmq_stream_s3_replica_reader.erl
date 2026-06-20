@@ -260,6 +260,14 @@ returned by the functional core module.
     retention_pid :: pid() | undefined,
     %% Timer ref for the retention task timeout.
     retention_timer :: reference() | undefined,
+    %% Correlation token for the in-flight retention task. Each spawned task
+    %% gets a fresh make_ref/0 and tags its result with it; only a
+    %% {retention_result, Token, _} whose Token matches the current task is
+    %% applied. A result from a task we stopped tracking (e.g. one the retention
+    %% timeout already killed, whose message was queued before the kill) carries
+    %% a stale token and is ignored rather than mis-applied onto a manifest it
+    %% no longer matches.
+    retention_token :: reference() | undefined,
     %% Kind of the group upload currently in flight. Cleared when the
     %% group_upload_result message arrives. Only one rebalance is in
     %% flight at a time so a single slot suffices.
@@ -387,9 +395,20 @@ handle_call(
     _From,
     #state{core = Core, retention = Retention, cfg = #cfg{stream = StreamId}} = State
 ) ->
-    Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(Core),
-    State1 = maybe_evaluate_remote_retention(Manifest, Retention, StreamId, State),
-    {reply, ok, State1};
+    case rabbitmq_stream_s3_replica_reader_core:pending_prefix_rewrite(Core) of
+        none ->
+            Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(Core),
+            State1 = maybe_evaluate_remote_retention(Manifest, Retention, StreamId, State),
+            {reply, ok, State1};
+        Blocker ->
+            %% A manifest-prefix rewrite (an async retention evaluation or a
+            %% rebalance) is already in flight. Spawning a second evaluation
+            %% would capture the same pre-retention snapshot and recompute the
+            %% identical prefix-truncation edit, which would be applied twice.
+            %% Refuse and name the blocker so the operator can retry once it
+            %% settles.
+            {reply, {error, {in_progress, Blocker}}, State}
+    end;
 handle_call(force_fragment_cut, _From, #state{assembly = undefined} = State) ->
     {reply, {error, no_assembly}, State};
 handle_call(
@@ -578,8 +597,9 @@ handle_info(
             core = Core, group_mon = undefined, pending_group_kind = undefined
         })};
 handle_info(
-    {retention_result, unchanged},
-    #state{core = Core0, retention_mon = Mon, retention_timer = TRef} = State0
+    {retention_result, Token, unchanged},
+    #state{retention_token = Token, core = Core0, retention_mon = Mon, retention_timer = TRef} =
+        State0
 ) ->
     %% Evaluation ran and found nothing to remove: not a failure, not counted.
     demonitor(Mon, [flush]),
@@ -590,11 +610,13 @@ handle_info(
             core = Core,
             retention_mon = undefined,
             retention_pid = undefined,
-            retention_timer = undefined
+            retention_timer = undefined,
+            retention_token = undefined
         })};
 handle_info(
-    {retention_result, {failed, Reason}},
-    #state{core = Core0, retention_mon = Mon, retention_timer = TRef} = State0
+    {retention_result, Token, {failed, Reason}},
+    #state{retention_token = Token, core = Core0, retention_mon = Mon, retention_timer = TRef} =
+        State0
 ) ->
     %% The async retention task caught a crash and reported it as a failure
     %% (distinct from unchanged, which means it ran and found nothing). The
@@ -609,18 +631,38 @@ handle_info(
             core = Core,
             retention_mon = undefined,
             retention_pid = undefined,
-            retention_timer = undefined
+            retention_timer = undefined,
+            retention_token = undefined
         })};
 handle_info(
-    {retention_result, {Edit, Refs}},
-    #state{core = Core0, retention_mon = Mon, retention_timer = TRef, cfg = #cfg{stream = StreamId}} =
+    {retention_result, Token, {Edit, Refs}},
+    #state{
+        retention_token = Token,
+        core = Core0,
+        retention_mon = Mon,
+        retention_timer = TRef,
+        cfg = #cfg{stream = StreamId}
+    } =
         State0
 ) ->
     demonitor(Mon, [flush]),
     _ = cancel_timer(TRef),
     State = on_remote_retention(Edit, Refs, StreamId, Core0, State0#state{
-        retention_mon = undefined, retention_pid = undefined, retention_timer = undefined
+        retention_mon = undefined,
+        retention_pid = undefined,
+        retention_timer = undefined,
+        retention_token = undefined
     }),
+    {noreply, State};
+handle_info(
+    {retention_result, _StaleToken, _Result},
+    #state{cfg = #cfg{stream = StreamId}} = State
+) ->
+    %% A result from a retention task we are no longer tracking - typically one
+    %% the retention timeout already killed, whose message was queued before the
+    %% kill. Its token does not match the current (or absent) task, so ignore it
+    %% rather than apply a stale truncation edit or demonitor a cleared monitor.
+    ?LOG_DEBUG("~ts ignoring stale retention result", [StreamId]),
     {noreply, State};
 handle_info(
     retention_timeout,
@@ -637,7 +679,8 @@ handle_info(
             core = Core,
             retention_mon = undefined,
             retention_pid = undefined,
-            retention_timer = undefined
+            retention_timer = undefined,
+            retention_token = undefined
         })};
 handle_info(retention_timeout, State) ->
     %% Stale timeout after normal completion; ignore.
@@ -725,7 +768,8 @@ handle_info(
             core = Core,
             retention_mon = undefined,
             retention_pid = undefined,
-            retention_timer = undefined
+            retention_timer = undefined,
+            retention_token = undefined
         })};
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -1154,22 +1198,8 @@ update_counter(Cnt, FstOff, NumSegLeft) ->
 maybe_evaluate_remote_retention(_Manifest, [], _StreamId, State) ->
     State;
 maybe_evaluate_remote_retention(Manifest, Retention, StreamId, #state{core = Core0} = State) ->
-    case rabbitmq_stream_s3_replica_reader_core:rebalance_in_flight(Core0) of
-        true ->
-            %% A rebalance is rewriting the manifest's leading entries. Remote
-            %% retention rewrites the same prefix, so evaluating it now would
-            %% compute an edit against a manifest the rebalance is about to
-            %% change, and applying it would race the rebalance over that
-            %% prefix (Single mutator). Skip; retention is re-evaluated by the
-            %% next persist_complete once the rebalance has finished. This
-            %% guards the manual CLI trigger; the automatic post-persist path
-            %% is already gated by persist_complete.
-            ?LOG_DEBUG(
-                "~ts skipping remote retention evaluation: rebalance in flight",
-                [StreamId]
-            ),
-            State;
-        false ->
+    case rabbitmq_stream_s3_replica_reader_core:pending_prefix_rewrite(Core0) of
+        none ->
             inc(State, ?C_REMOTE_TIER_RETENTION_EVALUATIONS, 1),
             Now = erlang:system_time(millisecond),
             %% First try without group download (handles the fragments-only
@@ -1182,7 +1212,26 @@ maybe_evaluate_remote_retention(Manifest, Retention, StreamId, #state{core = Cor
                     maybe_spawn_group_retention(Manifest, Retention, Now, StreamId, State);
                 {Edit, Refs} ->
                     on_remote_retention(Edit, Refs, StreamId, Core0, State)
-            end
+            end;
+        Blocker ->
+            %% A manifest-prefix rewrite is already in flight. Remote retention
+            %% rewrites that same prefix, so evaluating it now would compute an
+            %% edit against a manifest that is about to change (racing the
+            %% in-flight writer: Single mutator). A second remote-retention task
+            %% in particular would capture the same pre-retention snapshot and
+            %% recompute the identical prefix-truncation edit, which would then
+            %% be applied a second time: splicing out live entries and
+            %% double-counting total_size. The corrupt edit is persisted and
+            %% broadcast in-sequence, so every replica applies it with no gap
+            %% detected. Skip; retention is re-evaluated by the next
+            %% persist_complete once the in-flight work finishes. This guards the
+            %% manual CLI and retention_updated triggers; the automatic
+            %% post-persist path is already gated by persist_complete.
+            ?LOG_DEBUG(
+                "~ts skipping remote retention evaluation: ~ts in flight",
+                [StreamId, Blocker]
+            ),
+            State
     end.
 
 %% Handle a retention result (synchronous fragments-only case or async completion).
@@ -1210,6 +1259,7 @@ maybe_spawn_group_retention(
     State
 ) when Kind =/= ?MANIFEST_KIND_FRAGMENT ->
     Self = self(),
+    Token = make_ref(),
     GetGroupFun = rabbitmq_stream_s3_manifest:get_cached_group_fun(StreamId),
     {Pid, MonRef} = spawn_monitor(fun() ->
         logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
@@ -1225,12 +1275,18 @@ maybe_spawn_group_retention(
                     ),
                     {failed, {Class, Reason}}
             end,
-        Self ! {retention_result, Result}
+        Self ! {retention_result, Token, Result}
     end),
     Core = rabbitmq_stream_s3_replica_reader_core:retention_started(State#state.core),
     Timeout = rabbitmq_stream_s3_config:retention_task_timeout(),
     TRef = erlang:send_after(Timeout, Self, retention_timeout),
-    State#state{core = Core, retention_mon = MonRef, retention_pid = Pid, retention_timer = TRef};
+    State#state{
+        core = Core,
+        retention_mon = MonRef,
+        retention_pid = Pid,
+        retention_timer = TRef,
+        retention_token = Token
+    };
 maybe_spawn_group_retention(_Manifest, _Retention, _Now, _StreamId, State) ->
     State.
 

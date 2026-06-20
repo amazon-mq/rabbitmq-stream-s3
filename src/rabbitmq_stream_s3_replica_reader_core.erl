@@ -16,7 +16,7 @@ testable without mocks or timing.
     init/2,
     manifest/1,
     persisted_manifest/1,
-    rebalance_in_flight/1,
+    pending_prefix_rewrite/1,
     format_state/1,
     fragment_cut/2,
     transfer_complete/3,
@@ -147,14 +147,20 @@ persisted_manifest(#state{last_persisted_manifest = Manifest}) ->
     Manifest.
 
 -doc """
-Whether a root rebalance (factoring leading entries into a group object) is in
-flight. The shell consults this before evaluating remote retention, since both
-rewrite the manifest's leading entries and must not run concurrently (Single
-mutator).
+Which manifest-prefix rewrite, if any, is in flight: a `rebalance` (factoring
+leading entries into a group object) or a remote `retention` evaluation
+(truncating leading entries). Both rewrite the manifest's leading entries, so a
+remote-retention trigger must stand down while either runs: evaluating against a
+prefix that is about to change races the in-flight writer (Single mutator), and
+a second retention task in particular would capture the same pre-retention
+snapshot, recompute the identical prefix-truncation edit, and apply it twice,
+deleting live entries and double-counting total_size. Returns the specific
+blocker so the caller can report which one is in progress.
 """.
--spec rebalance_in_flight(state()) -> boolean().
-rebalance_in_flight(#state{rebalance_in_flight = Flag}) ->
-    Flag.
+-spec pending_prefix_rewrite(state()) -> none | rebalance | retention.
+pending_prefix_rewrite(#state{rebalance_in_flight = true}) -> rebalance;
+pending_prefix_rewrite(#state{retention_in_flight = true}) -> retention;
+pending_prefix_rewrite(#state{}) -> none.
 
 -spec format_state(state()) -> map().
 format_state(#state{

@@ -67,6 +67,7 @@ all() ->
         retention_defers_persist,
         retention_edit_broadcast_on_persist_complete,
         retention_failed_clears_flag,
+        pending_prefix_rewrite_reports_blocker,
         persist_failed_during_rebalance_retries_after,
         recursive_rebalance_three_levels_deep,
         multiple_persist_conflicts_reinitialize,
@@ -1093,6 +1094,25 @@ retention_edit_broadcast_on_persist_complete(_Config) ->
     ?assertMatch([_], RetEdits),
     %% The invariant must hold.
     assert_edits_reproduce_manifest(From, To, Edits).
+
+pending_prefix_rewrite_reports_blocker(_Config) ->
+    %% pending_prefix_rewrite/1 is the single gate the shell consults before
+    %% evaluating remote retention. It must report none when idle, and name the
+    %% specific in-flight prefix rewrite (retention or rebalance) so the CLI can
+    %% tell the operator which one is blocking.
+    {S0, _} = init_core(#{rebalance_threshold => 4, persist_threshold => 100}),
+    ?assertEqual(none, rabbitmq_stream_s3_replica_reader_core:pending_prefix_rewrite(S0)),
+    %% An async remote-retention evaluation in flight.
+    SRet = rabbitmq_stream_s3_replica_reader_core:retention_started(S0),
+    ?assertEqual(retention, rabbitmq_stream_s3_replica_reader_core:pending_prefix_rewrite(SRet)),
+    %% A rebalance in flight: four fragments reach the rebalance threshold.
+    S1 = cut_and_complete(S0, 0, 100, 1001),
+    S2 = cut_and_complete(S1, 100, 200, 1002),
+    S3 = cut_and_complete(S2, 200, 300, 1003),
+    S4 = cut_and_complete(S3, 300, 400, 1004),
+    #{rebalance_in_flight := true} =
+        rabbitmq_stream_s3_replica_reader_core:format_state(S4),
+    ?assertEqual(rebalance, rabbitmq_stream_s3_replica_reader_core:pending_prefix_rewrite(S4)).
 
 retention_failed_clears_flag(_Config) ->
     %% After retention_failed, persist should be unblocked.

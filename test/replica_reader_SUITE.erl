@@ -89,7 +89,8 @@ groups() ->
             remote_retention_deletes_within_group,
             remote_retention_deletes_all_fragments,
             old_manifest_roots_deleted,
-            attach_to_stream_with_prior_retention
+            attach_to_stream_with_prior_retention,
+            stale_retention_result_is_ignored
         ]},
         {with_replica, [], [
             replication_happy_path
@@ -1033,6 +1034,25 @@ attach_to_stream_with_prior_retention(Config) ->
     {FirstOffset, NextOffset} = get_range(Config),
     ?assert(FirstOffset > 0),
     ?assertEqual(20, NextOffset).
+
+stale_retention_result_is_ignored(Config) ->
+    %% A retention result whose token does not match the in-flight task (for
+    %% example one the retention timeout already killed, whose message was
+    %% queued before the kill) must be ignored, not routed to the apply path.
+    %% Inject one with a fresh, unknown token and a payload that would crash the
+    %% reader if it reached the edit-apply handler ({not_an_edit, []} would be
+    %% taken as an {Edit, Refs} result), then confirm the reader is unaffected.
+    StreamId = ?config(stream_id, Config),
+    _ = start_writer(Config, #{}),
+    ReaderPid = rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}),
+    ?assert(is_pid(ReaderPid)),
+    ReaderPid ! {retention_result, make_ref(), {not_an_edit, []}},
+    %% A synchronous call doubles as a barrier: it only returns once the info
+    %% message above has been handled. The reader must still be the same live
+    %% process (no crash, no supervised restart).
+    _ = rabbitmq_stream_s3_replica_reader:evaluate_remote_retention(StreamId),
+    ?assert(is_process_alive(ReaderPid)),
+    ?assertEqual(ReaderPid, rabbitmq_stream_s3_registry:whereis_name({StreamId, node()})).
 
 replication_happy_path(Config) ->
     StreamId = ?config(stream_id, Config),
