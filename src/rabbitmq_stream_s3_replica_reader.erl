@@ -599,10 +599,21 @@ handle_info({transfer_deadline, Ref, Token}, #state{core = Core0} = State0) ->
     end;
 handle_info({retry_transfer, Ref, Dir, Meta}, #state{cfg = #cfg{stream = StreamId}} = State) ->
     %% A previously failed fragment upload is being retried after its backoff
-    %% delay. The in-flight gauges were already restored when the delayed
-    %% resubmit effect was executed, so only re-submit the upload here.
-    submit_upload(Ref, Dir, StreamId, Meta),
-    {noreply, State};
+    %% delay. If a reset (local-log-ahead recovery) cleared the in-flight
+    %% transfer tracking after this retry was scheduled, the fragment is no
+    %% longer part of the pipeline; drop the retry rather than re-submitting a
+    %% phantom upload against the discarded core (mirrors the stale
+    %% transfer_result guard above). The timer is fire-and-forget, so this is
+    %% where the stale retry is filtered.
+    case is_map_key(Ref, State#state.transfer_sizes) of
+        true ->
+            %% The in-flight gauges were already restored when the delayed
+            %% resubmit effect was executed, so only re-submit the upload here.
+            submit_upload(Ref, Dir, StreamId, Meta),
+            {noreply, State};
+        false ->
+            {noreply, State}
+    end;
 handle_info(
     {group_upload_result, {ok, Uid}}, #state{core = Core0, group_mon = Mon} = State0
 ) when Mon =/= undefined ->
@@ -2313,6 +2324,18 @@ evaluate_retention_on_unresolved_manifest_replies_error_test() ->
     ?assertEqual(
         {reply, {error, manifest_not_resolved}, State},
         handle_call(evaluate_remote_retention, From, State)
+    ).
+
+%% A retry_transfer that fires after a reset cleared the in-flight transfer
+%% tracking must be dropped, not re-submitted as a phantom upload (would
+%% otherwise touch the governor against the discarded core).
+retry_transfer_after_reset_is_dropped_test() ->
+    State = #state{transfer_sizes = #{}, cfg = #cfg{stream = <<"s">>}},
+    Ref = make_ref(),
+    Meta = #{first_offset => 0, size => 0},
+    ?assertEqual(
+        {noreply, State},
+        handle_info({retry_transfer, Ref, <<"/tmp">>, Meta}, State)
     ).
 
 %% reset_for_recovery must tear down every in-flight async task: clear the
