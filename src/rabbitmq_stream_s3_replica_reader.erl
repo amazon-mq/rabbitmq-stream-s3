@@ -97,19 +97,20 @@ returned by the functional core module.
 -define(C_BYTES_PERSISTED, 21).
 -define(C_REMOTE_TIER_RETENTION_FAILURES, 22).
 -define(C_MANIFEST_RESOLUTION_FAILURES, 23).
+-define(C_REMOTE_TIER_AHEAD_RECOVERIES, 24).
 %% Counters above; gauges below. The macro ?NODE_COUNTERS filters by
 %% type, and seshat requires counter indexes to be 1..N sequential. Add
 %% new counters before this divider and renumber the gauges that follow.
--define(C_TRANSFERS_IN_FLIGHT, 24).
--define(C_LAST_PERSIST_TIMESTAMP_MS, 25).
--define(C_MANIFEST_FIRST_OFFSET, 26).
--define(C_MANIFEST_NEXT_OFFSET, 27).
--define(C_MANIFEST_FIRST_TIMESTAMP_MS, 28).
--define(C_REMOTE_BYTES, 29).
--define(C_REMOTE_MESSAGES, 30).
--define(C_BYTES_IN_ASSEMBLY, 31).
--define(C_BYTES_IN_TRANSFER, 32).
--define(C_BYTES_IN_PERSIST, 33).
+-define(C_TRANSFERS_IN_FLIGHT, 25).
+-define(C_LAST_PERSIST_TIMESTAMP_MS, 26).
+-define(C_MANIFEST_FIRST_OFFSET, 27).
+-define(C_MANIFEST_NEXT_OFFSET, 28).
+-define(C_MANIFEST_FIRST_TIMESTAMP_MS, 29).
+-define(C_REMOTE_BYTES, 30).
+-define(C_REMOTE_MESSAGES, 31).
+-define(C_BYTES_IN_ASSEMBLY, 32).
+-define(C_BYTES_IN_TRANSFER, 33).
+-define(C_BYTES_IN_PERSIST, 34).
 
 -define(STREAM_COUNTERS, [
     {transfers_completed, ?C_TRANSFERS_COMPLETED, counter,
@@ -151,6 +152,10 @@ returned by the functional core module.
     {local_log_ahead_recoveries, ?C_LOCAL_LOG_AHEAD_RECOVERIES, counter,
         "Times the replica reader discarded the remote manifest because the local log "
         "was ahead (e.g. local retention deleted un-uploaded data)"},
+    {remote_tier_ahead_recoveries, ?C_REMOTE_TIER_AHEAD_RECOVERIES, counter,
+        "Times the replica reader discarded the remote manifest because the remote tier "
+        "was ahead of the local log (the manifest's next_offset was beyond the local "
+        "log's last offset after a leader election or data-directory loss)"},
     {bytes_drained_total, ?C_BYTES_DRAINED, counter,
         "Cumulative bytes the replica reader has drained from osiris (sum of chunk "
         "byte sizes read via osiris_log:read_header)"},
@@ -1490,8 +1495,7 @@ start_reading0(
         cfg = #cfg{
             writer_pid = WriterPid,
             fragment_target_size = TargetSize,
-            stream = StreamId,
-            epoch = Epoch
+            stream = StreamId
         },
         core = Core
     } = State
@@ -1521,21 +1525,30 @@ start_reading0(
                 [StreamId, LocalFirst, StartOffset]
             ),
             inc(State1, ?C_LOCAL_LOG_AHEAD_RECOVERIES, 1),
-            FreshManifest = reset_manifest(LocalFirst, Manifest#manifest.revision),
-            {Core1, _} = rabbitmq_stream_s3_replica_reader_core:init(
-                FreshManifest, State1#state.config
+            restart_at_local_floor(LocalFirst, Manifest, State1);
+        {error, {offset_out_of_range, {LocalFirst, _LastOffset}}} ->
+            %% The manifest's next_offset is beyond the local log's last offset
+            %% (LocalFirst =< StartOffset, so this is not the local-ahead case
+            %% above): a leader election or a power-loss timeline change left the
+            %% local log shorter than the committed manifest. This is the "remote
+            %% tier ahead of local" case in failure-modes.md. Local data is
+            %% authoritative, so discard the remote manifest and restart from the
+            %% local log's first offset. Without this the open at StartOffset
+            %% fails identically on every retry_resolve, wedging tiering forever
+            %% and growing local disk unbounded (local retention only reclaims
+            %% offsets below the pinned next_offset). The empty-local-log shape
+            %% (offset_out_of_range = empty) is intentionally left to the retry
+            %% path below: an empty local log can be a transient writer-recovery
+            %% state, and resetting then would prematurely discard recoverable
+            %% remote data.
+            ?LOG_WARNING(
+                "~ts remote tier ahead of local log "
+                "(manifest_next=~b, local_first=~b). "
+                "Discarding remote manifest and restarting from the local log.",
+                [StreamId, StartOffset, LocalFirst]
             ),
-            ok = rabbitmq_stream_s3_manifest_replica:put_manifest(StreamId, FreshManifest),
-            %% Propagate the reset to replicas. The reset discards the writer's
-            %% manifest and installs a fresh one at the local floor, but leaves
-            %% broadcast_seq unchanged. Replicas still hold the pre-reset
-            %% manifest at their last broadcast seq; without this resync the
-            %% next broadcast would land in-sequence and splice an edit onto a
-            %% manifest the writer has already discarded, corrupting every
-            %% replica (the same silent divergence as an unsynced register).
-            ok = sync_all_replicas(FreshManifest, State1),
-            gc_stream_async(StreamId, Epoch),
-            start_reading(State1#state{core = Core1});
+            inc(State1, ?C_REMOTE_TIER_AHEAD_RECOVERIES, 1),
+            restart_at_local_floor(LocalFirst, Manifest, State1);
         {error, Reason} ->
             ?LOG_WARNING(
                 "Failed to open data reader for stream ~ts: ~p",
@@ -1553,6 +1566,31 @@ start_reading0(
             %% Retry immediately (same pattern as osiris_log:init_offset_reader).
             start_reading((close_log(State1))#state{core = Core, assembly = undefined})
     end.
+
+%% Discard the remote manifest and restart tiering from the local log's first
+%% offset. Shared by both manifest/local divergence directions handled in
+%% start_reading0/1: local-ahead (local retention trimmed the local log past the
+%% manifest) and remote-ahead (the manifest's next_offset is beyond the local
+%% log after a timeline change). In both, local data is authoritative.
+-spec restart_at_local_floor(osiris:offset(), #manifest{}, #state{}) -> #state{}.
+restart_at_local_floor(
+    LocalFirst,
+    #manifest{revision = Revision},
+    #state{cfg = #cfg{stream = StreamId, epoch = Epoch}} = State
+) ->
+    FreshManifest = reset_manifest(LocalFirst, Revision),
+    {Core1, _} = rabbitmq_stream_s3_replica_reader_core:init(FreshManifest, State#state.config),
+    ok = rabbitmq_stream_s3_manifest_replica:put_manifest(StreamId, FreshManifest),
+    %% Propagate the reset to replicas. The reset discards the writer's manifest
+    %% and installs a fresh one at the local floor, but leaves broadcast_seq
+    %% unchanged. Replicas still hold the pre-reset manifest at their last
+    %% broadcast seq; without this resync the next broadcast would land
+    %% in-sequence and splice an edit onto a manifest the writer has already
+    %% discarded, corrupting every replica (the same silent divergence as an
+    %% unsynced register).
+    ok = sync_all_replicas(FreshManifest, State),
+    gc_stream_async(StreamId, Epoch),
+    start_reading(State#state{core = Core1}).
 
 %% Whether the live local log has been trimmed past the manifest's next_offset.
 %% When true, the segment backing the stalled head fragment is permanently gone

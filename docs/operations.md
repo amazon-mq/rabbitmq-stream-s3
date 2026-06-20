@@ -202,6 +202,7 @@ These metrics decompose disk-resident bytes by their position in the upload pipe
 | `rabbitmq_stream_s3_manifests_resolved_empty`          | counter | Times a genuinely empty manifest was resolved on startup          |
 | `rabbitmq_stream_s3_manifest_resolution_failures`      | counter | Resolutions that hit a transient store or object error and were retried instead of resolving empty |
 | `rabbitmq_stream_s3_local_log_ahead_recoveries`        | counter | Times the replica reader discarded the remote manifest because the local log was ahead (e.g. retention deleted un-uploaded data) |
+| `rabbitmq_stream_s3_remote_tier_ahead_recoveries`      | counter | Times the replica reader discarded the remote manifest because the remote tier was ahead of the local log (manifest next_offset beyond the local log after a leader election or data-directory loss) |
 
 #### Retention
 

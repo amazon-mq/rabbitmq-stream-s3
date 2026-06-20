@@ -59,15 +59,15 @@ For the concepts behind these scenarios, see [concepts.md](./concepts.md). For t
 **Detection.** Logs on the writer node when the replica reader starts:
 
 ```
-~ts local log ahead of manifest (local_first=N, manifest_next=M).
-Discarding remote manifest and restarting.
+~ts remote tier ahead of local log (manifest_next=M, local_first=N).
+Discarding remote manifest and restarting from the local log.
 ```
 
-`rabbitmq_stream_s3_local_log_ahead_recoveries` increments. The manifest's `rabbitmq_stream_s3_manifest_next_offset` resets to the local log's first offset.
+`rabbitmq_stream_s3_remote_tier_ahead_recoveries` increments. The manifest's `rabbitmq_stream_s3_manifest_next_offset` resets to the local log's first offset. (This is the inverse of the "Segment deleted before upload" case below, which fires `rabbitmq_stream_s3_local_log_ahead_recoveries`: there the local log's first offset is *ahead of* the manifest; here the manifest's next offset is *beyond* the local log's last offset.)
 
 **Mitigation.** None. The replica reader handles this automatically on startup.
 
-**Resolution.** The replica reader discards the remote manifest, deletes the stale fragment objects in the background (via the reaper), and resumes normal operation from the local log's first offset. The local log is always authoritative.
+**Resolution.** The replica reader discards the remote manifest, deletes the stale fragment objects in the background (via the reaper), and resumes normal operation from the local log's first offset. The local log is always authoritative. One sub-case is intentionally left to the ordinary resolution retry rather than triggering a reset: a *completely empty* local log paired with a non-empty manifest, which is more often a transient writer-recovery state than a genuine timeline divergence, and resetting then would prematurely discard recoverable remote data.
 
 ---
 
