@@ -903,41 +903,44 @@ reinit_remote(NextOffset, Config) ->
 ) -> {ok, #remote_location{}} | {error, any()}.
 find_position(Spec, #manifest{} = Manifest, StreamId) ->
     GetGroupFun = rabbitmq_stream_s3_manifest:get_group_fun(StreamId),
-    #fragment_ref{offset = FragmentOffset, uid = Uid, size = Size} =
-        FragRef =
-        find_fragment(Manifest#manifest.entries, Spec, GetGroupFun),
-    %% Download the index from the fragment to find the exact chunk position.
-    IdxStartPos = ?SEGMENT_HEADER_B + Size,
-    case index_data(StreamId, FragmentOffset, Uid, IdxStartPos) of
-        {ok, IndexData} when byte_size(IndexData) >= ?INDEX_RECORD_B ->
-            warn_on_partial_index(StreamId, FragmentOffset, IndexData),
-            {ChunkId, _, FragPos} = find_index_position(IndexData, Spec),
-            %% Position within the fragment object (after the 8-byte header).
-            Position = ?SEGMENT_HEADER_B + FragPos,
-            %% Create an iterator positioned at this fragment for forward navigation.
-            Iterator = rabbitmq_stream_s3_fragment_iterator:init(
-                Manifest, FragmentOffset, GetGroupFun
-            ),
-            %% Advance past the current entry so the iterator is ready for `next`.
-            Iterator1 = advance_past_current(Iterator),
-            {ok, #remote_location{
-                chunk_id = ChunkId,
-                position = Position,
-                fragment_ref = FragRef,
-                iterator = Iterator1
-            }};
-        {ok, IndexData} ->
-            %% The index region read back with fewer than one full record, for
-            %% example a truncated or partially written fragment object.
-            %% Resolving a position from it would crash the reader on an empty
-            %% array, so fail loudly and let the caller surface the error.
-            ?LOG_WARNING(
-                "Empty or truncated index for stream '~ts' fragment ~b (~b bytes);"
-                " cannot resolve a remote position",
-                [StreamId, FragmentOffset, byte_size(IndexData)],
-                ?DOMAIN
-            ),
-            {error, {empty_index, FragmentOffset}};
+    case find_fragment(Manifest#manifest.entries, Spec, GetGroupFun) of
+        {ok, #fragment_ref{offset = FragmentOffset, uid = Uid, size = Size} = FragRef} ->
+            %% Download the index from the fragment to find the exact chunk position.
+            IdxStartPos = ?SEGMENT_HEADER_B + Size,
+            case index_data(StreamId, FragmentOffset, Uid, IdxStartPos) of
+                {ok, IndexData} when byte_size(IndexData) >= ?INDEX_RECORD_B ->
+                    warn_on_partial_index(StreamId, FragmentOffset, IndexData),
+                    {ChunkId, _, FragPos} = find_index_position(IndexData, Spec),
+                    %% Position within the fragment object (after the 8-byte header).
+                    Position = ?SEGMENT_HEADER_B + FragPos,
+                    %% Create an iterator positioned at this fragment for forward navigation.
+                    Iterator = rabbitmq_stream_s3_fragment_iterator:init(
+                        Manifest, FragmentOffset, GetGroupFun
+                    ),
+                    %% Advance past the current entry so the iterator is ready for `next`.
+                    Iterator1 = advance_past_current(Iterator),
+                    {ok, #remote_location{
+                        chunk_id = ChunkId,
+                        position = Position,
+                        fragment_ref = FragRef,
+                        iterator = Iterator1
+                    }};
+                {ok, IndexData} ->
+                    %% The index region read back with fewer than one full record,
+                    %% for example a truncated or partially written fragment
+                    %% object. Resolving a position from it would crash the reader
+                    %% on an empty array, so fail loudly and let the caller surface
+                    %% the error.
+                    ?LOG_WARNING(
+                        "Empty or truncated index for stream '~ts' fragment ~b (~b bytes);"
+                        " cannot resolve a remote position",
+                        [StreamId, FragmentOffset, byte_size(IndexData)],
+                        ?DOMAIN
+                    ),
+                    {error, {empty_index, FragmentOffset}};
+                {error, _} = Err ->
+                    Err
+            end;
         {error, _} = Err ->
             Err
     end.
@@ -984,7 +987,7 @@ and then searched recursively.
     rabbitmq_stream_s3:entries(),
     {offset, osiris:offset()} | {timestamp, osiris:timestamp()},
     fun((#group_ref{}) -> {ok, rabbitmq_stream_s3:entries()} | {error, any()})
-) -> #fragment_ref{}.
+) -> {ok, #fragment_ref{}} | {error, {group_fetch_failed, term()}}.
 find_fragment(Entries, Spec, GetGroup) ->
     PartitionPredicate =
         case Spec of
@@ -1011,17 +1014,25 @@ find_fragment(Entries, Spec, GetGroup) ->
         end,
     case rabbitmq_stream_s3_array:at(Idx, ?ENTRY_B, Entries) of
         ?ENTRY(EntryOffset, _FTs, _LTs, ?MANIFEST_KIND_FRAGMENT, Size, Uid, _) ->
-            #fragment_ref{offset = EntryOffset, uid = Uid, size = Size};
+            {ok, #fragment_ref{offset = EntryOffset, uid = Uid, size = Size}};
         ?ENTRY(GroupOffset, _FTs, _LTs, Kind, _Sz, Uid, _) ->
-            %% Download the group and search recursively within that.
+            %% Download the group and search recursively within that. The group
+            %% object can be missing (a retention deferred-deletion window) or
+            %% briefly unfetchable (a transient S3 error surviving retries);
+            %% surface that as an error so the caller fails the read setup
+            %% cleanly rather than crashing the consumer on a badmatch.
             ?LOG_DEBUG(
                 "Entry is not a fragment. Searching within group ~b kind ~b",
                 [GroupOffset, Kind],
                 ?DOMAIN
             ),
             GroupRef = #group_ref{uid = Uid, kind = Kind, offset = GroupOffset},
-            {ok, GroupEntries} = GetGroup(GroupRef),
-            find_fragment(GroupEntries, Spec, GetGroup)
+            case GetGroup(GroupRef) of
+                {ok, GroupEntries} ->
+                    find_fragment(GroupEntries, Spec, GetGroup);
+                {error, Reason} ->
+                    {error, {group_fetch_failed, Reason}}
+            end
     end.
 
 find_index_position(IndexData, Spec) ->
@@ -1251,7 +1262,7 @@ find_fragment_test() ->
         {ok, FragmentEntries}
     end,
     FindFragment2 = fun(Spec) ->
-        #fragment_ref{offset = FoundOffset} = find_fragment(Entries, Spec, GetGroup),
+        {ok, #fragment_ref{offset = FoundOffset}} = find_fragment(Entries, Spec, GetGroup),
         FoundOffset
     end,
     %% The new fragments can be found normally.
@@ -1264,6 +1275,22 @@ find_fragment_test() ->
     %% Offset and timestamp assertions on flat fragment lists are omitted here;
     %% they are covered by the property-based tests in unit_SUITE.
     ok.
+
+%% A group object can be missing (a retention deferred-deletion window) or
+%% briefly unfetchable (a transient S3 error surviving retries). find_fragment
+%% must surface a clean error rather than crash the consumer on a badmatch.
+find_fragment_group_fetch_error_is_surfaced_test() ->
+    GroupUid = rabbitmq_stream_s3:uid(),
+    Entries = ?ENTRY(0, 1000, 2000, ?MANIFEST_KIND_GROUP, 0, GroupUid),
+    GetGroup = fun(#group_ref{}) -> {error, not_found} end,
+    ?assertEqual(
+        {error, {group_fetch_failed, not_found}},
+        find_fragment(Entries, {offset, 5}, GetGroup)
+    ),
+    ?assertEqual(
+        {error, {group_fetch_failed, not_found}},
+        find_fragment(Entries, {timestamp, 1500}, GetGroup)
+    ).
 
 find_fragment_timestamp_boundary_test() ->
     %% A flat fragment list (no group), so this isolates fragment selection.
@@ -1282,7 +1309,7 @@ find_fragment_timestamp_boundary_test() ->
     >>,
     NoGroup = fun(_) -> error(unexpected_group_fetch) end,
     FindFragment2 = fun(Spec) ->
-        #fragment_ref{offset = FoundOffset} = find_fragment(Entries, Spec, NoGroup),
+        {ok, #fragment_ref{offset = FoundOffset}} = find_fragment(Entries, Spec, NoGroup),
         FoundOffset
     end,
     %% A timestamp strictly inside a fragment resolves to that fragment.
