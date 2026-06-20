@@ -65,7 +65,9 @@ groups() ->
             local_to_remote_transition,
             read_through_group,
             read_detects_crc_corruption,
-            offset_spec_at_tier_boundary
+            offset_spec_at_tier_boundary,
+            remote_reader_restart_self_heals,
+            become_local_stops_remote_reader
         ]},
         {with_replica, [], [
             read_from_replica_node
@@ -409,6 +411,80 @@ offset_spec_at_tier_boundary(Config) ->
     ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader2)),
     rabbitmq_stream_s3_log_reader:close(Reader2).
 
+remote_reader_restart_self_heals(Config) ->
+    %% When the remote reader gen_server exits unexpectedly, the read must not
+    %% crash the consumer. The log reader surfaces a clean error, restarts a
+    %% fresh remote reader and the subscription self-heals.
+    Writer = start_writer(Config, #{fragment_target_size => 1000}),
+    N = 200,
+    write_sequential(Writer, N, 5),
+
+    ReaderCfg = reader_config(Writer, Config),
+    #{shared := Shared} = ReaderCfg,
+    ?awaitMatch([S] when S > 0, list_segment_offsets(Config), 1000),
+    ?awaitMatch(F when F > 0, osiris_log_shared:first_chunk_id(Shared), 1000),
+
+    {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg),
+    ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),
+
+    %% Kill the remote reader out from under the consumer.
+    Pid = rabbitmq_stream_s3_log_reader:remote_pid(Reader0),
+    ?assert(is_process_alive(Pid)),
+    exit(Pid, kill),
+    ?awaitMatch(false, is_process_alive(Pid), 1000),
+
+    %% The next read restarts a fresh reader (a new live pid) instead of
+    %% crashing on the dead one.
+    {ok, _Header, Iter, Reader1} =
+        rabbitmq_stream_s3_log_reader:chunk_iterator(Reader0, 1, undefined),
+    NewPid = rabbitmq_stream_s3_log_reader:remote_pid(Reader1),
+    ?assertNotEqual(Pid, NewPid),
+    ?assert(is_process_alive(NewPid)),
+
+    %% The full stream reads back correctly across the restart.
+    FirstChunk = drain_iter(Iter, 0, []),
+    Rest = read_all(Reader1),
+    assert_sequential(FirstChunk ++ Rest, N).
+
+become_local_stops_remote_reader(Config) ->
+    %% A reader that transitions from the remote tier back to the local tier
+    %% (become_local) must stop the remote reader gen_server rather than
+    %% leaving it orphaned for the consumer's lifetime.
+    %%
+    %% Build a remote tier that stops short of the local tail: upload a first
+    %% batch and let retention evict its early segments, then halt uploads and
+    %% append a local-only tail. A reader starting below the local floor opens
+    %% on the remote tier and must become_local when it reaches the tail.
+    WriterCfg0 = ?config(writer_cfg, Config),
+    WriterCfg = maps:merge(WriterCfg0, #{log_hooks => undefined}),
+    {ok, Writer} = osiris_writer:start(WriterCfg),
+    flush_writer(Writer),
+
+    %% Batch A: uploaded and partly evicted by retention.
+    write_sequential(Writer, 200, 5),
+    ReaderPid = start_replica_reader(Writer, Config, #{fragment_target_size => 500}),
+    await_offset(Config, 200),
+    ReaderCfg = reader_config(Writer, Config),
+    #{shared := Shared} = ReaderCfg,
+    ?awaitMatch(F when F > 0, osiris_log_shared:first_chunk_id(Shared), 2000),
+
+    %% Halt uploads, then append a tail that stays local-only.
+    ok = rabbitmq_stream_s3_replica_reader_sup:stop_child(ReaderPid),
+    write_sequential(Writer, 50, 5),
+    flush_writer(Writer),
+
+    {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg),
+    ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),
+    RemotePid = rabbitmq_stream_s3_log_reader:remote_pid(Reader0),
+    ?assert(is_process_alive(RemotePid)),
+
+    %% Read forward until the reader crosses into the local tier.
+    ReaderFinal = read_until_local(Reader0),
+    ?assertEqual(local, rabbitmq_stream_s3_log_reader:mode(ReaderFinal)),
+
+    %% The orphaned remote reader must have been stopped.
+    ?awaitMatch(false, is_process_alive(RemotePid), 1000).
+
 read_from_replica_node(Config) ->
     StreamId = ?config(stream_id, Config),
     ReplicaNode = ?config(replica_node, Config),
@@ -451,6 +527,19 @@ read_from_replica_node(Config) ->
 %% ------------------------------------------------------------------
 %% Internal helpers
 %% ------------------------------------------------------------------
+
+read_until_local(Reader) ->
+    case rabbitmq_stream_s3_log_reader:mode(Reader) of
+        local ->
+            Reader;
+        remote ->
+            case rabbitmq_stream_s3_log_reader:chunk_iterator(Reader, 1, undefined) of
+                {ok, _Header, _Iter, Reader1} ->
+                    read_until_local(Reader1);
+                {end_of_stream, Reader1} ->
+                    Reader1
+            end
+    end.
 
 corrupt_first_fragment(Config) ->
     RemoteDir = ?config(remote_dir, Config),
