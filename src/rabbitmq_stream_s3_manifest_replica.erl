@@ -18,6 +18,13 @@ Edits carry a monotonic sequence number and epoch. The replica applies
 edits only if `seq == last_seq + 1` and the epoch matches. On gap or
 epoch mismatch, the replica requests a full re-sync from the writer.
 
+The sequence number is the writer's manifest revision (the stream's Khepri
+`payload_version`), which advances by exactly one per persist in lockstep with
+broadcasts. Because it is durable, a writer-side reader that crashes and is
+restarted at the same epoch resumes the sequence where the previous incarnation
+left off, so its sync is not rejected as stale (a same-epoch restart would
+otherwise restart an in-memory counter at zero and wedge replica sync).
+
 No heartbeat or reconnection mechanism is needed because:
 - Message loss on a live connection is detected when the next edit
   arrives (gap in sequence). The persist interval (default 2s)

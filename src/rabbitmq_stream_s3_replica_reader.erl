@@ -219,9 +219,6 @@ returned by the functional core module.
     core :: rabbitmq_stream_s3_replica_reader_core:state() | undefined,
     %% Nodes registered for manifest broadcast.
     replicas = #{} :: #{node() => reference()},
-    %% Monotonic sequence number for broadcast edits. Incremented per edit
-    %% batch sent. Replicas use this to detect gaps and request re-sync.
-    broadcast_seq = 0 :: non_neg_integer(),
     %% User-configured retention specs for remote tier evaluation.
     retention = [] :: [osiris:retention_spec()],
     %% Commit timer reference.
@@ -448,7 +445,6 @@ handle_cast(
     #state{
         replicas = Replicas,
         core = Core,
-        broadcast_seq = Seq,
         cfg = #cfg{stream = StreamId, epoch = Epoch}
     } = State
 ) ->
@@ -457,18 +453,16 @@ handle_cast(
             {noreply, State};
         false ->
             MonRef = monitor(process, {rabbitmq_stream_s3_manifest_replica, Node}),
-            %% Sync the *persisted* manifest, not the live one. Seq is
-            %% broadcast_seq, which only advances when a {broadcast, _} effect
-            %% runs; it therefore lags any edit applied to the live manifest but
-            %% not yet broadcast. Pairing the live manifest with the lagging seq
-            %% makes the replica cache an edit it was never told about, and the
-            %% deferred broadcast then re-delivers that edit in-sequence so the
-            %% replica double-applies it (silent, unhealable divergence: no gap
-            %% is ever observed). persisted_manifest/1 is exactly the snapshot
-            %% consistent with broadcast_seq. Do not change this back to
-            %% manifest/1.
+            %% Sync the *persisted* manifest, not the live one: sync_manifest/4
+            %% tags the sync with the manifest's revision as the sequence number
+            %% (see the {broadcast, _} effect), and that revision only advances
+            %% when a persist commits. Pairing the live manifest with the
+            %% persisted revision would cache an edit the replica was never told
+            %% about, which the next broadcast then re-delivers in-sequence so
+            %% the replica double-applies it (silent, unhealable divergence: no
+            %% gap is ever observed). Do not change this back to manifest/1.
             Manifest = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(Core),
-            rabbitmq_stream_s3_manifest_replica:sync(StreamId, Seq, Epoch, Manifest, Node),
+            sync_manifest(StreamId, Epoch, Manifest, Node),
             {noreply, State#state{replicas = Replicas#{Node => MonRef}}}
     end;
 handle_cast(
@@ -482,14 +476,13 @@ handle_cast(
     {resync, Node},
     #state{
         core = Core,
-        broadcast_seq = Seq,
         cfg = #cfg{stream = StreamId, epoch = Epoch}
     } = State
 ) ->
-    %% Persisted manifest, not live: it must be consistent with broadcast_seq
-    %% (Seq). See the register_acceptor handler.
+    %% Persisted manifest, not live: its revision is the sequence number the
+    %% replica gap-detects against. See the register_acceptor handler.
     Manifest = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(Core),
-    rabbitmq_stream_s3_manifest_replica:sync(StreamId, Seq, Epoch, Manifest, Node),
+    sync_manifest(StreamId, Epoch, Manifest, Node),
     {noreply, State};
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -902,7 +895,6 @@ register_replica(
     #state{
         replicas = Replicas,
         core = Core,
-        broadcast_seq = Seq,
         cfg = #cfg{stream = StreamId, epoch = Epoch}
     } = State
 ) ->
@@ -911,35 +903,46 @@ register_replica(
             State;
         false ->
             MonRef = monitor(process, {rabbitmq_stream_s3_manifest_replica, Node}),
-            %% Persisted manifest, not live: it must be consistent with
-            %% broadcast_seq (Seq). See the register_acceptor handler.
+            %% Persisted manifest, not live: its revision is the sequence number.
+            %% See the register_acceptor handler.
             Manifest = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(Core),
-            rabbitmq_stream_s3_manifest_replica:sync(StreamId, Seq, Epoch, Manifest, Node),
+            sync_manifest(StreamId, Epoch, Manifest, Node),
             State#state{replicas = Replicas#{Node => MonRef}}
     end.
 
 %% Force every registered replica to drop its cached manifest and adopt the
-%% given one via a full sync, tagged with the current broadcast_seq. Used after
-%% a manifest reset (local-log-ahead recovery), which discards the writer's
-%% manifest without advancing broadcast_seq: subsequent broadcasts continue at
-%% broadcast_seq + 1 and stay in sequence relative to this sync. Casts to a
-%% given node are FIFO from this process, so each replica observes the sync
-%% before the next apply_edits.
+%% given one via a full sync, tagged with that manifest's revision as the
+%% sequence number. Used after a manifest reset (local-log-ahead and
+%% remote-tier-ahead recovery), which installs a fresh manifest carrying the
+%% discarded manifest's revision: subsequent broadcasts continue at the next
+%% revision and stay in sequence relative to this sync. Casts to a given node
+%% are FIFO from this process, so each replica observes the sync before the
+%% next apply_edits.
 -spec sync_all_replicas(#manifest{}, #state{}) -> ok.
 sync_all_replicas(
     Manifest,
     #state{
         replicas = Replicas,
-        broadcast_seq = Seq,
         cfg = #cfg{stream = StreamId, epoch = Epoch}
     }
 ) ->
     maps:foreach(
         fun(Node, _MonRef) ->
-            rabbitmq_stream_s3_manifest_replica:sync(StreamId, Seq, Epoch, Manifest, Node)
+            sync_manifest(StreamId, Epoch, Manifest, Node)
         end,
         Replicas
     ).
+
+%% Send a full sync of Manifest to a replica node, tagged with the manifest's
+%% revision as the broadcast sequence number. The revision (the stream's Khepri
+%% payload_version) is the single source of the sequence: it advances by exactly
+%% one per persist, the persist's CAS rejects any competing same-epoch write so
+%% consecutive revisions are contiguous, and it is durable so a restarted reader
+%% resumes the sequence where the previous incarnation left off rather than
+%% restarting at zero (which a replica would reject as stale).
+-spec sync_manifest(stream_id(), non_neg_integer(), #manifest{}, node()) -> ok.
+sync_manifest(StreamId, Epoch, #manifest{revision = Revision} = Manifest, Node) ->
+    rabbitmq_stream_s3_manifest_replica:sync(StreamId, Revision, Epoch, Manifest, Node).
 
 gc_stream_async(StreamId, WriterEpoch) ->
     spawn(fun() ->
@@ -1144,16 +1147,25 @@ execute_effect({update_range, _FirstOffset, _NextOffset}, #state{cfg = Cfg, core
     on_persist_completed(Manifest, State);
 execute_effect(
     {broadcast, StreamId, Edits},
-    #state{replicas = Replicas, broadcast_seq = Seq0, cfg = #cfg{epoch = Epoch}} = State
+    #state{replicas = Replicas, core = Core, cfg = #cfg{epoch = Epoch}} = State
 ) ->
-    Seq = Seq0 + 1,
+    %% Tag the broadcast with the persisted manifest's revision as the sequence
+    %% number. This effect is emitted by persist_complete, which has already
+    %% stamped the core's persisted manifest with the new revision (the Khepri
+    %% payload_version), so persisted_manifest/1 carries it here. The revision
+    %% advances by exactly one per persist, and the persist's CAS rejects any
+    %% competing same-epoch write, so consecutive broadcasts are contiguous
+    %% (revision N then N+1) - the replica's gap detection holds without a
+    %% separate counter, and a restarted reader resumes the sequence from the
+    %% durable revision instead of restarting at zero.
+    #manifest{revision = Seq} = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(Core),
     maps:foreach(
         fun(Node, _MonRef) ->
             rabbitmq_stream_s3_manifest_replica:apply_edits(StreamId, Edits, Seq, Epoch, Node)
         end,
         Replicas
     ),
-    State#state{broadcast_seq = Seq};
+    State;
 execute_effect(
     {evaluate_retention, _StreamId, _Dir},
     #state{core = Core, retention = Retention, cfg = Cfg} = State
@@ -1581,13 +1593,13 @@ restart_at_local_floor(
     FreshManifest = reset_manifest(LocalFirst, Revision),
     {Core1, _} = rabbitmq_stream_s3_replica_reader_core:init(FreshManifest, State#state.config),
     ok = rabbitmq_stream_s3_manifest_replica:put_manifest(StreamId, FreshManifest),
-    %% Propagate the reset to replicas. The reset discards the writer's manifest
-    %% and installs a fresh one at the local floor, but leaves broadcast_seq
-    %% unchanged. Replicas still hold the pre-reset manifest at their last
-    %% broadcast seq; without this resync the next broadcast would land
-    %% in-sequence and splice an edit onto a manifest the writer has already
-    %% discarded, corrupting every replica (the same silent divergence as an
-    %% unsynced register).
+    %% Propagate the reset to replicas. The fresh manifest carries the discarded
+    %% manifest's revision (the broadcast sequence number), so the sync is not
+    %% rejected as stale and subsequent broadcasts continue in sequence. Replicas
+    %% still hold the pre-reset manifest; without this resync the next broadcast
+    %% would land in-sequence and splice an edit onto a manifest the writer has
+    %% already discarded, corrupting every replica (the same silent divergence as
+    %% an unsynced register).
     ok = sync_all_replicas(FreshManifest, State),
     gc_stream_async(StreamId, Epoch),
     start_reading(State#state{core = Core1}).
