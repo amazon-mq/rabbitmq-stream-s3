@@ -1478,10 +1478,19 @@ classify_store_result(Other, _StreamId) ->
     {ok, #manifest{}} | {retry, term()}.
 classify_object_result({ok, Data}, Rev, _Key) ->
     {ok, (parse_manifest_root(Data))#manifest{revision = Rev}};
-classify_object_result({error, not_found}, _Rev, _Key) ->
-    %% The metadata node exists but no manifest object does yet: a stream that
-    %% has not persisted a manifest. Empty is correct.
+classify_object_result({error, not_found}, Rev, _Key) when Rev =< 0 ->
+    %% No committed revision: a genuinely new stream that has not persisted a
+    %% manifest. Empty is correct.
     {ok, #manifest{}};
+classify_object_result({error, not_found}, _Rev, Key) ->
+    %% Khepri references a manifest at a committed revision (> 0) but the object
+    %% is gone. The object is always PUT before the Khepri CAS, so this is not a
+    %% new stream: it is typically a stale local Khepri read still pointing at a
+    %% manifest object that a newer committed revision already deleted. Fail
+    %% closed and retry rather than misclassifying the stream as empty and
+    %% re-tiering over the real remote objects (Local authority). Resolution
+    %% retries until the local Khepri replica catches up to the newer revision.
+    {retry, {manifest_object_missing, Key}};
 classify_object_result({error, Reason}, _Rev, Key) ->
     %% Khepri references a manifest at this revision but the object store could
     %% not be read (a transient error, not a 404). Do not assume empty.
@@ -2401,7 +2410,17 @@ classify_object_result_transient_error_retries_test() ->
 
 %% A 404 on the manifest object means it has not been written yet: empty.
 classify_object_result_not_found_is_empty_test() ->
-    ?assertEqual({ok, #manifest{}}, classify_object_result({error, not_found}, 7, <<"k">>)).
+    %% A 404 with no committed revision is a genuinely new stream: empty.
+    ?assertEqual({ok, #manifest{}}, classify_object_result({error, not_found}, 0, <<"k">>)).
+
+%% A 404 on a manifest object referenced by a committed revision (> 0) is a
+%% stale local Khepri read pointing at a since-deleted object, not an empty
+%% stream. Fail closed and retry rather than re-tiering over the real objects.
+classify_object_result_not_found_with_revision_retries_test() ->
+    ?assertEqual(
+        {retry, {manifest_object_missing, <<"k">>}},
+        classify_object_result({error, not_found}, 7, <<"k">>)
+    ).
 
 %% A fetched manifest object parses and carries the Khepri revision.
 classify_object_result_ok_parses_with_revision_test() ->
