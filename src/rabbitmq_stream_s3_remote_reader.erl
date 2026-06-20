@@ -75,6 +75,10 @@ synchronous feedback is generated.
     from :: gen_server:from() | undefined,
     %% Timer that fires deadline_expired if the pending read is not served in time.
     deadline_timer :: reference() | undefined,
+    %% Token tagging the current deadline timer's message. cancel_timer cannot
+    %% remove an already-fired message, so a deadline_expired carrying a stale
+    %% token (its read was served, or superseded by a newer read) is ignored.
+    deadline_token :: reference() | undefined,
     %% Maps fragment_offset -> {async_req, async_state}
     requests = #{} :: #{
         osiris:offset() => {
@@ -209,11 +213,13 @@ handle_call(
     {Core1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
         Core0, {read, Offset, Bytes, Hint}
     ),
-    Timer = erlang:send_after(Deadline, self(), deadline_expired),
+    Token = make_ref(),
+    Timer = erlang:send_after(Deadline, self(), {deadline_expired, Token}),
     State1 = State0#state{
         core = Core1,
         from = From,
-        deadline_timer = Timer
+        deadline_timer = Timer,
+        deadline_token = Token
     },
     State = execute_effects(Effects, State1),
     maybe_stop(State);
@@ -235,11 +241,9 @@ handle_info(retry_requests, #state{stream = StreamId, core = Core0} = State0) ->
     {Core1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(Core0, retry),
     State = execute_effects(Effects, State0#state{core = Core1}),
     maybe_stop(State);
-handle_info(deadline_expired, #state{from = undefined} = State) ->
-    %% Timer fired after the read was already served. Ignore.
-    {noreply, State};
 handle_info(
-    deadline_expired, #state{stream = StreamId, core = Core0} = State0
+    {deadline_expired, Token},
+    #state{deadline_token = Token, stream = StreamId, core = Core0} = State0
 ) ->
     ?LOG_DEBUG(
         "remote_reader deadline_expired for stream ~ts"
@@ -250,8 +254,16 @@ handle_info(
     %% reset buffer after the core clears it.
     State1 = cancel_all_requests(State0),
     {Core1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(Core0, deadline_expired),
-    State = execute_effects(Effects, State1#state{core = Core1, deadline_timer = undefined}),
+    State = execute_effects(
+        Effects, State1#state{core = Core1, deadline_timer = undefined, deadline_token = undefined}
+    ),
     maybe_stop(State);
+handle_info({deadline_expired, _StaleToken}, State) ->
+    %% A deadline timer that fired after its read was served, or that belongs to
+    %% a read since superseded by a newer one. cancel_timer cannot remove an
+    %% already-queued message, so ignore the stale token rather than reset a
+    %% newer read's buffer and cancel its in-flight requests.
+    {noreply, State};
 handle_info(Msg, #state{requests = Requests0, cancelled = Cancelled0} = State0) ->
     AsyncStates = #{Req => AsyncState || _ := {Req, AsyncState} <- Requests0},
     case rabbitmq_stream_s3_api:match_async(Msg, AsyncStates, Cancelled0) of
@@ -384,7 +396,7 @@ execute_effect(
     end,
     cancel_deadline_timer(Timer),
     gen_server:reply(From, Result),
-    State#state{from = undefined, deadline_timer = undefined};
+    State#state{from = undefined, deadline_timer = undefined, deadline_token = undefined};
 execute_effect({reply, _Result}, State) ->
     State;
 execute_effect({observe, hit, ReadSize}, State) ->
@@ -519,3 +531,20 @@ cancel_deadline_timer(Timer) ->
 
 counter() ->
     persistent_term:get(?COUNTER_KEY).
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+%% A deadline_expired carrying a token that does not match the current read's
+%% token (its read was already served, or it was superseded by a newer read)
+%% must be ignored rather than reset a newer read's buffer and cancel its
+%% in-flight requests. cancel_timer cannot remove an already-queued message.
+stale_deadline_token_is_ignored_test() ->
+    Stale = make_ref(),
+    State = #state{deadline_token = make_ref()},
+    ?assertEqual({noreply, State}, handle_info({deadline_expired, Stale}, State)),
+    %% Also ignored when no read is pending (token undefined).
+    State2 = #state{deadline_token = undefined},
+    ?assertEqual({noreply, State2}, handle_info({deadline_expired, Stale}, State2)).
+
+-endif.
