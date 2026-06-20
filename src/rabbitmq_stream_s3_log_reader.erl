@@ -188,7 +188,13 @@ resolve_remote_location(Spec, _Config) when Spec =:= last orelse Spec =:= next -
 resolve_remote_location(first, #{name := StreamId, shared := Shared}) ->
     LocalFirstOffset = osiris_log_shared:first_chunk_id(Shared),
     case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
-        #manifest{first_offset = RemoteFirstOffset} when RemoteFirstOffset < LocalFirstOffset ->
+        #manifest{first_offset = RemoteFirstOffset} when
+            LocalFirstOffset =:= -1; RemoteFirstOffset < LocalFirstOffset
+        ->
+            %% The remote tier starts before the local log (or the local log is
+            %% empty, first_chunk_id = -1, fully trimmed), so 'first' is in the
+            %% remote tier. Without the -1 case an empty local log would resolve
+            %% to the local tail and skip the entire remote tier.
             ?LOG_DEBUG(
                 "Attaching remote reader at first offset ~b for spec 'first'",
                 [RemoteFirstOffset],
@@ -207,7 +213,10 @@ resolve_remote_location(Offset, #{name := StreamId, shared := Shared}) when
         ?DOMAIN
     ),
     FirstChunkId = osiris_log_shared:first_chunk_id(Shared),
-    case Offset >= FirstChunkId of
+    %% first_chunk_id = -1 means the local log is empty (fully trimmed or not yet
+    %% populated): there is no local floor, so no offset is served locally and
+    %% every offset must be resolved against the remote tier.
+    case FirstChunkId =/= -1 andalso Offset >= FirstChunkId of
         true ->
             ?LOG_DEBUG(
                 "Offset ~b is in the local tier of stream '~ts' (start ~b), using a local reader",
@@ -232,6 +241,14 @@ resolve_remote_location(Offset, #{name := StreamId, shared := Shared}) when
                     %% would attach at the tail and silently skip all local (and
                     %% any remote) data the consumer asked for.
                     {local, first};
+                #manifest{next_offset = RemoteNext} when
+                    FirstChunkId =:= -1, Offset >= RemoteNext
+                ->
+                    %% The local log is empty and the offset is at or beyond the
+                    %% remote tier's tail, i.e. beyond the committed stream.
+                    %% Attach at the live tail and wait for new writes, as a
+                    %% local reader at or past the tail would.
+                    {local, next};
                 #manifest{first_offset = FirstOffset} when Offset < FirstOffset ->
                     %% Emulate osiris_log's behavior: attach at the beginning
                     %% of the stream.
@@ -282,7 +299,16 @@ resolve_remote_location({abs, Offset}, Config) ->
 total_range(#{name := StreamId, shared := Shared}) ->
     case osiris_log_shared:first_chunk_id(Shared) of
         -1 ->
-            empty;
+            %% Local log empty (fully trimmed or not yet populated): the range,
+            %% if any, is the remote tier's. Returning `empty` unconditionally
+            %% made {abs, Offset} reads of valid remote offsets fail as
+            %% out_of_range whenever the local log was empty.
+            case rabbitmq_stream_s3_manifest_replica:get_range(StreamId) of
+                {RemoteFirst, RemoteNext} ->
+                    {RemoteFirst, RemoteNext - 1};
+                empty ->
+                    empty
+            end;
         LocalFirst ->
             LocalLast = osiris_log_shared:committed_offset(Shared),
             case rabbitmq_stream_s3_manifest_replica:get_range(StreamId) of
@@ -1216,6 +1242,43 @@ resolve_below_floor_empty_manifest_falls_back_to_first_test_() ->
                 ?_assertEqual({local, first}, resolve_remote_location(50, Config)),
                 %% Below the manifest's first_offset: attach at the beginning.
                 ?_assertEqual({local, first}, resolve_remote_location(5, Config))
+            ]
+        end}.
+
+%% An empty local log (first_chunk_id = -1) must not be treated as a local floor
+%% of -1: every offset is then "local" and the populated remote tier is silently
+%% skipped. With the local log empty the resolver must route to the remote tier.
+resolve_empty_local_log_uses_remote_tier_test_() ->
+    {setup,
+        fun() ->
+            {ok, Pid} = rabbitmq_stream_s3_manifest_replica:start_link(),
+            unlink(Pid),
+            Pid
+        end,
+        fun(Pid) -> gen_server:stop(Pid) end, fun(_) ->
+            StreamId = <<"empty-local-stream">>,
+            %% Fresh shared atomics: first_chunk_id = -1 (empty local log).
+            Shared = osiris_log_shared:new(),
+            %% Remote tier covers [10, 30) with one fragment entry.
+            Entries = ?ENTRY(10, 1000, 2000, ?MANIFEST_KIND_FRAGMENT, 200, 42),
+            Manifest = #manifest{first_offset = 10, next_offset = 30, entries = Entries},
+            ok = rabbitmq_stream_s3_manifest_replica:put_manifest(StreamId, Manifest),
+            Config = #{name => StreamId, shared => Shared},
+            [
+                %% 'first' attaches to the remote tier, not the empty local log.
+                ?_assertMatch({ok, #remote_location{}}, resolve_remote_location(first, Config)),
+                %% An offset below the remote first attaches at the remote start.
+                ?_assertMatch({ok, #remote_location{}}, resolve_remote_location(5, Config)),
+                %% An offset at/beyond the remote tail waits at the live tail.
+                ?_assertEqual({local, next}, resolve_remote_location(30, Config)),
+                ?_assertEqual({local, next}, resolve_remote_location(100, Config)),
+                %% total_range reports the remote range (not empty), so {abs}
+                %% reads of remote offsets are no longer rejected as out_of_range.
+                ?_assertEqual({10, 29}, total_range(Config)),
+                ?_assertEqual(
+                    {error, {offset_out_of_range, {10, 29}}},
+                    resolve_remote_location({abs, 100}, Config)
+                )
             ]
         end}.
 
