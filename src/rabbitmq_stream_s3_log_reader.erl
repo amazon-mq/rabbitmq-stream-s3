@@ -236,8 +236,16 @@ resolve_remote_location(Offset, #{name := StreamId, shared := Shared}) when
                     %% Emulate osiris_log's behavior: attach at the beginning
                     %% of the stream.
                     resolve_first(StreamId, FirstOffset);
-                #manifest{} = Manifest ->
-                    find_position({offset, Offset}, Manifest, StreamId)
+                #manifest{entries = Entries} = Manifest when byte_size(Entries) >= ?ENTRY_B ->
+                    find_position({offset, Offset}, Manifest, StreamId);
+                #manifest{} ->
+                    %% The remote manifest has no fragment entries (the remote
+                    %% tier is behind the local floor, or retention emptied it).
+                    %% The offset is below the local floor and no remote fragment
+                    %% can serve it, so emulate osiris_log and attach at the local
+                    %% first offset rather than crashing in find_fragment on an
+                    %% empty entry array.
+                    {local, first}
             end
     end;
 resolve_remote_location({timestamp, Ts} = Spec, #{name := StreamId}) ->
@@ -1168,6 +1176,35 @@ resolve_below_floor_cold_cache_falls_back_to_first_test_() ->
                 %% At/above the local floor: local reader at the offset (no
                 %% cache needed), unaffected by this change.
                 ?_assertEqual({local, 150}, resolve_remote_location(150, Config))
+            ]
+        end}.
+
+%% A subscription by offset below the local floor, when the cached remote
+%% manifest has no fragment entries (the remote tier is behind the local floor,
+%% or retention emptied it), must fall back to the local first offset rather
+%% than crashing in find_fragment on an empty entry array.
+resolve_below_floor_empty_manifest_falls_back_to_first_test_() ->
+    {setup,
+        fun() ->
+            {ok, Pid} = rabbitmq_stream_s3_manifest_replica:start_link(),
+            unlink(Pid),
+            Pid
+        end,
+        fun(Pid) -> gen_server:stop(Pid) end, fun(_) ->
+            StreamId = <<"empty-manifest-stream">>,
+            Shared = osiris_log_shared:new(),
+            ok = osiris_log_shared:set_first_chunk_id(Shared, 100),
+            %% An empty manifest: no entries, first_offset = next_offset = 10.
+            ok = rabbitmq_stream_s3_manifest_replica:put_manifest(
+                StreamId, #manifest{first_offset = 10, next_offset = 10}
+            ),
+            Config = #{name => StreamId, shared => Shared},
+            [
+                %% At/above the empty manifest's next_offset but below the local
+                %% floor: fall back to local first instead of crashing.
+                ?_assertEqual({local, first}, resolve_remote_location(50, Config)),
+                %% Below the manifest's first_offset: attach at the beginning.
+                ?_assertEqual({local, first}, resolve_remote_location(5, Config))
             ]
         end}.
 
