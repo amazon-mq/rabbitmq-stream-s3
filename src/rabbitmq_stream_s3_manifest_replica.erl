@@ -67,7 +67,8 @@ No heartbeat or reconnection mechanism is needed because:
     apply_edits/5,
     sync/4,
     sync/5,
-    register_replica_context/4
+    register_replica_context/4,
+    is_context_registered/1
 ]).
 -export([
     init/1,
@@ -166,6 +167,11 @@ Called from the acceptor hook when a replica starts.
 register_replica_context(StreamId, Dir, Shared, Counter) ->
     gen_server:call(?MODULE, {register_replica_context, StreamId, Dir, Shared, Counter}).
 
+-doc "Whether a replica context is registered for the stream on this node.".
+-spec is_context_registered(stream_id()) -> boolean().
+is_context_registered(StreamId) ->
+    gen_server:call(?MODULE, {is_context_registered, StreamId}).
+
 %% ------------------------------------------------------------------
 %% gen_server callbacks
 %% ------------------------------------------------------------------
@@ -228,6 +234,8 @@ handle_call(
 ) ->
     Ctx = #replica_ctx{dir = Dir, shared = Shared, counter = Counter},
     {reply, ok, State#state{contexts = Ctxs#{StreamId => Ctx}}};
+handle_call({is_context_registered, StreamId}, _From, #state{contexts = Ctxs} = State) ->
+    {reply, maps:is_key(StreamId, Ctxs), State};
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown}, State}.
 

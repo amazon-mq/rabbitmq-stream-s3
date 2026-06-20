@@ -86,6 +86,16 @@ init([]) ->
         type => worker,
         start => {rabbitmq_stream_s3_membership_reconciliation, start_link, []}
     },
+    %% Re-attaches readers/contexts to local osiris processes the plugin has
+    %% become detached from (writer-restart race, parked reader, manifest_replica
+    %% restart). Started last so its dependencies (the registry, the replica
+    %% reader factory, the manifest cache) are already up; its first tick is one
+    %% interval away regardless.
+    Reconciler = #{
+        id => rabbitmq_stream_s3_reconciler,
+        type => worker,
+        start => {rabbitmq_stream_s3_reconciler, start_link, []}
+    },
     Procs = [
         CredentialServer,
         ManifestCache,
@@ -94,7 +104,8 @@ init([]) ->
         UploadPool,
         GeneralPool,
         Governor,
-        ReplicaReaderSup
+        ReplicaReaderSup,
+        Reconciler
     ],
     {ok, {SupFlags, Procs}}.
 

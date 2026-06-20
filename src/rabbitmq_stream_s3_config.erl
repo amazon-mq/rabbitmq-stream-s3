@@ -31,6 +31,8 @@ lives here. Callers use these functions instead of calling
     membership_reconciliation_trigger_interval/0,
     membership_reconciliation_target_group_size/0,
     membership_reconciliation_auto_remove/0,
+    reconciliation_enabled/0,
+    reconciliation_interval/0,
     task_retry_delay_max_ms/0,
     task_retry_delay_constant/0,
     task_retry_delay_exponent/0,
@@ -142,6 +144,19 @@ membership_reconciliation_target_group_size() ->
 membership_reconciliation_auto_remove() ->
     application:get_env(?APP, membership_reconciliation_auto_remove, false).
 
+%% Periodic reconciliation of the plugin's attachment to local osiris
+%% processes: a replica reader bound to each live writer, and a registered
+%% manifest_replica context for each live replica. Recovers a stream left
+%% un-tiered by a writer-restart race, a parked reader, or a manifest_replica
+%% restart that lost its in-memory contexts and cache.
+-spec reconciliation_enabled() -> boolean().
+reconciliation_enabled() ->
+    application:get_env(?APP, reconciliation_enabled, true).
+
+-spec reconciliation_interval() -> non_neg_integer().
+reconciliation_interval() ->
+    application:get_env(?APP, reconciliation_interval, 60_000).
+
 -spec task_retry_delay_max_ms() -> non_neg_integer().
 task_retry_delay_max_ms() ->
     application:get_env(?APP, task_retry_delay_max_ms, 5_000).
@@ -240,6 +255,8 @@ defaults_test_() ->
         ?_assertEqual(10_000, membership_reconciliation_trigger_interval()),
         ?_assertEqual(undefined, membership_reconciliation_target_group_size()),
         ?_assertEqual(false, membership_reconciliation_auto_remove()),
+        ?_assertEqual(true, reconciliation_enabled()),
+        ?_assertEqual(60_000, reconciliation_interval()),
         ?_assertEqual(5_000, task_retry_delay_max_ms()),
         ?_assertEqual(10, task_retry_delay_constant()),
         ?_assertEqual(2, task_retry_delay_exponent()),
