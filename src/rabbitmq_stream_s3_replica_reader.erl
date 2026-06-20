@@ -489,6 +489,11 @@ handle_cast(
     sync_manifest(StreamId, Epoch, Manifest, Node),
     {noreply, State};
 handle_cast(reconcile_replicas, #state{cfg = #cfg{writer_pid = WriterPid}} = State) ->
+    %% Re-seed the writer node's own manifest cache if it was lost (its
+    %% manifest_replica restarted) and no persist has refilled it - otherwise an
+    %% idle stream's remote tier becomes invisible to consumers on this node.
+    %% reconcile_replicas covers other nodes but never node() itself.
+    maybe_reseed_local_cache(State),
     %% Re-sync any replica node the writer currently has that this reader is no
     %% longer broadcasting to - a replica drops out of the map when its
     %% manifest_replica restarts (the monitored DOWN removes it), losing its
@@ -904,6 +909,33 @@ resolve_stream_id(VHost, QueueName) ->
     end.
 
 identity_formatter(Evt) -> Evt.
+
+%% Re-seed the writer node's own manifest cache from the committed manifest when
+%% it is missing. The cache is normally filled by each persist's put_manifest,
+%% but if the node's manifest_replica restarts and the stream is then idle (no
+%% further persist), the cache stays empty and consumers on this node resolve
+%% the remote tier as absent ({local, first}), silently skipping remote data.
+%% Only repairs a genuine cache miss; a no-op once seeded.
+maybe_reseed_local_cache(#state{core = undefined}) ->
+    ok;
+maybe_reseed_local_cache(#state{core = Core, cfg = #cfg{stream = StreamId}}) ->
+    case rabbitmq_stream_s3_replica_reader_core:persisted_manifest(Core) of
+        #manifest{next_offset = 0} ->
+            %% No remote tier yet; nothing to cache.
+            ok;
+        #manifest{} = Manifest ->
+            case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
+                undefined ->
+                    ?LOG_INFO(
+                        "Reconciliation: re-seeding the local manifest cache for "
+                        "stream ~ts after a manifest_replica restart",
+                        [StreamId]
+                    ),
+                    ok = rabbitmq_stream_s3_manifest_replica:put_manifest(StreamId, Manifest);
+                _ ->
+                    ok
+            end
+    end.
 
 %% Proactively register replica nodes for manifest broadcast.
 %% Idempotent: skips nodes already in the replicas map.
