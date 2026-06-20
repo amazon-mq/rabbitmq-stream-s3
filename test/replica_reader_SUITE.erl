@@ -90,7 +90,9 @@ groups() ->
             remote_retention_deletes_all_fragments,
             old_manifest_roots_deleted,
             attach_to_stream_with_prior_retention,
-            stale_retention_result_is_ignored
+            stale_retention_result_is_ignored,
+            stale_persist_result_is_ignored,
+            stale_group_upload_result_is_ignored
         ]},
         {with_replica, [], [
             replication_happy_path
@@ -1051,6 +1053,40 @@ stale_retention_result_is_ignored(Config) ->
     %% message above has been handled. The reader must still be the same live
     %% process (no crash, no supervised restart).
     _ = rabbitmq_stream_s3_replica_reader:evaluate_remote_retention(StreamId),
+    ?assert(is_process_alive(ReaderPid)),
+    ?assertEqual(ReaderPid, rabbitmq_stream_s3_registry:whereis_name({StreamId, node()})).
+
+stale_persist_result_is_ignored(Config) ->
+    %% A persist result arriving when no persist is in flight (persist_mon
+    %% cleared by reset_for_recovery, the task killed, but its result message
+    %% already queued) must be ignored. Before the guard, the handler matched
+    %% with persist_mon = undefined and crashed on demonitor(undefined, _);
+    %% reaching persist_complete on a core with no in-flight persist would also
+    %% crash. The reader is idle here, so persist_mon is undefined.
+    StreamId = ?config(stream_id, Config),
+    _ = start_writer(Config, #{}),
+    ReaderPid = rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}),
+    ?assert(is_pid(ReaderPid)),
+    ReaderPid ! {persist_result, {ok, 999999}},
+    %% A synchronous call doubles as a barrier: it returns only once the info
+    %% message above has been handled.
+    _ = rabbitmq_stream_s3_replica_reader:status(StreamId),
+    ?assert(is_process_alive(ReaderPid)),
+    ?assertEqual(ReaderPid, rabbitmq_stream_s3_registry:whereis_name({StreamId, node()})).
+
+stale_group_upload_result_is_ignored(Config) ->
+    %% A group upload result arriving when no rebalance is in flight (group_mon
+    %% cleared by reset_for_recovery) must be ignored. Before the guard, the
+    %% handler matched with group_mon = undefined and crashed on
+    %% demonitor(undefined, _); group_upload_complete on a core with no pending
+    %% rebalance would also crash. The reader is idle here, so group_mon is
+    %% undefined.
+    StreamId = ?config(stream_id, Config),
+    _ = start_writer(Config, #{}),
+    ReaderPid = rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}),
+    ?assert(is_pid(ReaderPid)),
+    ReaderPid ! {group_upload_result, {ok, <<"stale-uid">>}},
+    _ = rabbitmq_stream_s3_replica_reader:status(StreamId),
     ?assert(is_process_alive(ReaderPid)),
     ?assertEqual(ReaderPid, rabbitmq_stream_s3_registry:whereis_name({StreamId, node()})).
 
