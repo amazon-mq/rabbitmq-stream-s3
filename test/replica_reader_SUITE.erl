@@ -75,6 +75,7 @@ groups() ->
             large_record_cuts_immediately,
             seed_log_uploads_deterministic,
             local_ahead_discards_manifest,
+            upload_path_recovers_from_trimmed_segment,
             remote_tier_ahead_discards_manifest,
             reconcile_reattaches_orphaned_writer,
             reconcile_reseeds_writer_cache_after_restart,
@@ -146,6 +147,12 @@ end_per_testcase(_TestCase, Config) ->
     %% Stop the writer if still running (cascades to replica reader).
     WriterCfg = ?config(writer_cfg, Config),
     catch osiris_writer:stop(WriterCfg),
+    %% Restore the default API backend in case a test swapped in the fault
+    %% backend, and drop any armed fault rules.
+    application:set_env(
+        rabbitmq_stream_s3, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_fs
+    ),
+    catch rabbitmq_stream_s3_api_fault:reset(),
     %% Clean up any per-test app env overrides.
     application:unset_env(rabbitmq_stream_s3, fragment_target_size),
     application:unset_env(rabbitmq_stream_s3, persist_threshold),
@@ -616,6 +623,68 @@ local_ahead_discards_manifest(Config) ->
     NewFragments = list_fragment_offsets(Config),
     ?assert(length(NewFragments) > 0),
     ?assert(hd(NewFragments) >= FirstLocal).
+
+upload_path_recovers_from_trimmed_segment(Config) ->
+    %% Issue #225, mid-stream path: while a fragment upload is in flight, user
+    %% retention trims the local segment backing it, so the upload can never
+    %% succeed. The reader must recover (reset to the local floor and resume),
+    %% not stall the manifest forever. The fault backend holds the upload at
+    %% stream_put - before it reads the segment - so the trim is deterministic.
+    StreamId = ?config(stream_id, Config),
+    ok = application:set_env(
+        rabbitmq_stream_s3, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_fault
+    ),
+    ok = rabbitmq_stream_s3_api_fault:setup(),
+    %% Keep the transfer deadline well clear of the block window so recovery
+    %% fires via the upload's enoent, not the deadline path.
+    ok = application:set_env(rabbitmq_stream_s3, transfer_deadline_ms, 60_000),
+
+    Writer = start_writer(
+        Config,
+        #{max_segment_size_bytes => 2000, retention => [{max_bytes, 20000}]},
+        #{fragment_target_size => 1000}
+    ),
+    #{shared := Shared} = gen_batch_server:call(Writer, get_reader_context),
+    Record = binary:copy(<<"x">>, 500),
+    Write = fun(N) ->
+        lists:foreach(fun(_) -> ok = osiris_writer:write(Writer, Record) end, lists:seq(1, N)),
+        flush_writer(Writer)
+    end,
+
+    %% Batch A (under max_bytes): fully drain it so the baseline manifest
+    %% next_offset is known and the next upload starts exactly there.
+    Write(20),
+    ok = await_offset(Config, 20),
+    {_, NextA} = get_range(Config),
+
+    %% Arm a one-shot block on the next fragment upload (the one at NextA), then
+    %% write so its upload parks at stream_put (before it reads the segment).
+    Ref = rabbitmq_stream_s3_api_fault:block_once(stream_put, StreamId),
+    Write(5),
+    TaskPid = rabbitmq_stream_s3_api_fault:await_blocked(Ref, 10_000),
+
+    %% Write a lot more: user retention (max_bytes) trims the un-tiered backlog,
+    %% including the segment backing the blocked upload (the oldest, at NextA),
+    %% lifting the local floor above the stalled manifest next_offset.
+    Write(80),
+    ?awaitMatch(F when F > NextA, osiris_log_shared:first_chunk_id(Shared), 10_000),
+
+    %% Release the blocked upload: it now reads a trimmed segment, fails enoent,
+    %% and the reader recovers by resetting to the local floor instead of
+    %% stalling the manifest at NextA forever.
+    ok = rabbitmq_stream_s3_api_fault:release(TaskPid, Ref),
+
+    %% Keep writing so the reset reader is driven by osiris offset notifications
+    %% to drain and re-upload (in #225 writes are continuous). No permanent
+    %% stall: the manifest leaves NextA and advances past it.
+    ?awaitMatch(
+        {_, N} when N > NextA,
+        begin
+            Write(5),
+            get_range(Config)
+        end,
+        30_000
+    ).
 
 remote_tier_ahead_discards_manifest(Config) ->
     StreamId = ?config(stream_id, Config),
