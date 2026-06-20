@@ -222,17 +222,23 @@ step(State0, {request_error, _RequestId, Fragment, not_found}) ->
     end;
 step(
     #state{cfg = #cfg{max_retry_delay_ms = MaxDelay}} = State0,
-    {request_error, _RequestId, _Fragment, Reason}
+    {request_error, _RequestId, Fragment, Reason}
 ) when
     Reason =:= slow_down; Reason =:= internal_error
 ->
     RetryDelay = State0#state.retry_delay,
     NextDelay = min(RetryDelay * 2, MaxDelay),
-    State = State0#state{retry_delay = NextDelay, requests_in_flight = #{}},
+    %% Drop only the failed fragment, not the whole in-flight map. Wiping it
+    %% orphaned a co-pending request (e.g. the prefetch for the next fragment):
+    %% the core forgot it, the retry re-issued it, and the shell overwrote the
+    %% still-live original, leaking its pooled connection and skewing the
+    %% in-flight gauges. The retry re-issues only fragments no longer in flight.
+    Reqs = maps:remove(Fragment, State0#state.requests_in_flight),
+    State = State0#state{retry_delay = NextDelay, requests_in_flight = Reqs},
     {State, [{set_timer, RetryDelay}]};
 step(
     #state{pool_busy_delay = Delay} = State0,
-    {request_error, _RequestId, _Fragment, pool_busy}
+    {request_error, _RequestId, Fragment, pool_busy}
 ) ->
     %% Pool is growing — a connection becomes available once its TLS handshake
     %% completes (fast on same-region S3, but not instant). Use a mild backoff
@@ -240,20 +246,24 @@ step(
     %% as soon as it is ready, doubling up to a 500ms cap so we don't spin if the
     %% pool cannot grow (e.g. S3 unreachable).
     NextDelay = min(Delay * 2, 500),
-    State = State0#state{pool_busy_delay = NextDelay, requests_in_flight = #{}},
+    Reqs = maps:remove(Fragment, State0#state.requests_in_flight),
+    State = State0#state{pool_busy_delay = NextDelay, requests_in_flight = Reqs},
     {State, [{set_timer, Delay}]};
 step(
     #state{cfg = #cfg{max_retry_delay_ms = MaxDelay}} = State0,
-    {request_error, _RequestId, _Fragment, Reason}
+    {request_error, _RequestId, Fragment, Reason}
 ) when
     Reason =:= timeout;
     Reason =:= stream_error;
     Reason =:= connection_error
 ->
-    %% Transient error. Retry with exponential backoff.
+    %% Transient error. Retry with exponential backoff, dropping only the failed
+    %% fragment so a co-pending request is not orphaned (see the slow_down
+    %% clause above).
     RetryDelay = State0#state.retry_delay,
     NextDelay = min(RetryDelay * 2, MaxDelay),
-    State = State0#state{retry_delay = NextDelay, requests_in_flight = #{}},
+    Reqs = maps:remove(Fragment, State0#state.requests_in_flight),
+    State = State0#state{retry_delay = NextDelay, requests_in_flight = Reqs},
     {State, [{set_timer, RetryDelay}]};
 step(State0, {request_error, _RequestId, _Fragment, Reason}) ->
     %% Non-retryable error (e.g. 403 AccessDenied, an unexpected status). Report

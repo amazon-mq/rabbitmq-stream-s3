@@ -48,6 +48,8 @@ all() ->
         fragment_404_emits_refresh_iterator,
         last_fragment_404_no_pending_read_refreshes_past_current,
         observe_effects_emitted_for_hit_miss_and_transition,
+        %% A retryable error drops only the failed fragment, not all in-flight
+        retryable_error_preserves_co_pending_request,
         %% pool_busy backoff (separate from the network-error backoff)
         pool_busy_backoff_capped_at_500,
         pool_busy_delay_resets_on_data,
@@ -428,6 +430,32 @@ multi_chunk_data_accumulation(_Config) ->
 %% ------------------------------------------------------------------
 %% Fragment navigation tests
 %% ------------------------------------------------------------------
+
+retryable_error_preserves_co_pending_request(_Config) ->
+    %% A retryable request error must drop only the failed fragment from the
+    %% in-flight set, not wipe it. Wiping orphaned a co-pending request: the
+    %% retry re-issued it, the shell overwrote the still-live original, and the
+    %% pooled connection leaked. Here fragment 0 (streamed to its end via a
+    %% continue chunk, so its request stays in flight) and fragment 100 (the
+    %% prefetch) are both in flight; an error on 0 must leave 100 untouched, so
+    %% the retry does not re-issue (duplicate) it.
+    FragRef = frag_ref(0, 200, 42),
+    Iterator = mock_iterator([{0, 200, 42}, {100, 500, 43}]),
+    {S0, _} = init(stream_id(), FragRef, 64, Iterator),
+    Data = binary:copy(<<0>>, 200),
+    {S1, E1} = rabbitmq_stream_s3_remote_reader_core:step(
+        S0, {data, make_ref(), 0, Data, continue}
+    ),
+    %% Filling fragment 0 to its end triggered the prefetch of fragment 100, so
+    %% both are now in flight.
+    ?assertMatch([{_, _, 100}], [{K, R, F} || {start_request, K, R, F} <- E1, F =:= 100]),
+    %% Fragment 0's request errors (retryable); only fragment 0 is dropped.
+    {S2, _} = rabbitmq_stream_s3_remote_reader_core:step(
+        S1, {request_error, make_ref(), 0, slow_down}
+    ),
+    %% On retry, the surviving prefetch of fragment 100 must NOT be re-issued.
+    {_S3, E3} = rabbitmq_stream_s3_remote_reader_core:step(S2, retry),
+    ?assertEqual([], [F || {start_request, _, _, F} <- E3, F =:= 100]).
 
 prefetch_next_fragment_triggered(_Config) ->
     %% After current fragment buffer is full, core emits start_request for next fragment.
