@@ -150,14 +150,21 @@ discover() ->
 Periodic reconciliation of the plugin's attachment to local osiris processes,
 driven by `rabbitmq_stream_s3_reconciler`.
 
-Re-runs the discover-style attach for a writer with no replica reader — left
-un-tiered by the writer-restart `already_started` race, a parked reader, or a
-reader that never started. Writers already attached are skipped, so a
-steady-state tick neither restarts readers nor re-runs retention updates.
+For each local osiris writer:
+- if it has no replica reader (the writer-restart `already_started` race, a
+  parked reader, or one that never started), attach one, and
+- otherwise poke its reader to re-sync any replica node that dropped out of its
+  broadcast set — a replica drops out when its `manifest_replica` restarted and
+  the monitored DOWN removed it, leaving the replica's manifest cache empty. The
+  re-sync goes through the writer's own replication state, so no queue-record or
+  coordinator lookup is involved.
 
-(The replica side — re-registering a `manifest_replica` context lost on a cache
-restart — is reconciled the same way and is a planned extension; it is omitted
-here until its cross-node re-seed can be exercised end to end.)
+For each local osiris replica:
+- if its `manifest_replica` context is missing (dropped when the per-node cache
+  singleton restarted), re-register it so tiering-aware local retention resumes.
+
+Streams the plugin is already attached to are skipped, so a steady-state tick
+neither restarts readers, re-runs retention updates, nor re-registers contexts.
 """.
 -spec reconcile() -> ok.
 reconcile() ->
@@ -181,7 +188,9 @@ reconcile_child({_Id, Pid, worker, [osiris_writer]}) when is_pid(Pid) ->
                 %% A reader is attached. If it is bound to a stale writer it is
                 %% already stopping (it monitors that writer's DOWN), so the next
                 %% tick sees no reader and attaches; do not disturb it here.
-                ok;
+                %% Otherwise poke it to re-sync any replica that fell out of its
+                %% broadcast set after the replica's manifest_replica restarted.
+                gen_server:cast(ReaderPid, reconcile_replicas);
             undefined ->
                 ?LOG_INFO(
                     "Reconciliation: writer ~p for stream ~ts has no replica "
@@ -199,12 +208,48 @@ reconcile_child({_Id, Pid, worker, [osiris_writer]}) when is_pid(Pid) ->
                 #{domain => ?RMQLOG_DOMAIN_STREAM_S3}
             )
     end;
+reconcile_child({_Id, Pid, worker, [osiris_replica]}) when is_pid(Pid) ->
+    try
+        StreamId = stream_id_of(Pid),
+        case rabbitmq_stream_s3_manifest_replica:is_context_registered(StreamId) of
+            true ->
+                ok;
+            false ->
+                ?LOG_INFO(
+                    "Reconciliation: replica ~p for stream ~ts has no manifest "
+                    "context; re-registering",
+                    [Pid, StreamId],
+                    #{domain => ?RMQLOG_DOMAIN_STREAM_S3}
+                ),
+                register_replica_context(Pid, StreamId)
+        end
+    catch
+        Class:Reason ->
+            ?LOG_WARNING(
+                "Reconciliation could not re-register replica ~p: ~ts:~p",
+                [Pid, Class, Reason],
+                #{domain => ?RMQLOG_DOMAIN_STREAM_S3}
+            )
+    end;
 reconcile_child(_) ->
     ok.
 
 stream_id_of(Pid) ->
     #{name := Name} = osiris_util:get_reader_context(Pid),
     rabbitmq_stream_s3:ensure_stream_id(Name).
+
+%% Re-register a discovered replica's context with the per-node manifest_replica
+%% so tiering-aware local retention resumes. Unlike attach_replica/1 this neither
+%% registers with the writer (the writer re-syncs the cache itself via
+%% reconcile_replicas) nor re-injects the retention fun (already on the live
+%% replica), and so needs no leader-node/queue-record lookup.
+register_replica_context(Pid, StreamId) ->
+    #{dir := Dir, shared := Shared, reference := Reference} =
+        osiris_util:get_reader_context(Pid),
+    Counter = osiris_counters:fetch({osiris_replica, Reference}),
+    rabbitmq_stream_s3_manifest_replica:register_replica_context(
+        StreamId, Dir, Shared, Counter
+    ).
 
 append_retention(StreamId, Config) ->
     Fun = {'fun', local_retention_fun(StreamId)},

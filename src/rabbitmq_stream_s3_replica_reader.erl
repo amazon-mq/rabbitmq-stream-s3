@@ -484,6 +484,22 @@ handle_cast(
     Manifest = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(Core),
     sync_manifest(StreamId, Epoch, Manifest, Node),
     {noreply, State};
+handle_cast(reconcile_replicas, #state{cfg = #cfg{writer_pid = WriterPid}} = State) ->
+    %% Re-sync any replica node the writer currently has that this reader is no
+    %% longer broadcasting to - a replica drops out of the map when its
+    %% manifest_replica restarts (the monitored DOWN removes it), losing its
+    %% manifest cache. Driven periodically by the reconciler. register_replicas/2
+    %% skips nodes already registered, so this is a no-op once every replica is
+    %% synced. Going through the writer's replication state avoids any
+    %% queue-record or coordinator lookup.
+    case is_process_alive(WriterPid) of
+        true ->
+            RepState = osiris_writer:query_replication_state(WriterPid),
+            ReplicaNodes = maps:keys(RepState) -- [node()],
+            {noreply, register_replicas(ReplicaNodes, State)};
+        false ->
+            {noreply, State}
+    end;
 handle_cast(_Msg, State) ->
     {noreply, State}.
 

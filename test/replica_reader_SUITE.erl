@@ -98,7 +98,8 @@ groups() ->
         ]},
         {with_replica, [], [
             replication_happy_path,
-            replication_survives_reader_restart
+            replication_survives_reader_restart,
+            reconcile_recovers_replica_after_cache_restart
         ]}
     ].
 
@@ -1221,3 +1222,50 @@ replication_survives_reader_restart(Config) ->
     [osiris:write(Writer, undefined, I, Record) || I <- lists:seq(11, 30)],
     ok = await_offset(StreamId, N1 + 5),
     ?awaitMatch({_, N2} when N2 > N1, get_range(Config, ReplicaNode), 3000).
+
+reconcile_recovers_replica_after_cache_restart(Config) ->
+    %% The per-node manifest_replica singleton holds the replica's per-stream
+    %% context and manifest cache in memory. A crash-restart drops both and
+    %% nothing re-registers them, so tiering-aware local retention stalls (N5)
+    %% and cross-tier reads skip the remote tier (c6). Reconciliation must
+    %% re-register the context (replica side) and re-sync the cache through the
+    %% writer (writer side).
+    StreamId = ?config(stream_id, Config),
+    ReplicaNode = ?config(replica_node, Config),
+    Cache = rabbitmq_stream_s3_manifest_replica,
+
+    {Writer, _ReplicaPids} = start_cluster(
+        Config, [ReplicaNode], #{max_segment_size_bytes => 500}, #{fragment_target_size => 1000}
+    ),
+    Record = binary:copy(<<"R">>, 300),
+    [osiris:write(Writer, undefined, I, Record) || I <- lists:seq(1, 10)],
+    ok = await_offset(StreamId, 5),
+    %% Replica context + cache are populated.
+    ?awaitMatch(true, erpc:call(ReplicaNode, Cache, is_context_registered, [StreamId]), 2000),
+    ?awaitMatch({_, N} when N > 0, get_range(Config, ReplicaNode), 2000),
+
+    %% Restart the replica's manifest_replica: context + owned-ETS cache lost.
+    OldPid = erpc:call(ReplicaNode, erlang, whereis, [Cache]),
+    true = erpc:call(ReplicaNode, erlang, exit, [OldPid, kill]),
+    ?awaitMatch(
+        P when is_pid(P) andalso P =/= OldPid,
+        erpc:call(ReplicaNode, erlang, whereis, [Cache]),
+        2000
+    ),
+    ?assertEqual(false, erpc:call(ReplicaNode, Cache, is_context_registered, [StreamId])),
+
+    %% Replica-side reconcile re-registers the context (N5).
+    ok = erpc:call(ReplicaNode, rabbitmq_stream_s3_hooks, reconcile, []),
+    ?assertEqual(true, erpc:call(ReplicaNode, Cache, is_context_registered, [StreamId])),
+
+    %% Writer-side reconcile re-syncs the replica through the writer, re-seeding
+    %% its cache (c6). Re-run reconcile each poll: the writer must first process
+    %% the replica's manifest_replica DOWN that frees it for re-sync.
+    ?awaitMatch(
+        {_, M} when M > 0,
+        begin
+            ok = rabbitmq_stream_s3_hooks:reconcile(),
+            get_range(Config, ReplicaNode)
+        end,
+        5000
+    ).
