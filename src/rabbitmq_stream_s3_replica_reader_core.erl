@@ -742,14 +742,35 @@ assert_contiguous(NextOffset, FragmentFirstOffset) ->
     ).
 
 -spec is_retriable(term()) -> boolean().
-is_retriable({http, 500}) -> true;
-is_retriable({http, 503}) -> true;
-is_retriable(timeout) -> true;
+%% Transient conditions worth retrying without operator intervention. These are
+%% the actual error shapes the S3 API layer produces (see
+%% rabbitmq_stream_s3_api_aws): a 500 is reported as `internal_error`, a 503 as
+%% `slow_down`, a dropped or oversaturated connection as `connection_error`, and
+%% any other non-success status as `#{status => _}`. The earlier `{http, 500}`
+%% / `{http, 503}` clauses matched terms that no code ever constructs, so every
+%% real transient fell through to the fatal answer. The transfer paths that
+%% consult this never abandon a confirmed fragment (the fatal branch retries
+%% with a backoff), so a wrong answer only changes retry timing; keep the set to
+%% genuinely transient conditions and let everything else fall through.
+is_retriable(timeout) ->
+    true;
 %% A reader-side transfer deadline: the governor never reported a result for a
 %% submitted transfer (lost message, externally killed task, or a queued
 %% submission dropped by a governor restart). The fragment was never made
-%% durable, so retrying immediately under the same reference is both safe and
+%% durable, so retrying immediately under the same reference is safe and
 %% correct. See rabbitmq_stream_s3_config:transfer_deadline_ms/0 and the
 %% transfer_deadline handler in rabbitmq_stream_s3_replica_reader.
-is_retriable(transfer_deadline) -> true;
-is_retriable(_) -> false.
+is_retriable(transfer_deadline) ->
+    true;
+is_retriable(connection_error) ->
+    true;
+is_retriable(slow_down) ->
+    true;
+is_retriable(internal_error) ->
+    true;
+is_retriable(#{status := Status}) ->
+    %% 408 request timeout, 429 throttling, and any 5xx are server-side
+    %% transients; everything else (e.g. 403, 404) is fatal.
+    Status =:= 408 orelse Status =:= 429 orelse (Status >= 500 andalso Status =< 599);
+is_retriable(_) ->
+    false.
