@@ -75,6 +75,7 @@ groups() ->
             large_record_cuts_immediately,
             seed_log_uploads_deterministic,
             local_ahead_discards_manifest,
+            remote_tier_ahead_discards_manifest,
             stream_deletion_cleans_remote_tier,
             stream_deletion_during_active_upload,
             persist_not_found_stops_reader,
@@ -611,6 +612,42 @@ local_ahead_discards_manifest(Config) ->
     NewFragments = list_fragment_offsets(Config),
     ?assert(length(NewFragments) > 0),
     ?assert(hd(NewFragments) >= FirstLocal).
+
+remote_tier_ahead_discards_manifest(Config) ->
+    StreamId = ?config(stream_id, Config),
+
+    %% Phase 1: seed a local log, upload, so the manifest reaches next_offset N.
+    #{next_offset := N} = seed_log(Config, [
+        {segment, [{chunk, #{records => 10, size => 600}}]},
+        {segment, [{chunk, #{records => 10, size => 600}}]}
+    ]),
+    Writer = start_writer(Config, #{}, #{fragment_target_size => 500}),
+    flush_writer(Writer),
+    await_offset(Config, N),
+
+    %% Phase 2: stop the reader and forge a manifest whose next_offset is far
+    %% beyond the local log's last offset, as a leader election or a
+    %% data-directory loss would leave it (the remote tier ahead of local).
+    %% Keep the committed revision so the reader trusts this cached manifest on
+    %% resolve.
+    ReaderPid = rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}),
+    ok = rabbitmq_stream_s3_replica_reader_sup:stop_child(ReaderPid),
+    Manifest = rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId),
+    {ok, #{revision := Rev}} = rabbitmq_stream_s3_db:get(StreamId),
+    Ahead = Manifest#manifest{next_offset = N + 1000, revision = Rev},
+    ok = rabbitmq_stream_s3_manifest_replica:put_manifest(StreamId, Ahead),
+
+    %% Phase 3: restart the reader. It must discard the remote manifest and
+    %% restart from the local log's first offset, then re-tier the local log
+    %% back up to N - rather than wedging in a 1s retry_resolve loop with
+    %% next_offset pinned at N+1000 (the bug). Recovery resets next_offset below
+    %% the forged value and re-tiering brings it back to exactly N.
+    _ = start_replica_reader(Writer, Config, #{fragment_target_size => 500}),
+    ?awaitMatch(
+        #manifest{next_offset = N},
+        rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId),
+        5000
+    ).
 
 stream_deletion_cleans_remote_tier(Config) ->
     StreamId = ?config(stream_id, Config),
