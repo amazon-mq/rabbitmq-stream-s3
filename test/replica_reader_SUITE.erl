@@ -76,6 +76,7 @@ groups() ->
             seed_log_uploads_deterministic,
             local_ahead_discards_manifest,
             remote_tier_ahead_discards_manifest,
+            reconcile_reattaches_orphaned_writer,
             stream_deletion_cleans_remote_tier,
             stream_deletion_during_active_upload,
             persist_not_found_stops_reader,
@@ -649,6 +650,33 @@ remote_tier_ahead_discards_manifest(Config) ->
         rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId),
         5000
     ).
+
+reconcile_reattaches_orphaned_writer(Config) ->
+    %% The writer-restart race (and a parked reader) leaves a live writer with no
+    %% replica reader and nothing to start one. Periodic reconciliation must
+    %% re-attach a reader, and must not disturb an already-attached one.
+    StreamId = ?config(stream_id, Config),
+    _Writer = start_writer(Config, #{}),
+    Pid1 = rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}),
+    ?assert(is_pid(Pid1)),
+
+    %% Orphan the writer: stop its reader while the writer stays alive.
+    ok = rabbitmq_stream_s3_replica_reader_sup:stop_child(Pid1),
+    ?awaitMatch(
+        undefined,
+        rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}),
+        1000
+    ),
+
+    %% Reconciliation re-attaches a fresh reader to the still-live writer.
+    ok = rabbitmq_stream_s3_hooks:reconcile(),
+    Pid2 = rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}),
+    ?assert(is_pid(Pid2)),
+    ?assertNotEqual(Pid1, Pid2),
+
+    %% Idempotent: a second tick leaves the healthy reader untouched.
+    ok = rabbitmq_stream_s3_hooks:reconcile(),
+    ?assertEqual(Pid2, rabbitmq_stream_s3_registry:whereis_name({StreamId, node()})).
 
 stream_deletion_cleans_remote_tier(Config) ->
     StreamId = ?config(stream_id, Config),

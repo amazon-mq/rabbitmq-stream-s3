@@ -21,7 +21,8 @@ retention is updated.
     on_retention_updated/2,
     on_retention_evaluated/2,
     local_retention_fun/1,
-    discover/0
+    discover/0,
+    reconcile/0
 ]).
 
 -doc """
@@ -145,9 +146,65 @@ discover() ->
         end,
     lists:foreach(fun discover_child/1, Children).
 
+-doc """
+Periodic reconciliation of the plugin's attachment to local osiris processes,
+driven by `rabbitmq_stream_s3_reconciler`.
+
+Re-runs the discover-style attach for a writer with no replica reader — left
+un-tiered by the writer-restart `already_started` race, a parked reader, or a
+reader that never started. Writers already attached are skipped, so a
+steady-state tick neither restarts readers nor re-runs retention updates.
+
+(The replica side — re-registering a `manifest_replica` context lost on a cache
+restart — is reconciled the same way and is a planned extension; it is omitted
+here until its cross-node re-seed can be exercised end to end.)
+""".
+-spec reconcile() -> ok.
+reconcile() ->
+    Children =
+        try
+            supervisor:which_children(osiris_server_sup)
+        catch
+            exit:{noproc, _} -> []
+        end,
+    lists:foreach(fun reconcile_child/1, Children).
+
 %% ------------------------------------------------------------------
 %% Internal
 %% ------------------------------------------------------------------
+
+reconcile_child({_Id, Pid, worker, [osiris_writer]}) when is_pid(Pid) ->
+    try
+        StreamId = stream_id_of(Pid),
+        case rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}) of
+            ReaderPid when is_pid(ReaderPid) ->
+                %% A reader is attached. If it is bound to a stale writer it is
+                %% already stopping (it monitors that writer's DOWN), so the next
+                %% tick sees no reader and attaches; do not disturb it here.
+                ok;
+            undefined ->
+                ?LOG_INFO(
+                    "Reconciliation: writer ~p for stream ~ts has no replica "
+                    "reader; attaching",
+                    [Pid, StreamId],
+                    #{domain => ?RMQLOG_DOMAIN_STREAM_S3}
+                ),
+                attach_writer(Pid)
+        end
+    catch
+        Class:Reason ->
+            ?LOG_WARNING(
+                "Reconciliation could not attach tiering to writer ~p: ~ts:~p",
+                [Pid, Class, Reason],
+                #{domain => ?RMQLOG_DOMAIN_STREAM_S3}
+            )
+    end;
+reconcile_child(_) ->
+    ok.
+
+stream_id_of(Pid) ->
+    #{name := Name} = osiris_util:get_reader_context(Pid),
+    rabbitmq_stream_s3:ensure_stream_id(Name).
 
 append_retention(StreamId, Config) ->
     Fun = {'fun', local_retention_fun(StreamId)},
