@@ -388,10 +388,14 @@ handle_call({await_offset, Offset}, From, #state{core = Core0} = State) ->
     {noreply, execute_effects(Effects, State#state{core = Core})};
 handle_call(status, _From, State) ->
     {reply, format_state(State), State};
+handle_call(evaluate_local_retention, _From, #state{core = undefined} = State) ->
+    {reply, {error, manifest_not_resolved}, State};
 handle_call(evaluate_local_retention, _From, #state{core = Core} = State) ->
     Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(Core),
     maybe_evaluate_retention(Manifest, State),
     {reply, ok, State};
+handle_call(evaluate_remote_retention, _From, #state{core = undefined} = State) ->
+    {reply, {error, manifest_not_resolved}, State};
 handle_call(
     evaluate_remote_retention,
     _From,
@@ -2262,6 +2266,22 @@ classify_store_result_transient_error_retries_test() ->
 %% A genuinely absent metadata node resolves to an empty manifest.
 classify_store_result_not_found_is_empty_test() ->
     ?assertEqual({ok, #manifest{}}, classify_store_result({error, not_found}, <<"s">>)).
+
+%% Before the manifest resolves (or while resolution retries after a store
+%% outage) the core is undefined. The CLI retention commands must reply with an
+%% error rather than crash the reader with a function_clause on the undefined
+%% core.
+evaluate_retention_on_unresolved_manifest_replies_error_test() ->
+    State = #state{core = undefined},
+    From = {self(), make_ref()},
+    ?assertEqual(
+        {reply, {error, manifest_not_resolved}, State},
+        handle_call(evaluate_local_retention, From, State)
+    ),
+    ?assertEqual(
+        {reply, {error, manifest_not_resolved}, State},
+        handle_call(evaluate_remote_retention, From, State)
+    ).
 
 %% reset_for_recovery must tear down every in-flight async task: clear the
 %% correlation fields (so a late result is ignored rather than applied to the

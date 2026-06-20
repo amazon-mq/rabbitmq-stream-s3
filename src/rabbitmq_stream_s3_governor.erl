@@ -146,21 +146,38 @@ format_state(#state{bucket = Bucket, pending = Pending}) ->
 dispatch(Item, #state{bucket = unlimited} = State) ->
     spawn_task(Item),
     State;
-dispatch({_Fun, Size, _ReplyTo, _Ref} = Item, #state{bucket = Bucket0} = State) ->
+dispatch(Item, #state{pending = Pending} = State) ->
+    case queue:is_empty(Pending) of
+        false ->
+            %% Items are already waiting for tokens. Queue behind them rather
+            %% than checking the bucket directly: letting a new submission jump
+            %% ahead lets a steady stream of smaller transfers permanently
+            %% starve a larger one stuck at the head of the queue. Only
+            %% drain_pending admits queued items, head first.
+            enqueue(Item, State);
+        true ->
+            try_admit(Item, State)
+    end.
+
+try_admit({_Fun, Size, _ReplyTo, _Ref} = Item, #state{bucket = Bucket0} = State) ->
     case rabbitmq_stream_s3_token_bucket:request(Size, Bucket0) of
         {ok, Bucket} ->
             count_oversized(Size, Bucket0),
             spawn_task(Item),
             State#state{bucket = Bucket};
         {insufficient, _, _} ->
-            %% Queue for later. Start timer if not running.
-            Pending = queue:in(Item, State#state.pending),
-            set(?C_PENDING_SUBMISSIONS, queue:len(Pending)),
-            State1 = State#state{pending = Pending},
-            case State1#state.timer_ref of
-                undefined -> State1#state{timer_ref = schedule_refill()};
-                _ -> State1
-            end
+            enqueue(Item, State)
+    end.
+
+%% Append a submission to the pending queue and ensure the refill timer is
+%% running so it will eventually drain.
+enqueue(Item, State) ->
+    Pending = queue:in(Item, State#state.pending),
+    set(?C_PENDING_SUBMISSIONS, queue:len(Pending)),
+    State1 = State#state{pending = Pending},
+    case State1#state.timer_ref of
+        undefined -> State1#state{timer_ref = schedule_refill()};
+        _ -> State1
     end.
 
 drain_pending(#state{pending = Pending0, bucket = Bucket0} = State) ->
@@ -312,6 +329,33 @@ oversized_transfer_does_not_deadlock_test() ->
     ?assertEqual({ok, small}, maps:get(RefSmall, Results)),
     gen_server:stop(Pid).
 
+%% A submission must not jump ahead of items already waiting in the queue.
+%% Before the fix each new submission checked the bucket directly, so a steady
+%% stream of small transfers could permanently starve a larger transfer stuck
+%% at the head of the queue: the small ones drained the very tokens the queued
+%% item was waiting to accumulate. With FIFO admission, once anything is queued
+%% later submissions queue behind it and only drain_pending admits, head first.
+queued_item_is_not_starved_by_later_submissions_test() ->
+    {ok, Pid} = start_link(#{rate => 1000, burst => 1000}),
+    Self = self(),
+    RefA = make_ref(),
+    RefHead = make_ref(),
+    RefSmall = make_ref(),
+    %% Drain the bucket, then queue a large item behind the drain.
+    submit(fun() -> {ok, a} end, 1000, Self, RefA),
+    submit(fun() -> {ok, head} end, 800, Self, RefHead),
+    receive
+        {transfer_result, RefA, _} -> ok
+    after 1000 -> error(a_timeout)
+    end,
+    %% Let the bucket partially refill: enough for the small item, not yet for
+    %% the queued head. A small item submitted now must not jump ahead.
+    timer:sleep(300),
+    submit(fun() -> {ok, small} end, 100, Self, RefSmall),
+    %% The head (submitted first) must complete before the later small item.
+    ?assertEqual([RefHead, RefSmall], collect_order([RefHead, RefSmall], 5000)),
+    gen_server:stop(Pid).
+
 collect_results(Refs, Timeout) ->
     collect_results(Refs, Timeout, #{}).
 collect_results([], _Timeout, Acc) ->
@@ -322,6 +366,22 @@ collect_results([Ref | Rest], Timeout, Acc) ->
             collect_results(Rest, Timeout, Acc#{Ref => Result})
     after Timeout ->
         error({timeout_waiting_for, Ref})
+    end.
+
+%% Record the order in which the given refs' results arrive, ignoring others.
+collect_order(Refs, Timeout) ->
+    collect_order(Refs, Timeout, []).
+collect_order([], _Timeout, Acc) ->
+    lists:reverse(Acc);
+collect_order(Refs, Timeout, Acc) ->
+    receive
+        {transfer_result, Ref, _} ->
+            case lists:member(Ref, Refs) of
+                true -> collect_order(Refs -- [Ref], Timeout, [Ref | Acc]);
+                false -> collect_order(Refs, Timeout, Acc)
+            end
+    after Timeout ->
+        error({timeout_waiting_for, Refs})
     end.
 
 -endif.
