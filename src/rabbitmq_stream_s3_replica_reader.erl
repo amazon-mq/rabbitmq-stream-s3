@@ -580,7 +580,9 @@ handle_info({retry_transfer, Ref, Dir, Meta}, #state{cfg = #cfg{stream = StreamI
     %% resubmit effect was executed, so only re-submit the upload here.
     submit_upload(Ref, Dir, StreamId, Meta),
     {noreply, State};
-handle_info({group_upload_result, {ok, Uid}}, #state{core = Core0, group_mon = Mon} = State0) ->
+handle_info(
+    {group_upload_result, {ok, Uid}}, #state{core = Core0, group_mon = Mon} = State0
+) when Mon =/= undefined ->
     demonitor(Mon, [flush]),
     State1 = on_group_upload_completed(State0),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:group_upload_complete(Uid, Core0),
@@ -588,7 +590,7 @@ handle_info({group_upload_result, {ok, Uid}}, #state{core = Core0, group_mon = M
 handle_info(
     {group_upload_result, {error, Reason}},
     #state{core = Core0, group_mon = Mon, cfg = #cfg{stream = StreamId}} = State0
-) ->
+) when Mon =/= undefined ->
     demonitor(Mon, [flush]),
     ?LOG_WARNING("~ts group upload failed: ~p", [StreamId, Reason]),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:group_upload_failed(Reason, Core0),
@@ -596,6 +598,14 @@ handle_info(
         execute_effects(Effects, State0#state{
             core = Core, group_mon = undefined, pending_group_kind = undefined
         })};
+handle_info({group_upload_result, _Result}, #state{cfg = #cfg{stream = StreamId}} = State) ->
+    %% A result from a group upload task we are no longer tracking - recovery
+    %% cleared group_mon. The result is an ordinary message that demonitor/flush
+    %% does not remove, so it can still be queued; ignore it rather than apply
+    %% group_upload_complete to the freshly resolved core (which has no pending
+    %% rebalance, so the core would crash on a badmatch).
+    ?LOG_DEBUG("~ts ignoring stale group upload result", [StreamId]),
+    {noreply, State};
 handle_info(
     {retention_result, Token, unchanged},
     #state{retention_token = Token, core = Core0, retention_mon = Mon, retention_timer = TRef} =
@@ -703,7 +713,9 @@ handle_info(
         MonRef -> {noreply, State#state{replicas = maps:remove(Node, Replicas)}};
         _ -> {noreply, State}
     end;
-handle_info({persist_result, {ok, Revision}}, #state{core = Core0, persist_mon = Mon} = State0) ->
+handle_info(
+    {persist_result, {ok, Revision}}, #state{core = Core0, persist_mon = Mon} = State0
+) when Mon =/= undefined ->
     demonitor(Mon, [flush]),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_complete(Revision, Core0),
     {noreply,
@@ -712,7 +724,7 @@ handle_info({persist_result, {ok, Revision}}, #state{core = Core0, persist_mon =
         })};
 handle_info(
     {persist_result, {error, {conflict, _Entry}}}, #state{core = Core0, persist_mon = Mon} = State0
-) ->
+) when Mon =/= undefined ->
     demonitor(Mon, [flush]),
     State1 = on_persist_failed(conflict, State0),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_failed(conflict, Core0),
@@ -720,7 +732,9 @@ handle_info(
         execute_effects(Effects, State1#state{
             core = Core, persist_mon = undefined, persist_pid = undefined
         })};
-handle_info({persist_result, {error, Reason}}, #state{core = Core0, persist_mon = Mon} = State0) ->
+handle_info(
+    {persist_result, {error, Reason}}, #state{core = Core0, persist_mon = Mon} = State0
+) when Mon =/= undefined ->
     demonitor(Mon, [flush]),
     State1 = on_persist_failed(Reason, State0),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_failed(Reason, Core0),
@@ -729,6 +743,14 @@ handle_info({persist_result, {error, Reason}}, #state{core = Core0, persist_mon 
             core = Core, persist_mon = undefined, persist_pid = undefined
         })
     );
+handle_info({persist_result, _Result}, #state{cfg = #cfg{stream = StreamId}} = State) ->
+    %% A result from a persist task we are no longer tracking - recovery
+    %% (reset_for_recovery) cleared persist_mon and killed the task, but its
+    %% result was an ordinary message already queued before the kill. Ignore it
+    %% rather than apply persist_complete/persist_failed to the freshly resolved
+    %% core (which has no in-flight persist, so persist_complete would crash).
+    ?LOG_DEBUG("~ts ignoring stale persist result", [StreamId]),
+    {noreply, State};
 handle_info(
     {'DOWN', Mon, process, _, Reason},
     #state{persist_mon = Mon, core = Core0, cfg = #cfg{stream = StreamId}} = State0
@@ -2061,7 +2083,8 @@ reset_for_recovery(#state{transfer_deadlines = Deadlines0} = State0) ->
     set(State0, ?C_BYTES_IN_PERSIST, 0),
     maps:foreach(fun(_Ref, {TimerRef, _Token}) -> erlang:cancel_timer(TimerRef) end, Deadlines0),
     State1 = close_log(State0),
-    State1#state{
+    State2 = cancel_inflight_tasks(State1),
+    State2#state{
         assembly = undefined,
         transfer_deadlines = #{},
         transfer_sizes = #{},
@@ -2069,6 +2092,59 @@ reset_for_recovery(#state{transfer_deadlines = Deadlines0} = State0) ->
         persisting_bytes = 0,
         deferred_deletions = []
     }.
+
+%% Tear down every in-flight async task before recovery replaces the core.
+%% A task's result is delivered as an ordinary message, not the monitor
+%% 'DOWN', so demonitor/2's flush does not remove a result that was already
+%% queued before we kill the task. Clearing the correlation fields here makes
+%% the result-handling clauses ignore such a stale result rather than apply it
+%% to the freshly resolved manifest. Without this, a late persist/retention/
+%% group result lands on the new core and either crashes it (a badrecord on
+%% persist_complete, a badmatch on group_upload_complete) or applies a stale
+%% prefix-truncation edit that deletes still-referenced objects and corrupts
+%% the manifest.
+-spec cancel_inflight_tasks(#state{}) -> #state{}.
+cancel_inflight_tasks(State0) ->
+    State1 = stop_persist_task(State0),
+    State2 = stop_group_task(State1),
+    stop_retention_task(State2).
+
+stop_persist_task(#state{persist_mon = Mon, persist_pid = Pid, persist_timer = TRef} = State) ->
+    kill_task(Mon, Pid),
+    _ = cancel_timer(TRef),
+    State#state{persist_mon = undefined, persist_pid = undefined, persist_timer = undefined}.
+
+stop_group_task(#state{group_mon = Mon} = State) ->
+    %% The group upload task's pid is not retained, so it cannot be killed; it
+    %% finishes and its result is ignored (its uploaded object, if any, is left
+    %% for orphan garbage collection). Dropping group_mon flushes its 'DOWN'.
+    kill_task(Mon, undefined),
+    State#state{group_mon = undefined, pending_group_kind = undefined}.
+
+stop_retention_task(
+    #state{retention_mon = Mon, retention_pid = Pid, retention_timer = TRef} = State
+) ->
+    kill_task(Mon, Pid),
+    _ = cancel_timer(TRef),
+    State#state{
+        retention_mon = undefined,
+        retention_pid = undefined,
+        retention_timer = undefined,
+        retention_token = undefined
+    }.
+
+%% Demonitor (flushing the queued 'DOWN') and kill the task process if its pid
+%% is known. A result message already in the mailbox is intentionally not
+%% removed; the cleared correlation fields make the result handlers drop it.
+kill_task(undefined, _Pid) ->
+    ok;
+kill_task(Mon, Pid) ->
+    demonitor(Mon, [flush]),
+    case Pid of
+        undefined -> ok;
+        _ -> exit(Pid, kill)
+    end,
+    ok.
 
 on_manifest_resolved(#manifest{next_offset = 0}, State) ->
     inc(State, ?C_MANIFESTS_RESOLVED_EMPTY, 1),
@@ -2120,6 +2196,58 @@ classify_store_result_transient_error_retries_test() ->
 %% A genuinely absent metadata node resolves to an empty manifest.
 classify_store_result_not_found_is_empty_test() ->
     ?assertEqual({ok, #manifest{}}, classify_store_result({error, not_found}, <<"s">>)).
+
+%% reset_for_recovery must tear down every in-flight async task: clear the
+%% correlation fields (so a late result is ignored rather than applied to the
+%% freshly resolved core) and kill the tasks whose pid is retained.
+cancel_inflight_tasks_clears_all_tasks_test() ->
+    Idle = fun() ->
+        receive
+            stop -> ok
+        end
+    end,
+    PersistPid = spawn(Idle),
+    RetentionPid = spawn(Idle),
+    GroupPid = spawn(Idle),
+    State0 = #state{
+        persist_mon = monitor(process, PersistPid),
+        persist_pid = PersistPid,
+        persist_timer = erlang:send_after(60000, self(), persist_timer),
+        group_mon = monitor(process, GroupPid),
+        pending_group_kind = ?MANIFEST_KIND_GROUP,
+        retention_mon = monitor(process, RetentionPid),
+        retention_pid = RetentionPid,
+        retention_timer = erlang:send_after(60000, self(), retention_timeout),
+        retention_token = make_ref()
+    },
+    State1 = cancel_inflight_tasks(State0),
+    %% Every correlation field is cleared.
+    ?assertEqual(undefined, State1#state.persist_mon),
+    ?assertEqual(undefined, State1#state.persist_pid),
+    ?assertEqual(undefined, State1#state.persist_timer),
+    ?assertEqual(undefined, State1#state.group_mon),
+    ?assertEqual(undefined, State1#state.pending_group_kind),
+    ?assertEqual(undefined, State1#state.retention_mon),
+    ?assertEqual(undefined, State1#state.retention_pid),
+    ?assertEqual(undefined, State1#state.retention_timer),
+    ?assertEqual(undefined, State1#state.retention_token),
+    %% Tasks whose pid is retained (persist, retention) are killed; the group
+    %% task whose pid is not retained is left to finish on its own.
+    ?assert(wait_dead(PersistPid, 100)),
+    ?assert(wait_dead(RetentionPid, 100)),
+    ?assert(is_process_alive(GroupPid)),
+    GroupPid ! stop.
+
+wait_dead(_Pid, 0) ->
+    false;
+wait_dead(Pid, N) ->
+    case is_process_alive(Pid) of
+        false ->
+            true;
+        true ->
+            timer:sleep(5),
+            wait_dead(Pid, N - 1)
+    end.
 
 %% A transient object-store error (not a 404) must schedule a retry: Khepri
 %% references a manifest at this revision, so the tier is not empty.
