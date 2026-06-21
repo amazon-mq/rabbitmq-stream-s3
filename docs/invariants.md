@@ -22,8 +22,10 @@ States evolve as `M₀, M₁, …` under five operations: append (upload), rebal
 | Invariant | Statement | Where |
 |---|---|---|
 | Coverage | `Cov(M) = [f, n)` and the fragment intervals are pairwise disjoint: every offset in `[f, n)` belongs to exactly one fragment, so the interior has no gap. | [upload-path.md](./upload-path.md) (Durability boundary) |
-| Durability | Every offset in `[f, n)` is durable in S3. A local segment may be reclaimed once its offsets fall below `n`; Coverage and Durability are what make that safe. | [upload-path.md](./upload-path.md) (Drain loop) |
+| Durability | Every offset in `[f, n)` is durable in S3 — and durability is promised for `[f, n)` **only**, not for the un-tiered tail `[n, T)`. Local segments are reclaimed by two independent drivers: the tiering fun (offsets below `n`, made safe by Coverage and Durability) and the user's retention bound (`max-age`/`max-bytes`), which is authoritative over upload progress and may trim un-tiered segments at or above `n` once they pass the bound. When that lifts `f_local` above `n`, the un-uploaded range `[n, f_local)` is lost from both tiers; see Reset safety. | [upload-path.md](./upload-path.md) (Drain loop), [architecture.md](./architecture.md) (Durability versus the local retention bound) |
 | Contiguous advance | `n` is non-decreasing. An append adds one fragment `x` with `lo(x) = n` and sets `n := hi(x)`. No operation advances `n` over an offset outside `Cov`. | [upload-path.md](./upload-path.md) (Drain loop) |
+
+> **Non-guarantee.** The plugin does not guarantee that every acked offset reaches S3. Only `[f, n)` is durable. The un-uploaded tail past the user's retention bound is lost exactly as a non-tiered stream with the same policy would lose it — the bound is a stream-retention limit, not a local-disk limit, and local trimming wins over upload progress (see [architecture.md](./architecture.md), "Durability versus the local retention bound", and issues #206/#225/#227). A formal model must therefore scope durability to `[f, n)` and model the retention-trim-past-seam + reset; it must not assert that every appended offset is eventually durable.
 
 ## Retention
 
