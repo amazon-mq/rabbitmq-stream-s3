@@ -1667,6 +1667,10 @@ handle_local_log_ahead(
         "remote tier.",
         [StreamId, NextOffset, Reason, LocalFirst, NextOffset]
     ),
+    %% Count the mid-stream (upload-path) recovery too, not just the reader-init
+    %% path (start_reading0/1), so the #225 trimmed-segment recovery is visible
+    %% in the local_log_ahead_recoveries metric and not only in the logs.
+    inc(State0, ?C_LOCAL_LOG_AHEAD_RECOVERIES, 1),
     resolve_and_start(reset_for_recovery(State0)).
 
 -spec drain(#state{}) -> #state{}.
