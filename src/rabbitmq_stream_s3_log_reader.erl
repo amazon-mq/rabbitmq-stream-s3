@@ -119,7 +119,7 @@ tier.
 -export([mode/1, remote_pid/1]).
 
 -ifdef(TEST).
--export([find_fragment/3, find_index_position/2, resolve_remote_location/2]).
+-export([find_fragment/3, find_index_position/2, resolve_remote_location/2, resolve_first_lookup/1]).
 -endif.
 
 %%%===================================================================
@@ -1123,20 +1123,52 @@ resolve_first(StreamId, FirstOffset) ->
             Iterator = rabbitmq_stream_s3_fragment_iterator:init(
                 Manifest, FirstOffset, GetGroupFun
             ),
-            case rabbitmq_stream_s3_fragment_iterator:next(Iterator) of
-                {ok, FragRef, Iterator1} ->
-                    {ok, #remote_location{
-                        chunk_id = FragRef#fragment_ref.offset,
-                        position = ?SEGMENT_HEADER_B,
-                        fragment_ref = FragRef,
-                        iterator = Iterator1
-                    }};
-                _ ->
-                    {local, first}
+            Lookup = rabbitmq_stream_s3_fragment_iterator:next(Iterator),
+            case resolve_first_lookup(Lookup) of
+                {remote, Location} ->
+                    {ok, Location};
+                {local, first} ->
+                    {local, first};
+                {retry, Reason} ->
+                    %% A transient group fetch failed while descending to the
+                    %% first fragment. Failing the read setup (rather than
+                    %% falling back to the local tier) makes the consumer retry
+                    %% instead of silently skipping the remote range below the
+                    %% local floor.
+                    {error, Reason}
             end;
         _ ->
             {local, first}
     end.
+
+%% Interpret the first-fragment lookup returned by the fragment iterator. Total
+%% over the three outcomes of `fragment_iterator:next/1`, with no catch-all so a
+%% transient fetch error cannot be silently absorbed into the "empty -> local"
+%% branch: an `ok` serves the read remotely; `end_of_manifest` means the remote
+%% tier is genuinely empty here, so the local tier serves it; a transient
+%% `group_fetch_failed` must fail the read setup so the consumer retries rather
+%% than skipping the remote range below the local floor. The same point fix has
+%% been applied one site at a time (`find_fragment`, `remote_reader_core`); this
+%% was the site left behind. Exercised directly by `read_resolution_SUITE`.
+-spec resolve_first_lookup(
+    {ok, #fragment_ref{}, rabbitmq_stream_s3_fragment_iterator:iterator()}
+    | end_of_manifest
+    | {error, {group_fetch_failed, term()}}
+) ->
+    {remote, #remote_location{}}
+    | {local, first}
+    | {retry, {group_fetch_failed, term()}}.
+resolve_first_lookup({ok, #fragment_ref{offset = Offset} = FragRef, Iterator}) ->
+    {remote, #remote_location{
+        chunk_id = Offset,
+        position = ?SEGMENT_HEADER_B,
+        fragment_ref = FragRef,
+        iterator = Iterator
+    }};
+resolve_first_lookup(end_of_manifest) ->
+    {local, first};
+resolve_first_lookup({error, {group_fetch_failed, _} = Reason}) ->
+    {retry, Reason}.
 
 -define(READ_RETRY_ATTEMPTS, 3).
 -define(READ_RETRY_DELAY_MS, 500).
