@@ -1435,7 +1435,7 @@ prop_find_fragment_timestamp() ->
             Entries = fragments_to_entries(Fragments),
             GetGroup = fun(_) -> erlang:error(no_groups) end,
             FindFragment = fun(Ts) ->
-                #fragment_ref{offset = Offset} = rabbitmq_stream_s3_log_reader:find_fragment(
+                {ok, #fragment_ref{offset = Offset}} = rabbitmq_stream_s3_log_reader:find_fragment(
                     Entries, {timestamp, Ts}, GetGroup
                 ),
                 Offset
