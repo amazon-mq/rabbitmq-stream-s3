@@ -627,32 +627,11 @@ handle_info({retry_transfer, Ref, Dir, Meta}, #state{cfg = #cfg{stream = StreamI
         false ->
             {noreply, State}
     end;
-handle_info(
-    {group_upload_result, {ok, Uid}}, #state{core = Core0, group_mon = Mon} = State0
-) when Mon =/= undefined ->
-    demonitor(Mon, [flush]),
-    State1 = on_group_upload_completed(State0),
-    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:group_upload_complete(Uid, Core0),
-    {noreply, execute_effects(Effects, State1#state{core = Core, group_mon = undefined})};
-handle_info(
-    {group_upload_result, {error, Reason}},
-    #state{core = Core0, group_mon = Mon, cfg = #cfg{stream = StreamId}} = State0
-) when Mon =/= undefined ->
-    demonitor(Mon, [flush]),
-    ?LOG_WARNING("~ts group upload failed: ~p", [StreamId, Reason]),
-    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:group_upload_failed(Reason, Core0),
-    {noreply,
-        execute_effects(Effects, State0#state{
-            core = Core, group_mon = undefined, pending_group_kind = undefined
-        })};
-handle_info({group_upload_result, _Result}, #state{cfg = #cfg{stream = StreamId}} = State) ->
-    %% A result from a group upload task we are no longer tracking - recovery
-    %% cleared group_mon. The result is an ordinary message that demonitor/flush
-    %% does not remove, so it can still be queued; ignore it rather than apply
-    %% group_upload_complete to the freshly resolved core (which has no pending
-    %% rebalance, so the core would crash on a badmatch).
-    ?LOG_DEBUG("~ts ignoring stale group upload result", [StreamId]),
-    {noreply, State};
+handle_info({group_upload_result, Gen, Result}, #state{tasks = Tasks0} = State0) ->
+    {Tasks, Decisions} = rabbitmq_stream_s3_replica_reader_tasks:step(
+        {group_result, Gen, Result}, Tasks0
+    ),
+    apply_group_decisions(Decisions, State0#state{tasks = Tasks});
 handle_info(
     {retention_result, Token, unchanged},
     #state{retention_token = Token, core = Core0, retention_mon = Mon, retention_timer = TRef} =
@@ -765,16 +744,6 @@ handle_info({persist_result, Gen, Result}, #state{tasks = Tasks0} = State0) ->
         {persist_result, Gen, Result}, Tasks0
     ),
     apply_persist_decisions(Decisions, State0#state{tasks = Tasks});
-handle_info(
-    {'DOWN', Mon, process, _, Reason},
-    #state{group_mon = Mon, core = Core0, cfg = #cfg{stream = StreamId}} = State0
-) ->
-    ?LOG_WARNING("~ts group upload task crashed: ~p", [StreamId, Reason]),
-    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:group_upload_failed(Reason, Core0),
-    {noreply,
-        execute_effects(Effects, State0#state{
-            core = Core, group_mon = undefined, pending_group_kind = undefined
-        })};
 handle_info(
     {'DOWN', Mon, process, _, Reason},
     #state{retention_mon = Mon, retention_timer = TRef, core = Core0, cfg = #cfg{stream = StreamId}} =
@@ -1125,9 +1094,10 @@ execute_effect(
     on_transfer_submitted(Ref, maps:get(size, Meta), State0);
 execute_effect(
     {upload_group, StreamId, Kind, Entries, _Pos, _Len},
-    State0
+    #state{tasks = Tasks0, task_io = Io} = State0
 ) ->
     Self = self(),
+    Gen = rabbitmq_stream_s3_replica_reader_tasks:generation(Tasks0),
     {_Pid, MonRef} = spawn_monitor(fun() ->
         logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
         Result =
@@ -1140,9 +1110,10 @@ execute_effect(
                     ),
                     {error, {crashed, Reason}}
             end,
-        Self ! {group_upload_result, Result}
+        Self ! {group_upload_result, Gen, Result}
     end),
-    State0#state{group_mon = MonRef, pending_group_kind = Kind};
+    {Tasks, []} = rabbitmq_stream_s3_replica_reader_tasks:step({spawn_group, Kind}, Tasks0),
+    State0#state{tasks = Tasks, task_io = Io#{group => #{mon => MonRef}}};
 execute_effect(
     {start_persist, Manifest, Epoch, Reference, ExpectedRevision, _Edits},
     #state{cfg = #cfg{stream = StreamId}, tasks = Tasks0, task_io = Io} = State
@@ -2081,7 +2052,7 @@ on_transfer_result(Ref, Outcome, #state{transfer_sizes = Sizes} = State0) ->
             State0
     end.
 
-on_group_upload_completed(#state{pending_group_kind = Kind} = State) ->
+on_group_upload_completed(Kind, State) ->
     Idx =
         case Kind of
             ?MANIFEST_KIND_GROUP -> ?C_GROUPS_CREATED;
@@ -2093,7 +2064,7 @@ on_group_upload_completed(#state{pending_group_kind = Kind} = State) ->
         undefined -> ok;
         _ -> inc(State, Idx, 1)
     end,
-    State#state{pending_group_kind = undefined}.
+    State.
 
 %% Called from execute_effect/2 for {update_range, ...}, which the core
 %% only emits after a successful manifest persist.
@@ -2322,6 +2293,29 @@ apply_persist_decisions([{drop, _Reason}], #state{cfg = #cfg{stream = StreamId}}
     ?LOG_DEBUG("~ts ignoring stale persist result", [StreamId]),
     {noreply, State}.
 
+%% Carry out the group-upload task model's decision. The kind is carried in the
+%% completion so the per-kind "created" metric is attributed without re-reading
+%% the slot the model just freed.
+apply_group_decisions([{deliver, group_complete, {Kind, Uid}}], State0) ->
+    State1 = clear_task_io(group, State0),
+    State2 = on_group_upload_completed(Kind, State1),
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:group_upload_complete(
+        Uid, State2#state.core
+    ),
+    {noreply, execute_effects(Effects, State2#state{core = Core})};
+apply_group_decisions(
+    [{deliver, group_failed, Reason}], #state{cfg = #cfg{stream = StreamId}} = State0
+) ->
+    State1 = clear_task_io(group, State0),
+    ?LOG_WARNING("~ts group upload failed: ~p", [StreamId, Reason]),
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:group_upload_failed(
+        Reason, State1#state.core
+    ),
+    {noreply, execute_effects(Effects, State1#state{core = Core})};
+apply_group_decisions([{drop, _Reason}], #state{cfg = #cfg{stream = StreamId}} = State) ->
+    ?LOG_DEBUG("~ts ignoring stale group upload result", [StreamId]),
+    {noreply, State}.
+
 %% Translate a monitored task's crash into a failure result for the live task.
 apply_task_crash(persist, Reason, #state{tasks = Tasks0, cfg = #cfg{stream = StreamId}} = State0) ->
     ?LOG_WARNING("~ts commit task crashed: ~p", [StreamId, Reason]),
@@ -2329,7 +2323,14 @@ apply_task_crash(persist, Reason, #state{tasks = Tasks0, cfg = #cfg{stream = Str
     {Tasks, Decisions} = rabbitmq_stream_s3_replica_reader_tasks:step(
         {persist_result, Gen, {error, Reason}}, Tasks0
     ),
-    apply_persist_decisions(Decisions, State0#state{tasks = Tasks}).
+    apply_persist_decisions(Decisions, State0#state{tasks = Tasks});
+apply_task_crash(group, Reason, #state{tasks = Tasks0, cfg = #cfg{stream = StreamId}} = State0) ->
+    ?LOG_WARNING("~ts group upload task crashed: ~p", [StreamId, Reason]),
+    Gen = rabbitmq_stream_s3_replica_reader_tasks:generation(Tasks0),
+    {Tasks, Decisions} = rabbitmq_stream_s3_replica_reader_tasks:step(
+        {group_result, Gen, {error, Reason}}, Tasks0
+    ),
+    apply_group_decisions(Decisions, State0#state{tasks = Tasks}).
 
 on_manifest_resolved(#manifest{next_offset = 0}, State) ->
     inc(State, ?C_MANIFESTS_RESOLVED_EMPTY, 1),
