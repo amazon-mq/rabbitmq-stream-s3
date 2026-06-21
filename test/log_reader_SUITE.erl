@@ -386,12 +386,16 @@ read_through_group(Config) ->
     assert_sequential(Records, NextOffset).
 
 read_group_fetch_error_is_surfaced(Config) ->
-    %% Resolving a numeric offset that descends into a group whose object cannot
-    %% be fetched (a retention deferred-deletion 404, or a transient S3 error)
-    %% must surface a clean error, not crash the consumer's reader. The `first`
-    %% spec goes via the fragment iterator (already tolerant); the numeric and
-    %% timestamp specs go via find_fragment, which this guards. The fault backend
-    %% 404s the group object on fetch.
+    %% Resolving a spec that descends into a group hitting a *transient* S3 error
+    %% (here slow_down) must surface a clean error, not silently fall back to a
+    %% local reader (skipping the remote tier) or crash the consumer's reader. The
+    %% numeric spec goes via find_fragment; the `first` spec goes via resolve_first
+    %% and the fragment iterator. Both must surface the error.
+    %%
+    %% A transient error is distinct from not_found: the iterator treats not_found
+    %% as a group deleted by retention and skips past it (covered for find_fragment
+    %% by the eunit find_fragment_group_fetch_error_is_surfaced_test), so a
+    %% transient error is what exercises the resolve_first surfacing fix.
     ok = application:set_env(
         rabbitmq_stream_s3, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_fault
     ),
@@ -414,14 +418,33 @@ read_group_fetch_error_is_surfaced(Config) ->
     ReaderCfg = reader_config(Writer, Config),
     #{shared := Shared} = ReaderCfg,
     ?awaitMatch(F when F > 0, osiris_log_shared:first_chunk_id(Shared), 1000),
+    %% The assertions require the descent to actually fetch a group object, so
+    %% barrier on the rebalance having factored the leading fragments into a
+    %% group entry. first_chunk_id alone (local retention) does not imply the
+    %% manifest has been grouped yet: without this the resolution can find a flat
+    %% fragment, fetch no group, and return {ok, _} instead of the injected error.
+    ?awaitMatch(true, manifest_has_group(Config), 5000),
 
-    %% The group object 404s on fetch (consumer reads use `get` only for group
-    %% objects; index uses get_range, data uses get_range_async).
-    ok = rabbitmq_stream_s3_api_fault:fail_next(get, <<"group">>, not_found),
+    %% Every group object fetch returns a transient error (consumer reads use
+    %% `get` only for group objects; index uses get_range, data uses
+    %% get_range_async). fail_matching (not fail_next) so a background retention
+    %% group fetch cannot consume a one-shot failure before the resolution under
+    %% test reaches the backend.
+    ok = rabbitmq_stream_s3_api_fault:fail_matching(get, <<"group">>, slow_down),
 
+    %% The numeric spec resolves through find_fragment.
     ?assertMatch(
-        {error, {group_fetch_failed, not_found}},
+        {error, {group_fetch_failed, slow_down}},
         rabbitmq_stream_s3_log_reader:init_offset_reader(0, ReaderCfg)
+    ),
+
+    %% The `first` spec resolves through resolve_first, which descends into the
+    %% leading group. A transient fetch error there must surface, not silently
+    %% return a local reader at the local floor (which would skip the entire
+    %% remote tier below it).
+    ?assertMatch(
+        {error, {group_fetch_failed, slow_down}},
+        rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg)
     ).
 
 read_detects_crc_corruption(Config) ->
@@ -626,6 +649,22 @@ read_from_replica_node(Config) ->
 %% ------------------------------------------------------------------
 %% Internal helpers
 %% ------------------------------------------------------------------
+
+%% Whether the stream's cached manifest has had any fragments factored into a
+%% group entry (the rebalance has run).
+manifest_has_group(Config) ->
+    StreamId = ?config(stream_id, Config),
+    case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
+        #manifest{entries = Entries} -> entries_have_group(Entries);
+        _ -> false
+    end.
+
+entries_have_group(?ENTRY(_O, _F, _L, ?MANIFEST_KIND_GROUP, _S, _U, _Rest)) ->
+    true;
+entries_have_group(<<_:?ENTRY_B/binary, Rest/binary>>) ->
+    entries_have_group(Rest);
+entries_have_group(_) ->
+    false.
 
 read_until_local(Reader) ->
     case rabbitmq_stream_s3_log_reader:mode(Reader) of
