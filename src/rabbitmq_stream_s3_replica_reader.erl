@@ -632,95 +632,16 @@ handle_info({group_upload_result, Gen, Result}, #state{tasks = Tasks0} = State0)
         {group_result, Gen, Result}, Tasks0
     ),
     apply_group_decisions(Decisions, State0#state{tasks = Tasks});
-handle_info(
-    {retention_result, Token, unchanged},
-    #state{retention_token = Token, core = Core0, retention_mon = Mon, retention_timer = TRef} =
-        State0
-) ->
-    %% Evaluation ran and found nothing to remove: not a failure, not counted.
-    demonitor(Mon, [flush]),
-    _ = cancel_timer(TRef),
-    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:retention_failed(unchanged, Core0),
-    {noreply,
-        execute_effects(Effects, State0#state{
-            core = Core,
-            retention_mon = undefined,
-            retention_pid = undefined,
-            retention_timer = undefined,
-            retention_token = undefined
-        })};
-handle_info(
-    {retention_result, Token, {failed, Reason}},
-    #state{retention_token = Token, core = Core0, retention_mon = Mon, retention_timer = TRef} =
-        State0
-) ->
-    %% The async retention task caught a crash and reported it as a failure
-    %% (distinct from unchanged, which means it ran and found nothing). The
-    %% task already logged the crash with a stack trace; record the failure
-    %% as a metric so it is visible separately from no-op evaluations.
-    demonitor(Mon, [flush]),
-    _ = cancel_timer(TRef),
-    inc(State0, ?C_REMOTE_TIER_RETENTION_FAILURES, 1),
-    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:retention_failed(Reason, Core0),
-    {noreply,
-        execute_effects(Effects, State0#state{
-            core = Core,
-            retention_mon = undefined,
-            retention_pid = undefined,
-            retention_timer = undefined,
-            retention_token = undefined
-        })};
-handle_info(
-    {retention_result, Token, {Edit, Refs}},
-    #state{
-        retention_token = Token,
-        core = Core0,
-        retention_mon = Mon,
-        retention_timer = TRef,
-        cfg = #cfg{stream = StreamId}
-    } =
-        State0
-) ->
-    demonitor(Mon, [flush]),
-    _ = cancel_timer(TRef),
-    State = on_remote_retention(Edit, Refs, StreamId, Core0, State0#state{
-        retention_mon = undefined,
-        retention_pid = undefined,
-        retention_timer = undefined,
-        retention_token = undefined
-    }),
-    {noreply, State};
-handle_info(
-    {retention_result, _StaleToken, _Result},
-    #state{cfg = #cfg{stream = StreamId}} = State
-) ->
-    %% A result from a retention task we are no longer tracking - typically one
-    %% the retention timeout already killed, whose message was queued before the
-    %% kill. Its token does not match the current (or absent) task, so ignore it
-    %% rather than apply a stale truncation edit or demonitor a cleared monitor.
-    ?LOG_DEBUG("~ts ignoring stale retention result", [StreamId]),
-    {noreply, State};
-handle_info(
-    retention_timeout,
-    #state{retention_mon = Mon, retention_pid = Pid, core = Core0, cfg = #cfg{stream = StreamId}} =
-        State0
-) when Mon =/= undefined ->
-    ?LOG_WARNING("~ts retention evaluation task timed out, killing", [StreamId]),
-    exit(Pid, kill),
-    demonitor(Mon, [flush]),
-    inc(State0, ?C_REMOTE_TIER_RETENTION_FAILURES, 1),
-    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:retention_failed(timeout, Core0),
-    {noreply,
-        execute_effects(Effects, State0#state{
-            core = Core,
-            retention_mon = undefined,
-            retention_pid = undefined,
-            retention_timer = undefined,
-            retention_token = undefined
-        })};
-handle_info(retention_timeout, State) ->
-    %% Stale timeout after normal completion; ignore.
-    {noreply, State};
+handle_info({retention_result, Gen, Result}, #state{tasks = Tasks0} = State0) ->
+    {Tasks, Decisions} = rabbitmq_stream_s3_replica_reader_tasks:step(
+        {retention_result, Gen, Result}, Tasks0
+    ),
+    apply_retention_decisions(Decisions, State0#state{tasks = Tasks});
+handle_info({retention_timeout, Gen}, #state{tasks = Tasks0} = State0) ->
+    {Tasks, Decisions} = rabbitmq_stream_s3_replica_reader_tasks:step(
+        {retention_timeout, Gen}, Tasks0
+    ),
+    apply_retention_timeout_decisions(Decisions, State0#state{tasks = Tasks});
 handle_info(persist_timer, #state{core = Core0} = State0) ->
     Now = erlang:system_time(millisecond),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:tick(Now, Core0),
@@ -744,23 +665,6 @@ handle_info({persist_result, Gen, Result}, #state{tasks = Tasks0} = State0) ->
         {persist_result, Gen, Result}, Tasks0
     ),
     apply_persist_decisions(Decisions, State0#state{tasks = Tasks});
-handle_info(
-    {'DOWN', Mon, process, _, Reason},
-    #state{retention_mon = Mon, retention_timer = TRef, core = Core0, cfg = #cfg{stream = StreamId}} =
-        State0
-) ->
-    ?LOG_WARNING("~ts retention evaluation task crashed: ~p", [StreamId, Reason]),
-    _ = cancel_timer(TRef),
-    inc(State0, ?C_REMOTE_TIER_RETENTION_FAILURES, 1),
-    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:retention_failed(Reason, Core0),
-    {noreply,
-        execute_effects(Effects, State0#state{
-            core = Core,
-            retention_mon = undefined,
-            retention_pid = undefined,
-            retention_timer = undefined,
-            retention_token = undefined
-        })};
 handle_info({'DOWN', Mon, process, _Pid, Reason}, State) ->
     %% A monitored async task crashed. Its 'DOWN' carries the monitor ref, which
     %% identifies the family (and, via the model's slot, its generation): a crash
@@ -1311,7 +1215,8 @@ maybe_spawn_group_retention(
     State
 ) when Kind =/= ?MANIFEST_KIND_FRAGMENT ->
     Self = self(),
-    Token = make_ref(),
+    #state{tasks = Tasks0, task_io = Io} = State,
+    Gen = rabbitmq_stream_s3_replica_reader_tasks:generation(Tasks0),
     GetGroupFun = rabbitmq_stream_s3_manifest:get_cached_group_fun(StreamId),
     {Pid, MonRef} = spawn_monitor(fun() ->
         logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
@@ -1327,17 +1232,16 @@ maybe_spawn_group_retention(
                     ),
                     {failed, {Class, Reason}}
             end,
-        Self ! {retention_result, Token, Result}
+        Self ! {retention_result, Gen, Result}
     end),
     Core = rabbitmq_stream_s3_replica_reader_core:retention_started(State#state.core),
     Timeout = rabbitmq_stream_s3_config:retention_task_timeout(),
-    TRef = erlang:send_after(Timeout, Self, retention_timeout),
+    TRef = erlang:send_after(Timeout, Self, {retention_timeout, Gen}),
+    {Tasks, []} = rabbitmq_stream_s3_replica_reader_tasks:step(spawn_retention, Tasks0),
     State#state{
         core = Core,
-        retention_mon = MonRef,
-        retention_pid = Pid,
-        retention_timer = TRef,
-        retention_token = Token
+        tasks = Tasks,
+        task_io = Io#{retention => #{mon => MonRef, pid => Pid, timer => TRef}}
     };
 maybe_spawn_group_retention(_Manifest, _Retention, _Now, _StreamId, State) ->
     State.
@@ -2260,6 +2164,19 @@ clear_task_io(Family, #state{task_io = Io} = State) ->
             State
     end.
 
+%% Tear down one single-in-flight task that is still running (a timeout): kill
+%% its process, demonitor (flush its 'DOWN'), and cancel its timer.
+-spec discard_task_io(persist | group | retention, #state{}) -> #state{}.
+discard_task_io(Family, #state{task_io = Io} = State) ->
+    case maps:take(Family, Io) of
+        {Handle, Io1} ->
+            kill_task(maps:get(mon, Handle), maps:get(pid, Handle, undefined)),
+            _ = cancel_timer(maps:get(timer, Handle, undefined)),
+            State#state{task_io = Io1};
+        error ->
+            State
+    end.
+
 %% On recovery: tear down every single-in-flight task - demonitor (flush its
 %% 'DOWN'), cancel its timer, and kill its process if the pid was retained.
 -spec kill_task_io(#state{}) -> #state{}.
@@ -2316,6 +2233,49 @@ apply_group_decisions([{drop, _Reason}], #state{cfg = #cfg{stream = StreamId}} =
     ?LOG_DEBUG("~ts ignoring stale group upload result", [StreamId]),
     {noreply, State}.
 
+%% Carry out the retention task model's decision for a retention *result*. The
+%% task has finished, so its monitor is demonitored and its timeout timer
+%% cancelled (clear_task_io); a timeout is handled separately below because it
+%% must kill a still-running task. unchanged is a no-op evaluation and is not
+%% counted as a failure.
+apply_retention_decisions(
+    [{deliver, retention_complete, {Edit, Refs}}], #state{cfg = #cfg{stream = StreamId}} = State0
+) ->
+    State1 = clear_task_io(retention, State0),
+    {noreply, on_remote_retention(Edit, Refs, StreamId, State1#state.core, State1)};
+apply_retention_decisions([{deliver, retention_failed, unchanged}], State0) ->
+    State1 = clear_task_io(retention, State0),
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:retention_failed(
+        unchanged, State1#state.core
+    ),
+    {noreply, execute_effects(Effects, State1#state{core = Core})};
+apply_retention_decisions([{deliver, retention_failed, Reason}], State0) ->
+    State1 = clear_task_io(retention, State0),
+    inc(State1, ?C_REMOTE_TIER_RETENTION_FAILURES, 1),
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:retention_failed(
+        Reason, State1#state.core
+    ),
+    {noreply, execute_effects(Effects, State1#state{core = Core})};
+apply_retention_decisions([{drop, _Reason}], #state{cfg = #cfg{stream = StreamId}} = State) ->
+    ?LOG_DEBUG("~ts ignoring stale retention result", [StreamId]),
+    {noreply, State}.
+
+%% Carry out the model's decision for a retention *timeout*. The task is still
+%% running, so it is killed (discard_task_io) rather than merely demonitored.
+apply_retention_timeout_decisions(
+    [{deliver, retention_failed, timeout}], #state{cfg = #cfg{stream = StreamId}} = State0
+) ->
+    ?LOG_WARNING("~ts retention evaluation task timed out, killing", [StreamId]),
+    State1 = discard_task_io(retention, State0),
+    inc(State1, ?C_REMOTE_TIER_RETENTION_FAILURES, 1),
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:retention_failed(
+        timeout, State1#state.core
+    ),
+    {noreply, execute_effects(Effects, State1#state{core = Core})};
+apply_retention_timeout_decisions([{drop, _Reason}], State) ->
+    %% Stale timeout after normal completion or a recovery; ignore.
+    {noreply, State}.
+
 %% Translate a monitored task's crash into a failure result for the live task.
 apply_task_crash(persist, Reason, #state{tasks = Tasks0, cfg = #cfg{stream = StreamId}} = State0) ->
     ?LOG_WARNING("~ts commit task crashed: ~p", [StreamId, Reason]),
@@ -2330,7 +2290,16 @@ apply_task_crash(group, Reason, #state{tasks = Tasks0, cfg = #cfg{stream = Strea
     {Tasks, Decisions} = rabbitmq_stream_s3_replica_reader_tasks:step(
         {group_result, Gen, {error, Reason}}, Tasks0
     ),
-    apply_group_decisions(Decisions, State0#state{tasks = Tasks}).
+    apply_group_decisions(Decisions, State0#state{tasks = Tasks});
+apply_task_crash(retention, Reason, #state{tasks = Tasks0, cfg = #cfg{stream = StreamId}} = State0) ->
+    ?LOG_WARNING("~ts retention evaluation task crashed: ~p", [StreamId, Reason]),
+    Gen = rabbitmq_stream_s3_replica_reader_tasks:generation(Tasks0),
+    %% A crash is reported as a failure (mirrors the {failed, _} result), so it is
+    %% counted as a retention failure by apply_retention_decisions.
+    {Tasks, Decisions} = rabbitmq_stream_s3_replica_reader_tasks:step(
+        {retention_result, Gen, {failed, Reason}}, Tasks0
+    ),
+    apply_retention_decisions(Decisions, State0#state{tasks = Tasks}).
 
 on_manifest_resolved(#manifest{next_offset = 0}, State) ->
     inc(State, ?C_MANIFESTS_RESOLVED_EMPTY, 1),
