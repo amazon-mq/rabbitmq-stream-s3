@@ -45,7 +45,11 @@ If the index is out of bounds then this function returns `undefined` instead.
 """.
 -spec try_at(index(), entry_size(), array()) -> entry() | undefined.
 try_at(Index, EntrySize, Array) when is_binary(Array) ->
-    case Index * EntrySize < byte_size(Array) of
+    %% Require the whole entry to fit. A trailing partial record (the array is
+    %% not an exact multiple of EntrySize, e.g. a truncated index object) would
+    %% otherwise pass `Index * EntrySize < byte_size` for the partial index and
+    %% crash binary:part reading past the end. Treat it as out of bounds.
+    case Index * EntrySize + EntrySize =< byte_size(Array) of
         true ->
             binary:part(Array, Index * EntrySize, EntrySize);
         false ->
@@ -65,7 +69,13 @@ at(Index, EntrySize, Array) when is_integer(Index) andalso Index >= 0 andalso is
 last(_EntrySize, <<>>) ->
     undefined;
 last(EntrySize, Array) when is_binary(Array) ->
-    binary:part(Array, byte_size(Array), -EntrySize).
+    %% The last *complete* entry. Reading the trailing EntrySize bytes directly
+    %% would return a misaligned entry when the array has a partial trailing
+    %% record (not an exact multiple of EntrySize).
+    case len(EntrySize, Array) of
+        0 -> undefined;
+        Len -> at(Len - 1, EntrySize, Array)
+    end.
 
 -spec slice(index(), entry_size(), array()) -> array().
 slice(Index, EntrySize, Array) when is_binary(Array) ->
@@ -174,3 +184,34 @@ fold(FoldFn, Acc, EntrySize, Idx, Array) ->
         Entry ->
             fold(FoldFn, FoldFn(Entry, Acc), EntrySize, Idx + 1, Array)
     end.
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+%% A trailing partial record (array length not an exact multiple of the entry
+%% size, e.g. a truncated index object) must not crash try_at or yield a
+%% misaligned entry from last/2.
+partial_trailing_record_test() ->
+    ES = 4,
+    %% Three complete 4-byte entries plus 2 trailing bytes.
+    Array = <<1:32, 2:32, 3:32, 99, 98>>,
+    ?assertEqual(3, len(ES, Array)),
+    ?assertEqual(<<1:32>>, try_at(0, ES, Array)),
+    ?assertEqual(<<3:32>>, try_at(2, ES, Array)),
+    %% The partial trailing record is out of bounds, not a crash.
+    ?assertEqual(undefined, try_at(3, ES, Array)),
+    %% last/2 returns the last complete entry, not the misaligned tail.
+    ?assertEqual(<<3:32>>, last(ES, Array)),
+    %% fold visits only the complete entries.
+    Collected = fold(fun(E, Acc) -> [E | Acc] end, [], ES, Array),
+    ?assertEqual([<<1:32>>, <<2:32>>, <<3:32>>], lists:reverse(Collected)).
+
+exact_multiple_unaffected_test() ->
+    ES = 4,
+    Array = <<1:32, 2:32, 3:32>>,
+    ?assertEqual(<<3:32>>, try_at(2, ES, Array)),
+    ?assertEqual(undefined, try_at(3, ES, Array)),
+    ?assertEqual(<<3:32>>, last(ES, Array)),
+    ?assertEqual(undefined, last(ES, <<>>)).
+
+-endif.

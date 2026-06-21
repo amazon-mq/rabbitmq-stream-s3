@@ -489,6 +489,11 @@ handle_cast(
     sync_manifest(StreamId, Epoch, Manifest, Node),
     {noreply, State};
 handle_cast(reconcile_replicas, #state{cfg = #cfg{writer_pid = WriterPid}} = State) ->
+    %% Re-seed the writer node's own manifest cache if it was lost (its
+    %% manifest_replica restarted) and no persist has refilled it - otherwise an
+    %% idle stream's remote tier becomes invisible to consumers on this node.
+    %% reconcile_replicas covers other nodes but never node() itself.
+    maybe_reseed_local_cache(State),
     %% Re-sync any replica node the writer currently has that this reader is no
     %% longer broadcasting to - a replica drops out of the map when its
     %% manifest_replica restarts (the monitored DOWN removes it), losing its
@@ -594,10 +599,21 @@ handle_info({transfer_deadline, Ref, Token}, #state{core = Core0} = State0) ->
     end;
 handle_info({retry_transfer, Ref, Dir, Meta}, #state{cfg = #cfg{stream = StreamId}} = State) ->
     %% A previously failed fragment upload is being retried after its backoff
-    %% delay. The in-flight gauges were already restored when the delayed
-    %% resubmit effect was executed, so only re-submit the upload here.
-    submit_upload(Ref, Dir, StreamId, Meta),
-    {noreply, State};
+    %% delay. If a reset (local-log-ahead recovery) cleared the in-flight
+    %% transfer tracking after this retry was scheduled, the fragment is no
+    %% longer part of the pipeline; drop the retry rather than re-submitting a
+    %% phantom upload against the discarded core (mirrors the stale
+    %% transfer_result guard above). The timer is fire-and-forget, so this is
+    %% where the stale retry is filtered.
+    case is_map_key(Ref, State#state.transfer_sizes) of
+        true ->
+            %% The in-flight gauges were already restored when the delayed
+            %% resubmit effect was executed, so only re-submit the upload here.
+            submit_upload(Ref, Dir, StreamId, Meta),
+            {noreply, State};
+        false ->
+            {noreply, State}
+    end;
 handle_info(
     {group_upload_result, {ok, Uid}}, #state{core = Core0, group_mon = Mon} = State0
 ) when Mon =/= undefined ->
@@ -904,6 +920,33 @@ resolve_stream_id(VHost, QueueName) ->
     end.
 
 identity_formatter(Evt) -> Evt.
+
+%% Re-seed the writer node's own manifest cache from the committed manifest when
+%% it is missing. The cache is normally filled by each persist's put_manifest,
+%% but if the node's manifest_replica restarts and the stream is then idle (no
+%% further persist), the cache stays empty and consumers on this node resolve
+%% the remote tier as absent ({local, first}), silently skipping remote data.
+%% Only repairs a genuine cache miss; a no-op once seeded.
+maybe_reseed_local_cache(#state{core = undefined}) ->
+    ok;
+maybe_reseed_local_cache(#state{core = Core, cfg = #cfg{stream = StreamId}}) ->
+    case rabbitmq_stream_s3_replica_reader_core:persisted_manifest(Core) of
+        #manifest{next_offset = 0} ->
+            %% No remote tier yet; nothing to cache.
+            ok;
+        #manifest{} = Manifest ->
+            case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
+                undefined ->
+                    ?LOG_INFO(
+                        "Reconciliation: re-seeding the local manifest cache for "
+                        "stream ~ts after a manifest_replica restart",
+                        [StreamId]
+                    ),
+                    ok = rabbitmq_stream_s3_manifest_replica:put_manifest(StreamId, Manifest);
+                _ ->
+                    ok
+            end
+    end.
 
 %% Proactively register replica nodes for manifest broadcast.
 %% Idempotent: skips nodes already in the replicas map.
@@ -1435,10 +1478,19 @@ classify_store_result(Other, _StreamId) ->
     {ok, #manifest{}} | {retry, term()}.
 classify_object_result({ok, Data}, Rev, _Key) ->
     {ok, (parse_manifest_root(Data))#manifest{revision = Rev}};
-classify_object_result({error, not_found}, _Rev, _Key) ->
-    %% The metadata node exists but no manifest object does yet: a stream that
-    %% has not persisted a manifest. Empty is correct.
+classify_object_result({error, not_found}, Rev, _Key) when Rev =< 0 ->
+    %% No committed revision: a genuinely new stream that has not persisted a
+    %% manifest. Empty is correct.
     {ok, #manifest{}};
+classify_object_result({error, not_found}, _Rev, Key) ->
+    %% Khepri references a manifest at a committed revision (> 0) but the object
+    %% is gone. The object is always PUT before the Khepri CAS, so this is not a
+    %% new stream: it is typically a stale local Khepri read still pointing at a
+    %% manifest object that a newer committed revision already deleted. Fail
+    %% closed and retry rather than misclassifying the stream as empty and
+    %% re-tiering over the real remote objects (Local authority). Resolution
+    %% retries until the local Khepri replica catches up to the newer revision.
+    {retry, {manifest_object_missing, Key}};
 classify_object_result({error, Reason}, _Rev, Key) ->
     %% Khepri references a manifest at this revision but the object store could
     %% not be read (a transient error, not a 404). Do not assume empty.
@@ -2283,6 +2335,18 @@ evaluate_retention_on_unresolved_manifest_replies_error_test() ->
         handle_call(evaluate_remote_retention, From, State)
     ).
 
+%% A retry_transfer that fires after a reset cleared the in-flight transfer
+%% tracking must be dropped, not re-submitted as a phantom upload (would
+%% otherwise touch the governor against the discarded core).
+retry_transfer_after_reset_is_dropped_test() ->
+    State = #state{transfer_sizes = #{}, cfg = #cfg{stream = <<"s">>}},
+    Ref = make_ref(),
+    Meta = #{first_offset => 0, size => 0},
+    ?assertEqual(
+        {noreply, State},
+        handle_info({retry_transfer, Ref, <<"/tmp">>, Meta}, State)
+    ).
+
 %% reset_for_recovery must tear down every in-flight async task: clear the
 %% correlation fields (so a late result is ignored rather than applied to the
 %% freshly resolved core) and kill the tasks whose pid is retained.
@@ -2346,7 +2410,17 @@ classify_object_result_transient_error_retries_test() ->
 
 %% A 404 on the manifest object means it has not been written yet: empty.
 classify_object_result_not_found_is_empty_test() ->
-    ?assertEqual({ok, #manifest{}}, classify_object_result({error, not_found}, 7, <<"k">>)).
+    %% A 404 with no committed revision is a genuinely new stream: empty.
+    ?assertEqual({ok, #manifest{}}, classify_object_result({error, not_found}, 0, <<"k">>)).
+
+%% A 404 on a manifest object referenced by a committed revision (> 0) is a
+%% stale local Khepri read pointing at a since-deleted object, not an empty
+%% stream. Fail closed and retry rather than re-tiering over the real objects.
+classify_object_result_not_found_with_revision_retries_test() ->
+    ?assertEqual(
+        {retry, {manifest_object_missing, <<"k">>}},
+        classify_object_result({error, not_found}, 7, <<"k">>)
+    ).
 
 %% A fetched manifest object parses and carries the Khepri revision.
 classify_object_result_ok_parses_with_revision_test() ->

@@ -77,6 +77,7 @@ groups() ->
             local_ahead_discards_manifest,
             remote_tier_ahead_discards_manifest,
             reconcile_reattaches_orphaned_writer,
+            reconcile_reseeds_writer_cache_after_restart,
             stream_deletion_cleans_remote_tier,
             stream_deletion_during_active_upload,
             persist_not_found_stops_reader,
@@ -678,6 +679,41 @@ reconcile_reattaches_orphaned_writer(Config) ->
     %% Idempotent: a second tick leaves the healthy reader untouched.
     ok = rabbitmq_stream_s3_hooks:reconcile(),
     ?assertEqual(Pid2, rabbitmq_stream_s3_registry:whereis_name({StreamId, node()})).
+
+reconcile_reseeds_writer_cache_after_restart(Config) ->
+    %% On the writer node the manifest cache is filled by each persist. If the
+    %% node's manifest_replica restarts and the stream is then idle (no further
+    %% persist), the cache stays empty and consumers on this node resolve the
+    %% remote tier as absent, silently skipping remote data. Writer-side
+    %% reconciliation must re-seed the local cache from the reader's manifest.
+    StreamId = ?config(stream_id, Config),
+    Cache = rabbitmq_stream_s3_manifest_replica,
+    Writer = start_writer(Config, #{fragment_target_size => 1000}),
+    Record = binary:copy(<<"R">>, 300),
+    [osiris:write(Writer, undefined, I, Record) || I <- lists:seq(1, 50)],
+    %% Await the full offset so the persist pipeline is quiesced: an in-flight
+    %% persist would otherwise re-seed the cache right after we clear it and the
+    %% stream would not be genuinely idle.
+    ok = await_offset(StreamId, 50),
+    %% The writer node's local cache holds the stream's manifest.
+    ?awaitMatch(M when M =/= undefined, Cache:get_manifest(StreamId), 2000),
+
+    %% Restart the manifest_replica: the owned-ETS cache is lost. The stream is
+    %% idle, so no persist refills it.
+    OldPid = whereis(Cache),
+    true = exit(OldPid, kill),
+    ?awaitMatch(P when is_pid(P) andalso P =/= OldPid, whereis(Cache), 2000),
+    ?assertEqual(undefined, Cache:get_manifest(StreamId)),
+
+    %% Writer-side reconcile re-seeds the local cache from the reader's manifest.
+    ?awaitMatch(
+        M when M =/= undefined,
+        begin
+            ok = rabbitmq_stream_s3_hooks:reconcile(),
+            Cache:get_manifest(StreamId)
+        end,
+        5000
+    ).
 
 stream_deletion_cleans_remote_tier(Config) ->
     StreamId = ?config(stream_id, Config),
