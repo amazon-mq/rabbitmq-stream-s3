@@ -234,59 +234,14 @@ returned by the functional core module.
     replicas = #{} :: #{node() => reference()},
     %% User-configured retention specs for remote tier evaluation.
     retention = [] :: [osiris:retention_spec()],
-    %% Commit timer reference.
+    %% Periodic commit-tick timer reference. Drives the core's persist
+    %% scheduling; distinct from the async persist task (which lives in the task
+    %% model and task_io).
     persist_timer :: reference() | undefined,
-    %% Monitor ref and PID for the in-flight commit task.
-    persist_mon :: reference() | undefined,
-    persist_pid :: pid() | undefined,
     %% Per-stream seshat counter ref. The id used to register this counter
     %% in the rabbitmq_stream_s3 seshat group, used for cleanup on terminate.
     metrics :: counters:counters_ref() | undefined,
     metrics_id :: term() | undefined,
-    %% Map from in-flight transfer ref to its byte size. Tracked in the
-    %% shell so we can attribute bytes_transferred and decrement
-    %% transfers_in_flight when the result message arrives.
-    transfer_sizes = #{} :: #{reference() => non_neg_integer()},
-    %% Per in-flight transfer, a deadline timer that fires if the governor
-    %% never reports a result. A submitted transfer can fail to report back if
-    %% the governor crashes while the submission sits in its pending queue
-    %% (only when a finite rate limit is configured), if the spawned task is
-    %% killed externally (e.g. by the OOM killer) before it replies, or if the
-    %% result message is otherwise lost. In every case the in-flight queue head
-    %% never drains and the stream's uploads stall silently and permanently. On
-    %% expiry the transfer is resubmitted under the same reference through the
-    %% core's retry path (see the {transfer_deadline, ...} handler). The map
-    %% value is {TimerRef, Token}: the Token disambiguates a live deadline from
-    %% a stale timer message that fired into the mailbox in the narrow window
-    %% before its timer was cancelled.
-    transfer_deadlines = #{} :: #{reference() => {reference(), reference()}},
-    %% Bytes uploaded but not yet covered by a started persist. Moves to
-    %% persisting_bytes when the next start_persist effect fires.
-    persist_pending_bytes = 0 :: non_neg_integer(),
-    %% Bytes covered by the currently-in-flight persist. Snapshotted from
-    %% persist_pending_bytes at start_persist; cleared on persist_result.
-    %% bytes_in_persist gauge = persist_pending_bytes + persisting_bytes.
-    persisting_bytes = 0 :: non_neg_integer(),
-    %% Monitor ref for the in-flight group upload task.
-    group_mon :: reference() | undefined,
-    %% Monitor ref for the in-flight retention evaluation task.
-    retention_mon :: reference() | undefined,
-    %% PID of the in-flight retention evaluation task.
-    retention_pid :: pid() | undefined,
-    %% Timer ref for the retention task timeout.
-    retention_timer :: reference() | undefined,
-    %% Correlation token for the in-flight retention task. Each spawned task
-    %% gets a fresh make_ref/0 and tags its result with it; only a
-    %% {retention_result, Token, _} whose Token matches the current task is
-    %% applied. A result from a task we stopped tracking (e.g. one the retention
-    %% timeout already killed, whose message was queued before the kill) carries
-    %% a stale token and is ignored rather than mis-applied onto a manifest it
-    %% no longer matches.
-    retention_token :: reference() | undefined,
-    %% Kind of the group upload currently in flight. Cleared when the
-    %% group_upload_result message arrives. Only one rebalance is in
-    %% flight at a time so a single slot suffices.
-    pending_group_kind :: rabbitmq_stream_s3:kind() | undefined,
     %% Keys queued for deletion after the next successful persist.
     %% Retention computes which objects to delete but we defer the actual
     %% S3 DELETE until the manifest persist that records their removal
@@ -533,100 +488,24 @@ handle_info({osiris_offset, _Ref, _Offset}, State0) ->
     {noreply, State};
 handle_info(retry_resolve, State0) ->
     {noreply, resolve_and_start(State0)};
-handle_info({transfer_result, Ref, _Result}, State0) when
-    not is_map_key(Ref, State0#state.transfer_sizes)
-->
-    %% Stale result from a transfer submitted before a manifest recovery reset
-    %% the in-flight queue (see handle_local_log_ahead/3). The fragment is no
-    %% longer tracked by the shell or the core, so feeding it to the core would
-    %% crash get_meta or, for a success, append a non-contiguous orphan that
-    %% trips assert_contiguous. Drop it.
-    {noreply, State0};
-handle_info({transfer_result, Ref, {ok, Uid}}, #state{core = Core0} = State0) ->
-    State1 = on_transfer_result(Ref, ok, State0),
-    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_complete(Ref, Uid, Core0),
-    State2 = State1#state{core = Core},
-    State3 = execute_effects(Effects, State2),
-    {noreply, State3};
-handle_info({transfer_result, Ref, {error, Reason}}, #state{core = Core0} = State0) ->
-    State1 = on_transfer_result(Ref, {error, Reason}, State0),
-    case local_log_ahead(State1) of
-        {true, LocalFirst, NextOffset} ->
-            %% Local retention trimmed past the manifest's next_offset, so the
-            %% segment backing the stalled fragment is permanently gone and no
-            %% retry can ever make it durable. Without this the core would keep
-            %% the fragment at the head of the in-flight queue and retry it
-            %% forever (issue #225), wedging the manifest and making the bulk of
-            %% the stream inaccessible. Recover the same way start_reading0/1
-            %% does at reader init: discard the remote manifest and restart from
-            %% the local log's first offset, accepting the lost range.
-            {noreply, handle_local_log_ahead(LocalFirst, NextOffset, Reason, State1)};
-        false ->
-            {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(
-                Ref, Reason, Core0
-            ),
-            {noreply, execute_effects(Effects, State1#state{core = Core})}
-    end;
-handle_info({transfer_deadline, Ref, Token}, #state{core = Core0} = State0) ->
-    case maps:find(Ref, State0#state.transfer_deadlines) of
-        {ok, {_TimerRef, Token}} ->
-            %% The deadline elapsed with no result for this transfer. Treat it
-            %% exactly as a lost result: account the abandoned submission off
-            %% the pipeline gauges and drop its bookkeeping (as a real error
-            %% result would via on_transfer_result/3), then drive the core's
-            %% retry path to re-upload under the same Ref. If a late original
-            %% result and the resubmit both eventually complete, the second is
-            %% discarded by the stale-Ref clause above once the first has been
-            %% accounted for; the losing upload's object is left for orphan GC.
-            ?LOG_WARNING(
-                "~ts no result for an in-flight fragment transfer within the "
-                "transfer deadline. The governor may have lost the submission "
-                "(crash with a queued item), the upload task may have been "
-                "killed before replying, or the result message was lost. "
-                "Resubmitting to keep the upload pipeline live.",
-                [(State0#state.cfg)#cfg.stream]
-            ),
-            State1 = on_transfer_result(Ref, {error, transfer_deadline}, State0),
-            case local_log_ahead(State1) of
-                {true, LocalFirst, NextOffset} ->
-                    %% Local retention trimmed past next_offset while this
-                    %% transfer was stalled, so no resubmit can ever make the
-                    %% range durable. Recover the same way a permanent upload
-                    %% failure does (see the {error, Reason} clause).
-                    {noreply,
-                        handle_local_log_ahead(
-                            LocalFirst, NextOffset, transfer_deadline, State1
-                        )};
-                false ->
-                    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(
-                        Ref, transfer_deadline, Core0
-                    ),
-                    {noreply, execute_effects(Effects, State1#state{core = Core})}
-            end;
-        _ ->
-            %% Stale timer message: the result already arrived (the timer was
-            %% cancelled but had already fired into the mailbox), or a manifest
-            %% recovery reset the in-flight bookkeeping, or this Ref now tracks
-            %% a newer deadline with a different token. Ignore it.
-            {noreply, State0}
-    end;
-handle_info({retry_transfer, Ref, Dir, Meta}, #state{cfg = #cfg{stream = StreamId}} = State) ->
-    %% A previously failed fragment upload is being retried after its backoff
-    %% delay. If a reset (local-log-ahead recovery) cleared the in-flight
-    %% transfer tracking after this retry was scheduled, the fragment is no
-    %% longer part of the pipeline; drop the retry rather than re-submitting a
-    %% phantom upload against the discarded core (mirrors the stale
-    %% transfer_result guard above). The timer is fire-and-forget, so this is
-    %% where the stale retry is filtered.
-    case is_map_key(Ref, State#state.transfer_sizes) of
-        true ->
-            %% The in-flight gauges were already restored when the delayed
-            %% resubmit effect was executed, so only re-submit the upload here.
-            submit_upload(Ref, Dir, StreamId, Meta),
-            {noreply, State};
-        false ->
-            {noreply, State}
-    end;
+handle_info({transfer_result, Ref, Result}, #state{tasks = Tasks0} = State0) ->
+    %% Read the transferred byte count before the step removes the transfer; it
+    %% is needed for the cumulative bytes-transferred counter on success.
+    Size = transfer_byte_size(Ref, Tasks0),
+    {Tasks, Decisions} = rabbitmq_stream_s3_replica_reader_tasks:step(
+        {transfer_result, Ref, Result}, Tasks0
+    ),
+    apply_transfer_decisions(Decisions, Size, State0#state{tasks = Tasks});
+handle_info({transfer_deadline, Ref, Token}, #state{tasks = Tasks0} = State0) ->
+    {Tasks, Decisions} = rabbitmq_stream_s3_replica_reader_tasks:step(
+        {transfer_deadline, Ref, Token}, Tasks0
+    ),
+    apply_transfer_decisions(Decisions, 0, State0#state{tasks = Tasks});
+handle_info({retry_transfer, Ref, Dir, Meta}, #state{tasks = Tasks0} = State0) ->
+    {Tasks, Decisions} = rabbitmq_stream_s3_replica_reader_tasks:step(
+        {retry_transfer, Ref}, Tasks0
+    ),
+    apply_retry_decisions(Decisions, Dir, Meta, State0#state{tasks = Tasks});
 handle_info({group_upload_result, Gen, Result}, #state{tasks = Tasks0} = State0) ->
     {Tasks, Decisions} = rabbitmq_stream_s3_replica_reader_tasks:step(
         {group_result, Gen, Result}, Tasks0
@@ -661,10 +540,13 @@ handle_info(
         _ -> {noreply, State}
     end;
 handle_info({persist_result, Gen, Result}, #state{tasks = Tasks0} = State0) ->
+    %% Read the bytes this persist covered before the step frees the slot; needed
+    %% for the cumulative bytes-persisted counter on success.
+    PersistedBytes = persisting_snapshot(Tasks0),
     {Tasks, Decisions} = rabbitmq_stream_s3_replica_reader_tasks:step(
         {persist_result, Gen, Result}, Tasks0
     ),
-    apply_persist_decisions(Decisions, State0#state{tasks = Tasks});
+    apply_persist_decisions(Decisions, PersistedBytes, State0#state{tasks = Tasks});
 handle_info({'DOWN', Mon, process, _Pid, Reason}, State) ->
     %% A monitored async task crashed. Its 'DOWN' carries the monitor ref, which
     %% identifies the family (and, via the model's slot, its generation): a crash
@@ -712,12 +594,12 @@ format_state(#state{
     log = Log,
     assembly = Assembly,
     core = Core,
-    transfer_deadlines = Deadlines
+    transfer_timers = Timers
 }) ->
     #{
         stream => StreamId,
         fragment_target_size => Target,
-        transfer_deadlines_armed => maps:size(Deadlines),
+        transfer_deadlines_armed => maps:size(Timers),
         core =>
             case Core of
                 undefined -> undefined;
@@ -977,9 +859,8 @@ execute_effect({submit_transfer, Ref, _StreamId, Dir, Meta}, #state{cfg = Cfg} =
 execute_effect({resubmit_transfer, Ref, _StreamId, Dir, Meta}, #state{cfg = Cfg} = State0) ->
     StreamId = Cfg#cfg.stream,
     submit_upload(Ref, Dir, StreamId, Meta),
-    %% on_transfer_result already decremented the gauges and removed Ref
-    %% from transfer_sizes. Restore them so the eventual completion is
-    %% accounted for correctly.
+    %% The failure already removed Ref from the model. Re-add it (a fresh slot
+    %% with a new deadline token) so the eventual completion is accounted for.
     on_transfer_submitted(Ref, maps:get(size, Meta), State0);
 execute_effect(
     {resubmit_transfer_delayed, Ref, _StreamId, Dir, Meta, Reason}, #state{cfg = Cfg} = State0
@@ -993,8 +874,9 @@ execute_effect(
         [StreamId, maps:get(first_offset, Meta), Reason, Delay]
     ),
     erlang:send_after(Delay, self(), {retry_transfer, Ref, Dir, Meta}),
-    %% on_transfer_result already decremented the gauges. Restore them: the
-    %% fragment is still pending and its bytes are still in the pipeline.
+    %% The failure already removed Ref from the model. Re-add it now (the fragment
+    %% is still pending and its bytes are still in the pipeline); the retry_transfer
+    %% timer above triggers the actual re-upload after the backoff.
     on_transfer_submitted(Ref, maps:get(size, Meta), State0);
 execute_effect(
     {upload_group, StreamId, Kind, Entries, _Pos, _Len},
@@ -1032,19 +914,15 @@ execute_effect(
         Result = do_commit(StreamId, Manifest, Epoch, Reference, ExpectedRevision),
         Self ! {persist_result, Gen, Result}
     end),
+    %% step(spawn_persist) snapshots the model's pending bytes into the persist
+    %% slot (the bytes this commit will cover) and zeroes pending; bytes_in_persist
+    %% is unchanged. New transfer completions during the persist accumulate in the
+    %% model's pending pool and are covered by the next persist.
     {Tasks, []} = rabbitmq_stream_s3_replica_reader_tasks:step(spawn_persist, Tasks0),
-    %% Snapshot the bytes that this persist will cover. New transfer
-    %% completions during the persist accumulate in persist_pending_bytes
-    %% and will be covered by the next persist. The bytes_in_persist
-    %% gauge is unchanged here (its value equals
-    %% persisting_bytes + persist_pending_bytes both before and after).
-    Snapshot = State#state.persist_pending_bytes,
-    State#state{
+    derive_gauges(State#state{
         tasks = Tasks,
-        task_io = Io#{persist => #{mon => MonRef, pid => CommitPid}},
-        persisting_bytes = Snapshot,
-        persist_pending_bytes = 0
-    };
+        task_io = Io#{persist => #{mon => MonRef, pid => CommitPid}}
+    });
 execute_effect({update_range, _FirstOffset, _NextOffset}, #state{cfg = Cfg, core = Core} = State) ->
     %% Publish the *persisted* manifest, not the live one. This effect is
     %% emitted by persist_complete, and the cache + range table it updates gate
@@ -1893,68 +1771,120 @@ submit_upload(Ref, Dir, StreamId, Meta) ->
 %% Token; on expiry the {transfer_deadline, ...} handler only acts if the
 %% Token still matches the one stored for Ref, which rules out acting on a
 %% timer that fired into the mailbox just before it was cancelled.
-arm_transfer_deadline(Ref, #state{transfer_deadlines = Deadlines} = State) ->
+%% Called from execute_effect/2 for {submit_transfer, ...} and the resubmit
+%% effects. The single point at which a transfer becomes outstanding (initial
+%% submit and every resubmit): occupy a slot in the task model with a fresh
+%% deadline token, arm the liveness deadline timer, and re-derive the pipeline
+%% gauges. The model removes the Ref on every path that ends the transfer
+%% (result, deadline, recover), so a resubmit always finds the Ref absent.
+on_transfer_submitted(Ref, Size, #state{tasks = Tasks0, transfer_timers = Timers} = State) ->
     Token = make_ref(),
     Deadline = rabbitmq_stream_s3_config:transfer_deadline_ms(),
     TimerRef = erlang:send_after(Deadline, self(), {transfer_deadline, Ref, Token}),
-    State#state{transfer_deadlines = Deadlines#{Ref => {TimerRef, Token}}}.
+    {Tasks, []} = rabbitmq_stream_s3_replica_reader_tasks:step(
+        {spawn_transfer, Ref, Size, Token}, Tasks0
+    ),
+    derive_gauges(State#state{tasks = Tasks, transfer_timers = Timers#{Ref => TimerRef}}).
 
-%% Cancel and forget the liveness deadline for a single transfer. cancel_timer
-%% does not remove an already-delivered message, so a stale deadline message
-%% may still arrive; the Token check in the handler discards it.
-cancel_transfer_deadline(Ref, #state{transfer_deadlines = Deadlines} = State) ->
-    case maps:take(Ref, Deadlines) of
-        {{TimerRef, _Token}, Deadlines1} ->
-            _ = erlang:cancel_timer(TimerRef),
-            State#state{transfer_deadlines = Deadlines1};
+%% Cancel and forget the liveness deadline timer for a single transfer.
+%% cancel_timer does not remove an already-delivered message, so a stale deadline
+%% message may still arrive; the model's token check discards it.
+cancel_transfer_timer(Ref, #state{transfer_timers = Timers} = State) ->
+    case maps:take(Ref, Timers) of
+        {TimerRef, Timers1} ->
+            _ = cancel_timer(TimerRef),
+            State#state{transfer_timers = Timers1};
         error ->
             State
     end.
 
-%% Called from execute_effect/2 for {submit_transfer, ...}.
-on_transfer_submitted(Ref, Size, #state{transfer_sizes = Sizes} = State) ->
-    inc_gauge(State, ?C_TRANSFERS_IN_FLIGHT, 1),
-    %% Pipeline stage 2: bytes enter the transfer phase (governor queue
-    %% or in-flight S3 PUT). Decremented in on_transfer_result.
-    inc_gauge(State, ?C_BYTES_IN_TRANSFER, Size),
-    %% Arm the liveness deadline for this transfer. on_transfer_submitted is
-    %% the single point at which a transfer becomes outstanding (initial submit
-    %% and every resubmit), and on_transfer_result is the single point at which
-    %% it stops being outstanding, so the deadline map stays in lockstep with
-    %% transfer_sizes. Ref is always absent here (a resubmit is preceded by
-    %% on_transfer_result, which removes it), so no prior timer is leaked.
-    arm_transfer_deadline(Ref, State#state{transfer_sizes = Sizes#{Ref => Size}}).
-
-%% Called from handle_info on transfer_result. Outcome is `ok' or
-%% `{error, Reason}'.
-on_transfer_result(Ref, Outcome, #state{transfer_sizes = Sizes} = State0) ->
-    case maps:take(Ref, Sizes) of
-        {Size, Sizes1} ->
-            %% The transfer reported back (or a deadline is treating it as
-            %% reported): it is no longer outstanding, so cancel its liveness
-            %% deadline in lockstep with removing it from transfer_sizes.
-            State = cancel_transfer_deadline(Ref, State0#state{transfer_sizes = Sizes1}),
-            dec(State, ?C_TRANSFERS_IN_FLIGHT, 1),
-            dec(State, ?C_BYTES_IN_TRANSFER, Size),
-            case Outcome of
-                ok ->
-                    inc(State, ?C_TRANSFERS_COMPLETED, 1),
-                    inc(State, ?C_BYTES_TRANSFERRED, Size),
-                    %% Stage 3: bytes are now waiting for a manifest
-                    %% persist to confirm them.
-                    inc_gauge(State, ?C_BYTES_IN_PERSIST, Size),
-                    Pending = State#state.persist_pending_bytes + Size,
-                    State#state{
-                        persist_pending_bytes = Pending
-                    };
-                {error, _} ->
-                    inc(State, ?C_TRANSFERS_FAILED, 1),
-                    State
-            end;
-        error ->
-            %% Should not happen but be defensive.
-            State0
+%% Byte size of an outstanding transfer (for the cumulative bytes-transferred
+%% counter), read from the model before the step removes it.
+transfer_byte_size(Ref, Tasks) ->
+    case maps:find(Ref, rabbitmq_stream_s3_replica_reader_tasks:transfers(Tasks)) of
+        {ok, {Size, _Token}} -> Size;
+        error -> 0
     end.
+
+%% Bytes covered by the in-flight persist (for the cumulative bytes-persisted
+%% counter), read from the model before the step frees the slot.
+persisting_snapshot(Tasks) ->
+    case rabbitmq_stream_s3_replica_reader_tasks:persist_slot(Tasks) of
+        {in_flight, _Gen, Bytes} -> Bytes;
+        idle -> 0
+    end.
+
+%% Publish the pipeline gauges from the task model. They are pure functions of
+%% the model's state rather than independently mutated counters, so they cannot
+%% drift from the in-flight tasks.
+derive_gauges(#state{tasks = Tasks} = State) ->
+    set(
+        State,
+        ?C_TRANSFERS_IN_FLIGHT,
+        rabbitmq_stream_s3_replica_reader_tasks:transfers_in_flight(Tasks)
+    ),
+    set(
+        State,
+        ?C_BYTES_IN_TRANSFER,
+        rabbitmq_stream_s3_replica_reader_tasks:bytes_in_transfer(Tasks)
+    ),
+    set(
+        State, ?C_BYTES_IN_PERSIST, rabbitmq_stream_s3_replica_reader_tasks:bytes_in_persist(Tasks)
+    ),
+    State.
+
+%% Carry out the transfer task model's decision. The transferred byte size is
+%% read before the step for the cumulative counter on success.
+apply_transfer_decisions(
+    [{deliver, transfer_complete, {Ref, Uid}}], Size, #state{core = Core0} = State0
+) ->
+    State1 = cancel_transfer_timer(Ref, State0),
+    inc(State1, ?C_TRANSFERS_COMPLETED, 1),
+    inc(State1, ?C_BYTES_TRANSFERRED, Size),
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_complete(Ref, Uid, Core0),
+    {noreply, derive_gauges(execute_effects(Effects, State1#state{core = Core}))};
+apply_transfer_decisions([{deliver, transfer_failed, {Ref, Reason}}], _Size, State0) ->
+    handle_transfer_failure(Ref, Reason, State0);
+apply_transfer_decisions([{drop, _Reason}], _Size, State) ->
+    {noreply, State}.
+
+%% A transfer failed (an error result, or its liveness deadline elapsed). Account
+%% it off the pipeline and either recover (local retention trimmed past
+%% next_offset, so no retry can make the range durable - issue #225) or drive the
+%% core's retry path.
+handle_transfer_failure(Ref, Reason, #state{core = Core0} = State0) ->
+    maybe_log_transfer_deadline(Reason, State0),
+    State1 = cancel_transfer_timer(Ref, State0),
+    inc(State1, ?C_TRANSFERS_FAILED, 1),
+    case local_log_ahead(State1) of
+        {true, LocalFirst, NextOffset} ->
+            {noreply,
+                derive_gauges(handle_local_log_ahead(LocalFirst, NextOffset, Reason, State1))};
+        false ->
+            {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(
+                Ref, Reason, Core0
+            ),
+            {noreply, derive_gauges(execute_effects(Effects, State1#state{core = Core}))}
+    end.
+
+maybe_log_transfer_deadline(transfer_deadline, #state{cfg = #cfg{stream = StreamId}}) ->
+    ?LOG_WARNING(
+        "~ts no result for an in-flight fragment transfer within the transfer "
+        "deadline. The governor may have lost the submission (crash with a queued "
+        "item), the upload task may have been killed before replying, or the "
+        "result message was lost. Resubmitting to keep the upload pipeline live.",
+        [StreamId]
+    );
+maybe_log_transfer_deadline(_Reason, _State) ->
+    ok.
+
+%% Carry out the retry task model's decision: re-submit if the transfer is still
+%% outstanding, drop a retry left over from before a recovery.
+apply_retry_decisions([{resubmit, Ref}], Dir, Meta, #state{cfg = #cfg{stream = StreamId}} = State) ->
+    submit_upload(Ref, Dir, StreamId, Meta),
+    {noreply, State};
+apply_retry_decisions([{drop, _Reason}], _Dir, _Meta, State) ->
+    {noreply, State}.
 
 on_group_upload_completed(Kind, State) ->
     Idx =
@@ -1976,14 +1906,9 @@ on_persist_completed(#manifest{} = Manifest, State) ->
     inc(State, ?C_PERSISTS_COMPLETED, 1),
     inc(State, ?C_ROOTS_CREATED, 1),
     set(State, ?C_LAST_PERSIST_TIMESTAMP_MS, erlang:system_time(millisecond)),
-    %% Pipeline stage 3: the bytes covered by this persist exit the
-    %% pipeline. Decrement the in-persist gauge and bump the cumulative
-    %% persisted-bytes counter. persisting_bytes was snapshotted from
-    %% persist_pending_bytes at start_persist; reset it now that it has
-    %% been credited.
-    PersistedBytes = State#state.persisting_bytes,
-    dec(State, ?C_BYTES_IN_PERSIST, PersistedBytes),
-    inc(State, ?C_BYTES_PERSISTED, PersistedBytes),
+    %% The bytes_in_persist gauge is derived from the task model, which freed the
+    %% persist slot when this persist completed; the cumulative bytes-persisted
+    %% counter is bumped in apply_persist_decisions where the snapshot is known.
     update_manifest_gauges(Manifest, State),
     %% Persist succeeded. Now safe to delete objects that retention removed
     %% from the manifest. The manifest cache is updated, so readers will no
@@ -2001,7 +1926,7 @@ on_persist_completed(#manifest{} = Manifest, State) ->
     %% next retention pass will re-emit the edit and a subsequent persist
     %% will reconcile the manifest.
     flush_deferred_deletions(State),
-    State#state{persisting_bytes = 0, deferred_deletions = []}.
+    State#state{deferred_deletions = []}.
 
 flush_deferred_deletions(#state{deferred_deletions = []}) ->
     ok;
@@ -2034,94 +1959,49 @@ update_manifest_gauges(
     set(State, ?C_REMOTE_MESSAGES, max(0, NextOff - FirstOff)),
     ok.
 
+%% The snapshotted bytes of a failed persist are returned to the model's pending
+%% pool by step/2, so the next persist covers them and bytes_in_persist is
+%% unchanged. These helpers only bump the cumulative failure counters.
 on_persist_failed(conflict, State0) ->
     inc(State0, ?C_PERSISTS_FAILED, 1),
     inc(State0, ?C_PERSIST_CONFLICTS, 1),
-    return_persisting_bytes(State0);
+    State0;
 on_persist_failed(_Reason, State0) ->
     inc(State0, ?C_PERSISTS_FAILED, 1),
-    return_persisting_bytes(State0).
-
-%% A failed persist returns its snapshotted bytes to persist_pending_bytes
-%% so the next persist will cover them. The bytes_in_persist gauge is
-%% unchanged (the bytes are still in stage 3, just back in the pending
-%% bucket rather than the in-flight slot).
-return_persisting_bytes(#state{persisting_bytes = 0} = State) ->
-    State;
-return_persisting_bytes(
-    #state{persisting_bytes = Snapshot, persist_pending_bytes = Pending} = State
-) ->
-    State#state{persisting_bytes = 0, persist_pending_bytes = Pending + Snapshot}.
+    State0.
 
 %% Reset all in-flight bookkeeping for a manifest-recovery restart, returning
 %% the cleared state for the caller to re-resolve via resolve_and_start/1.
 -spec reset_for_recovery(#state{}) -> #state{}.
-reset_for_recovery(#state{transfer_deadlines = Deadlines0, tasks = Tasks0} = State0) ->
-    set(State0, ?C_TRANSFERS_IN_FLIGHT, 0),
+reset_for_recovery(
+    #state{transfer_timers = Timers0, persist_timer = PersistTimer, tasks = Tasks0} = State0
+) ->
     set(State0, ?C_BYTES_IN_ASSEMBLY, 0),
-    set(State0, ?C_BYTES_IN_TRANSFER, 0),
-    set(State0, ?C_BYTES_IN_PERSIST, 0),
-    maps:foreach(fun(_Ref, {TimerRef, _Token}) -> erlang:cancel_timer(TimerRef) end, Deadlines0),
+    %% Cancel the per-transfer liveness deadline timers (a late deadline message
+    %% is dropped by the model after recover clears the transfer map) and the
+    %% persist tick (the core is about to be replaced).
+    maps:foreach(fun(_Ref, TimerRef) -> erlang:cancel_timer(TimerRef) end, Timers0),
+    _ = cancel_timer(PersistTimer),
     State1 = close_log(State0),
-    State2 = cancel_inflight_tasks(State1),
-    State3 = kill_task_io(State2),
-    %% Bump the model's generation and clear its slots: any task spawned before
-    %% this recovery carries the old generation, so its late result is dropped by
-    %% step/2 rather than applied to the freshly resolved manifest.
+    %% Tear down every in-flight async task before recovery replaces the core: a
+    %% task's result is an ordinary message that demonitor's flush does not
+    %% remove, so it can still be queued. The model's recover bumps the generation
+    %% and clears its slots, so any such late result carries the old generation
+    %% and is dropped by step/2 rather than applied to the freshly resolved
+    %% manifest (which would crash the core or splice in a stale edit).
+    State2 = kill_task_io(State1),
     {Tasks, []} = rabbitmq_stream_s3_replica_reader_tasks:step(recover, Tasks0),
-    State3#state{
+    derive_gauges(State2#state{
         tasks = Tasks,
         assembly = undefined,
-        transfer_deadlines = #{},
-        transfer_sizes = #{},
-        persist_pending_bytes = 0,
-        persisting_bytes = 0,
+        transfer_timers = #{},
+        persist_timer = undefined,
         deferred_deletions = []
-    }.
-
-%% Tear down every in-flight async task before recovery replaces the core.
-%% A task's result is delivered as an ordinary message, not the monitor
-%% 'DOWN', so demonitor/2's flush does not remove a result that was already
-%% queued before we kill the task. Clearing the correlation fields here makes
-%% the result-handling clauses ignore such a stale result rather than apply it
-%% to the freshly resolved manifest. Without this, a late persist/retention/
-%% group result lands on the new core and either crashes it (a badrecord on
-%% persist_complete, a badmatch on group_upload_complete) or applies a stale
-%% prefix-truncation edit that deletes still-referenced objects and corrupts
-%% the manifest.
--spec cancel_inflight_tasks(#state{}) -> #state{}.
-cancel_inflight_tasks(State0) ->
-    State1 = stop_persist_task(State0),
-    State2 = stop_group_task(State1),
-    stop_retention_task(State2).
-
-stop_persist_task(#state{persist_mon = Mon, persist_pid = Pid, persist_timer = TRef} = State) ->
-    kill_task(Mon, Pid),
-    _ = cancel_timer(TRef),
-    State#state{persist_mon = undefined, persist_pid = undefined, persist_timer = undefined}.
-
-stop_group_task(#state{group_mon = Mon} = State) ->
-    %% The group upload task's pid is not retained, so it cannot be killed; it
-    %% finishes and its result is ignored (its uploaded object, if any, is left
-    %% for orphan garbage collection). Dropping group_mon flushes its 'DOWN'.
-    kill_task(Mon, undefined),
-    State#state{group_mon = undefined, pending_group_kind = undefined}.
-
-stop_retention_task(
-    #state{retention_mon = Mon, retention_pid = Pid, retention_timer = TRef} = State
-) ->
-    kill_task(Mon, Pid),
-    _ = cancel_timer(TRef),
-    State#state{
-        retention_mon = undefined,
-        retention_pid = undefined,
-        retention_timer = undefined,
-        retention_token = undefined
-    }.
+    }).
 
 %% Demonitor (flushing the queued 'DOWN') and kill the task process if its pid
 %% is known. A result message already in the mailbox is intentionally not
-%% removed; the cleared correlation fields make the result handlers drop it.
+%% removed; the model's recovered generation makes the result handlers drop it.
 kill_task(undefined, _Pid) ->
     ok;
 kill_task(Mon, Pid) ->
@@ -2191,22 +2071,26 @@ kill_task_io(#state{task_io = Io} = State) ->
     State#state{task_io = #{}}.
 
 %% Carry out the persist task model's decision: a deliver runs the matching core
-%% call, a drop ignores a stale result.
-apply_persist_decisions([{deliver, persist_complete, Revision}], State0) ->
+%% call, a drop ignores a stale result. PersistedBytes is the byte count the
+%% commit covered, for the cumulative bytes-persisted counter on success.
+apply_persist_decisions([{deliver, persist_complete, Revision}], PersistedBytes, State0) ->
     State1 = clear_task_io(persist, State0),
+    inc(State1, ?C_BYTES_PERSISTED, PersistedBytes),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_complete(
         Revision, State1#state.core
     ),
-    {noreply, execute_effects(Effects, State1#state{core = Core})};
-apply_persist_decisions([{deliver, persist_failed, Reason}], State0) ->
+    {noreply, derive_gauges(execute_effects(Effects, State1#state{core = Core}))};
+apply_persist_decisions([{deliver, persist_failed, Reason}], _PersistedBytes, State0) ->
     State1 = clear_task_io(persist, State0),
     State2 = on_persist_failed(Reason, State1),
     %% persist_failed/2 can return a stop effect, so route through maybe_stop/1.
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_failed(
         Reason, State2#state.core
     ),
-    maybe_stop(execute_effects(Effects, State2#state{core = Core}));
-apply_persist_decisions([{drop, _Reason}], #state{cfg = #cfg{stream = StreamId}} = State) ->
+    maybe_stop(derive_gauges(execute_effects(Effects, State2#state{core = Core})));
+apply_persist_decisions(
+    [{drop, _Reason}], _PersistedBytes, #state{cfg = #cfg{stream = StreamId}} = State
+) ->
     ?LOG_DEBUG("~ts ignoring stale persist result", [StreamId]),
     {noreply, State}.
 
@@ -2280,10 +2164,11 @@ apply_retention_timeout_decisions([{drop, _Reason}], State) ->
 apply_task_crash(persist, Reason, #state{tasks = Tasks0, cfg = #cfg{stream = StreamId}} = State0) ->
     ?LOG_WARNING("~ts commit task crashed: ~p", [StreamId, Reason]),
     Gen = rabbitmq_stream_s3_replica_reader_tasks:generation(Tasks0),
+    PersistedBytes = persisting_snapshot(Tasks0),
     {Tasks, Decisions} = rabbitmq_stream_s3_replica_reader_tasks:step(
         {persist_result, Gen, {error, Reason}}, Tasks0
     ),
-    apply_persist_decisions(Decisions, State0#state{tasks = Tasks});
+    apply_persist_decisions(Decisions, PersistedBytes, State0#state{tasks = Tasks});
 apply_task_crash(group, Reason, #state{tasks = Tasks0, cfg = #cfg{stream = StreamId}} = State0) ->
     ?LOG_WARNING("~ts group upload task crashed: ~p", [StreamId, Reason]),
     Gen = rabbitmq_stream_s3_replica_reader_tasks:generation(Tasks0),
@@ -2372,7 +2257,8 @@ evaluate_retention_on_unresolved_manifest_replies_error_test() ->
 %% tracking must be dropped, not re-submitted as a phantom upload (would
 %% otherwise touch the governor against the discarded core).
 retry_transfer_after_reset_is_dropped_test() ->
-    State = #state{transfer_sizes = #{}, cfg = #cfg{stream = <<"s">>}},
+    %% Default task model has an empty transfer map, as after a recovery.
+    State = #state{cfg = #cfg{stream = <<"s">>}},
     Ref = make_ref(),
     Meta = #{first_offset => 0, size => 0},
     ?assertEqual(
@@ -2380,10 +2266,10 @@ retry_transfer_after_reset_is_dropped_test() ->
         handle_info({retry_transfer, Ref, <<"/tmp">>, Meta}, State)
     ).
 
-%% reset_for_recovery must tear down every in-flight async task: clear the
-%% correlation fields (so a late result is ignored rather than applied to the
-%% freshly resolved core) and kill the tasks whose pid is retained.
-cancel_inflight_tasks_clears_all_tasks_test() ->
+%% Recovery must tear down every in-flight async task's I/O handle: clear the
+%% task_io map and kill the tasks whose pid is retained (a late result is dropped
+%% by the recovered model generation rather than applied to the fresh core).
+kill_task_io_tears_down_all_tasks_test() ->
     Idle = fun() ->
         receive
             stop -> ok
@@ -2393,27 +2279,19 @@ cancel_inflight_tasks_clears_all_tasks_test() ->
     RetentionPid = spawn(Idle),
     GroupPid = spawn(Idle),
     State0 = #state{
-        persist_mon = monitor(process, PersistPid),
-        persist_pid = PersistPid,
-        persist_timer = erlang:send_after(60000, self(), persist_timer),
-        group_mon = monitor(process, GroupPid),
-        pending_group_kind = ?MANIFEST_KIND_GROUP,
-        retention_mon = monitor(process, RetentionPid),
-        retention_pid = RetentionPid,
-        retention_timer = erlang:send_after(60000, self(), retention_timeout),
-        retention_token = make_ref()
+        task_io = #{
+            persist => #{mon => monitor(process, PersistPid), pid => PersistPid},
+            group => #{mon => monitor(process, GroupPid)},
+            retention => #{
+                mon => monitor(process, RetentionPid),
+                pid => RetentionPid,
+                timer => erlang:send_after(60000, self(), {retention_timeout, 0})
+            }
+        }
     },
-    State1 = cancel_inflight_tasks(State0),
-    %% Every correlation field is cleared.
-    ?assertEqual(undefined, State1#state.persist_mon),
-    ?assertEqual(undefined, State1#state.persist_pid),
-    ?assertEqual(undefined, State1#state.persist_timer),
-    ?assertEqual(undefined, State1#state.group_mon),
-    ?assertEqual(undefined, State1#state.pending_group_kind),
-    ?assertEqual(undefined, State1#state.retention_mon),
-    ?assertEqual(undefined, State1#state.retention_pid),
-    ?assertEqual(undefined, State1#state.retention_timer),
-    ?assertEqual(undefined, State1#state.retention_token),
+    State1 = kill_task_io(State0),
+    %% All I/O handles are cleared.
+    ?assertEqual(#{}, State1#state.task_io),
     %% Tasks whose pid is retained (persist, retention) are killed; the group
     %% task whose pid is not retained is left to finish on its own.
     ?assert(wait_dead(PersistPid, 100)),
@@ -2519,7 +2397,8 @@ local_log_ahead_false_when_local_behind_test() ->
 %% the core, which would otherwise crash get_meta on the unknown reference or
 %% append a non-contiguous orphan. The state is returned unchanged.
 stale_transfer_result_dropped_test() ->
-    State = #state{transfer_sizes = #{}},
+    %% Default task model has an empty transfer map.
+    State = #state{},
     Ref = make_ref(),
     ?assertEqual({noreply, State}, handle_info({transfer_result, Ref, {ok, 1}}, State)),
     ?assertEqual(
