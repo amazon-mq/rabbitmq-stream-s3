@@ -24,6 +24,8 @@ fragments (via tree-branch-like "group" objects, for large enough streams).
     init/0,
     new_edit/1,
     apply_edit/2,
+    is_well_formed/1,
+    assert_well_formed/1,
     get_group_fun/1,
     get_cached_group_fun/1,
     clear_group_cache/2,
@@ -144,14 +146,21 @@ apply_edit(
     %% below zero; reject that here rather than let it crash serialisation on
     %% the writer or poison max-bytes retention / metrics on a replica.
     ?assert(TotalSize >= 0),
-    Manifest0#manifest{
+    Manifest = Manifest0#manifest{
         first_offset = FirstOffset,
         first_timestamp = FirstTs,
         first_last_timestamp = FirstLastTs,
         next_offset = NextOffset,
         total_size = TotalSize,
         entries = Entries
-    }.
+    },
+    %% Validate the post-state, not just the edit shape: a well-shaped but
+    %% wrong edit (stale, mis-positioned, wrong size delta) can still produce a
+    %% structurally invalid manifest. Failing here keeps corruption from being
+    %% persisted (writer) or served (replica; the caller catches it and
+    %% resyncs).
+    assert_well_formed(Manifest),
+    Manifest.
 
 %% Structural invariants common to every edit shape: offsets and lengths into
 %% the entries array are non-negative, entry-aligned, and within the array. A
@@ -167,6 +176,96 @@ assert_edit_well_formed(Pos, Len, EditLen, Size0) ->
     ?assertEqual(0, EditLen rem ?ENTRY_B),
     ?assert(Pos + Len =< Size0),
     ok.
+
+-doc """
+Value-level well-formedness predicate over a manifest. Decides, from the value
+alone (no S3 access), the structural invariants that hold for any committed
+manifest:
+
+- `0 =< first_offset =< next_offset` and `total_size >= 0` (bounds);
+- coverage is empty iff `first_offset == next_offset` (no entries);
+- root entries are in strictly increasing offset order (ordering);
+- the first entry starts at or before `first_offset` (no gap below the floor:
+  it is `==` for a flat manifest and `=<` after intra-group retention, which
+  advances `first_offset` inside the leading group entry);
+- the last entry starts strictly below `next_offset`;
+- for a flat manifest (no group entries) only, `total_size` equals the sum of
+  the entry sizes. The check is skipped when a group entry is present: a group
+  entry carries size 0 while `total_size` still counts its underlying fragment
+  bytes, so verifying accounting would require fetching the group objects.
+
+Durability-in-S3 and the temporal invariants (`next_offset`/`first_offset`
+monotonicity across steps) are not value-level and are not checked here. See
+docs/invariants.md (Durability: Coverage, Accounting; Manifest structure:
+Ordering).
+""".
+-spec is_well_formed(t()) -> boolean().
+is_well_formed(#manifest{first_offset = F, next_offset = N, total_size = TS, entries = Entries}) ->
+    is_integer(F) andalso is_integer(N) andalso is_integer(TS) andalso
+        F >= 0 andalso F =< N andalso TS >= 0 andalso
+        entries_well_formed(F, N, TS, Entries).
+
+entries_well_formed(F, N, _TS, <<>>) ->
+    %% No entries: coverage [f, n) is empty, so f must equal n.
+    F =:= N;
+entries_well_formed(F, N, TS, Entries) ->
+    #{first := First, last := Last, sum := Sum, has_group := HasGroup, ordered := Ordered} =
+        rabbitmq_stream_s3_array:fold(fun wf_fold/2, init_wf_acc(), ?ENTRY_B, Entries),
+    Ordered andalso
+        First =< F andalso
+        Last < N andalso
+        (HasGroup orelse Sum =:= TS).
+
+init_wf_acc() ->
+    #{
+        first => undefined,
+        prev => undefined,
+        last => undefined,
+        sum => 0,
+        has_group => false,
+        ordered => true
+    }.
+
+wf_fold(
+    ?ENTRY(Offset, _FirstTs, _LastTs, Kind, Size, _Uid),
+    #{prev := Prev, sum := Sum, has_group := HasGroup, ordered := Ordered} = Acc
+) ->
+    Acc#{
+        first :=
+            case maps:get(first, Acc) of
+                undefined -> Offset;
+                F0 -> F0
+            end,
+        prev := Offset,
+        last := Offset,
+        sum := Sum + Size,
+        has_group := HasGroup orelse Kind =/= ?MANIFEST_KIND_FRAGMENT,
+        ordered := Ordered andalso (Prev =:= undefined orelse Offset > Prev)
+    }.
+
+-doc """
+Assert a manifest is well-formed, raising `{manifest_not_well_formed, Summary}`
+with a compact summary otherwise. The runtime guard at the manifest mutation
+boundary (apply_edit/2): a malformed result is a bug (a mis-applied or stale
+edit), and failing here turns silent corruption into a caught error rather than
+persisting it (writer) or serving it (replica, whose caller resyncs).
+""".
+-spec assert_well_formed(t()) -> ok.
+assert_well_formed(#manifest{} = M) ->
+    case is_well_formed(M) of
+        true ->
+            ok;
+        false ->
+            erlang:error({manifest_not_well_formed, wf_summary(M)})
+    end.
+
+wf_summary(#manifest{first_offset = F, next_offset = N, total_size = TS, entries = Entries}) ->
+    #{
+        first_offset => F,
+        next_offset => N,
+        total_size => TS,
+        num_entries => byte_size(Entries) div ?ENTRY_B
+    }.
 
 -doc """
 Returns a function that downloads group objects from S3 and returns their
@@ -633,3 +732,86 @@ collect_fragment_refs(Entries, Acc) ->
 group_header_size(?MANIFEST_KIND_GROUP) -> ?MANIFEST_HEADER_SIZE;
 group_header_size(?MANIFEST_KIND_KILO_GROUP) -> ?MANIFEST_HEADER_SIZE;
 group_header_size(?MANIFEST_KIND_MEGA_GROUP) -> ?MANIFEST_HEADER_SIZE.
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+frag(O, Sz) ->
+    FTs = O * 10,
+    LTs = FTs + 9,
+    Uid = O + 1,
+    ?ENTRY(O, FTs, LTs, ?MANIFEST_KIND_FRAGMENT, Sz, Uid).
+grp(O, Sz) ->
+    FTs = O * 10,
+    LTs = FTs + 9,
+    Uid = O + 1,
+    ?ENTRY(O, FTs, LTs, ?MANIFEST_KIND_GROUP, Sz, Uid).
+
+%% An empty manifest is well-formed iff first_offset == next_offset.
+is_well_formed_empty_test() ->
+    ?assert(
+        is_well_formed(#manifest{first_offset = 7, next_offset = 7, total_size = 0, entries = <<>>})
+    ),
+    ?assertNot(
+        is_well_formed(#manifest{first_offset = 0, next_offset = 5, total_size = 0, entries = <<>>})
+    ).
+
+%% A flat manifest: ordered offsets, first == f, last < n, total_size == sum.
+is_well_formed_flat_test() ->
+    Entries = <<(frag(0, 100))/binary, (frag(10, 200))/binary>>,
+    Good = #manifest{first_offset = 0, next_offset = 20, total_size = 300, entries = Entries},
+    ?assert(is_well_formed(Good)),
+    %% Accounting drift (total_size != sum of flat entry sizes).
+    ?assertNot(is_well_formed(Good#manifest{total_size = 999})),
+    %% first_offset > next_offset.
+    ?assertNot(is_well_formed(Good#manifest{first_offset = 25, next_offset = 24})),
+    %% Last entry offset (10) is not strictly below next_offset.
+    ?assertNot(is_well_formed(Good#manifest{next_offset = 10, total_size = 300})).
+
+%% Offsets must be strictly increasing.
+is_well_formed_unordered_test() ->
+    Entries = <<(frag(10, 100))/binary, (frag(0, 100))/binary>>,
+    ?assertNot(
+        is_well_formed(#manifest{
+            first_offset = 0, next_offset = 30, total_size = 200, entries = Entries
+        })
+    ).
+
+%% No gap below the floor: the first entry must start at or before first_offset.
+is_well_formed_gap_below_floor_test() ->
+    Entries = <<(frag(10, 100))/binary, (frag(20, 100))/binary>>,
+    ?assertNot(
+        is_well_formed(#manifest{
+            first_offset = 0, next_offset = 30, total_size = 200, entries = Entries
+        })
+    ).
+
+%% A group-led manifest: accounting is skipped (group hides bytes), and
+%% first_offset may sit inside the leading group (intra-group retention).
+is_well_formed_group_led_test() ->
+    Entries = <<(grp(0, 0))/binary, (frag(100, 200))/binary>>,
+    %% total_size intentionally not equal to the visible entry sizes; skipped.
+    M = #manifest{first_offset = 50, next_offset = 200, total_size = 999, entries = Entries},
+    ?assert(is_well_formed(M)),
+    ?assert(is_well_formed(M#manifest{first_offset = 0})),
+    %% Still rejects an out-of-order group-led manifest.
+    Bad = <<(grp(100, 0))/binary, (frag(0, 200))/binary>>,
+    ?assertNot(
+        is_well_formed(#manifest{
+            first_offset = 100, next_offset = 200, total_size = 999, entries = Bad
+        })
+    ).
+
+assert_well_formed_raises_test() ->
+    Bad = #manifest{
+        first_offset = 0, next_offset = 20, total_size = 999, entries = <<(frag(0, 100))/binary>>
+    },
+    ?assertError({manifest_not_well_formed, _}, assert_well_formed(Bad)),
+    ?assertEqual(
+        ok,
+        assert_well_formed(#manifest{
+            first_offset = 0, next_offset = 0, total_size = 0, entries = <<>>
+        })
+    ).
+
+-endif.
