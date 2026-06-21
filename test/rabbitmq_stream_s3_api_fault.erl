@@ -16,6 +16,10 @@ specific operation. The control surface (minimal for now):
   trimmed-segment upload failure of issue #225 without a timing race.
 - `fail_next(Op, KeyPattern, Reason)` makes the next matching call to `Op`
   return `{error, Reason}` (e.g. `slow_down`, `not_found`, `timeout`).
+- `fail_matching(Op, KeyPattern, Reason)` makes *every* matching call to `Op`
+  return `{error, Reason}` until `reset/0`. Unlike `fail_next`, this is immune to
+  a background call (e.g. a retention group fetch) racing in and consuming a
+  one-shot failure before the call under test reaches the backend.
 - `delay(Op, KeyPattern, Ms)` sleeps before every matching call to `Op`,
   simulating slow S3 (cleared by `reset/0`).
 
@@ -52,6 +56,7 @@ passthrough to the FS backend.
     await_blocked/2,
     release/2,
     fail_next/3,
+    fail_matching/3,
     delay/3
 ]).
 
@@ -102,6 +107,13 @@ release(TaskPid, Ref) ->
 -spec fail_next(atom(), binary(), term()) -> ok.
 fail_next(Op, KeyPat, Reason) ->
     true = ets:insert(?TBL, {{fail, Op}, KeyPat, Reason, 1}),
+    ok.
+
+%% Fail every matching call to Op until reset/0. Use when a background call could
+%% race a one-shot failure (e.g. retention fetching a group object).
+-spec fail_matching(atom(), binary(), term()) -> ok.
+fail_matching(Op, KeyPat, Reason) ->
+    true = ets:insert(?TBL, {{fail, Op}, KeyPat, Reason, infinity}),
     ok.
 
 %% Sleep Ms before every matching call to Op (persists until reset/0).
@@ -197,9 +209,10 @@ maybe_fail(Op, Key) ->
         {ok, {KeyPat, Reason, N}} ->
             case matches(KeyPat, Key) of
                 true ->
-                    case N =< 1 of
-                        true -> ets:delete(?TBL, {fail, Op});
-                        false -> ets:insert(?TBL, {{fail, Op}, KeyPat, Reason, N - 1})
+                    case N of
+                        infinity -> ok;
+                        _ when N =< 1 -> ets:delete(?TBL, {fail, Op});
+                        _ -> ets:insert(?TBL, {{fail, Op}, KeyPat, Reason, N - 1})
                     end,
                     {error, Reason};
                 false ->
