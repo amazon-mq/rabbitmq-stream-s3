@@ -67,7 +67,10 @@ groups() ->
             read_detects_crc_corruption,
             offset_spec_at_tier_boundary,
             remote_reader_restart_self_heals,
-            become_local_stops_remote_reader
+            become_local_stops_remote_reader,
+            read_retries_transient_remote_error,
+            read_tolerates_slow_remote,
+            read_group_fetch_error_is_surfaced
         ]},
         {with_replica, [], [
             read_from_replica_node
@@ -114,6 +117,11 @@ init_per_testcase(TestCase, Config) ->
 end_per_testcase(_TestCase, Config) ->
     WriterCfg = ?config(writer_cfg, Config),
     catch osiris_writer:stop(WriterCfg),
+    %% Restore the default API backend if a test swapped in the fault backend.
+    application:set_env(
+        rabbitmq_stream_s3, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_fs
+    ),
+    catch rabbitmq_stream_s3_api_fault:reset(),
     Config.
 
 %% ------------------------------------------------------------------
@@ -134,6 +142,58 @@ read_from_remote_first(Config) ->
     {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg),
     ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),
 
+    Records = read_all(Reader0),
+    assert_sequential(Records, N).
+
+read_retries_transient_remote_error(Config) ->
+    %% A transient S3 error on a remote fragment GET must be retried, not
+    %% surfaced to the consumer: the read still delivers the full stream. The
+    %% fault backend injects one slow_down on the next fragment GET.
+    StreamId = ?config(stream_id, Config),
+    ok = application:set_env(
+        rabbitmq_stream_s3, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_fault
+    ),
+    ok = rabbitmq_stream_s3_api_fault:setup(),
+
+    Writer = start_writer(Config, #{fragment_target_size => 1000}),
+    N = 200,
+    write_sequential(Writer, N, 5),
+    ReaderCfg = reader_config(Writer, Config),
+    #{shared := Shared} = ReaderCfg,
+    ?awaitMatch([S] when S > 0, list_segment_offsets(Config), 1000),
+    ?awaitMatch(F when F > 0, osiris_log_shared:first_chunk_id(Shared), 1000),
+
+    %% The next remote fragment GET returns a transient error; the reader must
+    %% retry and still deliver the full stream.
+    ok = rabbitmq_stream_s3_api_fault:fail_next(get_range_async, StreamId, slow_down),
+
+    {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg),
+    ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),
+    Records = read_all(Reader0),
+    assert_sequential(Records, N).
+
+read_tolerates_slow_remote(Config) ->
+    %% A slow remote tier (latency on every fragment GET) must still deliver the
+    %% full, correct stream.
+    StreamId = ?config(stream_id, Config),
+    ok = application:set_env(
+        rabbitmq_stream_s3, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_fault
+    ),
+    ok = rabbitmq_stream_s3_api_fault:setup(),
+
+    Writer = start_writer(Config, #{fragment_target_size => 1000}),
+    N = 100,
+    write_sequential(Writer, N, 5),
+    ReaderCfg = reader_config(Writer, Config),
+    #{shared := Shared} = ReaderCfg,
+    ?awaitMatch([S] when S > 0, list_segment_offsets(Config), 1000),
+    ?awaitMatch(F when F > 0, osiris_log_shared:first_chunk_id(Shared), 1000),
+
+    %% Inject latency on every remote fragment GET.
+    ok = rabbitmq_stream_s3_api_fault:delay(get_range_async, StreamId, 20),
+
+    {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg),
+    ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),
     Records = read_all(Reader0),
     assert_sequential(Records, N).
 
@@ -324,6 +384,45 @@ read_through_group(Config) ->
 
     Records = read_all(Reader0),
     assert_sequential(Records, NextOffset).
+
+read_group_fetch_error_is_surfaced(Config) ->
+    %% Resolving a numeric offset that descends into a group whose object cannot
+    %% be fetched (a retention deferred-deletion 404, or a transient S3 error)
+    %% must surface a clean error, not crash the consumer's reader. The `first`
+    %% spec goes via the fragment iterator (already tolerant); the numeric and
+    %% timestamp specs go via find_fragment, which this guards. The fault backend
+    %% 404s the group object on fetch.
+    ok = application:set_env(
+        rabbitmq_stream_s3, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_fault
+    ),
+    ok = rabbitmq_stream_s3_api_fault:setup(),
+
+    %% 5 fragments, rebalance threshold 4: the oldest 4 are factored into a group
+    %% at offset 0, so resolving offset 0 must descend into it.
+    #{next_offset := NextOffset} = seed_log(Config, [
+        {segment, [{chunk, #{records => 10, size => 600}}]},
+        {segment, [{chunk, #{records => 10, size => 600}}]},
+        {segment, [{chunk, #{records => 10, size => 600}}]},
+        {segment, [{chunk, #{records => 10, size => 600}}]},
+        {segment, [{chunk, #{records => 10, size => 600}}]}
+    ]),
+    Writer = start_writer(
+        Config, #{}, #{fragment_target_size => 500, rebalance_threshold => 4}
+    ),
+    flush_writer(Writer),
+    await_offset(Config, NextOffset),
+    ReaderCfg = reader_config(Writer, Config),
+    #{shared := Shared} = ReaderCfg,
+    ?awaitMatch(F when F > 0, osiris_log_shared:first_chunk_id(Shared), 1000),
+
+    %% The group object 404s on fetch (consumer reads use `get` only for group
+    %% objects; index uses get_range, data uses get_range_async).
+    ok = rabbitmq_stream_s3_api_fault:fail_next(get, <<"group">>, not_found),
+
+    ?assertMatch(
+        {error, {group_fetch_failed, not_found}},
+        rabbitmq_stream_s3_log_reader:init_offset_reader(0, ReaderCfg)
+    ).
 
 read_detects_crc_corruption(Config) ->
     %% When verify_crc_on_read is enabled, reading a corrupted fragment
