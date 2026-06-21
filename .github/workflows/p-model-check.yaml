@@ -19,6 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       gc_reset: ${{ steps.filter.outputs.gc_reset }}
+      read_resolution: ${{ steps.filter.outputs.read_resolution }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -33,8 +34,13 @@ jobs:
           fi
           CHANGED=$(git diff --name-only "$BASE" HEAD)
           echo "gc_reset=false" >> "$GITHUB_OUTPUT"
+          echo "read_resolution=false" >> "$GITHUB_OUTPUT"
           echo "$CHANGED" | grep -q '^p/gc-reset/' && echo "gc_reset=true" >> "$GITHUB_OUTPUT" || true
-          echo "$CHANGED" | grep -q '^\.github/workflows/p-model-check\.yaml' && echo "gc_reset=true" >> "$GITHUB_OUTPUT" || true
+          echo "$CHANGED" | grep -q '^p/read-resolution/' && echo "read_resolution=true" >> "$GITHUB_OUTPUT" || true
+          if echo "$CHANGED" | grep -q '^\.github/workflows/p-model-check\.yaml'; then
+            echo "gc_reset=true" >> "$GITHUB_OUTPUT"
+            echo "read_resolution=true" >> "$GITHUB_OUTPUT"
+          fi
 
   gc-reset:
     needs: changes
@@ -75,4 +81,45 @@ jobs:
             exit 1
           fi
           echo "Gate satisfied: guard-removed model fails with the expected dangling reference."
+          echo "::endgroup::"
+
+  read-resolution:
+    needs: changes
+    if: needs.changes.outputs.read_resolution == 'true' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install the P checker
+        run: |
+          dotnet tool install --global P --version 3.1.0
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+      - name: Compile
+        run: |
+          cd p/read-resolution
+          p compile
+      - name: Tests that must hold
+        run: |
+          cd p/read-resolution
+          for tc in tcReadResolveGuarded tcReadResolveExplore; do
+            echo "::group::$tc (expect hold)"
+            p check -tc "$tc" -i 5000
+            echo "::endgroup::"
+          done
+      - name: Validation gate (the catch-all model must reproduce the silent skip)
+        run: |
+          cd p/read-resolution
+          echo "::group::tcReadResolveBuggy (expect the INV#4 silent remote skip)"
+          if p check -tc tcReadResolveBuggy -i 2000; then
+            echo "ERROR: tcReadResolveBuggy passed; the model no longer reproduces the silent remote skip."
+            echo "The catch-all model must fail, otherwise the guarded result is not trustworthy."
+            exit 1
+          fi
+          if ! grep -rqF 'INV#4 violated: resolved' PCheckerOutput/BugFinding/; then
+            echo "ERROR: the catch-all run failed, but not with the expected INV#4 silent-skip counterexample."
+            exit 1
+          fi
+          echo "Gate satisfied: catch-all model fails with the expected silent remote skip."
           echo "::endgroup::"

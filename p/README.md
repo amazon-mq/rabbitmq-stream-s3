@@ -22,6 +22,14 @@ that the `still_dangling/1` guard in `rabbitmq_stream_s3_gc` prevents the sweep
 from deleting a live fragment that a concurrent reset re-tiered below the sweep's
 snapshot floor. See [`gc-reset/README.md`](gc-reset/README.md).
 
+### `read-resolution/`
+
+The read / tier-resolution seam: resolving the `first` offset spec when the
+leading manifest group fetch fails transiently. Verifies that
+`log_reader:resolve_first_lookup/1` surfaces a `group_fetch_failed` as a retry
+rather than silently falling back to the local tier (the pre-`e3f931b` catch-all
+bug). See [`read-resolution/README.md`](read-resolution/README.md).
+
 ## Running
 
 Requires the `p` CLI (provided by the repository Nix dev shell). From a model
