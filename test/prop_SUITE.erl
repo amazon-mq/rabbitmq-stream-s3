@@ -156,7 +156,11 @@ prop_sequence_of_edits_maintains_invariants() ->
         gen_edit_sequence(),
         begin
             Final = lists:foldl(fun apply_op/2, #manifest{}, Ops),
-            entries_sorted_by_offset(Final#manifest.entries) andalso
+            %% The structural well-formedness predicate must hold for the result
+            %% of any valid edit sequence (apply_edit also asserts it after each
+            %% step, so a malformed intermediate would already have raised).
+            rabbitmq_stream_s3_manifest:is_well_formed(Final) andalso
+                entries_sorted_by_offset(Final#manifest.entries) andalso
                 Final#manifest.total_size >= 0 andalso
                 Final#manifest.next_offset >= Final#manifest.first_offset
         end
@@ -613,9 +617,22 @@ run_ops_with_retention([fragment | Rest], State0, Offset, Rev, Threshold, Edits)
     {S4, NewRev, NewEdits} = maybe_drain_persist(S3, Effects, Rev),
     run_ops_with_retention(Rest, S4, Offset + 100, NewRev, Threshold, Edits ++ NewEdits);
 run_ops_with_retention([retention | Rest], State0, Offset, Rev, Threshold, Edits) ->
-    %% Only apply retention if the manifest has more than one entry.
+    %% Only apply retention if the manifest has more than one entry AND the first
+    %% entry is a fragment. The synthetic edit subtracts the first entry's size
+    %% field, which is correct for a fragment but 0 for a group entry (a group's
+    %% underlying fragment bytes are still counted in total_size; the real
+    %% evaluate_remote_retention descends the group to compute the true delta,
+    %% which this synthetic edit cannot). Removing a group here would leave
+    %% total_size overcounting - a malformed manifest. Group-removal accounting
+    %% is covered in replica_reader_core_SUITE.
     Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(State0),
-    case byte_size(Manifest#manifest.entries) > ?ENTRY_B of
+    Entries = Manifest#manifest.entries,
+    FirstIsFragment =
+        case Entries of
+            <<_:64, _:64/signed, _:64/signed, ?MANIFEST_KIND_FRAGMENT:8, _/binary>> -> true;
+            _ -> false
+        end,
+    case byte_size(Entries) > ?ENTRY_B andalso FirstIsFragment of
         true ->
             %% Remove the first entry.
             <<_:64, _:64/signed, _:64/signed, _:8, Size:40, _:32, _/binary>> =

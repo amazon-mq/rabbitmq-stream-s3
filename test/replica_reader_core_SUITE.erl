@@ -1325,7 +1325,12 @@ retention_and_rebalance_same_persist_cycle(_Config) ->
         first_timestamp = NewFirstTs,
         first_last_timestamp = NewFirstLTs,
         next_offset = undefined,
-        size = 0,
+        %% Removing the group entry must also subtract its underlying fragment
+        %% bytes from total_size (the group entry itself carries size 0, but its
+        %% Threshold fragments of 64 MB each are counted in total_size). The real
+        %% evaluate_remote_retention computes this delta by descending the group;
+        %% mirror it so the resulting manifest is well-formed.
+        size = -(Threshold * 64_000_000),
         entries = <<>>,
         pos = 0,
         len = ?ENTRY_B
