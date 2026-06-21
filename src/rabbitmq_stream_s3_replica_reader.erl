@@ -217,6 +217,19 @@ returned by the functional core module.
     assembly :: rabbitmq_stream_s3_fragment_assembly:state() | undefined,
     %% Functional core state.
     core :: rabbitmq_stream_s3_replica_reader_core:state() | undefined,
+    %% Pure model of the async-task lifecycle (persist, group, retention,
+    %% transfer). Owns the correlation decisions (deliver vs drop a result) and
+    %% the pipeline gauges; see rabbitmq_stream_s3_replica_reader_tasks. The
+    %% generation it carries is the join key with task_io below.
+    tasks = rabbitmq_stream_s3_replica_reader_tasks:init() ::
+        rabbitmq_stream_s3_replica_reader_tasks:tasks(),
+    %% Runtime I/O handles for the in-flight tasks the model decides about: the
+    %% monitor refs, pids and timer refs the shell needs to demonitor/kill/cancel.
+    %% Single-in-flight families are keyed by family atom; transfer deadline
+    %% timers are keyed by the transfer Ref. The model says which family/Ref to
+    %% tear down; these are the handles to do it with.
+    task_io = #{} :: #{persist | group | retention => #{atom() => term()}},
+    transfer_timers = #{} :: #{reference() => reference()},
     %% Nodes registered for manifest broadcast.
     replicas = #{} :: #{node() => reference()},
     %% User-configured retention specs for remote tier evaluation.
@@ -747,59 +760,11 @@ handle_info(
         MonRef -> {noreply, State#state{replicas = maps:remove(Node, Replicas)}};
         _ -> {noreply, State}
     end;
-handle_info(
-    {persist_result, {ok, Revision}}, #state{core = Core0, persist_mon = Mon} = State0
-) when Mon =/= undefined ->
-    demonitor(Mon, [flush]),
-    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_complete(Revision, Core0),
-    {noreply,
-        execute_effects(Effects, State0#state{
-            core = Core, persist_mon = undefined, persist_pid = undefined
-        })};
-handle_info(
-    {persist_result, {error, {conflict, _Entry}}}, #state{core = Core0, persist_mon = Mon} = State0
-) when Mon =/= undefined ->
-    demonitor(Mon, [flush]),
-    State1 = on_persist_failed(conflict, State0),
-    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_failed(conflict, Core0),
-    {noreply,
-        execute_effects(Effects, State1#state{
-            core = Core, persist_mon = undefined, persist_pid = undefined
-        })};
-handle_info(
-    {persist_result, {error, Reason}}, #state{core = Core0, persist_mon = Mon} = State0
-) when Mon =/= undefined ->
-    demonitor(Mon, [flush]),
-    State1 = on_persist_failed(Reason, State0),
-    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_failed(Reason, Core0),
-    maybe_stop(
-        execute_effects(Effects, State1#state{
-            core = Core, persist_mon = undefined, persist_pid = undefined
-        })
-    );
-handle_info({persist_result, _Result}, #state{cfg = #cfg{stream = StreamId}} = State) ->
-    %% A result from a persist task we are no longer tracking - recovery
-    %% (reset_for_recovery) cleared persist_mon and killed the task, but its
-    %% result was an ordinary message already queued before the kill. Ignore it
-    %% rather than apply persist_complete/persist_failed to the freshly resolved
-    %% core (which has no in-flight persist, so persist_complete would crash).
-    ?LOG_DEBUG("~ts ignoring stale persist result", [StreamId]),
-    {noreply, State};
-handle_info(
-    {'DOWN', Mon, process, _, Reason},
-    #state{persist_mon = Mon, core = Core0, cfg = #cfg{stream = StreamId}} = State0
-) ->
-    ?LOG_WARNING("~ts commit task crashed: ~p", [StreamId, Reason]),
-    State1 = on_persist_failed(Reason, State0),
-    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_failed(Reason, Core0),
-    %% Route through maybe_stop/1 like the {persist_result, {error, _}} handler:
-    %% persist_failed/2 can return a stop effect, and a crashed persist task
-    %% must honour it rather than leaving the reader marked stopping but alive.
-    maybe_stop(
-        execute_effects(Effects, State1#state{
-            core = Core, persist_mon = undefined, persist_pid = undefined
-        })
-    );
+handle_info({persist_result, Gen, Result}, #state{tasks = Tasks0} = State0) ->
+    {Tasks, Decisions} = rabbitmq_stream_s3_replica_reader_tasks:step(
+        {persist_result, Gen, Result}, Tasks0
+    ),
+    apply_persist_decisions(Decisions, State0#state{tasks = Tasks});
 handle_info(
     {'DOWN', Mon, process, _, Reason},
     #state{group_mon = Mon, core = Core0, cfg = #cfg{stream = StreamId}} = State0
@@ -827,6 +792,16 @@ handle_info(
             retention_timer = undefined,
             retention_token = undefined
         })};
+handle_info({'DOWN', Mon, process, _Pid, Reason}, State) ->
+    %% A monitored async task crashed. Its 'DOWN' carries the monitor ref, which
+    %% identifies the family (and, via the model's slot, its generation): a crash
+    %% is delivered to the task model as a failure of the live task, exactly as an
+    %% error result would be. A 'DOWN' whose monitor matches no tracked task (a
+    %% task already torn down by recovery, flushed) falls through to a no-op.
+    case task_family_for_mon(Mon, State) of
+        {ok, Family} -> apply_task_crash(Family, Reason, State);
+        error -> {noreply, State}
+    end;
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -834,20 +809,19 @@ terminate(
     _Reason,
     #state{
         cfg = #cfg{stream = StreamId},
-        persist_mon = Mon,
-        persist_pid = CommitPid,
+        task_io = Io,
         metrics_id = MetricsId
     } = State
 ) ->
     %% Kill any in-flight commit task to prevent orphaned Khepri writes.
     %% An orphaned write advances the revision, causing conflicts for the
     %% next incarnation of this replica reader.
-    case CommitPid of
-        undefined ->
-            ok;
-        _ ->
+    case Io of
+        #{persist := #{mon := Mon, pid := CommitPid}} ->
             demonitor(Mon, [flush]),
-            exit(CommitPid, kill)
+            exit(CommitPid, kill);
+        _ ->
+            ok
     end,
     %% Close the open data reader so its segment file descriptors are released
     %% promptly rather than at process teardown.
@@ -1171,14 +1145,19 @@ execute_effect(
     State0#state{group_mon = MonRef, pending_group_kind = Kind};
 execute_effect(
     {start_persist, Manifest, Epoch, Reference, ExpectedRevision, _Edits},
-    #state{cfg = #cfg{stream = StreamId}} = State
+    #state{cfg = #cfg{stream = StreamId}, tasks = Tasks0, task_io = Io} = State
 ) ->
     Self = self(),
+    %% The result is tagged with the generation the task was spawned in so a
+    %% result that outlives a recovery is correlated to the right incarnation by
+    %% the task model rather than by the monitor field alone.
+    Gen = rabbitmq_stream_s3_replica_reader_tasks:generation(Tasks0),
     {CommitPid, MonRef} = spawn_monitor(fun() ->
         logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
         Result = do_commit(StreamId, Manifest, Epoch, Reference, ExpectedRevision),
-        Self ! {persist_result, Result}
+        Self ! {persist_result, Gen, Result}
     end),
+    {Tasks, []} = rabbitmq_stream_s3_replica_reader_tasks:step(spawn_persist, Tasks0),
     %% Snapshot the bytes that this persist will cover. New transfer
     %% completions during the persist accumulate in persist_pending_bytes
     %% and will be covered by the next persist. The bytes_in_persist
@@ -1186,8 +1165,8 @@ execute_effect(
     %% persisting_bytes + persist_pending_bytes both before and after).
     Snapshot = State#state.persist_pending_bytes,
     State#state{
-        persist_mon = MonRef,
-        persist_pid = CommitPid,
+        tasks = Tasks,
+        task_io = Io#{persist => #{mon => MonRef, pid => CommitPid}},
         persisting_bytes = Snapshot,
         persist_pending_bytes = 0
     };
@@ -2202,7 +2181,7 @@ return_persisting_bytes(
 %% Reset all in-flight bookkeeping for a manifest-recovery restart, returning
 %% the cleared state for the caller to re-resolve via resolve_and_start/1.
 -spec reset_for_recovery(#state{}) -> #state{}.
-reset_for_recovery(#state{transfer_deadlines = Deadlines0} = State0) ->
+reset_for_recovery(#state{transfer_deadlines = Deadlines0, tasks = Tasks0} = State0) ->
     set(State0, ?C_TRANSFERS_IN_FLIGHT, 0),
     set(State0, ?C_BYTES_IN_ASSEMBLY, 0),
     set(State0, ?C_BYTES_IN_TRANSFER, 0),
@@ -2210,7 +2189,13 @@ reset_for_recovery(#state{transfer_deadlines = Deadlines0} = State0) ->
     maps:foreach(fun(_Ref, {TimerRef, _Token}) -> erlang:cancel_timer(TimerRef) end, Deadlines0),
     State1 = close_log(State0),
     State2 = cancel_inflight_tasks(State1),
-    State2#state{
+    State3 = kill_task_io(State2),
+    %% Bump the model's generation and clear its slots: any task spawned before
+    %% this recovery carries the old generation, so its late result is dropped by
+    %% step/2 rather than applied to the freshly resolved manifest.
+    {Tasks, []} = rabbitmq_stream_s3_replica_reader_tasks:step(recover, Tasks0),
+    State3#state{
+        tasks = Tasks,
         assembly = undefined,
         transfer_deadlines = #{},
         transfer_sizes = #{},
@@ -2271,6 +2256,80 @@ kill_task(Mon, Pid) ->
         _ -> exit(Pid, kill)
     end,
     ok.
+
+%%----------------------------------------------------------------------------
+%% Task-model I/O. The task model (#state.tasks) decides which family's result
+%% to deliver or drop; these helpers carry out the matching I/O on the runtime
+%% handles in #state.task_io, which the model itself cannot hold.
+%%----------------------------------------------------------------------------
+
+%% Find which single-in-flight family a 'DOWN' monitor ref belongs to.
+-spec task_family_for_mon(reference(), #state{}) -> {ok, persist | group | retention} | error.
+task_family_for_mon(Mon, #state{task_io = Io}) ->
+    maps:fold(
+        fun
+            (Family, #{mon := M}, _Acc) when M =:= Mon -> {ok, Family};
+            (_Family, _Handle, Acc) -> Acc
+        end,
+        error,
+        Io
+    ).
+
+%% On normal completion of a single-in-flight task: demonitor (flushing the
+%% queued 'DOWN') and cancel its timeout timer if any. The task has finished, so
+%% its pid is not killed.
+-spec clear_task_io(persist | group | retention, #state{}) -> #state{}.
+clear_task_io(Family, #state{task_io = Io} = State) ->
+    case maps:take(Family, Io) of
+        {Handle, Io1} ->
+            _ = demonitor(maps:get(mon, Handle), [flush]),
+            _ = cancel_timer(maps:get(timer, Handle, undefined)),
+            State#state{task_io = Io1};
+        error ->
+            State
+    end.
+
+%% On recovery: tear down every single-in-flight task - demonitor (flush its
+%% 'DOWN'), cancel its timer, and kill its process if the pid was retained.
+-spec kill_task_io(#state{}) -> #state{}.
+kill_task_io(#state{task_io = Io} = State) ->
+    maps:foreach(
+        fun(_Family, Handle) ->
+            kill_task(maps:get(mon, Handle), maps:get(pid, Handle, undefined)),
+            _ = cancel_timer(maps:get(timer, Handle, undefined))
+        end,
+        Io
+    ),
+    State#state{task_io = #{}}.
+
+%% Carry out the persist task model's decision: a deliver runs the matching core
+%% call, a drop ignores a stale result.
+apply_persist_decisions([{deliver, persist_complete, Revision}], State0) ->
+    State1 = clear_task_io(persist, State0),
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_complete(
+        Revision, State1#state.core
+    ),
+    {noreply, execute_effects(Effects, State1#state{core = Core})};
+apply_persist_decisions([{deliver, persist_failed, Reason}], State0) ->
+    State1 = clear_task_io(persist, State0),
+    State2 = on_persist_failed(Reason, State1),
+    %% persist_failed/2 can return a stop effect, so route through maybe_stop/1.
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_failed(
+        Reason, State2#state.core
+    ),
+    maybe_stop(execute_effects(Effects, State2#state{core = Core}));
+apply_persist_decisions([{drop, _Reason}], #state{cfg = #cfg{stream = StreamId}} = State) ->
+    ?LOG_DEBUG("~ts ignoring stale persist result", [StreamId]),
+    {noreply, State}.
+
+%% Translate a monitored task's crash into a failure result for the live task.
+apply_task_crash(persist, Reason, #state{tasks = Tasks0, cfg = #cfg{stream = StreamId}} = State0) ->
+    ?LOG_WARNING("~ts commit task crashed: ~p", [StreamId, Reason]),
+    Gen = rabbitmq_stream_s3_replica_reader_tasks:generation(Tasks0),
+    {Tasks, Decisions} = rabbitmq_stream_s3_replica_reader_tasks:step(
+        {persist_result, Gen, {error, Reason}}, Tasks0
+    ),
+    apply_persist_decisions(Decisions, State0#state{tasks = Tasks}).
 
 on_manifest_resolved(#manifest{next_offset = 0}, State) ->
     inc(State, ?C_MANIFESTS_RESOLVED_EMPTY, 1),
