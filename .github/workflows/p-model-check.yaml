@@ -1,0 +1,78 @@
+name: P Model Check
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    paths:
+      - 'p/**'
+      - '.github/workflows/p-model-check.yaml'
+  schedule:
+    - cron: '0 6 * * 1'  # Every Monday at 06:00 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      gc_reset: ${{ steps.filter.outputs.gc_reset }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Detect changed paths
+        id: filter
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE=${{ github.event.pull_request.base.sha }}
+          else
+            BASE=${{ github.event.before }}
+          fi
+          CHANGED=$(git diff --name-only "$BASE" HEAD)
+          echo "gc_reset=false" >> "$GITHUB_OUTPUT"
+          echo "$CHANGED" | grep -q '^p/gc-reset/' && echo "gc_reset=true" >> "$GITHUB_OUTPUT" || true
+          echo "$CHANGED" | grep -q '^\.github/workflows/p-model-check\.yaml' && echo "gc_reset=true" >> "$GITHUB_OUTPUT" || true
+
+  gc-reset:
+    needs: changes
+    if: needs.changes.outputs.gc_reset == 'true' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install the P checker
+        run: |
+          dotnet tool install --global P --version 3.1.0
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+      - name: Compile
+        run: |
+          cd p/gc-reset
+          p compile
+      - name: Tests that must hold
+        run: |
+          cd p/gc-reset
+          for tc in tcGcResetGuarded tcGcResetExplore tcEpochAxisSafe; do
+            echo "::group::$tc (expect hold)"
+            p check -tc "$tc" -i 5000
+            echo "::endgroup::"
+          done
+      - name: Validation gate (the guard-removed model must reproduce GC x reset)
+        run: |
+          cd p/gc-reset
+          echo "::group::tcGcResetUnguarded (expect the GC x reset counterexample)"
+          if p check -tc tcGcResetUnguarded -i 2000; then
+            echo "ERROR: tcGcResetUnguarded passed; the model no longer reproduces GC x reset."
+            echo "The guard-removed model must fail, otherwise the guarded result is not trustworthy."
+            exit 1
+          fi
+          if ! grep -rqF 'INV#2 violated: GC deleted live object (offset=850, uid=2)' PCheckerOutput/BugFinding/; then
+            echo "ERROR: the unguarded run failed, but not with the expected INV#2 (850, uid 2) counterexample."
+            exit 1
+          fi
+          echo "Gate satisfied: guard-removed model fails with the expected dangling reference."
+          echo "::endgroup::"
