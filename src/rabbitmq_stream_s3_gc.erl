@@ -9,10 +9,25 @@ LISTs S3 objects under `rabbitmq/stream/` and identifies orphans by comparing
 object keys against current state in Khepri (epoch) and the manifest replica
 ETS cache (first_offset).
 
-Safety relies on monotonicity: epoch and first_offset only move forward.
-Eventually-consistent reads from Khepri or ETS can only return stale (lower)
-values, which makes the GC more conservative (false negatives), never less safe
-(false positives are structurally impossible).
+Safety relies on monotonicity: epoch only moves forward, and first_offset
+normally only moves forward. Eventually-consistent reads can only return stale
+(lower) values, which makes the GC more conservative (false negatives), never
+less safe.
+
+The one break in that monotonicity is a remote-tier-ahead reset, which rebuilds
+the manifest from the local log floor after a timeline change and can *lower*
+first_offset, re-tiering live fragments (with fresh UIDs) at offsets below a
+floor a concurrent sweep already snapshotted. Two guards keep the sweep safe:
+
+  1. Each candidate deletion is re-validated against the live first_offset
+     immediately before the object is deleted (see still_dangling/1) and skipped
+     if the floor has dropped to at or below its offset. The reset lowers the
+     cached floor before it re-uploads, so a re-tiered fragment is always at or
+     above the live floor by the time it exists.
+  2. The cross-stream sweep, like the single-stream path, gates each stream on a
+     strongly-consistent metadata read, so a partitioned or deposed node that
+     cannot reach a quorum fails closed and skips rather than deleting on a stale
+     local view.
 
 Streams with no local manifest replica are skipped (cannot verify first_offset).
 Unknown stream prefixes (stream not in Khepri) are skipped (no safe deletion
@@ -95,9 +110,46 @@ make_handler(dry_run) ->
     end;
 make_handler(delete) ->
     fun(#{stream_id := StreamId, key := Key} = Finding, Acc) ->
-        log_finding(Finding),
-        rabbitmq_stream_s3_reaper:delete_objects(StreamId, [Key]),
-        [Finding | Acc]
+        case still_dangling(Finding) of
+            true ->
+                log_finding(Finding),
+                rabbitmq_stream_s3_reaper:delete_objects(StreamId, [Key]),
+                [Finding | Acc];
+            false ->
+                ?LOG_INFO(
+                    "GC: not deleting ~ts (stream=~ts): it is no longer below the "
+                    "live first offset; a concurrent manifest reset re-tiered into "
+                    "this range",
+                    [Key, StreamId]
+                ),
+                Acc
+        end
+    end.
+
+%% Re-validate an offset-based finding against the live manifest immediately
+%% before deleting it. The sweep's safety argument is that first_offset only
+%% moves forward, so a snapshot floor is never above the live floor. A
+%% remote-tier-ahead reset breaks that: it lowers first_offset and re-tiers live
+%% fragments (with fresh UIDs) at offsets below the snapshot floor. The reset
+%% lowers the cached floor before it re-uploads, so re-reading the live floor here
+%% and skipping anything now at or above it restores the assumption; a genuine
+%% orphan skipped by a transient drop is reclaimed by a later sweep. Epoch-based
+%% (manifest) findings need no re-check: epoch is genuinely monotonic.
+-spec still_dangling(finding()) -> boolean().
+still_dangling(#{reason := stale_epoch}) ->
+    true;
+still_dangling(#{reason := below_first_offset, stream_id := StreamId, key := Key}) ->
+    case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
+        #manifest{first_offset = FirstOffset} ->
+            case parse_key(Key) of
+                {data, _StreamId, Offset} -> Offset < FirstOffset;
+                {group, _StreamId, Offset} -> Offset < FirstOffset;
+                _ -> false
+            end;
+        undefined ->
+            %% No live manifest to compare against: do not delete (a later sweep
+            %% reclaims a genuine orphan once a floor is known again).
+            false
     end.
 
 %% ------------------------------------------------------------------
@@ -106,15 +158,33 @@ make_handler(delete) ->
 
 build_lookup(Streams) ->
     maps:fold(
-        fun(StreamId, #{epoch := Epoch}, Acc) ->
-            case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
-                #manifest{entries = <<>>} ->
-                    %% Empty manifest: nothing in the remote tier to compare
-                    %% against (matches the prior get_range/1 `empty` skip).
-                    Acc;
-                #manifest{first_offset = FirstOffset} = Manifest ->
-                    Acc#{StreamId => lookup_entry(StreamId, Epoch, FirstOffset, Manifest)};
-                undefined ->
+        fun(StreamId, _LocalEntry, Acc) ->
+            %% Like the single-stream path (build_stream_lookup/2), gate each
+            %% stream on a strongly-consistent metadata read so a partitioned or
+            %% deposed node that cannot reach a quorum fails closed and skips,
+            %% rather than deleting on a stale local view. The committed epoch
+            %% from this read is also more authoritative than the local db:list/0
+            %% snapshot. This makes a full sweep do one quorum read per stream,
+            %% which is acceptable for an infrequent operator-driven sweep.
+            case rabbitmq_stream_s3_db:get_consistent(StreamId) of
+                {ok, #{epoch := Epoch}} ->
+                    case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
+                        #manifest{entries = <<>>} ->
+                            %% Empty manifest: nothing in the remote tier to
+                            %% compare against (matches the prior get_range/1
+                            %% `empty` skip).
+                            Acc;
+                        #manifest{first_offset = FirstOffset} = Manifest ->
+                            Acc#{StreamId => lookup_entry(StreamId, Epoch, FirstOffset, Manifest)};
+                        undefined ->
+                            Acc
+                    end;
+                {error, Reason} ->
+                    ?LOG_INFO(
+                        "GC for stream ~ts skipped: could not read committed "
+                        "metadata with quorum (~p); not sweeping",
+                        [StreamId, Reason]
+                    ),
                     Acc
             end
         end,
@@ -544,5 +614,72 @@ classify_unknown_stream_skipped_test() ->
     Lookup = #{},
     Key = <<"rabbitmq/stream/unknown/data/00000000000000000100.deadbeef.fragment">>,
     ?assertEqual(skip, classify(Key, Lookup)).
+
+%% A candidate deletion is re-validated against the live first_offset just before
+%% deleting. A remote-tier-ahead reset lowers first_offset and re-tiers live
+%% fragments below a sweep's snapshot floor; the re-validation must skip them
+%% while still reclaiming genuine orphans below the live floor. This is the
+%% durability hole that an offset-only snapshot check would open.
+still_dangling_respects_live_first_offset_test_() ->
+    {setup,
+        fun() ->
+            {ok, Pid} = rabbitmq_stream_s3_manifest_replica:start_link(),
+            unlink(Pid),
+            Pid
+        end,
+        fun(Pid) -> gen_server:stop(Pid) end, fun(_) ->
+            StreamId = <<"gc-revalidate-stream">>,
+            %% Live, post-reset floor: first_offset lowered to 800.
+            ok = rabbitmq_stream_s3_manifest_replica:put_manifest(
+                StreamId, #manifest{first_offset = 800, next_offset = 800}
+            ),
+            Orphan = #{
+                stream_id => StreamId,
+                key =>
+                    <<"rabbitmq/stream/gc-revalidate-stream/data/00000000000000000700.0000002a.fragment">>,
+                reason => below_first_offset
+            },
+            ReTiered = #{
+                stream_id => StreamId,
+                key =>
+                    <<"rabbitmq/stream/gc-revalidate-stream/data/00000000000000000850.0000002b.fragment">>,
+                reason => below_first_offset
+            },
+            StaleManifest = #{
+                stream_id => StreamId,
+                key =>
+                    <<"rabbitmq/stream/gc-revalidate-stream/metadata/root.1.0000aabb.manifest">>,
+                reason => stale_epoch
+            },
+            [
+                %% 700 < live floor 800: a genuine orphan, still deletable.
+                ?_assert(still_dangling(Orphan)),
+                %% 850 >= live floor 800: a reset re-tiered into this range. A
+                %% sweep that snapshotted the old floor (e.g. 1000) would have
+                %% marked it; the live floor protects it.
+                ?_assertNot(still_dangling(ReTiered)),
+                %% Epoch-based findings are not re-checked (epoch is monotonic).
+                ?_assert(still_dangling(StaleManifest))
+            ]
+        end}.
+
+%% With no live manifest (cache miss), a candidate is not deleted: there is no
+%% floor to confirm it is still an orphan.
+still_dangling_without_manifest_keeps_object_test_() ->
+    {setup,
+        fun() ->
+            {ok, Pid} = rabbitmq_stream_s3_manifest_replica:start_link(),
+            unlink(Pid),
+            Pid
+        end,
+        fun(Pid) -> gen_server:stop(Pid) end, fun(_) ->
+            Finding = #{
+                stream_id => <<"gc-no-manifest-stream">>,
+                key =>
+                    <<"rabbitmq/stream/gc-no-manifest-stream/data/00000000000000000100.0000002a.fragment">>,
+                reason => below_first_offset
+            },
+            [?_assertNot(still_dangling(Finding))]
+        end}.
 
 -endif.
