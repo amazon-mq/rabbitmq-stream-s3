@@ -69,7 +69,8 @@ groups() ->
             remote_reader_restart_self_heals,
             become_local_stops_remote_reader,
             read_retries_transient_remote_error,
-            read_tolerates_slow_remote
+            read_tolerates_slow_remote,
+            read_group_fetch_error_is_surfaced
         ]},
         {with_replica, [], [
             read_from_replica_node
@@ -383,6 +384,45 @@ read_through_group(Config) ->
 
     Records = read_all(Reader0),
     assert_sequential(Records, NextOffset).
+
+read_group_fetch_error_is_surfaced(Config) ->
+    %% Resolving a numeric offset that descends into a group whose object cannot
+    %% be fetched (a retention deferred-deletion 404, or a transient S3 error)
+    %% must surface a clean error, not crash the consumer's reader. The `first`
+    %% spec goes via the fragment iterator (already tolerant); the numeric and
+    %% timestamp specs go via find_fragment, which this guards. The fault backend
+    %% 404s the group object on fetch.
+    ok = application:set_env(
+        rabbitmq_stream_s3, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_fault
+    ),
+    ok = rabbitmq_stream_s3_api_fault:setup(),
+
+    %% 5 fragments, rebalance threshold 4: the oldest 4 are factored into a group
+    %% at offset 0, so resolving offset 0 must descend into it.
+    #{next_offset := NextOffset} = seed_log(Config, [
+        {segment, [{chunk, #{records => 10, size => 600}}]},
+        {segment, [{chunk, #{records => 10, size => 600}}]},
+        {segment, [{chunk, #{records => 10, size => 600}}]},
+        {segment, [{chunk, #{records => 10, size => 600}}]},
+        {segment, [{chunk, #{records => 10, size => 600}}]}
+    ]),
+    Writer = start_writer(
+        Config, #{}, #{fragment_target_size => 500, rebalance_threshold => 4}
+    ),
+    flush_writer(Writer),
+    await_offset(Config, NextOffset),
+    ReaderCfg = reader_config(Writer, Config),
+    #{shared := Shared} = ReaderCfg,
+    ?awaitMatch(F when F > 0, osiris_log_shared:first_chunk_id(Shared), 1000),
+
+    %% The group object 404s on fetch (consumer reads use `get` only for group
+    %% objects; index uses get_range, data uses get_range_async).
+    ok = rabbitmq_stream_s3_api_fault:fail_next(get, <<"group">>, not_found),
+
+    ?assertMatch(
+        {error, {group_fetch_failed, not_found}},
+        rabbitmq_stream_s3_log_reader:init_offset_reader(0, ReaderCfg)
+    ).
 
 read_detects_crc_corruption(Config) ->
     %% When verify_crc_on_read is enabled, reading a corrupted fragment
