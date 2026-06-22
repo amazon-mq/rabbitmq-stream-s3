@@ -19,6 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       gc_reset: ${{ steps.filter.outputs.gc_reset }}
+      gc_leading_group: ${{ steps.filter.outputs.gc_leading_group }}
       read_resolution: ${{ steps.filter.outputs.read_resolution }}
       trimmed_segment: ${{ steps.filter.outputs.trimmed_segment }}
       orphan_leak: ${{ steps.filter.outputs.orphan_leak }}
@@ -36,8 +37,10 @@ jobs:
           fi
           CHANGED=$(git diff --name-only "$BASE" HEAD)
           echo "gc_reset=false" >> "$GITHUB_OUTPUT"
+          echo "gc_leading_group=false" >> "$GITHUB_OUTPUT"
           echo "read_resolution=false" >> "$GITHUB_OUTPUT"
           echo "$CHANGED" | grep -q '^p/gc-reset/' && echo "gc_reset=true" >> "$GITHUB_OUTPUT" || true
+          echo "$CHANGED" | grep -q '^p/gc-leading-group/' && echo "gc_leading_group=true" >> "$GITHUB_OUTPUT" || true
           echo "$CHANGED" | grep -q '^p/read-resolution/' && echo "read_resolution=true" >> "$GITHUB_OUTPUT" || true
           echo "trimmed_segment=false" >> "$GITHUB_OUTPUT"
           echo "$CHANGED" | grep -q '^p/trimmed-segment/' && echo "trimmed_segment=true" >> "$GITHUB_OUTPUT" || true
@@ -45,6 +48,7 @@ jobs:
           echo "$CHANGED" | grep -q '^p/orphan-leak/' && echo "orphan_leak=true" >> "$GITHUB_OUTPUT" || true
           if echo "$CHANGED" | grep -q '^\.github/workflows/p-model-check\.yaml'; then
             echo "gc_reset=true" >> "$GITHUB_OUTPUT"
+            echo "gc_leading_group=true" >> "$GITHUB_OUTPUT"
             echo "read_resolution=true" >> "$GITHUB_OUTPUT"
             echo "trimmed_segment=true" >> "$GITHUB_OUTPUT"
             echo "orphan_leak=true" >> "$GITHUB_OUTPUT"
@@ -110,6 +114,45 @@ jobs:
             exit 1
           fi
           echo "Gate satisfied: floor-last ordering fails with the expected dangling reference."
+          echo "::endgroup::"
+
+  gc-leading-group:
+    needs: changes
+    if: needs.changes.outputs.gc_leading_group == 'true' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install the P checker
+        run: |
+          dotnet tool install --global P --version 3.1.0
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+      - name: Compile
+        run: |
+          cd p/gc-leading-group
+          p compile
+      - name: Tests that must hold
+        run: |
+          cd p/gc-leading-group
+          echo "::group::tcLeadingGroupGuarded (expect hold)"
+          p check -tc tcLeadingGroupGuarded -i 5000
+          echo "::endgroup::"
+      - name: Validation gate (removing the carve-out must delete the leading group)
+        run: |
+          cd p/gc-leading-group
+          echo "::group::tcLeadingGroupUnguarded (expect the INV#2 dangling reference)"
+          if p check -tc tcLeadingGroupUnguarded -i 2000; then
+            echo "ERROR: tcLeadingGroupUnguarded passed; the model no longer deletes the leading group."
+            echo "Removing the referenced_group_key carve-out must delete a live group."
+            exit 1
+          fi
+          if ! grep -rqF 'INV#2 violated: GC deleted referenced object (offset=80, uid=2)' PCheckerOutput/BugFinding/; then
+            echo "ERROR: the carve-out-removed run failed, but not with the expected INV#2 (80, uid 2) counterexample."
+            exit 1
+          fi
+          echo "Gate satisfied: carve-out-removed model deletes the referenced leading group."
           echo "::endgroup::"
 
   read-resolution:

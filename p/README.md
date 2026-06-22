@@ -20,7 +20,7 @@ The models target five global invariants of the tiered-storage design:
 | Invariant | Property | Model |
 | --- | --- | --- |
 | INV#1 | no lost acked data | `gc-reset/` |
-| INV#2 | no dangling reference (GC never deletes a live object) | `gc-reset/` |
+| INV#2 | no dangling reference (GC never deletes a live object) | `gc-reset/`, `gc-leading-group/` |
 | INV#3 | no unbounded orphan leak (liveness) | `orphan-leak/` |
 | INV#4 | tier resolution total / gap-free | `read-resolution/` |
 | INV#5 | monotonic frontier except a labeled reset | `gc-reset/`, `trimmed-segment/` |
@@ -33,6 +33,14 @@ The durability seam: orphan GC versus a remote-tier-ahead manifest reset. Verifi
 that the `still_dangling/1` guard in `rabbitmq_stream_s3_gc` prevents the sweep
 from deleting a live fragment that a concurrent reset re-tiered below the sweep's
 snapshot floor. See [`gc-reset/README.md`](gc-reset/README.md).
+
+### `gc-leading-group/`
+
+A second, independent live-deletion guard in the GC seam: `classify_group`
+protects the one leading group that straddles `first_offset` (retention advanced
+the floor into it on partial expiry) while deleting other groups below the floor.
+Verifies that removing the `referenced_group_key` carve-out deletes a live group.
+See [`gc-leading-group/README.md`](gc-leading-group/README.md).
 
 ### `read-resolution/`
 
