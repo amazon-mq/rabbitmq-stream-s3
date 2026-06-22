@@ -54,7 +54,17 @@ monotonic.
 | `tcGcResetGuarded` | **holds** - guard on; also asserts the genuine deep orphan `(500,0)` is reclaimed and the live `(850,2)` preserved (anti-vacuity) |
 | `tcGcResetUnguarded` | **fails** - guard off; `INV#2 violated: GC deleted live object (offset=850, uid=2)` |
 | `tcGcResetExplore` | **holds** - guard on, reset raced against the sweep across all interleavings |
+| `tcGcResetFloorLast` | **fails** - guard *on*, but the reset lowers the floor *after* re-tiering the object; the same INV#2 violation. Proves the atomic-prefix ordering is load-bearing - the guard alone is insufficient |
 | `tcEpochAxisSafe` | **holds** - a `stale_epoch` object is deleted with no re-check; safe because the epoch is monotonic (the asymmetry that proves the guard is only needed on the offset axis) |
+
+`tcGcResetFloorLast` is a rare interleaving (the guard's live-floor re-read must
+land in the window after the object is referenced but before the floor is
+lowered). The random strategy misses it even at 50k schedules; use the PCT
+strategy:
+
+```bash
+p check -tc tcGcResetFloorLast --sch-pct 10 -i 5000   # 1 bug: INV#2 on (850, uid 2)
+```
 
 `tcGcResetUnguarded` is *expected to fail*: that failing counterexample is the
 proof the model reproduces the real bug, so the guarded result is meaningful.

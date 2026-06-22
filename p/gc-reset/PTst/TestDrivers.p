@@ -48,7 +48,7 @@ fun RunGcResetScenario(self: machine, guardEnabled: bool) {
   PutObj(self, s3, (offset = 850, uid = 1, epoch = 1));
   PutObj(self, s3, (offset = 500, uid = 0, epoch = 1));
 
-  writer = new Writer((epoch = 1, manifest = mr, s3 = s3, driver = self));
+  writer = new Writer((epoch = 1, floorFirst = true, manifest = mr, s3 = s3, driver = self));
   gc = new GC((guardEnabled = guardEnabled, db = db, manifest = mr, s3 = s3, driver = self));
 
   /* 1. Sweep captures the snapshot floor (1000) and epoch (1). */
@@ -97,7 +97,7 @@ fun RunGcResetExplore(self: machine) {
   PutObj(self, s3, (offset = 850, uid = 1, epoch = 1));
   PutObj(self, s3, (offset = 500, uid = 0, epoch = 1));
 
-  writer = new Writer((epoch = 1, manifest = mr, s3 = s3, driver = self));
+  writer = new Writer((epoch = 1, floorFirst = true, manifest = mr, s3 = s3, driver = self));
   gc = new GC((guardEnabled = true, db = db, manifest = mr, s3 = s3, driver = self));
 
   send gc, eGcSnapshot;
@@ -106,6 +106,47 @@ fun RunGcResetExplore(self: machine) {
   /* Fire the reset and the rest of the sweep without sequencing: the scheduler
      interleaves the reset's manifest/S3 effects with the LIST and the guard's
      live-floor re-read. */
+  send writer, eDoReset, (localFloor = 850, newUid = 2);
+  send gc, eGcListClassify;
+  send gc, eGcExecute;
+
+  done = 0;
+  while (done < 3) {
+    receive {
+      case eResetDone: { done = done + 1; }
+      case eGcClassifyDone: { done = done + 1; }
+      case eGcExecuteDone: { done = done + 1; }
+    }
+  }
+}
+
+/* Atomic-prefix mutation: the reset references and uploads the re-tiered object
+   BEFORE lowering the floor (floorFirst = false). The guard is ON. This proves
+   the ordering is load-bearing: the guard alone does not protect the object,
+   because a sweep's live-floor re-read can land while the floor is still high. */
+fun RunGcResetFloorLast(self: machine) {
+  var db: machine;
+  var s3: machine;
+  var mr: machine;
+  var writer: machine;
+  var gc: machine;
+  var done: int;
+
+  db = new KhepriDB((epoch = 1,));
+  s3 = new S3Store();
+  mr = new ManifestReplica((floor = 1000, nextOffset = 1001));
+
+  PutObj(self, s3, (offset = 1000, uid = 10, epoch = 1));
+  AddEntry(self, mr, (offset = 1000, uid = 10));
+  PutObj(self, s3, (offset = 850, uid = 1, epoch = 1));
+  PutObj(self, s3, (offset = 500, uid = 0, epoch = 1));
+
+  writer = new Writer((epoch = 1, floorFirst = false, manifest = mr, s3 = s3, driver = self));
+  gc = new GC((guardEnabled = true, db = db, manifest = mr, s3 = s3, driver = self));
+
+  send gc, eGcSnapshot;
+  receive { case eGcSnapshotDone: { } }
+
   send writer, eDoReset, (localFloor = 850, newUid = 2);
   send gc, eGcListClassify;
   send gc, eGcExecute;
@@ -167,6 +208,12 @@ machine DriverExplore {
   }
 }
 
+machine DriverFloorLast {
+  start state Init {
+    entry { RunGcResetFloorLast(this); }
+  }
+}
+
 machine DriverEpochAxis {
   start state Init {
     entry { RunEpochAxisScenario(this); }
@@ -189,6 +236,12 @@ test tcGcResetUnguarded [main = DriverUnguarded]:
 test tcGcResetExplore [main = DriverExplore]:
   assert NoDanglingReference, NoLostAckedData, MonotonicFrontier in
   { DriverExplore, KhepriDB, S3Store, ManifestReplica, Writer, GC };
+
+/* Atomic-prefix mutation (guard on, floor lowered last): MUST fail. Proves the
+   floor-before-object ordering is load-bearing - the guard alone is insufficient. */
+test tcGcResetFloorLast [main = DriverFloorLast]:
+  assert NoDanglingReference, NoLostAckedData, MonotonicFrontier in
+  { DriverFloorLast, KhepriDB, S3Store, ManifestReplica, Writer, GC };
 
 /* Epoch-axis deletions are safe without a re-check. Must hold. */
 test tcEpochAxisSafe [main = DriverEpochAxis]:

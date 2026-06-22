@@ -90,6 +90,23 @@ jobs:
           fi
           echo "Gate satisfied: guard-removed model fails with the expected dangling reference."
           echo "::endgroup::"
+      - name: Validation gate (the reset atomic-prefix ordering is load-bearing)
+        run: |
+          cd p/gc-reset
+          # The floor-last ordering deletes a live object even with the guard on.
+          # It is a rare interleaving that the random strategy misses, so use PCT.
+          echo "::group::tcGcResetFloorLast (expect the GC x reset counterexample under PCT)"
+          if p check -tc tcGcResetFloorLast --sch-pct 10 -i 5000; then
+            echo "ERROR: tcGcResetFloorLast passed; lowering the floor after the re-tier no longer"
+            echo "deletes a live object. The atomic-prefix ordering is supposed to be necessary."
+            exit 1
+          fi
+          if ! grep -rqF 'INV#2 violated: GC deleted live object (offset=850, uid=2)' PCheckerOutput/BugFinding/; then
+            echo "ERROR: the floor-last run failed, but not with the expected INV#2 (850, uid 2) counterexample."
+            exit 1
+          fi
+          echo "Gate satisfied: floor-last ordering fails with the expected dangling reference."
+          echo "::endgroup::"
 
   read-resolution:
     needs: changes
