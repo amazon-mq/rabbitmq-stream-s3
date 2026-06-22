@@ -30,6 +30,15 @@ leading manifest group fetch fails transiently. Verifies that
 rather than silently falling back to the local tier (the pre-`e3f931b` catch-all
 bug). See [`read-resolution/README.md`](read-resolution/README.md).
 
+### `trimmed-segment/`
+
+The upload-pipeline seam (issue #225): a head fragment whose local segment is
+trimmed by retention before the upload reads it. Verifies that
+`handle_transfer_failure` recovers via `restart_at_local_floor` (the
+`local_log_ahead` branch) rather than resubmitting forever. This is a *liveness*
+property, checked with a `hot`-state monitor. See
+[`trimmed-segment/README.md`](trimmed-segment/README.md).
+
 ## Running
 
 Requires the `p` CLI (provided by the repository Nix dev shell). From a model

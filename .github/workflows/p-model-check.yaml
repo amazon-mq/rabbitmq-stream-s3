@@ -20,6 +20,7 @@ jobs:
     outputs:
       gc_reset: ${{ steps.filter.outputs.gc_reset }}
       read_resolution: ${{ steps.filter.outputs.read_resolution }}
+      trimmed_segment: ${{ steps.filter.outputs.trimmed_segment }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -37,9 +38,12 @@ jobs:
           echo "read_resolution=false" >> "$GITHUB_OUTPUT"
           echo "$CHANGED" | grep -q '^p/gc-reset/' && echo "gc_reset=true" >> "$GITHUB_OUTPUT" || true
           echo "$CHANGED" | grep -q '^p/read-resolution/' && echo "read_resolution=true" >> "$GITHUB_OUTPUT" || true
+          echo "trimmed_segment=false" >> "$GITHUB_OUTPUT"
+          echo "$CHANGED" | grep -q '^p/trimmed-segment/' && echo "trimmed_segment=true" >> "$GITHUB_OUTPUT" || true
           if echo "$CHANGED" | grep -q '^\.github/workflows/p-model-check\.yaml'; then
             echo "gc_reset=true" >> "$GITHUB_OUTPUT"
             echo "read_resolution=true" >> "$GITHUB_OUTPUT"
+            echo "trimmed_segment=true" >> "$GITHUB_OUTPUT"
           fi
 
   gc-reset:
@@ -122,4 +126,45 @@ jobs:
             exit 1
           fi
           echo "Gate satisfied: catch-all model fails with the expected silent remote skip."
+          echo "::endgroup::"
+
+  trimmed-segment:
+    needs: changes
+    if: needs.changes.outputs.trimmed_segment == 'true' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install the P checker
+        run: |
+          dotnet tool install --global P --version 3.1.0
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+      - name: Compile
+        run: |
+          cd p/trimmed-segment
+          p compile
+      - name: Tests that must hold
+        run: |
+          cd p/trimmed-segment
+          for tc in tcTrimGuarded tcTrimExplore; do
+            echo "::group::$tc (expect hold)"
+            p check -tc "$tc" -i 5000
+            echo "::endgroup::"
+          done
+      - name: Validation gate (removing local_log_ahead must wedge the transfer)
+        run: |
+          cd p/trimmed-segment
+          echo "::group::tcTrimBuggy (expect the liveness obligation to fail)"
+          if p check -tc tcTrimBuggy -i 2000; then
+            echo "ERROR: tcTrimBuggy passed; the model no longer wedges on a trimmed segment."
+            echo "Removing the local_log_ahead recovery must leave the transfer unresolved forever."
+            exit 1
+          fi
+          if ! grep -rqF "hot state 'AwaitingResolution'" PCheckerOutput/BugFinding/; then
+            echo "ERROR: the buggy run failed, but not via the TransferEventuallyResolves liveness obligation."
+            exit 1
+          fi
+          echo "Gate satisfied: the check-removed model leaves the transfer permanently unresolved."
           echo "::endgroup::"
