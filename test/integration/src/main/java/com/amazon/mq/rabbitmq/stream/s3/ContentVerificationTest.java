@@ -35,29 +35,13 @@ public class ContentVerificationTest implements Runnable {
 
   @CommandLine.Mixin private ClusterOptions cluster;
 
-  @CommandLine.Option(
-      names = "--duration",
-      description = "Publishing duration in seconds",
-      defaultValue = "300")
-  private int durationSeconds;
+  @CommandLine.Mixin private PublishOptions publish;
 
   @CommandLine.Option(
       names = "--producers",
       description = "Number of producers (use 1 for strict ordering verification)",
       defaultValue = "1")
   private int numProducers;
-
-  @CommandLine.Option(
-      names = "--message-size",
-      description = "Message body size in bytes (minimum 8 for the sequence header)",
-      defaultValue = "256")
-  private int messageSize;
-
-  @CommandLine.Option(
-      names = "--max-length-bytes",
-      description = "Stream max-length-bytes (small to force data into S3 quickly)",
-      defaultValue = "500000000")
-  private long maxLengthBytes;
 
   @CommandLine.Option(
       names = "--progress-interval",
@@ -80,18 +64,17 @@ public class ContentVerificationTest implements Runnable {
   @Override
   public void run() {
     LOG.info(
-        "Starting content-verification test: stream={} duration={}s producers={}"
-            + " msg-size={} max-length-bytes={}",
+        "Starting content-verification test: stream={} publish-duration={}s publish-messages={}"
+            + " publish-bytes={} producers={} msg-size={} max-length-bytes={}",
         cluster.stream,
-        durationSeconds,
+        publish.publishDurationSeconds,
+        publish.publishMessages,
+        publish.publishBytes,
         numProducers,
-        messageSize,
-        maxLengthBytes);
+        publish.messageSize,
+        publish.maxLengthBytes);
 
-    if (messageSize < 8) {
-      LOG.error("FAIL: --message-size must be >= 8 (need 8 bytes for sequence number)");
-      System.exit(1);
-    }
+    publish.validateStopConditions();
 
     ManagementApi mgmt = new ManagementApi(cluster.mgmtUri);
     MetricsClient metrics = new MetricsClient(cluster.metricsUris);
@@ -104,7 +87,7 @@ public class ContentVerificationTest implements Runnable {
 
     long[] result;
     try (Environment env = cluster.buildEnvironment()) {
-      TestSetup.setupStream(env, mgmt, s3Monitor, cluster.stream, maxLengthBytes);
+      TestSetup.setupStream(env, mgmt, s3Monitor, cluster.stream, publish.maxLengthBytes);
       result = publishPhase(env, metrics, health, s3Monitor, confirmed);
     } catch (Exception e) {
       LOG.error("FAILED during publish phase", e);
@@ -154,7 +137,7 @@ public class ContentVerificationTest implements Runnable {
       Thread t =
           new Thread(
               () -> {
-                byte[] padding = new byte[messageSize - 8];
+                byte[] padding = new byte[publish.messageSize - 8];
                 try {
                   while (!stop.await(0, TimeUnit.MILLISECONDS)) {
                     long seq = sequence.getAndIncrement();
@@ -180,12 +163,11 @@ public class ContentVerificationTest implements Runnable {
     }
 
     long startTime = System.currentTimeMillis();
-    long deadline = startTime + Duration.ofSeconds(durationSeconds).toMillis();
     long nextReport = startTime + Duration.ofSeconds(progressInterval).toMillis();
 
-    LOG.info("Publishing for {}s...", durationSeconds);
+    LOG.info("Publishing until {}...", publish.describeStop());
 
-    while (System.currentTimeMillis() < deadline) {
+    while (!publish.publishStopReached(startTime, totalConfirmed.get())) {
       Thread.sleep(1000);
       long now = System.currentTimeMillis();
       if (now >= nextReport) {

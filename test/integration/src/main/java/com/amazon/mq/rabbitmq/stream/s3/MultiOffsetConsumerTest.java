@@ -28,23 +28,7 @@ public class MultiOffsetConsumerTest implements Runnable {
 
   @CommandLine.Mixin private ClusterOptions cluster;
 
-  @CommandLine.Option(
-      names = "--duration",
-      description = "How long to run in seconds",
-      defaultValue = "600")
-  private int durationSeconds;
-
-  @CommandLine.Option(
-      names = "--message-size",
-      description = "Message body size in bytes",
-      defaultValue = "1024")
-  private int messageSize;
-
-  @CommandLine.Option(
-      names = "--max-length-bytes",
-      description = "Stream max-length-bytes (small to force S3 spill quickly)",
-      defaultValue = "500000000")
-  private long maxLengthBytes;
+  @CommandLine.Mixin private PublishOptions publish;
 
   @CommandLine.Option(
       names = "--consumer-rate",
@@ -67,13 +51,15 @@ public class MultiOffsetConsumerTest implements Runnable {
   @Override
   public void run() {
     LOG.info(
-        "Starting multi-offset-consumer: stream={} duration={}s consumer-rate={} msg/s"
+        "Starting multi-offset-consumer: stream={} publish-stop=[{}] consumer-rate={} msg/s"
             + " max-length-bytes={} warmup={}s",
         cluster.stream,
-        durationSeconds,
+        publish.describeStop(),
         consumerRate,
-        maxLengthBytes,
+        publish.maxLengthBytes,
         warmupSeconds);
+
+    publish.validateStopConditions();
 
     ManagementApi mgmt = new ManagementApi(cluster.mgmtUri);
     MetricsClient metrics = new MetricsClient(cluster.metricsUris);
@@ -81,7 +67,7 @@ public class MultiOffsetConsumerTest implements Runnable {
     S3Monitor s3Monitor = cluster.buildS3Monitor();
 
     try (Environment env = cluster.buildEnvironment()) {
-      TestSetup.setupStream(env, mgmt, s3Monitor, cluster.stream, maxLengthBytes);
+      TestSetup.setupStream(env, mgmt, s3Monitor, cluster.stream, publish.maxLengthBytes);
 
       AtomicLong totalPublished = new AtomicLong(0);
       AtomicLong headConsumed = new AtomicLong(0);
@@ -90,7 +76,7 @@ public class MultiOffsetConsumerTest implements Runnable {
       AtomicLong laggingOffset = new AtomicLong(-1);
       CountDownLatch stop = new CountDownLatch(1);
 
-      byte[] body = new byte[messageSize];
+      byte[] body = new byte[publish.messageSize];
       Producer producer = env.producerBuilder().stream(cluster.stream).build();
 
       Thread publisherThread =
@@ -176,12 +162,14 @@ public class MultiOffsetConsumerTest implements Runnable {
 
       LOG.info("Lagging consumer started at 'first' with rate limit {} msg/s", consumerRate);
 
+      // The publish stop conditions bound the post-warmup run. The duration is
+      // measured from here (after warmup), matching the original behavior; the
+      // message and byte limits count all confirmed messages, warmup included.
       long startTime = System.currentTimeMillis();
-      long deadline = startTime + Duration.ofSeconds(durationSeconds).toMillis();
       long nextReport = startTime + Duration.ofSeconds(progressInterval).toMillis();
       boolean s3RecvSeen = false;
 
-      while (System.currentTimeMillis() < deadline) {
+      while (!publish.publishStopReached(startTime, totalPublished.get())) {
         Thread.sleep(1000);
         long now = System.currentTimeMillis();
         if (now >= nextReport) {
