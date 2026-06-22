@@ -90,8 +90,7 @@ forever. A *liveness* property (`hot`-state monitor). See
 
 ## Running
 
-Requires the `p` CLI (provided by the repository Nix dev shell). From a model
-directory:
+Requires the `p` CLI. From a model directory:
 
 ```bash
 cd gc-reset/
