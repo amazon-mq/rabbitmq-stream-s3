@@ -89,8 +89,7 @@ the reader pool avoids reader starvation.
     checkout/2,
     try_checkout/1,
     checkin/2,
-    with/3,
-    connection_age_ms/2
+    with/3
 ]).
 
 %% gen_server
@@ -126,18 +125,6 @@ checkout(Pool, Timeout) ->
 -spec checkin(pool(), conn()) -> ok.
 checkin(Pool, Conn) ->
     gen_server:cast(Pool, {checkin, Conn}).
-
-%% DIAGNOSTIC (#275 follow-up, S3 read stall investigation): how long the given
-%% connection has been open, in milliseconds, or undefined if the pool no longer
-%% tracks it. Read-only; called only off the request-timeout path, never on the
-%% hot read path.
--spec connection_age_ms(pool(), conn()) -> non_neg_integer() | undefined.
-connection_age_ms(Pool, Conn) ->
-    try
-        gen_server:call(Pool, {connection_age_ms, Conn})
-    catch
-        _:_ -> undefined
-    end.
 
 -doc """
 Non-blocking checkout. Returns `Conn` if a connection is immediately available,
@@ -238,13 +225,6 @@ handle_call(
             ),
             {reply, busy, State0}
     end;
-handle_call({connection_age_ms, Conn}, _From, #?MODULE{created = Created} = State) ->
-    Reply =
-        case Created of
-            #{Conn := CreatedAt} -> erlang:monotonic_time(millisecond) - CreatedAt;
-            _ -> undefined
-        end,
-    {reply, Reply, State};
 handle_call(Request, From, State) ->
     ?LOG_INFO(?MODULE_STRING " received unexpected call from ~p: ~W", [From, Request, 10]),
     {noreply, State}.
@@ -321,10 +301,34 @@ handle_info(
             gun:close(Conn),
             {noreply, State0}
     end;
-handle_info({gun_down, _Conn, _Protocol, _Reason, _KilledStreams}, #?MODULE{} = State) ->
+handle_info(
+    {gun_down, Conn, _Protocol, Reason, KilledStreams},
+    #?MODULE{checkouts = Checkouts, created = Created} = State
+) ->
     %% With retry=>0, gun stops the connection process immediately after sending
     %% this message (with reason 'normal' for a clean close, or
     %% '{shutdown, Reason}' otherwise). The 'DOWN' handler does all cleanup.
+    %%
+    %% DIAGNOSTIC (#275 follow-up, S3 read stall investigation): a connection
+    %% going down while it has killed (in-flight) streams and is checked out is
+    %% the suspected cause of read stalls - the in-flight request gets no
+    %% response and only fails at its own timeout. Log the reason, age, killed
+    %% streams, and whether the connection was in use.
+    Age =
+        case Created of
+            #{Conn := CreatedAt} -> erlang:monotonic_time(millisecond) - CreatedAt;
+            _ -> undefined
+        end,
+    CheckedOut = is_map_key(Conn, Checkouts),
+    case Reason =:= normal andalso KilledStreams =:= [] of
+        true ->
+            ok;
+        false ->
+            ?LOG_WARNING(
+                "S3 connection ~tw down: reason=~0p killed_streams=~b checked_out=~tw age=~twms",
+                [Conn, Reason, length(KilledStreams), CheckedOut, Age]
+            )
+    end,
     {noreply, State};
 handle_info(
     {'DOWN', MRef, process, Pid, _Reason},
