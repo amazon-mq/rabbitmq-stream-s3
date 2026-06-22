@@ -22,7 +22,7 @@ The models target five global invariants of the tiered-storage design:
 | INV#1 | no lost acked data | `gc-reset/` |
 | INV#2 | no dangling reference (GC never deletes a live object) | `gc-reset/`, `gc-leading-group/` |
 | INV#3 | no unbounded orphan leak (liveness) | `orphan-leak/` |
-| INV#4 | tier resolution total / gap-free | `read-resolution/` |
+| INV#4 | tier resolution total / gap-free | `read-resolution/`, `tier-routing/` |
 | INV#5 | monotonic frontier except a labeled reset | `gc-reset/`, `trimmed-segment/` |
 
 ## Models
@@ -49,6 +49,14 @@ leading manifest group fetch fails transiently. Verifies that
 `log_reader:resolve_first_lookup/1` surfaces a `group_fetch_failed` as a retry
 rather than silently falling back to the local tier (the pre-`e3f931b` catch-all
 bug). See [`read-resolution/README.md`](read-resolution/README.md).
+
+### `tier-routing/`
+
+The offset -> tier routing branch of `resolve_remote_location`: when the local
+log is empty (`first_chunk_id == -1`), every offset must fall through to the
+remote tier. Verifies that dropping the `=/= -1` guard routes a remote-only
+offset to the local tail (a silent remote skip). A second INV#4 guard, distinct
+from the group-fetch catch-all. See [`tier-routing/README.md`](tier-routing/README.md).
 
 ### `trimmed-segment/`
 

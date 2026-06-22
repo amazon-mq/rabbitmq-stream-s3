@@ -23,6 +23,7 @@ jobs:
       read_resolution: ${{ steps.filter.outputs.read_resolution }}
       trimmed_segment: ${{ steps.filter.outputs.trimmed_segment }}
       orphan_leak: ${{ steps.filter.outputs.orphan_leak }}
+      tier_routing: ${{ steps.filter.outputs.tier_routing }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -46,12 +47,15 @@ jobs:
           echo "$CHANGED" | grep -q '^p/trimmed-segment/' && echo "trimmed_segment=true" >> "$GITHUB_OUTPUT" || true
           echo "orphan_leak=false" >> "$GITHUB_OUTPUT"
           echo "$CHANGED" | grep -q '^p/orphan-leak/' && echo "orphan_leak=true" >> "$GITHUB_OUTPUT" || true
+          echo "tier_routing=false" >> "$GITHUB_OUTPUT"
+          echo "$CHANGED" | grep -q '^p/tier-routing/' && echo "tier_routing=true" >> "$GITHUB_OUTPUT" || true
           if echo "$CHANGED" | grep -q '^\.github/workflows/p-model-check\.yaml'; then
             echo "gc_reset=true" >> "$GITHUB_OUTPUT"
             echo "gc_leading_group=true" >> "$GITHUB_OUTPUT"
             echo "read_resolution=true" >> "$GITHUB_OUTPUT"
             echo "trimmed_segment=true" >> "$GITHUB_OUTPUT"
             echo "orphan_leak=true" >> "$GITHUB_OUTPUT"
+            echo "tier_routing=true" >> "$GITHUB_OUTPUT"
           fi
 
   gc-reset:
@@ -285,4 +289,43 @@ jobs:
             exit 1
           fi
           echo "Gate satisfied: the re-sweep-removed model leaks an orphan forever."
+          echo "::endgroup::"
+
+  tier-routing:
+    needs: changes
+    if: needs.changes.outputs.tier_routing == 'true' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install the P checker
+        run: |
+          dotnet tool install --global P --version 3.1.0
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+      - name: Compile
+        run: |
+          cd p/tier-routing
+          p compile
+      - name: Tests that must hold
+        run: |
+          cd p/tier-routing
+          echo "::group::tcTierRoutingGuarded (expect hold)"
+          p check -tc tcTierRoutingGuarded -i 5000
+          echo "::endgroup::"
+      - name: Validation gate (removing the first_chunk_id == -1 guard must misroute)
+        run: |
+          cd p/tier-routing
+          echo "::group::tcTierRoutingBuggy (expect the INV#4 silent remote skip)"
+          if p check -tc tcTierRoutingBuggy -i 2000; then
+            echo "ERROR: tcTierRoutingBuggy passed; the model no longer misroutes an empty-local read."
+            echo "Removing the first_chunk_id =/= -1 guard must route a remote-only offset locally."
+            exit 1
+          fi
+          if ! grep -rqF 'INV#4 violated: an offset held only by the remote tier' PCheckerOutput/BugFinding/; then
+            echo "ERROR: the guard-removed run failed, but not with the expected INV#4 misrouting counterexample."
+            exit 1
+          fi
+          echo "Gate satisfied: the guard-removed model routes a remote-only offset to the local tier."
           echo "::endgroup::"
