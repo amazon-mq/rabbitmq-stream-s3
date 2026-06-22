@@ -1,0 +1,381 @@
+name: P Model Check
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    paths:
+      - 'p/**'
+      - '.github/workflows/p-model-check.yaml'
+  schedule:
+    - cron: '0 6 * * 1'  # Every Monday at 06:00 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      gc_reset: ${{ steps.filter.outputs.gc_reset }}
+      gc_leading_group: ${{ steps.filter.outputs.gc_leading_group }}
+      read_resolution: ${{ steps.filter.outputs.read_resolution }}
+      trimmed_segment: ${{ steps.filter.outputs.trimmed_segment }}
+      orphan_leak: ${{ steps.filter.outputs.orphan_leak }}
+      tier_routing: ${{ steps.filter.outputs.tier_routing }}
+      writer_fencing: ${{ steps.filter.outputs.writer_fencing }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - name: Detect changed paths
+        id: filter
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE=${{ github.event.pull_request.base.sha }}
+          else
+            BASE=${{ github.event.before }}
+          fi
+          CHANGED=$(git diff --name-only "$BASE" HEAD)
+          echo "gc_reset=false" >> "$GITHUB_OUTPUT"
+          echo "gc_leading_group=false" >> "$GITHUB_OUTPUT"
+          echo "read_resolution=false" >> "$GITHUB_OUTPUT"
+          echo "$CHANGED" | grep -q '^p/gc-reset/' && echo "gc_reset=true" >> "$GITHUB_OUTPUT" || true
+          echo "$CHANGED" | grep -q '^p/gc-leading-group/' && echo "gc_leading_group=true" >> "$GITHUB_OUTPUT" || true
+          echo "$CHANGED" | grep -q '^p/read-resolution/' && echo "read_resolution=true" >> "$GITHUB_OUTPUT" || true
+          echo "trimmed_segment=false" >> "$GITHUB_OUTPUT"
+          echo "$CHANGED" | grep -q '^p/trimmed-segment/' && echo "trimmed_segment=true" >> "$GITHUB_OUTPUT" || true
+          echo "orphan_leak=false" >> "$GITHUB_OUTPUT"
+          echo "$CHANGED" | grep -q '^p/orphan-leak/' && echo "orphan_leak=true" >> "$GITHUB_OUTPUT" || true
+          echo "tier_routing=false" >> "$GITHUB_OUTPUT"
+          echo "$CHANGED" | grep -q '^p/tier-routing/' && echo "tier_routing=true" >> "$GITHUB_OUTPUT" || true
+          echo "writer_fencing=false" >> "$GITHUB_OUTPUT"
+          echo "$CHANGED" | grep -q '^p/writer-fencing/' && echo "writer_fencing=true" >> "$GITHUB_OUTPUT" || true
+          if echo "$CHANGED" | grep -q '^\.github/workflows/p-model-check\.yaml'; then
+            echo "gc_reset=true" >> "$GITHUB_OUTPUT"
+            echo "gc_leading_group=true" >> "$GITHUB_OUTPUT"
+            echo "read_resolution=true" >> "$GITHUB_OUTPUT"
+            echo "trimmed_segment=true" >> "$GITHUB_OUTPUT"
+            echo "orphan_leak=true" >> "$GITHUB_OUTPUT"
+            echo "tier_routing=true" >> "$GITHUB_OUTPUT"
+            echo "writer_fencing=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  gc-reset:
+    needs: changes
+    if: needs.changes.outputs.gc_reset == 'true' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2 # v5.3.0
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install the P checker
+        run: |
+          dotnet tool install --global P --version 3.1.0
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+      - name: Compile
+        run: |
+          cd p/gc-reset
+          p compile
+      - name: Tests that must hold
+        run: |
+          cd p/gc-reset
+          for tc in tcGcResetGuarded tcGcResetExplore tcEpochAxisSafe; do
+            echo "::group::$tc (expect hold)"
+            p check -tc "$tc" -i 5000
+            echo "::endgroup::"
+          done
+          # PCT surfaces rare interleavings the random strategy misses.
+          echo "::group::tcGcResetExplore (PCT)"
+          p check -tc tcGcResetExplore --sch-pct 10 -i 5000
+          echo "::endgroup::"
+      - name: Validation gate (the guard-removed model must reproduce GC x reset)
+        run: |
+          cd p/gc-reset
+          rm -rf PCheckerOutput/
+          echo "::group::tcGcResetUnguarded (expect the GC x reset counterexample)"
+          if p check -tc tcGcResetUnguarded -i 2000; then
+            echo "ERROR: tcGcResetUnguarded passed; the model no longer reproduces GC x reset."
+            echo "The guard-removed model must fail, otherwise the guarded result is not trustworthy."
+            exit 1
+          fi
+          if ! grep -rqF 'INV#2 violated: GC deleted live object (offset=850, uid=2)' PCheckerOutput/BugFinding/; then
+            echo "ERROR: the unguarded run failed, but not with the expected INV#2 (850, uid 2) counterexample."
+            exit 1
+          fi
+          echo "Gate satisfied: guard-removed model fails with the expected dangling reference."
+          echo "::endgroup::"
+      - name: Validation gate (the reset atomic-prefix ordering is load-bearing)
+        run: |
+          cd p/gc-reset
+          rm -rf PCheckerOutput/
+          # The floor-last ordering deletes a live object even with the guard on.
+          # It is a rare interleaving that the random strategy misses, so use PCT.
+          echo "::group::tcGcResetFloorLast (expect the GC x reset counterexample under PCT)"
+          if p check -tc tcGcResetFloorLast --sch-pct 10 -i 5000; then
+            echo "ERROR: tcGcResetFloorLast passed; lowering the floor after the re-tier no longer"
+            echo "deletes a live object. The atomic-prefix ordering is supposed to be necessary."
+            exit 1
+          fi
+          if ! grep -rqF 'INV#2 violated: GC deleted live object (offset=850, uid=2)' PCheckerOutput/BugFinding/; then
+            echo "ERROR: the floor-last run failed, but not with the expected INV#2 (850, uid 2) counterexample."
+            exit 1
+          fi
+          echo "Gate satisfied: floor-last ordering fails with the expected dangling reference."
+          echo "::endgroup::"
+
+  gc-leading-group:
+    needs: changes
+    if: needs.changes.outputs.gc_leading_group == 'true' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2 # v5.3.0
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install the P checker
+        run: |
+          dotnet tool install --global P --version 3.1.0
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+      - name: Compile
+        run: |
+          cd p/gc-leading-group
+          p compile
+      - name: Tests that must hold
+        run: |
+          cd p/gc-leading-group
+          echo "::group::tcLeadingGroupGuarded (expect hold)"
+          p check -tc tcLeadingGroupGuarded -i 5000
+          echo "::endgroup::"
+      - name: Validation gate (removing the carve-out must delete the leading group)
+        run: |
+          cd p/gc-leading-group
+          echo "::group::tcLeadingGroupUnguarded (expect the INV#2 dangling reference)"
+          if p check -tc tcLeadingGroupUnguarded -i 2000; then
+            echo "ERROR: tcLeadingGroupUnguarded passed; the model no longer deletes the leading group."
+            echo "Removing the referenced_group_key carve-out must delete a live group."
+            exit 1
+          fi
+          if ! grep -rqF 'INV#2 violated: GC deleted referenced object (offset=80, uid=2)' PCheckerOutput/BugFinding/; then
+            echo "ERROR: the carve-out-removed run failed, but not with the expected INV#2 (80, uid 2) counterexample."
+            exit 1
+          fi
+          echo "Gate satisfied: carve-out-removed model deletes the referenced leading group."
+          echo "::endgroup::"
+
+  read-resolution:
+    needs: changes
+    if: needs.changes.outputs.read_resolution == 'true' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2 # v5.3.0
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install the P checker
+        run: |
+          dotnet tool install --global P --version 3.1.0
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+      - name: Compile
+        run: |
+          cd p/read-resolution
+          p compile
+      - name: Tests that must hold
+        run: |
+          cd p/read-resolution
+          for tc in tcReadResolveGuarded tcReadResolveExplore; do
+            echo "::group::$tc (expect hold)"
+            p check -tc "$tc" -i 5000
+            echo "::endgroup::"
+          done
+          echo "::group::tcReadResolveExplore (PCT)"
+          p check -tc tcReadResolveExplore --sch-pct 10 -i 5000
+          echo "::endgroup::"
+      - name: Validation gate (the catch-all model must reproduce the silent skip)
+        run: |
+          cd p/read-resolution
+          echo "::group::tcReadResolveBuggy (expect the INV#4 silent remote skip)"
+          if p check -tc tcReadResolveBuggy -i 2000; then
+            echo "ERROR: tcReadResolveBuggy passed; the model no longer reproduces the silent remote skip."
+            echo "The catch-all model must fail, otherwise the guarded result is not trustworthy."
+            exit 1
+          fi
+          if ! grep -rqF 'INV#4 violated: resolved' PCheckerOutput/BugFinding/; then
+            echo "ERROR: the catch-all run failed, but not with the expected INV#4 silent-skip counterexample."
+            exit 1
+          fi
+          echo "Gate satisfied: catch-all model fails with the expected silent remote skip."
+          echo "::endgroup::"
+
+  trimmed-segment:
+    needs: changes
+    if: needs.changes.outputs.trimmed_segment == 'true' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2 # v5.3.0
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install the P checker
+        run: |
+          dotnet tool install --global P --version 3.1.0
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+      - name: Compile
+        run: |
+          cd p/trimmed-segment
+          p compile
+      - name: Tests that must hold
+        run: |
+          cd p/trimmed-segment
+          for tc in tcTrimGuarded tcTrimExplore; do
+            echo "::group::$tc (expect hold)"
+            p check -tc "$tc" -i 5000
+            echo "::endgroup::"
+          done
+          echo "::group::tcTrimExplore (PCT)"
+          p check -tc tcTrimExplore --sch-pct 10 -i 5000
+          echo "::endgroup::"
+      - name: Validation gate (removing local_log_ahead must wedge the transfer)
+        run: |
+          cd p/trimmed-segment
+          echo "::group::tcTrimBuggy (expect the liveness obligation to fail)"
+          if p check -tc tcTrimBuggy -i 2000; then
+            echo "ERROR: tcTrimBuggy passed; the model no longer wedges on a trimmed segment."
+            echo "Removing the local_log_ahead recovery must leave the transfer unresolved forever."
+            exit 1
+          fi
+          if ! grep -rqF "hot state 'AwaitingResolution'" PCheckerOutput/BugFinding/; then
+            echo "ERROR: the buggy run failed, but not via the TransferEventuallyResolves liveness obligation."
+            exit 1
+          fi
+          echo "Gate satisfied: the check-removed model leaves the transfer permanently unresolved."
+          echo "::endgroup::"
+
+  orphan-leak:
+    needs: changes
+    if: needs.changes.outputs.orphan_leak == 'true' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2 # v5.3.0
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install the P checker
+        run: |
+          dotnet tool install --global P --version 3.1.0
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+      - name: Compile
+        run: |
+          cd p/orphan-leak
+          p compile
+      - name: Tests that must hold
+        run: |
+          cd p/orphan-leak
+          for tc in tcOrphanGuarded tcOrphanExplore; do
+            echo "::group::$tc (expect hold)"
+            p check -tc "$tc" -i 5000
+            echo "::endgroup::"
+          done
+          echo "::group::tcOrphanExplore (PCT)"
+          p check -tc tcOrphanExplore --sch-pct 10 -i 5000
+          echo "::endgroup::"
+      - name: Validation gate (removing the GC re-sweep must leak an orphan)
+        run: |
+          cd p/orphan-leak
+          echo "::group::tcOrphanBuggy (expect the liveness obligation to fail)"
+          if p check -tc tcOrphanBuggy -i 2000; then
+            echo "ERROR: tcOrphanBuggy passed; the model no longer leaks a transiently-failed delete."
+            echo "Removing the GC re-sweep must leave an orphan permanently outstanding."
+            exit 1
+          fi
+          if ! grep -rqF "hot state 'Dirty'" PCheckerOutput/BugFinding/; then
+            echo "ERROR: the buggy run failed, but not via the OrphanEventuallyReclaimed liveness obligation."
+            exit 1
+          fi
+          echo "Gate satisfied: the re-sweep-removed model leaks an orphan forever."
+          echo "::endgroup::"
+
+  tier-routing:
+    needs: changes
+    if: needs.changes.outputs.tier_routing == 'true' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2 # v5.3.0
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install the P checker
+        run: |
+          dotnet tool install --global P --version 3.1.0
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+      - name: Compile
+        run: |
+          cd p/tier-routing
+          p compile
+      - name: Tests that must hold
+        run: |
+          cd p/tier-routing
+          echo "::group::tcTierRoutingGuarded (expect hold)"
+          p check -tc tcTierRoutingGuarded -i 5000
+          echo "::endgroup::"
+      - name: Validation gate (removing the first_chunk_id == -1 guard must misroute)
+        run: |
+          cd p/tier-routing
+          echo "::group::tcTierRoutingBuggy (expect the INV#4 silent remote skip)"
+          if p check -tc tcTierRoutingBuggy -i 2000; then
+            echo "ERROR: tcTierRoutingBuggy passed; the model no longer misroutes an empty-local read."
+            echo "Removing the first_chunk_id =/= -1 guard must route a remote-only offset locally."
+            exit 1
+          fi
+          if ! grep -rqF 'INV#4 violated: an offset held only by the remote tier' PCheckerOutput/BugFinding/; then
+            echo "ERROR: the guard-removed run failed, but not with the expected INV#4 misrouting counterexample."
+            exit 1
+          fi
+          echo "Gate satisfied: the guard-removed model routes a remote-only offset to the local tier."
+          echo "::endgroup::"
+
+  writer-fencing:
+    needs: changes
+    if: needs.changes.outputs.writer_fencing == 'true' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2 # v5.3.0
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install the P checker
+        run: |
+          dotnet tool install --global P --version 3.1.0
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+      - name: Compile
+        run: |
+          cd p/writer-fencing
+          p compile
+      - name: Tests that must hold
+        run: |
+          cd p/writer-fencing
+          for tc in tcFencingGuarded tcFencingExplore; do
+            echo "::group::$tc (expect hold)"
+            p check -tc "$tc" -i 5000
+            echo "::endgroup::"
+          done
+          echo "::group::tcFencingExplore (PCT)"
+          p check -tc tcFencingExplore --sch-pct 10 -i 5000
+          echo "::endgroup::"
+      - name: Validation gate (removing the epoch fence must allow split-brain)
+        run: |
+          cd p/writer-fencing
+          echo "::group::tcFencingUnguarded (expect the epoch regression)"
+          if p check -tc tcFencingUnguarded -i 2000; then
+            echo "ERROR: tcFencingUnguarded passed; the model no longer regresses the committed epoch."
+            echo "Removing the epoch fence must let a deposed writer overwrite a newer one."
+            exit 1
+          fi
+          if ! grep -rqF 'split-brain: committed epoch regressed' PCheckerOutput/BugFinding/; then
+            echo "ERROR: the fence-removed run failed, but not with the expected split-brain regression."
+            exit 1
+          fi
+          echo "Gate satisfied: the fence-removed model regresses the committed epoch."
+          echo "::endgroup::"
