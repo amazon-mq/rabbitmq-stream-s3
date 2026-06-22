@@ -888,10 +888,24 @@ describe_stall(#{req_started_at := Start} = State) when is_integer(Start) ->
         end,
     HeadersMs = elapsed_or_undef(Start, HeadersAt),
     FirstDataMs = elapsed_or_undef(Start, FirstDataAt),
+    %% Connection age distinguishes a stall on a freshly-opened connection from
+    %% one on a connection that had been sitting in the pool (a likely-stale
+    %% reused connection the request was fired onto).
+    ConnAge =
+        case State of
+            #{pool := Pool, conn := Conn} ->
+                case rabbitmq_stream_s3_api_aws_pool:connection_age_ms(Pool, Conn) of
+                    undefined -> "n/a";
+                    Ms -> integer_to_list(Ms) ++ "ms"
+                end;
+            _ ->
+                "n/a"
+        end,
     lists:flatten(
         io_lib:format(
-            "phase=~ts elapsed=~bms headers_after=~ts first_data_after=~ts bytes=~b",
-            [Phase, Now - Start, HeadersMs, FirstDataMs, Rx]
+            "phase=~ts elapsed=~bms headers_after=~ts first_data_after=~ts bytes=~b"
+            " conn_age=~ts",
+            [Phase, Now - Start, HeadersMs, FirstDataMs, Rx, ConnAge]
         )
     );
 describe_stall(_State) ->

@@ -62,6 +62,11 @@ the reader pool avoids reader starvation.
     pending = queue:new() :: queue:queue(#pending{}),
     %% Idle timers for available connections.
     idle_timers = #{} :: #{conn() => reference()},
+    %% DIAGNOSTIC (#275 follow-up, S3 read stall investigation): monotonic
+    %% milliseconds at which each connection process was opened, used to report
+    %% a stalled connection's age. Populated on grow, cleaned when the
+    %% connection leaves the pool.
+    created = #{} :: #{conn() => integer()},
     counter :: counters:counters_ref()
 }).
 
@@ -84,7 +89,8 @@ the reader pool avoids reader starvation.
     checkout/2,
     try_checkout/1,
     checkin/2,
-    with/3
+    with/3,
+    connection_age_ms/2
 ]).
 
 %% gen_server
@@ -120,6 +126,18 @@ checkout(Pool, Timeout) ->
 -spec checkin(pool(), conn()) -> ok.
 checkin(Pool, Conn) ->
     gen_server:cast(Pool, {checkin, Conn}).
+
+%% DIAGNOSTIC (#275 follow-up, S3 read stall investigation): how long the given
+%% connection has been open, in milliseconds, or undefined if the pool no longer
+%% tracks it. Read-only; called only off the request-timeout path, never on the
+%% hot read path.
+-spec connection_age_ms(pool(), conn()) -> non_neg_integer() | undefined.
+connection_age_ms(Pool, Conn) ->
+    try
+        gen_server:call(Pool, {connection_age_ms, Conn})
+    catch
+        _:_ -> undefined
+    end.
 
 -doc """
 Non-blocking checkout. Returns `Conn` if a connection is immediately available,
@@ -220,6 +238,13 @@ handle_call(
             ),
             {reply, busy, State0}
     end;
+handle_call({connection_age_ms, Conn}, _From, #?MODULE{created = Created} = State) ->
+    Reply =
+        case Created of
+            #{Conn := CreatedAt} -> erlang:monotonic_time(millisecond) - CreatedAt;
+            _ -> undefined
+        end,
+    {reply, Reply, State};
 handle_call(Request, From, State) ->
     ?LOG_INFO(?MODULE_STRING " received unexpected call from ~p: ~W", [From, Request, 10]),
     {noreply, State}.
@@ -316,7 +341,10 @@ handle_info(
             %% was in use (or at least monitored), so demand exists regardless
             %% of whether anyone is in the Pending queue.
             Conn = Pid,
-            State1 = State0#?MODULE{monitors = maps:remove(Conn, Monitors0)},
+            State1 = State0#?MODULE{
+                monitors = maps:remove(Conn, Monitors0),
+                created = maps:remove(Conn, State0#?MODULE.created)
+            },
             State2 = cancel(Pid, State1),
             {noreply, grow(1, State2)};
         _ ->
@@ -396,10 +424,13 @@ grow(
 
 grow(0, State) ->
     State;
-grow(N, #?MODULE{monitors = Monitors0} = State0) ->
+grow(N, #?MODULE{monitors = Monitors0, created = Created0} = State0) ->
     case open() of
         {ok, Conn} ->
-            State = State0#?MODULE{monitors = Monitors0#{Conn => erlang:monitor(process, Conn)}},
+            State = State0#?MODULE{
+                monitors = Monitors0#{Conn => erlang:monitor(process, Conn)},
+                created = Created0#{Conn => erlang:monotonic_time(millisecond)}
+            },
             grow(N - 1, State);
         {error, Reason} ->
             ?LOG_WARNING("Failed to open S3 connection: ~0p", [Reason]),
@@ -527,12 +558,15 @@ make_available(Conn, #?MODULE{available = Available, idle_timers = Timers} = Sta
 %% Close a connection and stop monitoring it. Used when the connection has
 %% been idle too long, or when its caller died holding it (and we cannot
 %% trust its on-wire state). A no-op if the connection is not in `monitors`.
-close_connection(Conn, #?MODULE{monitors = Monitors} = State) ->
+close_connection(Conn, #?MODULE{monitors = Monitors, created = Created} = State) ->
     case Monitors of
         #{Conn := ConnMRef} ->
             erlang:demonitor(ConnMRef, [flush]),
             gun:close(Conn),
-            State#?MODULE{monitors = maps:remove(Conn, Monitors)};
+            State#?MODULE{
+                monitors = maps:remove(Conn, Monitors),
+                created = maps:remove(Conn, Created)
+            };
         _ ->
             State
     end.
