@@ -13,6 +13,18 @@ known bug when its guard is removed (the *validation gate*), so each model ships
 both a guarded test that must hold and an unguarded test that must fail with a
 specific counterexample.
 
+## Invariant coverage
+
+The models target five global invariants of the tiered-storage design:
+
+| Invariant | Property | Model |
+| --- | --- | --- |
+| INV#1 | no lost acked data | `gc-reset/` |
+| INV#2 | no dangling reference (GC never deletes a live object) | `gc-reset/` |
+| INV#3 | no unbounded orphan leak (liveness) | `orphan-leak/` |
+| INV#4 | tier resolution total / gap-free | `read-resolution/` |
+| INV#5 | monotonic frontier except a labeled reset | `gc-reset/`, `trimmed-segment/` |
+
 ## Models
 
 ### `gc-reset/`
@@ -38,6 +50,14 @@ trimmed by retention before the upload reads it. Verifies that
 `local_log_ahead` branch) rather than resubmitting forever. This is a *liveness*
 property, checked with a `hot`-state monitor. See
 [`trimmed-segment/README.md`](trimmed-segment/README.md).
+
+### `orphan-leak/`
+
+The GC reclamation seam: the reaper tolerates partial-batch DeleteObjects
+failures by leaving unconfirmed objects for orphan GC. Verifies that GC's
+re-sweep eventually reclaims a transiently-failed delete rather than leaking it
+forever. A *liveness* property (`hot`-state monitor). See
+[`orphan-leak/README.md`](orphan-leak/README.md).
 
 ## Running
 

@@ -21,6 +21,7 @@ jobs:
       gc_reset: ${{ steps.filter.outputs.gc_reset }}
       read_resolution: ${{ steps.filter.outputs.read_resolution }}
       trimmed_segment: ${{ steps.filter.outputs.trimmed_segment }}
+      orphan_leak: ${{ steps.filter.outputs.orphan_leak }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -40,10 +41,13 @@ jobs:
           echo "$CHANGED" | grep -q '^p/read-resolution/' && echo "read_resolution=true" >> "$GITHUB_OUTPUT" || true
           echo "trimmed_segment=false" >> "$GITHUB_OUTPUT"
           echo "$CHANGED" | grep -q '^p/trimmed-segment/' && echo "trimmed_segment=true" >> "$GITHUB_OUTPUT" || true
+          echo "orphan_leak=false" >> "$GITHUB_OUTPUT"
+          echo "$CHANGED" | grep -q '^p/orphan-leak/' && echo "orphan_leak=true" >> "$GITHUB_OUTPUT" || true
           if echo "$CHANGED" | grep -q '^\.github/workflows/p-model-check\.yaml'; then
             echo "gc_reset=true" >> "$GITHUB_OUTPUT"
             echo "read_resolution=true" >> "$GITHUB_OUTPUT"
             echo "trimmed_segment=true" >> "$GITHUB_OUTPUT"
+            echo "orphan_leak=true" >> "$GITHUB_OUTPUT"
           fi
 
   gc-reset:
@@ -167,4 +171,45 @@ jobs:
             exit 1
           fi
           echo "Gate satisfied: the check-removed model leaves the transfer permanently unresolved."
+          echo "::endgroup::"
+
+  orphan-leak:
+    needs: changes
+    if: needs.changes.outputs.orphan_leak == 'true' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install the P checker
+        run: |
+          dotnet tool install --global P --version 3.1.0
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+      - name: Compile
+        run: |
+          cd p/orphan-leak
+          p compile
+      - name: Tests that must hold
+        run: |
+          cd p/orphan-leak
+          for tc in tcOrphanGuarded tcOrphanExplore; do
+            echo "::group::$tc (expect hold)"
+            p check -tc "$tc" -i 5000
+            echo "::endgroup::"
+          done
+      - name: Validation gate (removing the GC re-sweep must leak an orphan)
+        run: |
+          cd p/orphan-leak
+          echo "::group::tcOrphanBuggy (expect the liveness obligation to fail)"
+          if p check -tc tcOrphanBuggy -i 2000; then
+            echo "ERROR: tcOrphanBuggy passed; the model no longer leaks a transiently-failed delete."
+            echo "Removing the GC re-sweep must leave an orphan permanently outstanding."
+            exit 1
+          fi
+          if ! grep -rqF "hot state 'Dirty'" PCheckerOutput/BugFinding/; then
+            echo "ERROR: the buggy run failed, but not via the OrphanEventuallyReclaimed liveness obligation."
+            exit 1
+          fi
+          echo "Gate satisfied: the re-sweep-removed model leaks an orphan forever."
           echo "::endgroup::"
