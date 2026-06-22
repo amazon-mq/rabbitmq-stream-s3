@@ -19,8 +19,9 @@ import picocli.CommandLine;
     description =
         "Publish messages with sequential IDs, then replay the whole stream from "
             + "'first' independently from every consumer and verify ordering, no "
-            + "duplicates, and no gaps in the confirmed sequences. Catches corruption, "
-            + "reordering, and silent message skips.")
+            + "duplicates, and no gaps above the readable floor. Catches corruption, "
+            + "reordering, and silent message skips, while tolerating ranges reclaimed "
+            + "by max_bytes retention mid-replay (#237).")
 public class ContentVerificationTest implements Runnable {
 
   private static final Logger LOG = LoggerFactory.getLogger(ContentVerificationTest.class);
@@ -487,13 +488,17 @@ public class ContentVerificationTest implements Runnable {
     }
 
     // Fan-out consistency: every consumer subscribed at 'first' and read to the
-    // same tail, so they must all observe the same number of messages. The
-    // consumers subscribe in a tight loop with no reads in between, so retention
-    // cannot advance the readable start between them and skew the counts. A
-    // divergence therefore means a consumer saw a different view of the log.
+    // same tail. Under active max_bytes retention a consumer attached at 'first'
+    // can be overtaken by retention mid-replay (see #237), and different
+    // consumers can be overtaken by different amounts, so they legitimately read
+    // different totals. Count divergence is therefore informational here;
+    // correctness is enforced by the above-floor gap check below, not by count
+    // agreement.
     if (min != max) {
-      LOG.error("REPLAY FAILED: consumers disagree on message count (min={} max={})", min, max);
-      System.exit(1);
+      LOG.info(
+          "Per-consumer counts differ (min={} max={}); expected under retention overtake",
+          min,
+          max);
     }
     if (min == 0) {
       LOG.error("REPLAY FAILED: consumers read zero messages");
@@ -503,10 +508,37 @@ public class ContentVerificationTest implements Runnable {
       LOG.error("CORRUPTION DETECTED: {} messages had invalid sequence numbers", corrupt);
       System.exit(1);
     }
-    // gaps counts only confirmed sequences that were skipped, so any gap is a
-    // real missing message rather than a hole left by an unconfirmed send.
-    if (gap > 0) {
-      LOG.error("GAP DETECTED: {} confirmed sequences were never delivered", gap);
+    // A gap is only real loss if the consumer resumed *above* the readable floor,
+    // i.e. it jumped past data that was still resident. A resume at or below the
+    // floor is an expected retention overtake: max_bytes retention reclaimed that
+    // range mid-replay, exactly as it would for a non-tiered stream (#237). Below
+    // the floor the data is gone for every reader and the cause (overtake vs.
+    // loss) cannot be told apart from the outside, so only above-floor holes
+    // fail. firstOffsetAtEnd is the final, highest floor (retention only advances
+    // it), so any data still resident then was resident throughout the replay.
+    boolean realLoss = false;
+    for (int i = 0; i < replayConsumers; i++) {
+      // Resume offsets increase monotonically per consumer, so the last gap's
+      // resume offset is the highest. If even that is at or below the final
+      // floor, every gap this consumer saw was a retention overtake.
+      if (lastGapOffset[i] > firstOffsetAtEnd) {
+        realLoss = true;
+        LOG.error(
+            "GAP DETECTED: consumer {} resumed at offset {} above the readable floor {}"
+                + " (jumped past resident data)",
+            i,
+            lastGapOffset[i],
+            firstOffsetAtEnd);
+      }
+    }
+    if (gap > 0 && !realLoss) {
+      LOG.info(
+          "Retention overtake: {} confirmed sequences fell below the readable floor {} during"
+              + " replay and were reclaimed (expected; mirrors non-tiered stream behavior)",
+          gap,
+          firstOffsetAtEnd);
+    }
+    if (realLoss) {
       System.exit(1);
     }
     if (dups > 0) {
