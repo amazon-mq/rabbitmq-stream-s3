@@ -24,6 +24,7 @@ jobs:
       trimmed_segment: ${{ steps.filter.outputs.trimmed_segment }}
       orphan_leak: ${{ steps.filter.outputs.orphan_leak }}
       tier_routing: ${{ steps.filter.outputs.tier_routing }}
+      writer_fencing: ${{ steps.filter.outputs.writer_fencing }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -49,6 +50,8 @@ jobs:
           echo "$CHANGED" | grep -q '^p/orphan-leak/' && echo "orphan_leak=true" >> "$GITHUB_OUTPUT" || true
           echo "tier_routing=false" >> "$GITHUB_OUTPUT"
           echo "$CHANGED" | grep -q '^p/tier-routing/' && echo "tier_routing=true" >> "$GITHUB_OUTPUT" || true
+          echo "writer_fencing=false" >> "$GITHUB_OUTPUT"
+          echo "$CHANGED" | grep -q '^p/writer-fencing/' && echo "writer_fencing=true" >> "$GITHUB_OUTPUT" || true
           if echo "$CHANGED" | grep -q '^\.github/workflows/p-model-check\.yaml'; then
             echo "gc_reset=true" >> "$GITHUB_OUTPUT"
             echo "gc_leading_group=true" >> "$GITHUB_OUTPUT"
@@ -56,6 +59,7 @@ jobs:
             echo "trimmed_segment=true" >> "$GITHUB_OUTPUT"
             echo "orphan_leak=true" >> "$GITHUB_OUTPUT"
             echo "tier_routing=true" >> "$GITHUB_OUTPUT"
+            echo "writer_fencing=true" >> "$GITHUB_OUTPUT"
           fi
 
   gc-reset:
@@ -328,4 +332,48 @@ jobs:
             exit 1
           fi
           echo "Gate satisfied: the guard-removed model routes a remote-only offset to the local tier."
+          echo "::endgroup::"
+
+  writer-fencing:
+    needs: changes
+    if: needs.changes.outputs.writer_fencing == 'true' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install the P checker
+        run: |
+          dotnet tool install --global P --version 3.1.0
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+      - name: Compile
+        run: |
+          cd p/writer-fencing
+          p compile
+      - name: Tests that must hold
+        run: |
+          cd p/writer-fencing
+          for tc in tcFencingGuarded tcFencingExplore; do
+            echo "::group::$tc (expect hold)"
+            p check -tc "$tc" -i 5000
+            echo "::endgroup::"
+          done
+          echo "::group::tcFencingExplore (PCT)"
+          p check -tc tcFencingExplore --sch-pct 10 -i 5000
+          echo "::endgroup::"
+      - name: Validation gate (removing the epoch fence must allow split-brain)
+        run: |
+          cd p/writer-fencing
+          echo "::group::tcFencingUnguarded (expect the epoch regression)"
+          if p check -tc tcFencingUnguarded -i 2000; then
+            echo "ERROR: tcFencingUnguarded passed; the model no longer regresses the committed epoch."
+            echo "Removing the epoch fence must let a deposed writer overwrite a newer one."
+            exit 1
+          fi
+          if ! grep -rqF 'split-brain: committed epoch regressed' PCheckerOutput/BugFinding/; then
+            echo "ERROR: the fence-removed run failed, but not with the expected split-brain regression."
+            exit 1
+          fi
+          echo "Gate satisfied: the fence-removed model regresses the committed epoch."
           echo "::endgroup::"

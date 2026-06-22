@@ -24,6 +24,11 @@ The models target five global invariants of the tiered-storage design:
 | INV#3 | no unbounded orphan leak (liveness) | `orphan-leak/` |
 | INV#4 | tier resolution total / gap-free | `read-resolution/`, `tier-routing/` |
 | INV#5 | monotonic frontier except a labeled reset | `gc-reset/`, `trimmed-segment/` |
+| (foundation) | epoch monotonicity / split-brain safety | `writer-fencing/` |
+
+The last row is the mechanism the others assume: `writer-fencing/` proves the
+committed epoch is monotonic, which is what gc-reset's epoch axis and the
+durability guards rely on.
 
 ## Models
 
@@ -66,6 +71,14 @@ trimmed by retention before the upload reads it. Verifies that
 `local_log_ahead` branch) rather than resubmitting forever. This is a *liveness*
 property, checked with a `hot`-state monitor. See
 [`trimmed-segment/README.md`](trimmed-segment/README.md).
+
+### `writer-fencing/`
+
+The manifest-commit fencing seam (`db.erl` optimistic-lock CAS): a commit
+succeeds only if the revision matches and the new epoch is `>=` the stored epoch.
+Verifies that removing the epoch fence lets a deposed lower-epoch writer overwrite
+a newer one (split-brain / epoch regression). This proves the epoch monotonicity
+the other models assume. See [`writer-fencing/README.md`](writer-fencing/README.md).
 
 ### `orphan-leak/`
 
