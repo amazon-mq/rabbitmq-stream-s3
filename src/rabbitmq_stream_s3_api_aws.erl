@@ -734,14 +734,16 @@ handle_async(
                         "object to slice ~p",
                         [?FUNCTION_NAME, Range]
                     ),
-                    State = State0#{data => [], pending_bytes => 0, slice_full => Range},
+                    State = State0#{
+                        data => [], pending_bytes => 0, slice_full => Range, headers_at => now_ms()
+                    },
                     {continue, State};
                 _ ->
-                    State = State0#{data => [], pending_bytes => 0},
+                    State = State0#{data => [], pending_bytes => 0, headers_at => now_ms()},
                     {continue, State}
             end;
         206 ->
-            State = State0#{data => [], pending_bytes => 0},
+            State = State0#{data => [], pending_bytes => 0, headers_at => now_ms()},
             {continue, State};
         _ ->
             %% Non-success response with a body. Cancel the request timer
@@ -814,13 +816,14 @@ handle_async(
         data := PendingData0
     } = State0
 ) ->
+    State1 = mark_first_data(State0, byte_size(Data)),
     case PendingBytes0 > ?BUFFER_PENDING_DATA_BYTES of
         true ->
             AllData = iolist_to_binary(lists:reverse(PendingData0, [Data])),
-            State = State0#{data := [], pending_bytes := 0},
+            State = State1#{data := [], pending_bytes := 0},
             {data, AllData, State};
         false ->
-            State = State0#{
+            State = State1#{
                 data := [Data | PendingData0],
                 pending_bytes := PendingBytes0 + byte_size(Data)
             },
@@ -839,7 +842,13 @@ handle_async(
     StreamRef,
     #{conn := Conn, stream_ref := StreamRef} = State
 ) ->
-    ?LOG_WARNING("S3 request timed out on ~tw/~tw", [Conn, StreamRef]),
+    %% DIAGNOSTIC (#275 follow-up, S3 read stall investigation): report which
+    %% phase the request stalled in. "no_response" means no response headers
+    %% ever arrived (connection/network/request-send stall); "mid_body" means
+    %% headers arrived but the body stalled (S3 slow to stream the object).
+    ?LOG_WARNING(
+        "S3 request timed out on ~tw/~tw: ~ts", [Conn, StreamRef, describe_stall(State)]
+    ),
     counters:add(counter(), ?C_REQUEST_TIMEOUTS, 1),
     %% gun cannot cancel an HTTP/1.1 stream on the wire - it only stops
     %% forwarding events to the owner. The cancelled stream continues to
@@ -849,6 +858,47 @@ handle_async(
     gun:close(Conn),
     finish_async_close(State),
     {done_cancel, {error, timeout}}.
+
+%% DIAGNOSTIC helpers (#275 follow-up, S3 read stall investigation).
+
+now_ms() ->
+    erlang:monotonic_time(millisecond).
+
+%% Record the time and running byte count of the first body frame.
+mark_first_data(#{first_data_at := undefined, bytes_received := Rx} = State, N) ->
+    State#{first_data_at := now_ms(), bytes_received := Rx + N};
+mark_first_data(#{bytes_received := Rx} = State, N) ->
+    State#{bytes_received := Rx + N};
+mark_first_data(State, _N) ->
+    State.
+
+%% Summarize how far a timed-out request progressed: whether response headers
+%% arrived, whether any body arrived, the elapsed time to each, and bytes
+%% received. Tolerates a state map without the diagnostic keys.
+describe_stall(#{req_started_at := Start} = State) when is_integer(Start) ->
+    Now = now_ms(),
+    HeadersAt = maps:get(headers_at, State, undefined),
+    FirstDataAt = maps:get(first_data_at, State, undefined),
+    Rx = maps:get(bytes_received, State, 0),
+    Phase =
+        case {HeadersAt, FirstDataAt} of
+            {undefined, _} -> "no_response (no headers received)";
+            {_, undefined} -> "headers_only (headers received, no body)";
+            {_, _} -> "mid_body (headers and partial body received)"
+        end,
+    HeadersMs = elapsed_or_undef(Start, HeadersAt),
+    FirstDataMs = elapsed_or_undef(Start, FirstDataAt),
+    lists:flatten(
+        io_lib:format(
+            "phase=~ts elapsed=~bms headers_after=~ts first_data_after=~ts bytes=~b",
+            [Phase, Now - Start, HeadersMs, FirstDataMs, Rx]
+        )
+    );
+describe_stall(_State) ->
+    "phase=unknown (no diagnostic state)".
+
+elapsed_or_undef(_Start, undefined) -> "n/a";
+elapsed_or_undef(Start, At) -> integer_to_list(At - Start) ++ "ms".
 
 -spec cancel_async(async_req(), async_state()) -> ok.
 cancel_async(StreamRef, #{conn := Conn, stream_ref := StreamRef} = State) ->
@@ -1059,7 +1109,18 @@ start_async_request(Pool, Method, Path, Headers, Body, Opts) ->
             %% NOTE: no need to wrap this in try/catch and checkin the conn
             %% since gun:request/5 cannot exit/error/throw.
             StreamRef = gun:request(Conn, Method, Path, Headers, Body),
-            State = #{pool => Pool, conn => Conn, stream_ref => StreamRef},
+            %% DIAGNOSTIC (#275 follow-up, S3 read stall investigation): stamp
+            %% the request start and record phase markers so a timeout can report
+            %% which phase stalled (no response headers vs. stalled mid-body).
+            State = #{
+                pool => Pool,
+                conn => Conn,
+                stream_ref => StreamRef,
+                req_started_at => erlang:monotonic_time(millisecond),
+                headers_at => undefined,
+                first_data_at => undefined,
+                bytes_received => 0
+            },
             {ok, StreamRef, maybe_set_timer(Opts, StreamRef, State)}
     end.
 
