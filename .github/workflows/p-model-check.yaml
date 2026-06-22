@@ -75,6 +75,10 @@ jobs:
             p check -tc "$tc" -i 5000
             echo "::endgroup::"
           done
+          # PCT surfaces rare interleavings the random strategy misses.
+          echo "::group::tcGcResetExplore (PCT)"
+          p check -tc tcGcResetExplore --sch-pct 10 -i 5000
+          echo "::endgroup::"
       - name: Validation gate (the guard-removed model must reproduce GC x reset)
         run: |
           cd p/gc-reset
@@ -133,6 +137,9 @@ jobs:
             p check -tc "$tc" -i 5000
             echo "::endgroup::"
           done
+          echo "::group::tcReadResolveExplore (PCT)"
+          p check -tc tcReadResolveExplore --sch-pct 10 -i 5000
+          echo "::endgroup::"
       - name: Validation gate (the catch-all model must reproduce the silent skip)
         run: |
           cd p/read-resolution
@@ -174,6 +181,9 @@ jobs:
             p check -tc "$tc" -i 5000
             echo "::endgroup::"
           done
+          echo "::group::tcTrimExplore (PCT)"
+          p check -tc tcTrimExplore --sch-pct 10 -i 5000
+          echo "::endgroup::"
       - name: Validation gate (removing local_log_ahead must wedge the transfer)
         run: |
           cd p/trimmed-segment
@@ -215,6 +225,9 @@ jobs:
             p check -tc "$tc" -i 5000
             echo "::endgroup::"
           done
+          echo "::group::tcOrphanExplore (PCT)"
+          p check -tc tcOrphanExplore --sch-pct 10 -i 5000
+          echo "::endgroup::"
       - name: Validation gate (removing the GC re-sweep must leak an orphan)
         run: |
           cd p/orphan-leak

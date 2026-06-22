@@ -74,5 +74,10 @@ p check -tc <testCase> -i 2000
 checker. `-i N` sets the number of schedules to explore; `-tc` selects a test
 case. Counterexample traces are written under `PCheckerOutput/BugFinding/`.
 
+The default random strategy can miss rare interleavings (the gc-reset
+atomic-prefix bug eludes it even at 50k schedules). Add `--sch-pct N` to use the
+PCT strategy, which is designed to surface low-probability concurrency bugs; CI
+runs the exploration tests under both strategies.
+
 Generated code (`PGenerated/`) and checker output (`PCheckerOutput/`) are build
 artifacts and are gitignored.
