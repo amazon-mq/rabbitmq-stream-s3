@@ -1,0 +1,4 @@
+# P formal models — Linguist has no "P" language and misdetects .p as
+# OpenEdge ABL / Gnuplot, so keep them out of the language statistics.
+p/**/*.p     linguist-detectable=false
+p/**/*.pproj linguist-detectable=false
