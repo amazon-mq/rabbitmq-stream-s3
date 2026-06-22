@@ -58,6 +58,7 @@ No heartbeat or reconnection mechanism is needed because:
 -export([init_counters/0]).
 -export([
     get_manifest/1,
+    get_manifest_and_epoch/1,
     get_range/1,
     put_manifest/2,
     put_manifest/3,
@@ -103,7 +104,20 @@ start_link() ->
 -spec get_manifest(stream_id()) -> #manifest{} | undefined.
 get_manifest(StreamId) ->
     case ets:lookup(?TABLE, StreamId) of
-        [{_, Manifest}] -> Manifest;
+        [{_, Manifest, _Epoch}] -> Manifest;
+        [] -> undefined
+    end.
+
+-doc """
+Get the cached manifest together with the writer epoch it was stored at. Direct
+ETS read. The epoch is `undefined` when the manifest was stored without one. GC
+uses this to skip a stream whose cache lags the committed epoch.
+""".
+-spec get_manifest_and_epoch(stream_id()) ->
+    {#manifest{}, non_neg_integer() | undefined} | undefined.
+get_manifest_and_epoch(StreamId) ->
+    case ets:lookup(?TABLE, StreamId) of
+        [{_, Manifest, Epoch}] -> {Manifest, Epoch};
         [] -> undefined
     end.
 
@@ -111,25 +125,33 @@ get_manifest(StreamId) ->
 -spec get_range(stream_id()) -> rabbitmq_stream_s3:range().
 get_range(StreamId) ->
     case ets:lookup(?TABLE, StreamId) of
-        [{_, #manifest{entries = <<>>}}] -> empty;
-        [{_, #manifest{first_offset = First, next_offset = Next}}] -> {First, Next};
+        [{_, #manifest{entries = <<>>}, _}] -> empty;
+        [{_, #manifest{first_offset = First, next_offset = Next}, _}] -> {First, Next};
         [] -> empty
     end.
 
--doc "Store a manifest locally (synchronous).".
+-doc """
+Store a manifest locally (synchronous), recording the writer epoch that produced
+it. The cached epoch lets a reader (notably GC) tell whether this node's cache
+reflects the committed reset or still lags it. The writer node updates its own
+cache through this path, so without the epoch its floor would be trusted blindly.
+""".
+-spec put_manifest(stream_id(), #manifest{}, non_neg_integer()) -> ok.
+put_manifest(StreamId, Manifest, Epoch) ->
+    gen_server:call(?MODULE, {put_manifest, StreamId, Manifest, Epoch}).
+
+-doc """
+Store a manifest locally without a known epoch (the cached epoch is left
+undefined). Only for callers that do not participate in epoch-gated reads.
+""".
 -spec put_manifest(stream_id(), #manifest{}) -> ok.
 put_manifest(StreamId, Manifest) ->
-    gen_server:call(?MODULE, {put_manifest, StreamId, Manifest}).
+    gen_server:call(?MODULE, {put_manifest, StreamId, Manifest, undefined}).
 
 -doc "Apply an edit locally (synchronous).".
 -spec apply_edit(stream_id(), #edit{}) -> ok.
 apply_edit(StreamId, Edit) ->
     gen_server:call(?MODULE, {apply_edit, StreamId, Edit}).
-
--doc "Seed the cache on a remote node. Fire-and-forget.".
--spec put_manifest(stream_id(), #manifest{}, node()) -> ok.
-put_manifest(StreamId, Manifest, Node) ->
-    gen_server:cast({?MODULE, Node}, {put_manifest, StreamId, Manifest}).
 
 -doc "Apply an edit on a remote node. Fire-and-forget.".
 -spec apply_edit(stream_id(), #edit{}, node()) -> ok.
@@ -180,8 +202,8 @@ init([]) ->
     _ = ets:new(?TABLE, [named_table, public, set, {read_concurrency, true}]),
     {ok, #state{}}.
 
-handle_call({put_manifest, StreamId, Manifest}, _From, State) ->
-    write_manifest(StreamId, Manifest),
+handle_call({put_manifest, StreamId, Manifest, Epoch}, _From, State) ->
+    write_manifest(StreamId, Manifest, Epoch),
     {reply, ok, State};
 handle_call({sync, StreamId, Seq, Epoch, Manifest, WriterNode}, _From, #state{seqs = Seqs} = State) ->
     Seqs1 = maybe_apply_sync(StreamId, Seq, Epoch, Manifest, WriterNode, Seqs),
@@ -192,10 +214,10 @@ handle_call(
     case maps:get(StreamId, Seqs, undefined) of
         {LastSeq, Epoch, _} when Seq =:= LastSeq + 1 ->
             case ets:lookup(?TABLE, StreamId) of
-                [{_, Manifest0}] ->
+                [{_, Manifest0, _}] ->
                     case apply_edits_catching(StreamId, Edits, Manifest0) of
                         {ok, Manifest} ->
-                            write_manifest(StreamId, Manifest),
+                            write_manifest(StreamId, Manifest, Epoch),
                             maybe_evaluate_retention(StreamId, Manifest0, Manifest, State),
                             {reply, ok, State#state{
                                 seqs = Seqs#{StreamId => {Seq, Epoch, WriterNode}}
@@ -214,10 +236,10 @@ handle_call(
 handle_call({apply_edit, StreamId, Edit}, _From, State) ->
     Reply =
         case ets:lookup(?TABLE, StreamId) of
-            [{_, Manifest0}] ->
+            [{_, Manifest0, Epoch0}] ->
                 case apply_edits_catching(StreamId, [Edit], Manifest0) of
                     {ok, Manifest} ->
-                        write_manifest(StreamId, Manifest),
+                        write_manifest(StreamId, Manifest, Epoch0),
                         maybe_evaluate_retention(StreamId, Manifest0, Manifest, State),
                         ok;
                     {error, _} = Err ->
@@ -239,15 +261,15 @@ handle_call({is_context_registered, StreamId}, _From, #state{contexts = Ctxs} = 
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown}, State}.
 
-handle_cast({put_manifest, StreamId, Manifest}, State) ->
-    write_manifest(StreamId, Manifest),
+handle_cast({put_manifest, StreamId, Manifest, Epoch}, State) ->
+    write_manifest(StreamId, Manifest, Epoch),
     {noreply, State};
 handle_cast({apply_edit, StreamId, Edit}, State) ->
     case ets:lookup(?TABLE, StreamId) of
-        [{_, Manifest0}] ->
+        [{_, Manifest0, Epoch0}] ->
             case apply_edits_catching(StreamId, [Edit], Manifest0) of
                 {ok, Manifest} ->
-                    write_manifest(StreamId, Manifest),
+                    write_manifest(StreamId, Manifest, Epoch0),
                     maybe_evaluate_retention(StreamId, Manifest0, Manifest, State);
                 {error, _} ->
                     %% No writer node on this path to resync from; keep the last
@@ -267,10 +289,10 @@ handle_cast({apply_edits, StreamId, Edits, Seq, Epoch, WriterNode}, #state{seqs 
         {LastSeq, Epoch, _} when Seq =:= LastSeq + 1 ->
             %% In sequence: apply edits.
             case ets:lookup(?TABLE, StreamId) of
-                [{_, Manifest0}] ->
+                [{_, Manifest0, _}] ->
                     case apply_edits_catching(StreamId, Edits, Manifest0) of
                         {ok, Manifest} ->
-                            write_manifest(StreamId, Manifest),
+                            write_manifest(StreamId, Manifest, Epoch),
                             maybe_evaluate_retention(StreamId, Manifest0, Manifest, State),
                             {noreply, State#state{
                                 seqs = Seqs#{StreamId => {Seq, Epoch, WriterNode}}
@@ -306,8 +328,8 @@ terminate(_Reason, _State) ->
 %% Internal
 %% ------------------------------------------------------------------
 
-write_manifest(StreamId, Manifest) ->
-    ets:insert(?TABLE, {StreamId, Manifest}).
+write_manifest(StreamId, Manifest, Epoch) ->
+    ets:insert(?TABLE, {StreamId, Manifest, Epoch}).
 
 %% Apply a batch of edits, catching any failure from apply_edit/2. apply_edit/2
 %% raises on a structurally inconsistent edit (a gap, a diverged replica, or a
@@ -359,7 +381,7 @@ maybe_apply_sync(StreamId, Seq, Epoch, Manifest, WriterNode, Seqs) ->
             ),
             Seqs;
         false ->
-            write_manifest(StreamId, Manifest),
+            write_manifest(StreamId, Manifest, Epoch),
             Seqs#{StreamId => {Seq, Epoch, WriterNode}}
     end.
 

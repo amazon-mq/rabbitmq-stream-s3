@@ -24,7 +24,8 @@ all() ->
         stale_edit_after_resync_ignored,
         retention_and_append_in_same_broadcast,
         sync_live_manifest_then_broadcast_double_applies,
-        manifest_reset_requires_resync
+        manifest_reset_requires_resync,
+        cached_epoch_reflects_writer_epoch
     ].
 
 init_per_suite(Config) ->
@@ -50,6 +51,31 @@ end_per_testcase(_TC, Config) ->
 unknown_stream(_Config) ->
     ?assertEqual(undefined, rabbitmq_stream_s3_manifest_replica:get_manifest(<<"unknown">>)),
     ?assertEqual(empty, rabbitmq_stream_s3_manifest_replica:get_range(<<"unknown">>)).
+
+%% The cache records the writer epoch that produced each manifest, so GC can tell
+%% whether this node reflects the committed reset or lags it. put_manifest/3 and
+%% sync stamp the epoch; put_manifest/2 leaves it undefined.
+cached_epoch_reflects_writer_epoch(_Config) ->
+    Replica = rabbitmq_stream_s3_manifest_replica,
+    StreamId = <<"epoch-stream">>,
+    {Manifest, _} = build_manifest([{fragment, #{offset => 0, size => 1000}}]),
+
+    %% put_manifest/3 (the writer's local update) records its epoch.
+    ok = Replica:put_manifest(StreamId, Manifest, 7),
+    ?assertEqual({Manifest, 7}, Replica:get_manifest_and_epoch(StreamId)),
+
+    %% A sync at a higher epoch advances the cached epoch.
+    {Manifest2, _} = build_manifest([{fragment, #{offset => 0, size => 2000}}]),
+    ok = Replica:sync(StreamId, 0, 9, Manifest2),
+    ?assertMatch({_, 9}, Replica:get_manifest_and_epoch(StreamId)),
+
+    %% put_manifest/2 stores no epoch: the cached epoch is undefined.
+    LegacyStream = <<"epoch-stream-legacy">>,
+    ok = Replica:put_manifest(LegacyStream, Manifest),
+    ?assertEqual({Manifest, undefined}, Replica:get_manifest_and_epoch(LegacyStream)),
+
+    %% Unknown stream resolves to undefined, like get_manifest/1.
+    ?assertEqual(undefined, Replica:get_manifest_and_epoch(<<"unknown">>)).
 
 put_and_get(_Config) ->
     StreamId = <<"stream-1">>,
