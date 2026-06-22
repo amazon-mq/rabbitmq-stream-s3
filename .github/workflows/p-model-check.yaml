@@ -94,6 +94,7 @@ jobs:
       - name: Validation gate (the guard-removed model must reproduce GC x reset)
         run: |
           cd p/gc-reset
+          rm -rf PCheckerOutput/
           echo "::group::tcGcResetUnguarded (expect the GC x reset counterexample)"
           if p check -tc tcGcResetUnguarded -i 2000; then
             echo "ERROR: tcGcResetUnguarded passed; the model no longer reproduces GC x reset."
@@ -109,6 +110,7 @@ jobs:
       - name: Validation gate (the reset atomic-prefix ordering is load-bearing)
         run: |
           cd p/gc-reset
+          rm -rf PCheckerOutput/
           # The floor-last ordering deletes a live object even with the guard on.
           # It is a rare interleaving that the random strategy misses, so use PCT.
           echo "::group::tcGcResetFloorLast (expect the GC x reset counterexample under PCT)"
