@@ -888,10 +888,14 @@ describe_stall(#{req_started_at := Start} = State) when is_integer(Start) ->
         end,
     HeadersMs = elapsed_or_undef(Start, HeadersAt),
     FirstDataMs = elapsed_or_undef(Start, FirstDataAt),
+    %% The socket's local address and port join this stalled request to its TCP
+    %% stream in a packet capture, so the on-the-wire behaviour can be inspected
+    %% directly. Queried only here on the slow timeout path.
+    SockInfo = sock_info(maps:get(conn, State, undefined)),
     lists:flatten(
         io_lib:format(
-            "phase=~ts elapsed=~bms headers_after=~ts first_data_after=~ts bytes=~b",
-            [Phase, Now - Start, HeadersMs, FirstDataMs, Rx]
+            "phase=~ts elapsed=~bms headers_after=~ts first_data_after=~ts bytes=~b ~ts",
+            [Phase, Now - Start, HeadersMs, FirstDataMs, Rx, SockInfo]
         )
     );
 describe_stall(_State) ->
@@ -899,6 +903,22 @@ describe_stall(_State) ->
 
 elapsed_or_undef(_Start, undefined) -> "n/a";
 elapsed_or_undef(Start, At) -> integer_to_list(At - Start) ++ "ms".
+
+%% Local socket IP and port for a connection, formatted to locate the TCP
+%% stream in a packet capture (the local port is unique per connection on the
+%% host). Queried only on the slow timeout path; tolerates a dead or unknown
+%% connection.
+sock_info(undefined) ->
+    "sock=n/a";
+sock_info(Conn) ->
+    try gun:info(Conn) of
+        #{sock_ip := SockIp, sock_port := SockPort} ->
+            lists:flatten(io_lib:format("sock=~ts:~b", [inet:ntoa(SockIp), SockPort]));
+        _ ->
+            "sock=n/a"
+    catch
+        _:_ -> "sock=n/a"
+    end.
 
 -spec cancel_async(async_req(), async_state()) -> ok.
 cancel_async(StreamRef, #{conn := Conn, stream_ref := StreamRef} = State) ->
