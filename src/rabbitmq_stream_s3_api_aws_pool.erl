@@ -329,11 +329,19 @@ handle_info(
                     {noreply, State}
             end
     end;
-handle_info({idle_timeout, Conn}, #?MODULE{idle_timers = Timers} = State0) ->
+handle_info(
+    {idle_timeout, Conn},
+    #?MODULE{idle_timers = Timers, monitors = Monitors, min_size = MinSize} = State0
+) ->
     case Timers of
+        #{Conn := _} when map_size(Monitors) =< MinSize ->
+            %% Closing this connection would drop below min_size. Reset the
+            %% idle timer to keep the warm floor intact.
+            TRef = erlang:send_after(?IDLE_TIMEOUT_MS, self(), {idle_timeout, Conn}),
+            {noreply, State0#?MODULE{idle_timers = Timers#{Conn := TRef}}};
         #{Conn := _} ->
-            %% Timer is still active (wasn't cancelled by a checkout), so the
-            %% connection has been idle too long. Close it.
+            %% Connection has been idle too long and the pool is above
+            %% min_size. Close it.
             State1 = State0#?MODULE{idle_timers = maps:remove(Conn, Timers)},
             State2 = cancel(Conn, State1),
             {noreply, close_connection(Conn, State2)};
