@@ -62,6 +62,9 @@ the reader pool avoids reader starvation.
     pending = queue:new() :: queue:queue(#pending{}),
     %% Idle timers for available connections.
     idle_timers = #{} :: #{conn() => reference()},
+    %% Monotonic milliseconds at which each connection was opened; used to
+    %% report age when a connection goes down unexpectedly.
+    created = #{} :: #{conn() => integer()},
     counter :: counters:counters_ref()
 }).
 
@@ -166,59 +169,59 @@ handle_call(
     #?MODULE{pending = Pending0, counter = Cnt} = State0
 ) ->
     case take_available(Pid, State0) of
-        {Conn, State} ->
+        {ok, Conn, State} ->
             counters:add(Cnt, ?C_CHECKOUTS, 1),
             {reply, Conn, State};
-        empty ->
+        {empty, State1} ->
             counters:add(Cnt, ?C_CHECKOUT_QUEUED, 1),
             MRef = erlang:monitor(process, Pid),
             P = #pending{from = From, checkout = Checkout, mref = MRef},
-            State1 = State0#?MODULE{pending = queue:in(P, Pending0)},
-            {noreply, grow(State1)}
+            State2 = State1#?MODULE{pending = queue:in(P, Pending0)},
+            {noreply, grow(State2)}
     end;
 handle_call(
     try_checkout,
     {Pid, _},
     #?MODULE{
         max_size = MaxSize,
-        available = Available,
-        monitors = Monitors,
-        checkouts = Checkouts,
         counter = Cnt
     } = State0
 ) ->
+    %% `take_available` may evict down connections, so the busy paths use the
+    %% state it returns, not `State0` whose `available`/`monitors` would then be
+    %% stale.
     case take_available(Pid, State0) of
-        {Conn, State} ->
+        {ok, Conn, State1} ->
             counters:add(Cnt, ?C_CHECKOUTS, 1),
-            {reply, Conn, State};
-        empty when map_size(Monitors) < MaxSize ->
+            {reply, Conn, State1};
+        {empty, #?MODULE{monitors = Monitors1} = State2} when map_size(Monitors1) < MaxSize ->
             ?LOG_DEBUG(
                 "Pool ~p try_checkout: busy, growing"
                 " (available=~b total=~b checked_out=~b max=~b caller=~p)",
                 [
                     self(),
-                    length(Available),
-                    map_size(Monitors),
-                    map_size(Checkouts),
+                    length(State2#?MODULE.available),
+                    map_size(Monitors1),
+                    map_size(State2#?MODULE.checkouts),
                     MaxSize,
                     Pid
                 ]
             ),
-            {reply, busy, grow(1, State0)};
-        empty ->
+            {reply, busy, grow(1, State2)};
+        {empty, #?MODULE{monitors = Monitors1} = State3} ->
             ?LOG_DEBUG(
                 "Pool ~p try_checkout: busy at max"
                 " (available=~b total=~b checked_out=~b max=~b caller=~p)",
                 [
                     self(),
-                    length(Available),
-                    map_size(Monitors),
-                    map_size(Checkouts),
+                    length(State3#?MODULE.available),
+                    map_size(Monitors1),
+                    map_size(State3#?MODULE.checkouts),
                     MaxSize,
                     Pid
                 ]
             ),
-            {reply, busy, State0}
+            {reply, busy, State3}
     end;
 handle_call(Request, From, State) ->
     ?LOG_INFO(?MODULE_STRING " received unexpected call from ~p: ~W", [From, Request, 10]),
@@ -296,11 +299,36 @@ handle_info(
             gun:close(Conn),
             {noreply, State0}
     end;
-handle_info({gun_down, _Conn, _Protocol, _Reason, _KilledStreams}, #?MODULE{} = State) ->
+handle_info(
+    {gun_down, Conn, _Protocol, Reason, KilledStreams},
+    #?MODULE{checkouts = Checkouts, created = Created} = State
+) ->
     %% With retry=>0, gun stops the connection process immediately after sending
     %% this message (with reason 'normal' for a clean close, or
-    %% '{shutdown, Reason}' otherwise). The 'DOWN' handler does all cleanup.
-    {noreply, State};
+    %% '{shutdown, Reason}' otherwise). Remove the connection from `available`
+    %% now so it cannot be checked out in the window before the monitor `DOWN`
+    %% arrives; a request fired onto a down connection is silently lost until it
+    %% times out. `monitors` is left intact so the `DOWN` handler still runs the
+    %% final cleanup and grows a replacement.
+    %%
+    %% Log abnormal closes (non-normal reason or killed in-flight streams)
+    %% with the connection's age and checkout status. Clean idle closes
+    %% (reason=normal, no killed streams) are not logged.
+    case Reason =:= normal andalso KilledStreams =:= [] of
+        true ->
+            ok;
+        false ->
+            Age =
+                case Created of
+                    #{Conn := CreatedAt} -> erlang:monotonic_time(millisecond) - CreatedAt;
+                    _ -> undefined
+                end,
+            ?LOG_WARNING(
+                "S3 connection ~tw down: reason=~0p killed_streams=~b checked_out=~tw age=~twms",
+                [Conn, Reason, length(KilledStreams), is_map_key(Conn, Checkouts), Age]
+            )
+    end,
+    {noreply, remove_available(Conn, State)};
 handle_info(
     {'DOWN', MRef, process, Pid, _Reason},
     #?MODULE{
@@ -316,7 +344,10 @@ handle_info(
             %% was in use (or at least monitored), so demand exists regardless
             %% of whether anyone is in the Pending queue.
             Conn = Pid,
-            State1 = State0#?MODULE{monitors = maps:remove(Conn, Monitors0)},
+            State1 = State0#?MODULE{
+                monitors = maps:remove(Conn, Monitors0),
+                created = maps:remove(Conn, State0#?MODULE.created)
+            },
             State2 = cancel(Pid, State1),
             {noreply, grow(1, State2)};
         _ ->
@@ -396,10 +427,13 @@ grow(
 
 grow(0, State) ->
     State;
-grow(N, #?MODULE{monitors = Monitors0} = State0) ->
+grow(N, #?MODULE{monitors = Monitors0, created = Created0} = State0) ->
     case open() of
         {ok, Conn} ->
-            State = State0#?MODULE{monitors = Monitors0#{Conn => erlang:monitor(process, Conn)}},
+            State = State0#?MODULE{
+                monitors = Monitors0#{Conn => erlang:monitor(process, Conn)},
+                created = Created0#{Conn => erlang:monotonic_time(millisecond)}
+            },
             grow(N - 1, State);
         {error, Reason} ->
             ?LOG_WARNING("Failed to open S3 connection: ~0p", [Reason]),
@@ -434,10 +468,26 @@ open() ->
                     {receiver_spawn_opts, [{fullsweep_after, 0}]},
                     {sender_spawn_opts, [{fullsweep_after, 0}]}
                 ],
-                %% Let connections which were closed from idleness (or errors) close
-                %% and be reopened lazily. With TLSv1.3 it only costs one round trip.
-                %% This pool optimizes for best resource use rather than consistently
-                %% low latency. (A fully idle broker should have a min-sized pool.)
+                %% retry => 0: gun does not reconnect a closed connection. The
+                %% pool manages connection lifecycle itself - a connection closed
+                %% from idleness or error is discarded and a fresh one is grown,
+                %% rather than gun silently reconnecting underneath the pool (a
+                %% reconnecting gun process sits in not_connected/domain_lookup
+                %% for tens of ms while the pool still believes it is usable).
+                %% With TLSv1.3 reopening costs one round trip; this pool
+                %% optimizes for resource use over consistently low latency (a
+                %% fully idle broker should have a min-sized pool).
+                %%
+                %% Consequence: with retry => 0, a request issued on a connection
+                %% gun has already moved out of the `connected` state is
+                %% postponed and then lost when the process stops, surfacing only
+                %% as a request timeout (#279). The checkout path must therefore
+                %% verify a connection is still usable before handing it out, and
+                %% the gun_down handler must evict it promptly. See `usable/1` and
+                %% the gun_down clause. The alternative - a small retry plus a
+                %% short "no response started" timeout so gun self-heals and a
+                %% stranded request fails fast - is a larger lifecycle change that
+                %% has not been made.
                 retry => 0
             },
             gun:open(Host, 443, Opts);
@@ -457,15 +507,24 @@ take_available(
 ) ->
     case Available0 of
         [Conn | Available] ->
-            MRef = erlang:monitor(process, Pid),
-            State = State0#?MODULE{
-                available = Available,
-                checkouts = Checkouts0#{Conn => MRef},
-                checkouts_rev = CheckoutsRev0#{MRef => Conn}
-            },
-            {Conn, cancel_idle_timer(Conn, State)};
+            case usable(Conn) of
+                true ->
+                    MRef = erlang:monitor(process, Pid),
+                    State = State0#?MODULE{
+                        available = Available,
+                        checkouts = Checkouts0#{Conn => MRef},
+                        checkouts_rev = CheckoutsRev0#{MRef => Conn}
+                    },
+                    {ok, Conn, cancel_idle_timer(Conn, State)};
+                false ->
+                    %% Connection is down or disconnected; drop it and try the
+                    %% next. `monitors` is left intact so the `DOWN` handler
+                    %% still runs the final cleanup and grows a replacement.
+                    State = cancel_idle_timer(Conn, State0#?MODULE{available = Available}),
+                    take_available(Pid, State)
+            end;
         [] ->
-            empty
+            {empty, State0}
     end.
 
 checkout(
@@ -479,15 +538,24 @@ checkout(
 ) ->
     case {queue:out(Pending0), Available0} of
         {{{value, #pending{from = From, mref = MRef}}, Pending}, [Conn | Available]} ->
-            counters:add(Cnt, ?C_CHECKOUTS, 1),
-            gen_server:reply(From, Conn),
-            State1 = cancel_idle_timer(Conn, State0#?MODULE{
-                pending = Pending,
-                available = Available,
-                checkouts = Checkouts0#{Conn => MRef},
-                checkouts_rev = CheckoutsRev0#{MRef => Conn}
-            }),
-            checkout(State1);
+            case usable(Conn) of
+                true ->
+                    counters:add(Cnt, ?C_CHECKOUTS, 1),
+                    gen_server:reply(From, Conn),
+                    State1 = cancel_idle_timer(Conn, State0#?MODULE{
+                        pending = Pending,
+                        available = Available,
+                        checkouts = Checkouts0#{Conn => MRef},
+                        checkouts_rev = CheckoutsRev0#{MRef => Conn}
+                    }),
+                    checkout(State1);
+                false ->
+                    %% Down connection at the head; drop it (leaving `monitors`
+                    %% for the `DOWN` handler) and retry without consuming the
+                    %% pending entry, so the waiting caller still gets served.
+                    State1 = cancel_idle_timer(Conn, State0#?MODULE{available = Available}),
+                    checkout(State1)
+            end;
         _ ->
             State0
     end.
@@ -517,6 +585,33 @@ cancel(
             end
     end.
 
+%% A connection is usable for a new request only if its gun process is alive
+%% and in the `connected` state. After S3 closes an idle connection gun clears
+%% its socket and moves to `not_connected` (then stops, with retry=>0); a
+%% request fired at it in that window is silently lost until the request times
+%% out. Checked on checkout so such a connection is never handed out, covering
+%% the window where the checkout is processed before gun's `gun_down`.
+usable(Conn) ->
+    is_process_alive(Conn) andalso
+        case catch gun:info(Conn) of
+            #{state_name := connected} -> true;
+            _ -> false
+        end.
+
+%% Remove a connection from `available` and cancel its idle timer, leaving
+%% `monitors` and `checkouts` untouched. Used when gun reports the connection
+%% down: it must not be checked out, but the monitor `DOWN` handler still owns
+%% the final cleanup (removing it from `monitors` and growing a replacement).
+%% A no-op if the connection is not currently available (e.g. checked out).
+remove_available(Conn, #?MODULE{available = Available0} = State) ->
+    case lists:member(Conn, Available0) of
+        true ->
+            State1 = State#?MODULE{available = lists:delete(Conn, Available0)},
+            cancel_idle_timer(Conn, State1);
+        false ->
+            State
+    end.
+
 make_available(Conn, #?MODULE{available = Available, idle_timers = Timers} = State) ->
     TRef = erlang:send_after(?IDLE_TIMEOUT_MS, self(), {idle_timeout, Conn}),
     checkout(State#?MODULE{
@@ -527,12 +622,15 @@ make_available(Conn, #?MODULE{available = Available, idle_timers = Timers} = Sta
 %% Close a connection and stop monitoring it. Used when the connection has
 %% been idle too long, or when its caller died holding it (and we cannot
 %% trust its on-wire state). A no-op if the connection is not in `monitors`.
-close_connection(Conn, #?MODULE{monitors = Monitors} = State) ->
+close_connection(Conn, #?MODULE{monitors = Monitors, created = Created} = State) ->
     case Monitors of
         #{Conn := ConnMRef} ->
             erlang:demonitor(ConnMRef, [flush]),
             gun:close(Conn),
-            State#?MODULE{monitors = maps:remove(Conn, Monitors)};
+            State#?MODULE{
+                monitors = maps:remove(Conn, Monitors),
+                created = maps:remove(Conn, Created)
+            };
         _ ->
             State
     end.
