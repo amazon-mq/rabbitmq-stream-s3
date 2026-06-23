@@ -4,7 +4,11 @@
 -module(rabbitmq_stream_s3_util).
 -moduledoc "Shared utility functions.".
 
--export([elapsed_ms/1, elapsed_ms/2]).
+-export([now/0, elapsed_ms/1, elapsed_ms/2]).
+
+-spec now() -> integer().
+now() ->
+    erlang:monotonic_time().
 
 -spec elapsed_ms(integer()) -> non_neg_integer().
 elapsed_ms(StartTs) ->
