@@ -21,11 +21,7 @@ public class StreamDeletionTest implements Runnable {
 
   @CommandLine.Mixin private ClusterOptions cluster;
 
-  @CommandLine.Option(
-      names = "--duration",
-      description = "Max seconds to publish waiting for S3 to populate",
-      defaultValue = "120")
-  private int durationSeconds;
+  @CommandLine.Mixin private PublishOptions publish;
 
   @CommandLine.Option(
       names = "--delete-timeout",
@@ -33,27 +29,17 @@ public class StreamDeletionTest implements Runnable {
       defaultValue = "60")
   private int deleteTimeoutSeconds;
 
-  @CommandLine.Option(
-      names = "--max-length-bytes",
-      description = "Stream max-length-bytes (small to force S3 spill quickly)",
-      defaultValue = "500000000")
-  private long maxLengthBytes;
-
-  @CommandLine.Option(
-      names = "--message-size",
-      description = "Message body size in bytes",
-      defaultValue = "1024")
-  private int messageSize;
-
   @Override
   public void run() {
     LOG.info(
-        "Starting stream-deletion test: stream={} max-length-bytes={} duration={}s"
+        "Starting stream-deletion test: stream={} max-length-bytes={} publish-stop=[{}]"
             + " delete-timeout={}s",
         cluster.stream,
-        maxLengthBytes,
-        durationSeconds,
+        publish.maxLengthBytes,
+        publish.describeStop(),
         deleteTimeoutSeconds);
+
+    publish.validateStopConditions();
 
     ManagementApi mgmt = new ManagementApi(cluster.mgmtUri);
     S3Monitor s3Monitor = cluster.buildS3Monitor();
@@ -63,11 +49,11 @@ public class StreamDeletionTest implements Runnable {
     }
 
     try (Environment env = cluster.buildEnvironment()) {
-      TestSetup.setupStream(env, mgmt, s3Monitor, cluster.stream, maxLengthBytes);
+      TestSetup.setupStream(env, mgmt, s3Monitor, cluster.stream, publish.maxLengthBytes);
 
       AtomicLong totalPublished = new AtomicLong(0);
       CountDownLatch stop = new CountDownLatch(1);
-      byte[] body = new byte[messageSize];
+      byte[] body = new byte[publish.messageSize];
 
       Producer producer = env.producerBuilder().stream(cluster.stream).build();
       Thread publisherThread =
@@ -90,10 +76,12 @@ public class StreamDeletionTest implements Runnable {
               "publisher");
       publisherThread.start();
 
-      LOG.info("Publishing until S3 is populated (max {}s)...", durationSeconds);
-      long deadline = System.currentTimeMillis() + Duration.ofSeconds(durationSeconds).toMillis();
+      // Publish until S3 is populated, bounded by the publish stop conditions
+      // (duration, messages, or bytes) as a ceiling.
+      LOG.info("Publishing until S3 is populated (max [{}])...", publish.describeStop());
+      long startTime = System.currentTimeMillis();
       long s3ObjectCount = 0;
-      while (System.currentTimeMillis() < deadline) {
+      while (!publish.publishStopReached(startTime, totalPublished.get())) {
         Thread.sleep(5000);
         S3Monitor.Snapshot snap = s3Monitor.snapshot();
         s3ObjectCount = snap.objectCount;
@@ -108,7 +96,7 @@ public class StreamDeletionTest implements Runnable {
       producer.close();
 
       if (s3ObjectCount == 0) {
-        LOG.error("FAIL: S3 was never populated within {}s", durationSeconds);
+        LOG.error("FAIL: S3 was never populated before the publish limit ([{}])", publish.describeStop());
         System.exit(1);
       }
 

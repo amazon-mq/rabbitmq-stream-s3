@@ -27,11 +27,7 @@ public class HighThroughputTest implements Runnable {
 
   @CommandLine.Mixin private ClusterOptions cluster;
 
-  @CommandLine.Option(
-      names = "--duration",
-      description = "Publishing duration in seconds",
-      defaultValue = "2700")
-  private int durationSeconds;
+  @CommandLine.Mixin private PublishOptions publish;
 
   @CommandLine.Option(
       names = "--producers",
@@ -44,18 +40,6 @@ public class HighThroughputTest implements Runnable {
       description = "Number of head-tracking consumers during publish phase",
       defaultValue = "2")
   private int numConsumers;
-
-  @CommandLine.Option(
-      names = "--message-size",
-      description = "Message body size in bytes",
-      defaultValue = "1024")
-  private int messageSize;
-
-  @CommandLine.Option(
-      names = "--max-length-bytes",
-      description = "Stream max-length-bytes (remote tier retention)",
-      defaultValue = "10000000000")
-  private long maxLengthBytes;
 
   @CommandLine.Option(
       names = "--progress-interval",
@@ -86,14 +70,18 @@ public class HighThroughputTest implements Runnable {
   @Override
   public void run() {
     LOG.info(
-        "Starting high-throughput test: stream={} duration={}s producers={} consumers={} "
-            + "msg-size={} max-length-bytes={}",
+        "Starting high-throughput test: stream={} publish-duration={}s publish-messages={}"
+            + " publish-bytes={} producers={} consumers={} msg-size={} max-length-bytes={}",
         cluster.stream,
-        durationSeconds,
+        publish.publishDurationSeconds,
+        publish.publishMessages,
+        publish.publishBytes,
         numProducers,
         numConsumers,
-        messageSize,
-        maxLengthBytes);
+        publish.messageSize,
+        publish.maxLengthBytes);
+
+    publish.validateStopConditions();
 
     ManagementApi mgmt = new ManagementApi(cluster.mgmtUri);
     MetricsClient metrics = new MetricsClient(cluster.metricsUris);
@@ -148,7 +136,7 @@ public class HighThroughputTest implements Runnable {
   }
 
   private void setupStream(Environment env, ManagementApi mgmt, S3Monitor s3Monitor) {
-    TestSetup.setupStream(env, mgmt, s3Monitor, cluster.stream, maxLengthBytes);
+    TestSetup.setupStream(env, mgmt, s3Monitor, cluster.stream, publish.maxLengthBytes);
   }
 
   private long publishPhase(
@@ -158,7 +146,7 @@ public class HighThroughputTest implements Runnable {
       ClusterHealthMonitor health,
       S3Monitor s3Monitor)
       throws InterruptedException {
-    byte[] body = new byte[messageSize];
+    byte[] body = new byte[publish.messageSize];
     AtomicLong totalPublished = new AtomicLong(0);
     AtomicLong totalConsumed = new AtomicLong(0);
     AtomicLong headOffset = new AtomicLong(-1);
@@ -208,7 +196,6 @@ public class HighThroughputTest implements Runnable {
     }
 
     long startTime = System.currentTimeMillis();
-    long deadline = startTime + Duration.ofSeconds(durationSeconds).toMillis();
     long nextReport = startTime + Duration.ofSeconds(progressInterval).toMillis();
     int zeroSentIntervals = 0;
     int reportCount = 0;
@@ -216,9 +203,11 @@ public class HighThroughputTest implements Runnable {
     long cumulativeBytesSent = 0;
 
     LOG.info(
-        "Publishing for {}s with {} head-tracking consumer(s)...", durationSeconds, numConsumers);
+        "Publishing until {} with {} head-tracking consumer(s)...",
+        publish.describeStop(),
+        numConsumers);
 
-    while (System.currentTimeMillis() < deadline) {
+    while (!publish.publishStopReached(startTime, totalPublished.get())) {
       Thread.sleep(1000);
       long now = System.currentTimeMillis();
       if (now >= nextReport) {
@@ -242,7 +231,7 @@ public class HighThroughputTest implements Runnable {
           }
           // Only check for retention stalls after enough data has been sent to
           // S3 to exceed max-length-bytes — retention cannot fire until then.
-          if (cumulativeBytesSent > maxLengthBytes
+          if (cumulativeBytesSent > publish.maxLengthBytes
               && !retentionSeen
               && s3Snap.monotonicGrowthIntervals >= retentionStallThreshold) {
             LOG.error(
@@ -251,7 +240,7 @@ public class HighThroughputTest implements Runnable {
                     + " — retention may not be working",
                 s3Snap.monotonicGrowthIntervals,
                 cumulativeBytesSent,
-                maxLengthBytes);
+                publish.maxLengthBytes);
             System.exit(1);
           }
         }
