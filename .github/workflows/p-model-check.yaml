@@ -20,6 +20,7 @@ jobs:
     outputs:
       gc_reset: ${{ steps.filter.outputs.gc_reset }}
       gc_leading_group: ${{ steps.filter.outputs.gc_leading_group }}
+      gc_reset_leading_group: ${{ steps.filter.outputs.gc_reset_leading_group }}
       read_resolution: ${{ steps.filter.outputs.read_resolution }}
       trimmed_segment: ${{ steps.filter.outputs.trimmed_segment }}
       orphan_leak: ${{ steps.filter.outputs.orphan_leak }}
@@ -40,9 +41,11 @@ jobs:
           CHANGED=$(git diff --name-only "$BASE" HEAD)
           echo "gc_reset=false" >> "$GITHUB_OUTPUT"
           echo "gc_leading_group=false" >> "$GITHUB_OUTPUT"
+          echo "gc_reset_leading_group=false" >> "$GITHUB_OUTPUT"
           echo "read_resolution=false" >> "$GITHUB_OUTPUT"
           echo "$CHANGED" | grep -q '^p/gc-reset/' && echo "gc_reset=true" >> "$GITHUB_OUTPUT" || true
           echo "$CHANGED" | grep -q '^p/gc-leading-group/' && echo "gc_leading_group=true" >> "$GITHUB_OUTPUT" || true
+          echo "$CHANGED" | grep -q '^p/gc-reset-leading-group/' && echo "gc_reset_leading_group=true" >> "$GITHUB_OUTPUT" || true
           echo "$CHANGED" | grep -q '^p/read-resolution/' && echo "read_resolution=true" >> "$GITHUB_OUTPUT" || true
           echo "trimmed_segment=false" >> "$GITHUB_OUTPUT"
           echo "$CHANGED" | grep -q '^p/trimmed-segment/' && echo "trimmed_segment=true" >> "$GITHUB_OUTPUT" || true
@@ -55,6 +58,7 @@ jobs:
           if echo "$CHANGED" | grep -q '^\.github/workflows/p-model-check\.yaml'; then
             echo "gc_reset=true" >> "$GITHUB_OUTPUT"
             echo "gc_leading_group=true" >> "$GITHUB_OUTPUT"
+            echo "gc_reset_leading_group=true" >> "$GITHUB_OUTPUT"
             echo "read_resolution=true" >> "$GITHUB_OUTPUT"
             echo "trimmed_segment=true" >> "$GITHUB_OUTPUT"
             echo "orphan_leak=true" >> "$GITHUB_OUTPUT"
@@ -163,6 +167,53 @@ jobs:
             exit 1
           fi
           echo "Gate satisfied: carve-out-removed model deletes the referenced leading group."
+          echo "::endgroup::"
+
+  gc-reset-leading-group:
+    needs: changes
+    if: needs.changes.outputs.gc_reset_leading_group == 'true' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2 # v5.3.0
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install the P checker
+        run: |
+          dotnet tool install --global P --version 3.1.0
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+      - name: Compile
+        run: |
+          cd p/gc-reset-leading-group
+          p compile
+      - name: Tests that must hold
+        run: |
+          cd p/gc-reset-leading-group
+          for tc in tcLeadingGroupResetFixed tcLeadingGroupResetExplore tcLeadingGroupRetentionOnly; do
+            echo "::group::$tc (expect hold)"
+            p check -tc "$tc" -i 5000
+            echo "::endgroup::"
+          done
+          # PCT surfaces rare interleavings the random strategy misses.
+          echo "::group::tcLeadingGroupResetExplore (PCT)"
+          p check -tc tcLeadingGroupResetExplore --sch-pct 10 -i 5000
+          echo "::endgroup::"
+      - name: Validation gate (offset-only re-check must delete the live leading group)
+        run: |
+          cd p/gc-reset-leading-group
+          rm -rf PCheckerOutput/
+          echo "::group::tcLeadingGroupResetBug (expect the GC x reset x leading-group counterexample)"
+          if p check -tc tcLeadingGroupResetBug -i 2000; then
+            echo "ERROR: tcLeadingGroupResetBug passed; the model no longer deletes the live leading group."
+            echo "The offset-only still_dangling re-check must delete a reset-installed leading group,"
+            echo "otherwise the carve-out re-validation result is not trustworthy."
+            exit 1
+          fi
+          if ! grep -rqF 'INV#2 violated: GC deleted live object (offset=850, uid=2) still referenced by the manifest (live leading group)' PCheckerOutput/BugFinding/; then
+            echo "ERROR: the offset-only run failed, but not with the expected INV#2 (850, uid 2) leading-group counterexample."
+            exit 1
+          fi
+          echo "Gate satisfied: the offset-only re-check deletes the live leading group."
           echo "::endgroup::"
 
   read-resolution:

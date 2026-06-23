@@ -135,21 +135,46 @@ make_handler(delete) ->
 %% and skipping anything now at or above it restores the assumption; a genuine
 %% orphan skipped by a transient drop is reclaimed by a later sweep. Epoch-based
 %% (manifest) findings need no re-check: epoch is genuinely monotonic.
+%%
+%% A group finding additionally re-validates the leading-group carve-out against
+%% the live manifest. classify_group/3 protected the SNAPSHOT leading group, but
+%% the carve-out (referenced_group_key) is captured once at build_lookup time. A
+%% reset followed by forward retention can install a NEW leading group below the
+%% live floor that the stale snapshot does not recognise, so an offset-only
+%% re-check here would delete the live referenced leading group. Re-deriving the
+%% carve-out from the live manifest closes that.
 -spec still_dangling(finding()) -> boolean().
 still_dangling(#{reason := stale_epoch}) ->
     true;
 still_dangling(#{reason := below_first_offset, stream_id := StreamId, key := Key}) ->
     case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
-        #manifest{first_offset = FirstOffset} ->
+        #manifest{first_offset = FirstOffset} = Manifest ->
             case parse_key(Key) of
-                {data, _StreamId, Offset} -> Offset < FirstOffset;
-                {group, _StreamId, Offset} -> Offset < FirstOffset;
-                _ -> false
+                {data, _StreamId, Offset} ->
+                    Offset < FirstOffset;
+                {group, _StreamId, Offset} ->
+                    Offset < FirstOffset andalso
+                        not live_leading_group(StreamId, Key, Manifest);
+                _ ->
+                    false
             end;
         undefined ->
             %% No live manifest to compare against: do not delete (a later sweep
             %% reclaims a genuine orphan once a floor is known again).
             false
+    end.
+
+%% Whether the group object Key is protected by the LIVE manifest's leading-group
+%% carve-out: it is the live referenced leading group, or the live manifest is in
+%% conservative skip-groups mode (a leading kilo-/mega-group). Mirrors
+%% classify_group/3, but re-derived from the live manifest rather than the sweep
+%% snapshot. See leading_group_info/2.
+-spec live_leading_group(stream_id(), rabbitmq_stream_s3:key(), #manifest{}) -> boolean().
+live_leading_group(StreamId, Key, Manifest) ->
+    case leading_group_info(StreamId, Manifest) of
+        {_ReferencedGroupKey, true} -> true;
+        {Key, _SkipGroups} -> true;
+        {_Other, _SkipGroups} -> false
     end.
 
 %% ------------------------------------------------------------------
@@ -660,6 +685,64 @@ still_dangling_respects_live_first_offset_test_() ->
                 ?_assertNot(still_dangling(ReTiered)),
                 %% Epoch-based findings are not re-checked (epoch is monotonic).
                 ?_assert(still_dangling(StaleManifest))
+            ]
+        end}.
+
+%% A group finding re-validates the leading-group carve-out against the LIVE
+%% manifest, not just the live floor. A reset followed by forward retention can
+%% install a new leading group below the live floor; the sweep's snapshot carve-out
+%% predates it, so an offset-only re-check would delete the live referenced
+%% leading group. The live re-derivation must protect it while still reclaiming a
+%% genuine orphan group at the same range (distinguished by uid).
+still_dangling_group_respects_live_leading_group_test_() ->
+    {setup,
+        fun() ->
+            {ok, Pid} = rabbitmq_stream_s3_manifest_replica:start_link(),
+            unlink(Pid),
+            Pid
+        end,
+        fun(Pid) -> gen_server:stop(Pid) end, fun(_) ->
+            StreamId = <<"gc-leading-revalidate-stream">>,
+            LeadingUid = 16#0000002b,
+            %% Live manifest: floor 870, with a leading group at 850 (straddling
+            %% the floor after a reset + forward retention) still referenced.
+            ok = rabbitmq_stream_s3_manifest_replica:put_manifest(
+                StreamId,
+                #manifest{
+                    first_offset = 870,
+                    next_offset = 2000,
+                    entries = group_entry(850, ?MANIFEST_KIND_GROUP, LeadingUid)
+                }
+            ),
+            LiveLeadingKey = rabbitmq_stream_s3:group_key(
+                StreamId, #group_ref{offset = 850, kind = ?MANIFEST_KIND_GROUP, uid = LeadingUid}
+            ),
+            LiveLeading = #{
+                stream_id => StreamId, key => LiveLeadingKey, reason => below_first_offset
+            },
+            %% Same offset, different uid: a stale group object, not the live
+            %% leading one, so a genuine orphan.
+            StaleAtLeadingOffset = #{
+                stream_id => StreamId,
+                key =>
+                    <<"rabbitmq/stream/gc-leading-revalidate-stream/metadata/00000000000000000850.0000002a.group">>,
+                reason => below_first_offset
+            },
+            %% A deep orphan group well below the floor.
+            DeepOrphanGroup = #{
+                stream_id => StreamId,
+                key =>
+                    <<"rabbitmq/stream/gc-leading-revalidate-stream/metadata/00000000000000000500.00000099.group">>,
+                reason => below_first_offset
+            },
+            [
+                %% The live leading group is below the floor but referenced: keep it.
+                ?_assertNot(still_dangling(LiveLeading)),
+                %% A stale object at the same offset (different uid) is a real
+                %% orphan: delete it.
+                ?_assert(still_dangling(StaleAtLeadingOffset)),
+                %% A deep orphan group below the floor: delete it.
+                ?_assert(still_dangling(DeepOrphanGroup))
             ]
         end}.
 
