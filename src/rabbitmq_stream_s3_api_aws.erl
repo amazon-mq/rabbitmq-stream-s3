@@ -735,15 +735,24 @@ handle_async(
                         [?FUNCTION_NAME, Range]
                     ),
                     State = State0#{
-                        data => [], pending_bytes => 0, slice_full => Range, headers_at => now_ms()
+                        data => [],
+                        pending_bytes => 0,
+                        slice_full => Range,
+                        headers_at => rabbitmq_stream_s3_util:now()
                     },
                     {continue, State};
                 _ ->
-                    State = State0#{data => [], pending_bytes => 0, headers_at => now_ms()},
+                    State = State0#{
+                        data => [],
+                        pending_bytes => 0,
+                        headers_at => rabbitmq_stream_s3_util:now()
+                    },
                     {continue, State}
             end;
         206 ->
-            State = State0#{data => [], pending_bytes => 0, headers_at => now_ms()},
+            State = State0#{
+                data => [], pending_bytes => 0, headers_at => rabbitmq_stream_s3_util:now()
+            },
             {continue, State};
         _ ->
             %% Non-success response with a body. Cancel the request timer
@@ -857,14 +866,11 @@ handle_async(
     finish_async_close(State),
     {done_cancel, {error, timeout}}.
 
-now_ms() ->
-    erlang:monotonic_time(millisecond).
-
 %% Record the time and running byte count of the first body frame. Runs on
 %% every body frame (a couple of map operations); enriches `describe_stall/1`
 %% on a timeout. Revisit if profiling flags the per-frame cost.
 mark_first_data(#{first_data_at := undefined, bytes_received := Rx} = State, N) ->
-    State#{first_data_at := now_ms(), bytes_received := Rx + N};
+    State#{first_data_at := rabbitmq_stream_s3_util:now(), bytes_received := Rx + N};
 mark_first_data(#{bytes_received := Rx} = State, N) ->
     State#{bytes_received := Rx + N};
 mark_first_data(State, _N) ->
@@ -874,7 +880,7 @@ mark_first_data(State, _N) ->
 %% arrived, whether any body arrived, the elapsed time to each, and bytes
 %% received. Tolerates a state map without the diagnostic keys.
 describe_stall(#{req_started_at := Start} = State) when is_integer(Start) ->
-    Now = now_ms(),
+    Now = rabbitmq_stream_s3_util:now(),
     HeadersAt = maps:get(headers_at, State, undefined),
     FirstDataAt = maps:get(first_data_at, State, undefined),
     Rx = maps:get(bytes_received, State, 0),
@@ -884,19 +890,22 @@ describe_stall(#{req_started_at := Start} = State) when is_integer(Start) ->
             {_, undefined} -> "headers_only (headers received, no body)";
             {_, _} -> "mid_body (headers and partial body received)"
         end,
+    ElapsedMs = rabbitmq_stream_s3_util:elapsed_ms(Now, Start),
     HeadersMs = elapsed_or_undef(Start, HeadersAt),
     FirstDataMs = elapsed_or_undef(Start, FirstDataAt),
     lists:flatten(
         io_lib:format(
             "phase=~ts elapsed=~bms headers_after=~ts first_data_after=~ts bytes=~b",
-            [Phase, Now - Start, HeadersMs, FirstDataMs, Rx]
+            [Phase, ElapsedMs, HeadersMs, FirstDataMs, Rx]
         )
     );
 describe_stall(_State) ->
     "phase=unknown (no diagnostic state)".
 
-elapsed_or_undef(_Start, undefined) -> "n/a";
-elapsed_or_undef(Start, At) -> integer_to_list(At - Start) ++ "ms".
+elapsed_or_undef(_Start, undefined) ->
+    "n/a";
+elapsed_or_undef(Start, At) ->
+    integer_to_list(rabbitmq_stream_s3_util:elapsed_ms(At, Start)) ++ "ms".
 
 -spec cancel_async(async_req(), async_state()) -> ok.
 cancel_async(StreamRef, #{conn := Conn, stream_ref := StreamRef} = State) ->
@@ -1112,7 +1121,7 @@ start_async_request(Pool, Method, Path, Headers, Body, Opts) ->
                 pool => Pool,
                 conn => Conn,
                 stream_ref => StreamRef,
-                req_started_at => erlang:monotonic_time(millisecond),
+                req_started_at => rabbitmq_stream_s3_util:now(),
                 headers_at => undefined,
                 first_data_at => undefined,
                 bytes_received => 0

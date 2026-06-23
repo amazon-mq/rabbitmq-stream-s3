@@ -62,8 +62,8 @@ the reader pool avoids reader starvation.
     pending = queue:new() :: queue:queue(#pending{}),
     %% Idle timers for available connections.
     idle_timers = #{} :: #{conn() => reference()},
-    %% Monotonic milliseconds at which each connection was opened; used to
-    %% report age when a connection goes down unexpectedly.
+    %% Native monotonic timestamp at which each connection was opened; used
+    %% to report age when a connection goes down unexpectedly.
     created = #{} :: #{conn() => integer()},
     counter :: counters:counters_ref()
 }).
@@ -320,7 +320,7 @@ handle_info(
         false ->
             Age =
                 case Created of
-                    #{Conn := CreatedAt} -> erlang:monotonic_time(millisecond) - CreatedAt;
+                    #{Conn := CreatedAt} -> rabbitmq_stream_s3_util:elapsed_ms(CreatedAt);
                     _ -> undefined
                 end,
             ?LOG_WARNING(
@@ -432,7 +432,7 @@ grow(N, #?MODULE{monitors = Monitors0, created = Created0} = State0) ->
         {ok, Conn} ->
             State = State0#?MODULE{
                 monitors = Monitors0#{Conn => erlang:monitor(process, Conn)},
-                created = Created0#{Conn => erlang:monotonic_time(millisecond)}
+                created = Created0#{Conn => rabbitmq_stream_s3_util:now()}
             },
             grow(N - 1, State);
         {error, Reason} ->
