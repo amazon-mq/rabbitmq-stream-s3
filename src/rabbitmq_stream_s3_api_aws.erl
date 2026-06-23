@@ -842,10 +842,8 @@ handle_async(
     StreamRef,
     #{conn := Conn, stream_ref := StreamRef} = State
 ) ->
-    %% DIAGNOSTIC (#275 follow-up, S3 read stall investigation): report which
-    %% phase the request stalled in. "no_response" means no response headers
-    %% ever arrived (connection/network/request-send stall); "mid_body" means
-    %% headers arrived but the body stalled (S3 slow to stream the object).
+    %% Report which phase the request stalled in so the log distinguishes a
+    %% connection-level failure (no response at all) from a slow S3 transfer.
     ?LOG_WARNING(
         "S3 request timed out on ~tw/~tw: ~ts", [Conn, StreamRef, describe_stall(State)]
     ),
@@ -859,19 +857,12 @@ handle_async(
     finish_async_close(State),
     {done_cancel, {error, timeout}}.
 
-%% DIAGNOSTIC helpers (#275 follow-up, S3 read stall investigation).
-
 now_ms() ->
     erlang:monotonic_time(millisecond).
 
-%% Record the time and running byte count of the first body frame.
-%%
-%% DIAGNOSTIC (#279): this runs on every body frame of every read, so it is the
-%% one diagnostic with a per-frame hot-path cost (a couple of map operations).
-%% It enriches the timeout summary in `describe_stall/1`, which post-fix should
-%% fire ~never. Kept for now because that enrichment is high-value triage if a
-%% stall ever recurs; revisit dropping it from the hot path if the per-frame
-%% cost ever shows up under profiling.
+%% Record the time and running byte count of the first body frame. Runs on
+%% every body frame (a couple of map operations); enriches `describe_stall/1`
+%% on a timeout. Revisit if profiling flags the per-frame cost.
 mark_first_data(#{first_data_at := undefined, bytes_received := Rx} = State, N) ->
     State#{first_data_at := now_ms(), bytes_received := Rx + N};
 mark_first_data(#{bytes_received := Rx} = State, N) ->
@@ -1116,9 +1107,7 @@ start_async_request(Pool, Method, Path, Headers, Body, Opts) ->
             %% NOTE: no need to wrap this in try/catch and checkin the conn
             %% since gun:request/5 cannot exit/error/throw.
             StreamRef = gun:request(Conn, Method, Path, Headers, Body),
-            %% DIAGNOSTIC (#275 follow-up, S3 read stall investigation): stamp
-            %% the request start and record phase markers so a timeout can report
-            %% which phase stalled (no response headers vs. stalled mid-body).
+            %% Phase markers for timeout reporting (see `describe_stall/1`).
             State = #{
                 pool => Pool,
                 conn => Conn,

@@ -62,10 +62,8 @@ the reader pool avoids reader starvation.
     pending = queue:new() :: queue:queue(#pending{}),
     %% Idle timers for available connections.
     idle_timers = #{} :: #{conn() => reference()},
-    %% DIAGNOSTIC (#275/#279, S3 read stall investigation): monotonic
-    %% milliseconds at which each connection process was opened, used to report
-    %% a down connection's age. Populated on grow, cleaned when the connection
-    %% leaves the pool.
+    %% Monotonic milliseconds at which each connection was opened; used to
+    %% report age when a connection goes down unexpectedly.
     created = #{} :: #{conn() => integer()},
     counter :: counters:counters_ref()
 }).
@@ -313,11 +311,9 @@ handle_info(
     %% times out. `monitors` is left intact so the `DOWN` handler still runs the
     %% final cleanup and grows a replacement.
     %%
-    %% DIAGNOSTIC (#275/#279): log an abnormal close (a non-normal reason, or
-    %% killed in-flight streams) with the connection's age and whether it was
-    %% checked out, to confirm the dead-connection-reuse pattern this fix
-    %% targets. A clean idle close (reason=normal, no killed streams) is not
-    %% logged, to avoid noise from ordinary connection turnover.
+    %% Log abnormal closes (non-normal reason or killed in-flight streams)
+    %% with the connection's age and checkout status. Clean idle closes
+    %% (reason=normal, no killed streams) are not logged.
     case Reason =:= normal andalso KilledStreams =:= [] of
         true ->
             ok;
