@@ -888,10 +888,10 @@ describe_stall(#{req_started_at := Start} = State) when is_integer(Start) ->
         end,
     HeadersMs = elapsed_or_undef(Start, HeadersAt),
     FirstDataMs = elapsed_or_undef(Start, FirstDataAt),
-    %% The socket's local address and port join this stalled request to its TCP
-    %% stream in a packet capture, so the on-the-wire behaviour can be inspected
-    %% directly. Queried only here on the slow timeout path.
-    SockInfo = sock_info(maps:get(conn, State, undefined)),
+    %% The socket's local address and port (captured at request-fire time) join
+    %% this stalled request to its TCP stream in a packet capture, so the
+    %% on-the-wire behaviour can be inspected directly.
+    SockInfo = maps:get(sock, State, "sock=n/a"),
     lists:flatten(
         io_lib:format(
             "phase=~ts elapsed=~bms headers_after=~ts first_data_after=~ts bytes=~b ~ts",
@@ -1132,11 +1132,16 @@ start_async_request(Pool, Method, Path, Headers, Body, Opts) ->
             %% DIAGNOSTIC (#275 follow-up, S3 read stall investigation): stamp
             %% the request start and record phase markers so a timeout can report
             %% which phase stalled (no response headers vs. stalled mid-body).
+            %% Capture the socket's local port here at fire time, while the
+            %% connection is live; by the time a request times out gun has often
+            %% already cleared the socket, so it cannot be read then. The local
+            %% port joins this request to its TCP stream in a packet capture.
             State = #{
                 pool => Pool,
                 conn => Conn,
                 stream_ref => StreamRef,
                 req_started_at => erlang:monotonic_time(millisecond),
+                sock => sock_info(Conn),
                 headers_at => undefined,
                 first_data_at => undefined,
                 bytes_received => 0
