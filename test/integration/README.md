@@ -122,11 +122,14 @@ aws s3 ls "s3://${BUCKET}/s3-access-logs/"
 ```
 
 Disable (turn off logging; remove the delivery policy if nothing else relies on
-it):
+it; delete the accumulated log objects). The `s3-access-logs/` prefix is
+separate from the plugin's `rabbitmq/stream/` data, so the scoped delete leaves
+stream data untouched:
 
 ```bash
 aws s3api put-bucket-logging --bucket "$BUCKET" --bucket-logging-status '{}'
 aws s3api delete-bucket-policy --bucket "$BUCKET"
+aws s3 rm "s3://${BUCKET}/s3-access-logs/" --recursive
 ```
 
 ### CloudTrail S3 data events
