@@ -865,6 +865,13 @@ now_ms() ->
     erlang:monotonic_time(millisecond).
 
 %% Record the time and running byte count of the first body frame.
+%%
+%% DIAGNOSTIC (#279): this runs on every body frame of every read, so it is the
+%% one diagnostic with a per-frame hot-path cost (a couple of map operations).
+%% It enriches the timeout summary in `describe_stall/1`, which post-fix should
+%% fire ~never. Kept for now because that enrichment is high-value triage if a
+%% stall ever recurs; revisit dropping it from the hot path if the per-frame
+%% cost ever shows up under profiling.
 mark_first_data(#{first_data_at := undefined, bytes_received := Rx} = State, N) ->
     State#{first_data_at := now_ms(), bytes_received := Rx + N};
 mark_first_data(#{bytes_received := Rx} = State, N) ->
@@ -888,14 +895,10 @@ describe_stall(#{req_started_at := Start} = State) when is_integer(Start) ->
         end,
     HeadersMs = elapsed_or_undef(Start, HeadersAt),
     FirstDataMs = elapsed_or_undef(Start, FirstDataAt),
-    %% The socket's local address and port (captured at request-fire time) join
-    %% this stalled request to its TCP stream in a packet capture, so the
-    %% on-the-wire behaviour can be inspected directly.
-    SockInfo = maps:get(sock, State, "sock=n/a"),
     lists:flatten(
         io_lib:format(
-            "phase=~ts elapsed=~bms headers_after=~ts first_data_after=~ts bytes=~b ~ts",
-            [Phase, Now - Start, HeadersMs, FirstDataMs, Rx, SockInfo]
+            "phase=~ts elapsed=~bms headers_after=~ts first_data_after=~ts bytes=~b",
+            [Phase, Now - Start, HeadersMs, FirstDataMs, Rx]
         )
     );
 describe_stall(_State) ->
@@ -903,36 +906,6 @@ describe_stall(_State) ->
 
 elapsed_or_undef(_Start, undefined) -> "n/a";
 elapsed_or_undef(Start, At) -> integer_to_list(At - Start) ++ "ms".
-
-%% Local socket IP and port for a connection, formatted to locate the TCP
-%% stream in a packet capture (the local port is unique per connection on the
-%% host). Queried only on the slow timeout path; tolerates a dead or unknown
-%% connection.
-sock_info(undefined) ->
-    "sock=n/a conn=undefined";
-sock_info(Conn) ->
-    Alive = is_process_alive(Conn),
-    try gun:info(Conn) of
-        #{state_name := StateName} = Info ->
-            %% state_name=connected with a sock_port means a live socket. Any
-            %% other state, or a missing sock_port, means gun has no usable
-            %% socket for this connection right now (e.g. the pooled connection
-            %% was closed by S3 while idle and is being fired onto regardless).
-            Sock =
-                case Info of
-                    #{sock_ip := SockIp, sock_port := SockPort} ->
-                        lists:flatten(io_lib:format("~ts:~b", [inet:ntoa(SockIp), SockPort]));
-                    _ ->
-                        "none"
-                end,
-            lists:flatten(
-                io_lib:format("sock=~ts gun_state=~p conn_alive=~p", [Sock, StateName, Alive])
-            );
-        _ ->
-            lists:flatten(io_lib:format("sock=none conn_alive=~p", [Alive]))
-    catch
-        C:E -> lists:flatten(io_lib:format("sock=err(~p:~p) conn_alive=~p", [C, E, Alive]))
-    end.
 
 -spec cancel_async(async_req(), async_state()) -> ok.
 cancel_async(StreamRef, #{conn := Conn, stream_ref := StreamRef} = State) ->
@@ -1146,16 +1119,11 @@ start_async_request(Pool, Method, Path, Headers, Body, Opts) ->
             %% DIAGNOSTIC (#275 follow-up, S3 read stall investigation): stamp
             %% the request start and record phase markers so a timeout can report
             %% which phase stalled (no response headers vs. stalled mid-body).
-            %% Capture the socket's local port here at fire time, while the
-            %% connection is live; by the time a request times out gun has often
-            %% already cleared the socket, so it cannot be read then. The local
-            %% port joins this request to its TCP stream in a packet capture.
             State = #{
                 pool => Pool,
                 conn => Conn,
                 stream_ref => StreamRef,
                 req_started_at => erlang:monotonic_time(millisecond),
-                sock => sock_info(Conn),
                 headers_at => undefined,
                 first_data_at => undefined,
                 bytes_received => 0
