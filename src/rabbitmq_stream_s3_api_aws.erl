@@ -51,9 +51,9 @@ A wrapper around the AWS S3 HTTP API.
 -define(GENERAL_POOL, rabbitmq_stream_s3_general_pool).
 -define(UPLOAD_POOL, rabbitmq_stream_s3_upload_pool).
 %% How long the read path waits for a pooled connection before returning
-%% pool_busy. Sized to cover a same-region TLS handshake (~50-100ms) so the
-%% caller is served by an in-flight grow rather than retrying externally.
--define(READ_CHECKOUT_TIMEOUT_MS, 200).
+%% pool_busy. Observed same-region TLS handshakes complete in 5-34ms; 100ms
+%% gives ~3x headroom while keeping reads responsive.
+-define(READ_CHECKOUT_TIMEOUT_MS, 100).
 %% Amount of data to buffer in async state before giving it to the remote
 %% reader process. See the async_state() type.
 %% 1024^2 (1 MiB).
