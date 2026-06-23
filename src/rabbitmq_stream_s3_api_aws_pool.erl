@@ -62,6 +62,11 @@ the reader pool avoids reader starvation.
     pending = queue:new() :: queue:queue(#pending{}),
     %% Idle timers for available connections.
     idle_timers = #{} :: #{conn() => reference()},
+    %% DIAGNOSTIC (#275/#279, S3 read stall investigation): monotonic
+    %% milliseconds at which each connection process was opened, used to report
+    %% a down connection's age. Populated on grow, cleaned when the connection
+    %% leaves the pool.
+    created = #{} :: #{conn() => integer()},
     counter :: counters:counters_ref()
 }).
 
@@ -296,7 +301,10 @@ handle_info(
             gun:close(Conn),
             {noreply, State0}
     end;
-handle_info({gun_down, Conn, _Protocol, _Reason, _KilledStreams}, #?MODULE{} = State) ->
+handle_info(
+    {gun_down, Conn, _Protocol, Reason, KilledStreams},
+    #?MODULE{checkouts = Checkouts, created = Created} = State
+) ->
     %% With retry=>0, gun stops the connection process immediately after sending
     %% this message (with reason 'normal' for a clean close, or
     %% '{shutdown, Reason}' otherwise). Remove the connection from `available`
@@ -304,6 +312,26 @@ handle_info({gun_down, Conn, _Protocol, _Reason, _KilledStreams}, #?MODULE{} = S
     %% arrives; a request fired onto a down connection is silently lost until it
     %% times out. `monitors` is left intact so the `DOWN` handler still runs the
     %% final cleanup and grows a replacement.
+    %%
+    %% DIAGNOSTIC (#275/#279): log an abnormal close (a non-normal reason, or
+    %% killed in-flight streams) with the connection's age and whether it was
+    %% checked out, to confirm the dead-connection-reuse pattern this fix
+    %% targets. A clean idle close (reason=normal, no killed streams) is not
+    %% logged, to avoid noise from ordinary connection turnover.
+    case Reason =:= normal andalso KilledStreams =:= [] of
+        true ->
+            ok;
+        false ->
+            Age =
+                case Created of
+                    #{Conn := CreatedAt} -> erlang:monotonic_time(millisecond) - CreatedAt;
+                    _ -> undefined
+                end,
+            ?LOG_WARNING(
+                "S3 connection ~tw down: reason=~0p killed_streams=~b checked_out=~tw age=~twms",
+                [Conn, Reason, length(KilledStreams), is_map_key(Conn, Checkouts), Age]
+            )
+    end,
     {noreply, remove_available(Conn, State)};
 handle_info(
     {'DOWN', MRef, process, Pid, _Reason},
@@ -320,7 +348,10 @@ handle_info(
             %% was in use (or at least monitored), so demand exists regardless
             %% of whether anyone is in the Pending queue.
             Conn = Pid,
-            State1 = State0#?MODULE{monitors = maps:remove(Conn, Monitors0)},
+            State1 = State0#?MODULE{
+                monitors = maps:remove(Conn, Monitors0),
+                created = maps:remove(Conn, State0#?MODULE.created)
+            },
             State2 = cancel(Pid, State1),
             {noreply, grow(1, State2)};
         _ ->
@@ -400,10 +431,13 @@ grow(
 
 grow(0, State) ->
     State;
-grow(N, #?MODULE{monitors = Monitors0} = State0) ->
+grow(N, #?MODULE{monitors = Monitors0, created = Created0} = State0) ->
     case open() of
         {ok, Conn} ->
-            State = State0#?MODULE{monitors = Monitors0#{Conn => erlang:monitor(process, Conn)}},
+            State = State0#?MODULE{
+                monitors = Monitors0#{Conn => erlang:monitor(process, Conn)},
+                created = Created0#{Conn => erlang:monotonic_time(millisecond)}
+            },
             grow(N - 1, State);
         {error, Reason} ->
             ?LOG_WARNING("Failed to open S3 connection: ~0p", [Reason]),
@@ -576,12 +610,15 @@ make_available(Conn, #?MODULE{available = Available, idle_timers = Timers} = Sta
 %% Close a connection and stop monitoring it. Used when the connection has
 %% been idle too long, or when its caller died holding it (and we cannot
 %% trust its on-wire state). A no-op if the connection is not in `monitors`.
-close_connection(Conn, #?MODULE{monitors = Monitors} = State) ->
+close_connection(Conn, #?MODULE{monitors = Monitors, created = Created} = State) ->
     case Monitors of
         #{Conn := ConnMRef} ->
             erlang:demonitor(ConnMRef, [flush]),
             gun:close(Conn),
-            State#?MODULE{monitors = maps:remove(Conn, Monitors)};
+            State#?MODULE{
+                monitors = maps:remove(Conn, Monitors),
+                created = maps:remove(Conn, Created)
+            };
         _ ->
             State
     end.
