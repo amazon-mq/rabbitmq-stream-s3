@@ -909,15 +909,29 @@ elapsed_or_undef(Start, At) -> integer_to_list(At - Start) ++ "ms".
 %% host). Queried only on the slow timeout path; tolerates a dead or unknown
 %% connection.
 sock_info(undefined) ->
-    "sock=n/a";
+    "sock=n/a conn=undefined";
 sock_info(Conn) ->
+    Alive = is_process_alive(Conn),
     try gun:info(Conn) of
-        #{sock_ip := SockIp, sock_port := SockPort} ->
-            lists:flatten(io_lib:format("sock=~ts:~b", [inet:ntoa(SockIp), SockPort]));
+        #{state_name := StateName} = Info ->
+            %% state_name=connected with a sock_port means a live socket. Any
+            %% other state, or a missing sock_port, means gun has no usable
+            %% socket for this connection right now (e.g. the pooled connection
+            %% was closed by S3 while idle and is being fired onto regardless).
+            Sock =
+                case Info of
+                    #{sock_ip := SockIp, sock_port := SockPort} ->
+                        lists:flatten(io_lib:format("~ts:~b", [inet:ntoa(SockIp), SockPort]));
+                    _ ->
+                        "none"
+                end,
+            lists:flatten(
+                io_lib:format("sock=~ts gun_state=~p conn_alive=~p", [Sock, StateName, Alive])
+            );
         _ ->
-            "sock=n/a"
+            lists:flatten(io_lib:format("sock=none conn_alive=~p", [Alive]))
     catch
-        _:_ -> "sock=n/a"
+        C:E -> lists:flatten(io_lib:format("sock=err(~p:~p) conn_alive=~p", [C, E, Alive]))
     end.
 
 -spec cancel_async(async_req(), async_state()) -> ok.
