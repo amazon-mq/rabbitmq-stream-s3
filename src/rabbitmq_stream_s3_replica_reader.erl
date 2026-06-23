@@ -658,7 +658,7 @@ identity_formatter(Evt) -> Evt.
 %% Only repairs a genuine cache miss; a no-op once seeded.
 maybe_reseed_local_cache(#state{core = undefined}) ->
     ok;
-maybe_reseed_local_cache(#state{core = Core, cfg = #cfg{stream = StreamId}}) ->
+maybe_reseed_local_cache(#state{core = Core, cfg = #cfg{stream = StreamId, epoch = Epoch}}) ->
     case rabbitmq_stream_s3_replica_reader_core:persisted_manifest(Core) of
         #manifest{next_offset = 0} ->
             %% No remote tier yet; nothing to cache.
@@ -671,7 +671,9 @@ maybe_reseed_local_cache(#state{core = Core, cfg = #cfg{stream = StreamId}}) ->
                         "stream ~ts after a manifest_replica restart",
                         [StreamId]
                     ),
-                    ok = rabbitmq_stream_s3_manifest_replica:put_manifest(StreamId, Manifest);
+                    ok = rabbitmq_stream_s3_manifest_replica:put_manifest(
+                        StreamId, Manifest, Epoch
+                    );
                 _ ->
                     ok
             end
@@ -791,7 +793,7 @@ do_commit(StreamId, Manifest, Epoch, Reference, ExpectedRevision) ->
         ok ->
             case commit_khepri(StreamId, Epoch, Reference, ExpectedRevision, Uid) of
                 {ok, OldRef, NewRevision} ->
-                    delete_old_manifest(StreamId, OldRef),
+                    delete_old_manifest(StreamId, Ref, OldRef),
                     {ok, NewRevision};
                 {error, _} = Err ->
                     Err
@@ -822,11 +824,29 @@ commit_khepri(StreamId, Epoch, Reference, ExpectedRevision, Uid) ->
             Err
     end.
 
-delete_old_manifest(_StreamId, undefined) ->
-    ok;
-delete_old_manifest(StreamId, #manifest_ref{} = Ref) ->
-    Key = rabbitmq_stream_s3:ref_key(StreamId, Ref),
-    rabbitmq_stream_s3_reaper:delete_objects(StreamId, [Key]).
+delete_old_manifest(StreamId, NewRef, OldRef) ->
+    case stale_manifest_ref(NewRef, OldRef) of
+        {delete, Ref} ->
+            Key = rabbitmq_stream_s3:ref_key(StreamId, Ref),
+            rabbitmq_stream_s3_reaper:delete_objects(StreamId, [Key]);
+        skip ->
+            ok
+    end.
+
+%% The prior manifest ref to delete after a commit, or `skip` when nothing can be
+%% safely deleted. The uid is a fresh 32-bit random value per commit
+%% (rabbitmq_stream_s3:uid/0), so it can collide with the immediately-prior
+%% commit's uid at the same epoch. A colliding ref maps to the same S3 key as the
+%% manifest just written, so deleting "the old" object would delete the live
+%% committed manifest. Skip the delete in that case.
+-spec stale_manifest_ref(#manifest_ref{}, #manifest_ref{} | undefined) ->
+    {delete, #manifest_ref{}} | skip.
+stale_manifest_ref(_NewRef, undefined) ->
+    skip;
+stale_manifest_ref(Ref, Ref) ->
+    skip;
+stale_manifest_ref(_NewRef, #manifest_ref{} = OldRef) ->
+    {delete, OldRef}.
 
 -spec serialize_manifest(#manifest{}) -> binary().
 serialize_manifest(#manifest{
@@ -938,7 +958,7 @@ execute_effect({update_range, _FirstOffset, _NextOffset}, #state{cfg = Cfg, core
     %% these offsets in the same batch), so the carried offsets are redundant
     %% and intentionally ignored. Do not change this back to manifest/1.
     Manifest = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(Core),
-    ok = rabbitmq_stream_s3_manifest_replica:put_manifest(Cfg#cfg.stream, Manifest),
+    ok = rabbitmq_stream_s3_manifest_replica:put_manifest(Cfg#cfg.stream, Manifest, Cfg#cfg.epoch),
     on_persist_completed(Manifest, State);
 execute_effect(
     {broadcast, StreamId, Edits},
@@ -1396,7 +1416,7 @@ restart_at_local_floor(
 ) ->
     FreshManifest = reset_manifest(LocalFirst, Revision),
     {Core1, _} = rabbitmq_stream_s3_replica_reader_core:init(FreshManifest, State#state.config),
-    ok = rabbitmq_stream_s3_manifest_replica:put_manifest(StreamId, FreshManifest),
+    ok = rabbitmq_stream_s3_manifest_replica:put_manifest(StreamId, FreshManifest, Epoch),
     %% Propagate the reset to replicas. The fresh manifest carries the discarded
     %% manifest's revision (the broadcast sequence number), so the sync is not
     %% rejected as stale and subsequent broadcasts continue in sequence. Replicas
@@ -2220,6 +2240,24 @@ on_remote_retention_deleted(Refs, StreamId, State) ->
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
+
+%% A fresh-random uid can collide with the immediately-prior commit's uid at the
+%% same epoch, so the "old" manifest ref maps to the same S3 key as the manifest
+%% just written. Deleting it would delete the live committed manifest, so the
+%% colliding ref must be skipped; an absent or genuinely distinct ref behaves as
+%% before (skip / delete respectively).
+stale_manifest_ref_skips_self_collision_test() ->
+    Ref = #manifest_ref{epoch = 7, uid = 42},
+    ?assertEqual(skip, stale_manifest_ref(Ref, undefined)),
+    ?assertEqual(skip, stale_manifest_ref(Ref, Ref)),
+    ?assertEqual(
+        {delete, #manifest_ref{epoch = 7, uid = 41}},
+        stale_manifest_ref(Ref, #manifest_ref{epoch = 7, uid = 41})
+    ),
+    ?assertEqual(
+        {delete, #manifest_ref{epoch = 6, uid = 42}},
+        stale_manifest_ref(Ref, #manifest_ref{epoch = 6, uid = 42})
+    ).
 
 %% A transient metadata-store error must schedule a retry, not resolve empty.
 classify_store_result_transient_error_retries_test() ->
