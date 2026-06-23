@@ -166,59 +166,59 @@ handle_call(
     #?MODULE{pending = Pending0, counter = Cnt} = State0
 ) ->
     case take_available(Pid, State0) of
-        {Conn, State} ->
+        {ok, Conn, State} ->
             counters:add(Cnt, ?C_CHECKOUTS, 1),
             {reply, Conn, State};
-        empty ->
+        {empty, State1} ->
             counters:add(Cnt, ?C_CHECKOUT_QUEUED, 1),
             MRef = erlang:monitor(process, Pid),
             P = #pending{from = From, checkout = Checkout, mref = MRef},
-            State1 = State0#?MODULE{pending = queue:in(P, Pending0)},
-            {noreply, grow(State1)}
+            State2 = State1#?MODULE{pending = queue:in(P, Pending0)},
+            {noreply, grow(State2)}
     end;
 handle_call(
     try_checkout,
     {Pid, _},
     #?MODULE{
         max_size = MaxSize,
-        available = Available,
-        monitors = Monitors,
-        checkouts = Checkouts,
         counter = Cnt
     } = State0
 ) ->
+    %% `take_available` may evict down connections, so the busy paths use the
+    %% state it returns, not `State0` whose `available`/`monitors` would then be
+    %% stale.
     case take_available(Pid, State0) of
-        {Conn, State} ->
+        {ok, Conn, State1} ->
             counters:add(Cnt, ?C_CHECKOUTS, 1),
-            {reply, Conn, State};
-        empty when map_size(Monitors) < MaxSize ->
+            {reply, Conn, State1};
+        {empty, #?MODULE{monitors = Monitors1} = State2} when map_size(Monitors1) < MaxSize ->
             ?LOG_DEBUG(
                 "Pool ~p try_checkout: busy, growing"
                 " (available=~b total=~b checked_out=~b max=~b caller=~p)",
                 [
                     self(),
-                    length(Available),
-                    map_size(Monitors),
-                    map_size(Checkouts),
+                    length(State2#?MODULE.available),
+                    map_size(Monitors1),
+                    map_size(State2#?MODULE.checkouts),
                     MaxSize,
                     Pid
                 ]
             ),
-            {reply, busy, grow(1, State0)};
-        empty ->
+            {reply, busy, grow(1, State2)};
+        {empty, #?MODULE{monitors = Monitors1} = State3} ->
             ?LOG_DEBUG(
                 "Pool ~p try_checkout: busy at max"
                 " (available=~b total=~b checked_out=~b max=~b caller=~p)",
                 [
                     self(),
-                    length(Available),
-                    map_size(Monitors),
-                    map_size(Checkouts),
+                    length(State3#?MODULE.available),
+                    map_size(Monitors1),
+                    map_size(State3#?MODULE.checkouts),
                     MaxSize,
                     Pid
                 ]
             ),
-            {reply, busy, State0}
+            {reply, busy, State3}
     end;
 handle_call(Request, From, State) ->
     ?LOG_INFO(?MODULE_STRING " received unexpected call from ~p: ~W", [From, Request, 10]),
@@ -296,11 +296,15 @@ handle_info(
             gun:close(Conn),
             {noreply, State0}
     end;
-handle_info({gun_down, _Conn, _Protocol, _Reason, _KilledStreams}, #?MODULE{} = State) ->
+handle_info({gun_down, Conn, _Protocol, _Reason, _KilledStreams}, #?MODULE{} = State) ->
     %% With retry=>0, gun stops the connection process immediately after sending
     %% this message (with reason 'normal' for a clean close, or
-    %% '{shutdown, Reason}' otherwise). The 'DOWN' handler does all cleanup.
-    {noreply, State};
+    %% '{shutdown, Reason}' otherwise). Remove the connection from `available`
+    %% now so it cannot be checked out in the window before the monitor `DOWN`
+    %% arrives; a request fired onto a down connection is silently lost until it
+    %% times out. `monitors` is left intact so the `DOWN` handler still runs the
+    %% final cleanup and grows a replacement.
+    {noreply, remove_available(Conn, State)};
 handle_info(
     {'DOWN', MRef, process, Pid, _Reason},
     #?MODULE{
@@ -457,15 +461,24 @@ take_available(
 ) ->
     case Available0 of
         [Conn | Available] ->
-            MRef = erlang:monitor(process, Pid),
-            State = State0#?MODULE{
-                available = Available,
-                checkouts = Checkouts0#{Conn => MRef},
-                checkouts_rev = CheckoutsRev0#{MRef => Conn}
-            },
-            {Conn, cancel_idle_timer(Conn, State)};
+            case usable(Conn) of
+                true ->
+                    MRef = erlang:monitor(process, Pid),
+                    State = State0#?MODULE{
+                        available = Available,
+                        checkouts = Checkouts0#{Conn => MRef},
+                        checkouts_rev = CheckoutsRev0#{MRef => Conn}
+                    },
+                    {ok, Conn, cancel_idle_timer(Conn, State)};
+                false ->
+                    %% Connection is down or disconnected; drop it and try the
+                    %% next. `monitors` is left intact so the `DOWN` handler
+                    %% still runs the final cleanup and grows a replacement.
+                    State = cancel_idle_timer(Conn, State0#?MODULE{available = Available}),
+                    take_available(Pid, State)
+            end;
         [] ->
-            empty
+            {empty, State0}
     end.
 
 checkout(
@@ -479,15 +492,24 @@ checkout(
 ) ->
     case {queue:out(Pending0), Available0} of
         {{{value, #pending{from = From, mref = MRef}}, Pending}, [Conn | Available]} ->
-            counters:add(Cnt, ?C_CHECKOUTS, 1),
-            gen_server:reply(From, Conn),
-            State1 = cancel_idle_timer(Conn, State0#?MODULE{
-                pending = Pending,
-                available = Available,
-                checkouts = Checkouts0#{Conn => MRef},
-                checkouts_rev = CheckoutsRev0#{MRef => Conn}
-            }),
-            checkout(State1);
+            case usable(Conn) of
+                true ->
+                    counters:add(Cnt, ?C_CHECKOUTS, 1),
+                    gen_server:reply(From, Conn),
+                    State1 = cancel_idle_timer(Conn, State0#?MODULE{
+                        pending = Pending,
+                        available = Available,
+                        checkouts = Checkouts0#{Conn => MRef},
+                        checkouts_rev = CheckoutsRev0#{MRef => Conn}
+                    }),
+                    checkout(State1);
+                false ->
+                    %% Down connection at the head; drop it (leaving `monitors`
+                    %% for the `DOWN` handler) and retry without consuming the
+                    %% pending entry, so the waiting caller still gets served.
+                    State1 = cancel_idle_timer(Conn, State0#?MODULE{available = Available}),
+                    checkout(State1)
+            end;
         _ ->
             State0
     end.
@@ -515,6 +537,33 @@ cancel(
                 false ->
                     State0
             end
+    end.
+
+%% A connection is usable for a new request only if its gun process is alive
+%% and in the `connected` state. After S3 closes an idle connection gun clears
+%% its socket and moves to `not_connected` (then stops, with retry=>0); a
+%% request fired at it in that window is silently lost until the request times
+%% out. Checked on checkout so such a connection is never handed out, covering
+%% the window where the checkout is processed before gun's `gun_down`.
+usable(Conn) ->
+    is_process_alive(Conn) andalso
+        case catch gun:info(Conn) of
+            #{state_name := connected} -> true;
+            _ -> false
+        end.
+
+%% Remove a connection from `available` and cancel its idle timer, leaving
+%% `monitors` and `checkouts` untouched. Used when gun reports the connection
+%% down: it must not be checked out, but the monitor `DOWN` handler still owns
+%% the final cleanup (removing it from `monitors` and growing a replacement).
+%% A no-op if the connection is not currently available (e.g. checked out).
+remove_available(Conn, #?MODULE{available = Available0} = State) ->
+    case lists:member(Conn, Available0) of
+        true ->
+            State1 = State#?MODULE{available = lists:delete(Conn, Available0)},
+            cancel_idle_timer(Conn, State1);
+        false ->
+            State
     end.
 
 make_available(Conn, #?MODULE{available = Available, idle_timers = Timers} = State) ->
