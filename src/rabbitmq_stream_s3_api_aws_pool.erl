@@ -472,10 +472,26 @@ open() ->
                     {receiver_spawn_opts, [{fullsweep_after, 0}]},
                     {sender_spawn_opts, [{fullsweep_after, 0}]}
                 ],
-                %% Let connections which were closed from idleness (or errors) close
-                %% and be reopened lazily. With TLSv1.3 it only costs one round trip.
-                %% This pool optimizes for best resource use rather than consistently
-                %% low latency. (A fully idle broker should have a min-sized pool.)
+                %% retry => 0: gun does not reconnect a closed connection. The
+                %% pool manages connection lifecycle itself - a connection closed
+                %% from idleness or error is discarded and a fresh one is grown,
+                %% rather than gun silently reconnecting underneath the pool (a
+                %% reconnecting gun process sits in not_connected/domain_lookup
+                %% for tens of ms while the pool still believes it is usable).
+                %% With TLSv1.3 reopening costs one round trip; this pool
+                %% optimizes for resource use over consistently low latency (a
+                %% fully idle broker should have a min-sized pool).
+                %%
+                %% Consequence: with retry => 0, a request issued on a connection
+                %% gun has already moved out of the `connected` state is
+                %% postponed and then lost when the process stops, surfacing only
+                %% as a request timeout (#279). The checkout path must therefore
+                %% verify a connection is still usable before handing it out, and
+                %% the gun_down handler must evict it promptly. See `usable/1` and
+                %% the gun_down clause. The alternative - a small retry plus a
+                %% short "no response started" timeout so gun self-heals and a
+                %% stranded request fails fast - is a larger lifecycle change that
+                %% has not been made.
                 retry => 0
             },
             gun:open(Host, 443, Opts);
