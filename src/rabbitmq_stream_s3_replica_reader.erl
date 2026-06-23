@@ -658,7 +658,7 @@ identity_formatter(Evt) -> Evt.
 %% Only repairs a genuine cache miss; a no-op once seeded.
 maybe_reseed_local_cache(#state{core = undefined}) ->
     ok;
-maybe_reseed_local_cache(#state{core = Core, cfg = #cfg{stream = StreamId}}) ->
+maybe_reseed_local_cache(#state{core = Core, cfg = #cfg{stream = StreamId, epoch = Epoch}}) ->
     case rabbitmq_stream_s3_replica_reader_core:persisted_manifest(Core) of
         #manifest{next_offset = 0} ->
             %% No remote tier yet; nothing to cache.
@@ -671,7 +671,9 @@ maybe_reseed_local_cache(#state{core = Core, cfg = #cfg{stream = StreamId}}) ->
                         "stream ~ts after a manifest_replica restart",
                         [StreamId]
                     ),
-                    ok = rabbitmq_stream_s3_manifest_replica:put_manifest(StreamId, Manifest);
+                    ok = rabbitmq_stream_s3_manifest_replica:put_manifest(
+                        StreamId, Manifest, Epoch
+                    );
                 _ ->
                     ok
             end
@@ -938,7 +940,7 @@ execute_effect({update_range, _FirstOffset, _NextOffset}, #state{cfg = Cfg, core
     %% these offsets in the same batch), so the carried offsets are redundant
     %% and intentionally ignored. Do not change this back to manifest/1.
     Manifest = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(Core),
-    ok = rabbitmq_stream_s3_manifest_replica:put_manifest(Cfg#cfg.stream, Manifest),
+    ok = rabbitmq_stream_s3_manifest_replica:put_manifest(Cfg#cfg.stream, Manifest, Cfg#cfg.epoch),
     on_persist_completed(Manifest, State);
 execute_effect(
     {broadcast, StreamId, Edits},
@@ -1396,7 +1398,7 @@ restart_at_local_floor(
 ) ->
     FreshManifest = reset_manifest(LocalFirst, Revision),
     {Core1, _} = rabbitmq_stream_s3_replica_reader_core:init(FreshManifest, State#state.config),
-    ok = rabbitmq_stream_s3_manifest_replica:put_manifest(StreamId, FreshManifest),
+    ok = rabbitmq_stream_s3_manifest_replica:put_manifest(StreamId, FreshManifest, Epoch),
     %% Propagate the reset to replicas. The fresh manifest carries the discarded
     %% manifest's revision (the broadcast sequence number), so the sync is not
     %% rejected as stale and subsequent broadcasts continue in sequence. Replicas

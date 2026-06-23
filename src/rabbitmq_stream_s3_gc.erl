@@ -193,14 +193,32 @@ build_lookup(Streams) ->
             %% which is acceptable for an infrequent operator-driven sweep.
             case rabbitmq_stream_s3_db:get_consistent(StreamId) of
                 {ok, #{epoch := Epoch}} ->
-                    case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
-                        #manifest{entries = <<>>} ->
+                    %% The floor comes from the local replica cache, but the
+                    %% committed epoch comes from the quorum read above. On a node
+                    %% that has not yet applied a floor-lowering reset's sync, the
+                    %% cache still holds the pre-reset high floor at the old epoch,
+                    %% and still_dangling/1 would re-read that same stale floor.
+                    %% Sweep only when the cached manifest's epoch matches the
+                    %% committed epoch; otherwise fail closed (the cache lags the
+                    %% committed reset). The `Epoch` in the matching clause is the
+                    %% committed epoch bound above, so the clause only matches an
+                    %% up-to-date cache.
+                    case rabbitmq_stream_s3_manifest_replica:get_manifest_and_epoch(StreamId) of
+                        {#manifest{entries = <<>>}, _} ->
                             %% Empty manifest: nothing in the remote tier to
                             %% compare against (matches the prior get_range/1
                             %% `empty` skip).
                             Acc;
-                        #manifest{first_offset = FirstOffset} = Manifest ->
+                        {#manifest{first_offset = FirstOffset} = Manifest, Epoch} ->
                             Acc#{StreamId => lookup_entry(StreamId, Epoch, FirstOffset, Manifest)};
+                        {#manifest{}, CacheEpoch} ->
+                            ?LOG_INFO(
+                                "GC for stream ~ts skipped: local manifest cache epoch ~p "
+                                "does not match the committed epoch ~p; the cache lags the "
+                                "committed reset, so its floor may be stale-high",
+                                [StreamId, CacheEpoch, Epoch]
+                            ),
+                            Acc;
                         undefined ->
                             Acc
                     end;
@@ -285,13 +303,27 @@ build_stream_lookup(StreamId, Config) ->
                     %% first_offset at the local floor, and that floor is precisely
                     %% what the orphaned fragments sit below. Using get_range/1
                     %% here would skip the stream and reclaim nothing.
-                    case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
-                        #manifest{first_offset = FirstOffset} = Manifest ->
+                    %% Sweep only against a cache at the committed epoch (see
+                    %% build_lookup/1). On the reset path the writer's own cache
+                    %% was just updated synchronously at this epoch, so this is a
+                    %% no-op there; it fails closed for any caller reading a node
+                    %% whose cache lags the committed reset. The matching clause
+                    %% reuses CommittedEpoch, so it only matches an up-to-date cache.
+                    case rabbitmq_stream_s3_manifest_replica:get_manifest_and_epoch(StreamId) of
+                        {#manifest{first_offset = FirstOffset} = Manifest, CommittedEpoch} ->
                             {ok, #{
                                 StreamId => lookup_entry(
                                     StreamId, CommittedEpoch, FirstOffset, Manifest
                                 )
                             }};
+                        {#manifest{}, CacheEpoch} ->
+                            ?LOG_INFO(
+                                "GC for stream ~ts skipped: local manifest cache epoch ~p "
+                                "does not match the committed epoch ~p; the cache lags the "
+                                "committed reset, so its floor may be stale-high",
+                                [StreamId, CacheEpoch, CommittedEpoch]
+                            ),
+                            skip;
                         undefined ->
                             skip
                     end;

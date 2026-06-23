@@ -19,6 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       gc_reset: ${{ steps.filter.outputs.gc_reset }}
+      gc_reset_multinode: ${{ steps.filter.outputs.gc_reset_multinode }}
       gc_leading_group: ${{ steps.filter.outputs.gc_leading_group }}
       gc_reset_leading_group: ${{ steps.filter.outputs.gc_reset_leading_group }}
       read_resolution: ${{ steps.filter.outputs.read_resolution }}
@@ -40,10 +41,12 @@ jobs:
           fi
           CHANGED=$(git diff --name-only "$BASE" HEAD)
           echo "gc_reset=false" >> "$GITHUB_OUTPUT"
+          echo "gc_reset_multinode=false" >> "$GITHUB_OUTPUT"
           echo "gc_leading_group=false" >> "$GITHUB_OUTPUT"
           echo "gc_reset_leading_group=false" >> "$GITHUB_OUTPUT"
           echo "read_resolution=false" >> "$GITHUB_OUTPUT"
           echo "$CHANGED" | grep -q '^p/gc-reset/' && echo "gc_reset=true" >> "$GITHUB_OUTPUT" || true
+          echo "$CHANGED" | grep -q '^p/gc-reset-multinode/' && echo "gc_reset_multinode=true" >> "$GITHUB_OUTPUT" || true
           echo "$CHANGED" | grep -q '^p/gc-leading-group/' && echo "gc_leading_group=true" >> "$GITHUB_OUTPUT" || true
           echo "$CHANGED" | grep -q '^p/gc-reset-leading-group/' && echo "gc_reset_leading_group=true" >> "$GITHUB_OUTPUT" || true
           echo "$CHANGED" | grep -q '^p/read-resolution/' && echo "read_resolution=true" >> "$GITHUB_OUTPUT" || true
@@ -57,6 +60,7 @@ jobs:
           echo "$CHANGED" | grep -q '^p/writer-fencing/' && echo "writer_fencing=true" >> "$GITHUB_OUTPUT" || true
           if echo "$CHANGED" | grep -q '^\.github/workflows/p-model-check\.yaml'; then
             echo "gc_reset=true" >> "$GITHUB_OUTPUT"
+            echo "gc_reset_multinode=true" >> "$GITHUB_OUTPUT"
             echo "gc_leading_group=true" >> "$GITHUB_OUTPUT"
             echo "gc_reset_leading_group=true" >> "$GITHUB_OUTPUT"
             echo "read_resolution=true" >> "$GITHUB_OUTPUT"
@@ -128,6 +132,53 @@ jobs:
             exit 1
           fi
           echo "Gate satisfied: floor-last ordering fails with the expected dangling reference."
+          echo "::endgroup::"
+
+  gc-reset-multinode:
+    needs: changes
+    if: needs.changes.outputs.gc_reset_multinode == 'true' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2 # v5.3.0
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install the P checker
+        run: |
+          dotnet tool install --global P --version 3.1.0
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+      - name: Compile
+        run: |
+          cd p/gc-reset-multinode
+          p compile
+      - name: Tests that must hold
+        run: |
+          cd p/gc-reset-multinode
+          for tc in tcMultiNodeStaleGuarded tcMultiNodeSyncedGuarded tcMultiNodeExplore; do
+            echo "::group::$tc (expect hold)"
+            p check -tc "$tc" -i 5000
+            echo "::endgroup::"
+          done
+          # PCT surfaces rare interleavings the random strategy misses.
+          echo "::group::tcMultiNodeExplore (PCT)"
+          p check -tc tcMultiNodeExplore --sch-pct 10 -i 5000
+          echo "::endgroup::"
+      - name: Validation gate (a stale replica cache must defeat still_dangling)
+        run: |
+          cd p/gc-reset-multinode
+          rm -rf PCheckerOutput/
+          echo "::group::tcMultiNodeStaleUnguarded (expect the cross-node GC x reset counterexample)"
+          if p check -tc tcMultiNodeStaleUnguarded -i 2000; then
+            echo "ERROR: tcMultiNodeStaleUnguarded passed; the model no longer reproduces the stale-cache delete."
+            echo "With the epoch guard off and the reset sync dropped, the shipped still_dangling/1 guard"
+            echo "must re-read the stale floor and delete a live object, otherwise the guarded result is not trustworthy."
+            exit 1
+          fi
+          if ! grep -rqF 'INV#2 violated: GC deleted live object (offset=850, uid=2)' PCheckerOutput/BugFinding/; then
+            echo "ERROR: the unguarded run failed, but not with the expected INV#2 (850, uid 2) counterexample."
+            exit 1
+          fi
+          echo "Gate satisfied: a stale replica cache defeats still_dangling and deletes the re-tiered live object."
           echo "::endgroup::"
 
   gc-leading-group:
