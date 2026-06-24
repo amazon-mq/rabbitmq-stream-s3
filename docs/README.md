@@ -60,6 +60,7 @@ Understand enough to configure, monitor, and troubleshoot the plugin.
 3. [enabling.md](./enabling.md): turning the plugin on for new and existing clusters
 4. [operations.md](./operations.md): configuration, metrics, debugging
 5. [failure-modes.md](./failure-modes.md): what breaks, what the system does, what you do
+6. [troubleshooting.md](./troubleshooting.md): symptoms that look like plugin bugs but originate in the host (network limits, instance sizing)
 
 ### Developer track
 

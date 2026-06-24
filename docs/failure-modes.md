@@ -107,7 +107,7 @@ Discarding remote manifest and restarting from the local log.
 **Mitigation.**
 
 - For S3 throttling: the system retries automatically. S3 scales up under sustained traffic.
-- For network or capacity issues: review instance bandwidth and `stream_s3.max_transfer_bytes_per_sec` if it is set.
+- For network or capacity issues: review instance bandwidth and `stream_s3.max_transfer_bytes_per_sec` if it is set. A sustained upload rate that holds then cliffs to a flat floor is usually host network burst-credit exhaustion, not the plugin; see [troubleshooting.md](./troubleshooting.md#upload-throughput-cliffs-after-a-sustained-burst).
 - For sustained over-throughput: ensure local retention has enough headroom that uploads can catch up after transient slowdowns.
 
 **Resolution.** Transient lag is self-correcting. Persistent lag indicates a capacity mismatch between write throughput and upload throughput; treat this as a capacity-planning issue.
@@ -158,9 +158,9 @@ Discarding remote manifest and restarting from the local log.
 
 **Trigger.** A node crashes (losing unflushed page cache data) and the node holding the surviving copy is partitioned from the remaining cluster.
 
-**Example.** Three nodes A, B, C all at committed offset 100. Node B crashes and restarts with only offset 75 on disk (offsets 76–100 were in page cache). Node A is then partitioned from B and C. Nodes B and C elect B as writer in a new epoch. B begins writing from offset 76, overwriting the old 76–100. Node A has the original data but is partitioned and will truncate when it rejoins.
+**Example.** Three nodes A, B, C all at committed offset 100. Node B crashes and restarts with only offset 75 on disk (offsets 76-100 were in page cache). Node A is then partitioned from B and C. Nodes B and C elect B as writer in a new epoch. B begins writing from offset 76, overwriting the old 76-100. Node A has the original data but is partitioned and will truncate when it rejoins.
 
-Committed data (offsets 76–100, confirmed to publishers) is lost. This requires only a single node crash plus a partition, not simultaneous power loss on multiple nodes.
+Committed data (offsets 76-100, confirmed to publishers) is lost. This requires only a single node crash plus a partition, not simultaneous power loss on multiple nodes.
 
 **Impact assessment.** Confirmed messages are lost. The stream is shorter than expected from the publisher's perspective. Publishers received confirms for messages that no longer exist anywhere in the cluster. If the lost range had been uploaded to S3 before the crash, the data is recoverable from the remote tier.
 
