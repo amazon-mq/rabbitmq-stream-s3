@@ -219,70 +219,78 @@ handle_cast(Message, State) ->
     ?LOG_DEBUG(?MODULE_STRING " received unexpected cast: ~W", [Message, 10]),
     {noreply, State}.
 
+get_conn_age(Conn, #?MODULE{created = Created}) when is_map_key(Conn, Created) ->
+    CreatedAt = maps:get(Conn, Created),
+    rabbitmq_stream_s3_util:elapsed_ms(CreatedAt);
+get_conn_age(_Conn, _State) ->
+    undefined.
+
+handle_gun_up(
+    Conn, #?MODULE{monitors = Monitors, available = Available, checkouts = Checkouts} = State
+) when is_map_key(Conn, Monitors) ->
+    ConnAge = get_conn_age(Conn, State),
+    ?LOG_DEBUG(
+        "Pool ~p gun_up: connection ~p ready in ~twms"
+        " (available=~b total=~b checked_out=~b)",
+        [
+            self(),
+            Conn,
+            ConnAge,
+            length(Available),
+            map_size(Monitors),
+            map_size(Checkouts)
+        ]
+    ),
+    {noreply, make_available(Conn, State)};
+handle_gun_up(Conn, State) ->
+    %% Stale gun_up from a connection opened by a previous pool instance.
+    gun:close(Conn),
+    {noreply, State}.
+
+%% With retry=>0, gun stops the connection process immediately after sending
+%% this message (with reason 'normal' for a clean close, or
+%% '{shutdown, Reason}' otherwise). Remove the connection from `available`
+%% now so it cannot be checked out in the window before the monitor `DOWN`
+%% arrives; a request fired onto a down connection is silently lost until it
+%% times out. `monitors` is left intact so the `DOWN` handler still runs the
+%% final cleanup and grows a replacement.
+%%
+%% Log abnormal closes with the connection's age and checkout status.
+%% Clean idle closes are not logged: reason=normal is gun's own clean
+%% shutdown; reason=closed is the remote side (S3) closing an idle
+%% keep-alive connection.
+handle_gun_down(Conn, Reason, _KilledStreams = [], State) when
+    Reason =:= normal orelse Reason =:= closed
+->
+    {noreply, remove_available(Conn, State)};
+handle_gun_down(Conn, Reason, KilledStreams, #?MODULE{checkouts = Checkouts} = State) ->
+    ConnAge = get_conn_age(Conn, State),
+    ?LOG_WARNING(
+        "S3 connection ~tw down: reason=~0p killed_streams=~b checked_out=~tw age=~twms",
+        [Conn, Reason, length(KilledStreams), is_map_key(Conn, Checkouts), ConnAge]
+    ),
+    {noreply, remove_available(Conn, State)}.
+
 handle_info(grow, State0) ->
     {noreply, grow(State0)};
-handle_info(
-    {gun_up, Conn, _Protocol},
-    #?MODULE{monitors = Monitors, available = Available, checkouts = Checkouts, created = Created} =
-        State0
-) ->
-    case is_map_key(Conn, Monitors) of
-        true ->
-            OpenMs =
-                case Created of
-                    #{Conn := CreatedAt} -> rabbitmq_stream_s3_util:elapsed_ms(CreatedAt);
-                    _ -> undefined
-                end,
-            ?LOG_DEBUG(
-                "Pool ~p gun_up: connection ~p ready in ~twms"
-                " (available=~b total=~b checked_out=~b)",
-                [
-                    self(),
-                    Conn,
-                    OpenMs,
-                    length(Available),
-                    map_size(Monitors),
-                    map_size(Checkouts)
-                ]
-            ),
-            {noreply, make_available(Conn, State0)};
-        false ->
-            %% Stale gun_up from a connection opened by a previous pool instance.
-            gun:close(Conn),
-            {noreply, State0}
-    end;
-handle_info(
-    {gun_down, Conn, _Protocol, Reason, KilledStreams},
-    #?MODULE{checkouts = Checkouts, created = Created} = State
-) ->
-    %% With retry=>0, gun stops the connection process immediately after sending
-    %% this message (with reason 'normal' for a clean close, or
-    %% '{shutdown, Reason}' otherwise). Remove the connection from `available`
-    %% now so it cannot be checked out in the window before the monitor `DOWN`
-    %% arrives; a request fired onto a down connection is silently lost until it
-    %% times out. `monitors` is left intact so the `DOWN` handler still runs the
-    %% final cleanup and grows a replacement.
-    %%
-    %% Log abnormal closes (non-normal reason or killed in-flight streams)
-    %% with the connection's age and checkout status. Clean idle closes
-    %% (reason=normal, no killed streams) are not logged.
-    case Reason =:= normal andalso KilledStreams =:= [] of
-        true ->
-            ok;
-        false ->
-            Age =
-                case Created of
-                    #{Conn := CreatedAt} -> rabbitmq_stream_s3_util:elapsed_ms(CreatedAt);
-                    _ -> undefined
-                end,
-            ?LOG_WARNING(
-                "S3 connection ~tw down: reason=~0p killed_streams=~b checked_out=~tw age=~twms",
-                [Conn, Reason, length(KilledStreams), is_map_key(Conn, Checkouts), Age]
-            )
-    end,
-    {noreply, remove_available(Conn, State)};
-handle_info(
-    {'DOWN', MRef, process, Pid, _Reason},
+handle_info({gun_up, Conn, _Protocol}, State) ->
+    handle_gun_up(Conn, State);
+handle_info({gun_down, Conn, _Protocol, Reason, KilledStreams}, State) ->
+    handle_gun_down(Conn, Reason, KilledStreams, State);
+handle_info({'DOWN', MRef, process, Pid, _Reason}, State) ->
+    handle_down(MRef, Pid, State);
+handle_info({idle_timeout, Conn}, State) ->
+    handle_idle_timeout(Conn, State);
+handle_info(Message, State) ->
+    ?LOG_DEBUG(
+        ?MODULE_STRING " received unexpected message: ~W",
+        [Message, 10]
+    ),
+    {noreply, State}.
+
+handle_down(
+    MRef,
+    Pid,
     #?MODULE{
         checkouts = Checkouts0,
         checkouts_rev = CheckoutsRev0,
@@ -328,10 +336,10 @@ handle_info(
                     State = State0#?MODULE{pending = Pending},
                     {noreply, State}
             end
-    end;
-handle_info(
-    {idle_timeout, Conn},
-    #?MODULE{idle_timers = Timers, monitors = Monitors, min_size = MinSize} = State0
+    end.
+
+handle_idle_timeout(
+    Conn, #?MODULE{idle_timers = Timers, monitors = Monitors, min_size = MinSize} = State0
 ) ->
     case Timers of
         #{Conn := _} when map_size(Monitors) =< MinSize ->
@@ -348,13 +356,7 @@ handle_info(
         _ ->
             %% Timer was already cancelled (stale message). Ignore.
             {noreply, State0}
-    end;
-handle_info(Message, State) ->
-    ?LOG_DEBUG(
-        ?MODULE_STRING " received unexpected message: ~W",
-        [Message, 10]
-    ),
-    {noreply, State}.
+    end.
 
 format_status(#{state := State0} = Status0) ->
     Status0#{state := format_state(State0)}.
