@@ -10,6 +10,8 @@ lives here. Callers use these functions instead of calling
 `application:get_env/2,3` directly.
 """.
 
+-include("include/rabbitmq_stream_s3.hrl").
+
 -export([
     api_backend/0,
     aws_access_key/0,
@@ -23,9 +25,10 @@ lives here. Callers use these functions instead of calling
     upload_pool_max_size/0,
     general_pool_min_size/0,
     general_pool_max_size/0,
-    manifest_rebalance_factor/0,
-    manifest_debounce_modifications/0,
-    manifest_debounce_milliseconds/0,
+    fragment_target_size/0,
+    persist_threshold/0,
+    persist_interval_ms/0,
+    rebalance_threshold/0,
     membership_reconciliation_enabled/0,
     membership_reconciliation_interval/0,
     membership_reconciliation_trigger_interval/0,
@@ -112,17 +115,30 @@ general_pool_min_size() ->
 general_pool_max_size() ->
     application:get_env(?APP, general_pool_max_size, 50).
 
--spec manifest_rebalance_factor() -> pos_integer().
-manifest_rebalance_factor() ->
-    application:get_env(?APP, manifest_rebalance_factor, 1024).
+%% Target byte size at which the replica reader cuts a fragment for upload.
+-spec fragment_target_size() -> pos_integer().
+fragment_target_size() ->
+    application:get_env(?APP, fragment_target_size, ?MAX_FRAGMENT_SIZE_B).
 
--spec manifest_debounce_modifications() -> non_neg_integer().
-manifest_debounce_modifications() ->
-    application:get_env(?APP, manifest_debounce_modifications, 10).
+%% Number of applied fragments after which a manifest persist is triggered.
+-spec persist_threshold() -> non_neg_integer().
+persist_threshold() ->
+    application:get_env(?APP, persist_threshold, 5).
 
--spec manifest_debounce_milliseconds() -> non_neg_integer().
-manifest_debounce_milliseconds() ->
-    application:get_env(?APP, manifest_debounce_milliseconds, 5000).
+%% Maximum time between manifest persists, in milliseconds. Bounds the persist
+%% window when fragments arrive slowly.
+-spec persist_interval_ms() -> non_neg_integer().
+persist_interval_ms() ->
+    application:get_env(?APP, persist_interval_ms, 2000).
+
+%% Manifest-tree branching factor: the number of same-kind leading entries in
+%% the root that triggers factoring them out into a group of the next-higher
+%% kind. A smaller value reduces memory footprint but increases the number of
+%% remote-tier requests during factoring and search; a larger value does the
+%% reverse.
+-spec rebalance_threshold() -> pos_integer().
+rebalance_threshold() ->
+    application:get_env(?APP, rebalance_threshold, 1024).
 
 -spec membership_reconciliation_enabled() -> boolean().
 membership_reconciliation_enabled() ->
@@ -247,9 +263,10 @@ defaults_test_() ->
         ?_assertEqual(20, upload_pool_max_size()),
         ?_assertEqual(2, general_pool_min_size()),
         ?_assertEqual(50, general_pool_max_size()),
-        ?_assertEqual(1024, manifest_rebalance_factor()),
-        ?_assertEqual(10, manifest_debounce_modifications()),
-        ?_assertEqual(5000, manifest_debounce_milliseconds()),
+        ?_assertEqual(?MAX_FRAGMENT_SIZE_B, fragment_target_size()),
+        ?_assertEqual(5, persist_threshold()),
+        ?_assertEqual(2000, persist_interval_ms()),
+        ?_assertEqual(1024, rebalance_threshold()),
         ?_assertEqual(false, membership_reconciliation_enabled()),
         ?_assertEqual(3_600_000, membership_reconciliation_interval()),
         ?_assertEqual(10_000, membership_reconciliation_trigger_interval()),

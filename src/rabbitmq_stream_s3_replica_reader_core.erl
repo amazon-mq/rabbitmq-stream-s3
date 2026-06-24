@@ -115,14 +115,18 @@ init(Manifest, Opts) ->
         persist_threshold = maps:get(
             persist_threshold,
             Opts,
-            application:get_env(rabbitmq_stream_s3, persist_threshold, 5)
+            rabbitmq_stream_s3_config:persist_threshold()
         ),
         persist_interval_ms = maps:get(
             persist_interval_ms,
             Opts,
-            application:get_env(rabbitmq_stream_s3, persist_interval_ms, 2000)
+            rabbitmq_stream_s3_config:persist_interval_ms()
         ),
-        rebalance_threshold = maps:get(rebalance_threshold, Opts, 1024)
+        rebalance_threshold = maps:get(
+            rebalance_threshold,
+            Opts,
+            rabbitmq_stream_s3_config:rebalance_threshold()
+        )
     },
     State = #state{
         cfg = Cfg,
