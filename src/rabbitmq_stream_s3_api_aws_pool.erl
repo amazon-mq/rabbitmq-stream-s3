@@ -531,9 +531,11 @@ cancel(Conn, State) ->
 %% the window where the checkout is processed before gun's `gun_down`.
 usable(Conn) ->
     is_process_alive(Conn) andalso
-        case catch gun:info(Conn) of
+        try gun:info(Conn) of
             #{state_name := connected} -> true;
             _ -> false
+        catch
+            _:_ -> false
         end.
 
 %% Remove a connection from `available` and cancel its idle timer, leaving
