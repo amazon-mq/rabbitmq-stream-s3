@@ -197,23 +197,24 @@ handle_checkin(
 handle_checkin(_Conn, State) ->
     {noreply, State}.
 
-handle_cast({checkin, Conn}, State) ->
-    handle_checkin(Conn, State);
-handle_cast({cancel_checkout, Checkout}, #?MODULE{pending = Pending0, counter = Cnt} = State0) ->
+handle_cancel_checkout(Checkout, #?MODULE{pending = Pending0, counter = Cnt} = State0) ->
     Pending = queue:delete_with(
-        fun(#pending{checkout = C, mref = MRef}) ->
-            case C =:= Checkout of
-                true ->
-                    counters:add(Cnt, ?C_CHECKOUT_CANCELLED, 1),
-                    erlang:demonitor(MRef, [flush]),
-                    true;
-                false ->
-                    false
-            end
+        fun
+            (#pending{checkout = C, mref = MRef}) when C =:= Checkout ->
+                counters:add(Cnt, ?C_CHECKOUT_CANCELLED, 1),
+                erlang:demonitor(MRef, [flush]),
+                true;
+            (_Pending) ->
+                false
         end,
         Pending0
     ),
-    {noreply, State0#?MODULE{pending = Pending}};
+    {noreply, State0#?MODULE{pending = Pending}}.
+
+handle_cast({checkin, Conn}, State) ->
+    handle_checkin(Conn, State);
+handle_cast({cancel_checkout, Checkout}, State) ->
+    handle_cancel_checkout(Checkout, State);
 handle_cast(Message, State) ->
     ?LOG_DEBUG(?MODULE_STRING " received unexpected cast: ~W", [Message, 10]),
     {noreply, State}.
