@@ -565,18 +565,18 @@ make_available(Conn, #?MODULE{available = Available, idle_timers = Timers} = Sta
 %% Close a connection and stop monitoring it. Used when the connection has
 %% been idle too long, or when its caller died holding it (and we cannot
 %% trust its on-wire state). A no-op if the connection is not in `monitors`.
-close_connection(Conn, #?MODULE{monitors = Monitors, created = Created} = State) ->
-    case Monitors of
-        #{Conn := ConnMRef} ->
-            erlang:demonitor(ConnMRef, [flush]),
-            gun:close(Conn),
-            State#?MODULE{
-                monitors = maps:remove(Conn, Monitors),
-                created = maps:remove(Conn, Created)
-            };
-        _ ->
-            State
-    end.
+close_connection(Conn, #?MODULE{monitors = Monitors, created = Created} = State) when
+    is_map_key(Conn, Monitors)
+->
+    ConnMRef = maps:get(Conn, Monitors),
+    erlang:demonitor(ConnMRef, [flush]),
+    gun:close(Conn),
+    State#?MODULE{
+        monitors = maps:remove(Conn, Monitors),
+        created = maps:remove(Conn, Created)
+    };
+close_connection(_Conn, State) ->
+    State.
 
 cancel_idle_timer(Conn, #?MODULE{idle_timers = Timers0} = State) ->
     case Timers0 of
