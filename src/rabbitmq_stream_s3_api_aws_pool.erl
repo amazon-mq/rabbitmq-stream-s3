@@ -578,14 +578,14 @@ close_connection(Conn, #?MODULE{monitors = Monitors, created = Created} = State)
 close_connection(_Conn, State) ->
     State.
 
-cancel_idle_timer(Conn, #?MODULE{idle_timers = Timers0} = State) ->
-    case Timers0 of
-        #{Conn := TRef} ->
-            ok = erlang:cancel_timer(TRef, [{async, true}, {info, false}]),
-            State#?MODULE{idle_timers = maps:remove(Conn, Timers0)};
-        _ ->
-            State
-    end.
+cancel_idle_timer(Conn, #?MODULE{idle_timers = Timers0} = State) when
+    is_map_key(Conn, Timers0)
+->
+    TRef = maps:get(Conn, Timers0),
+    ok = erlang:cancel_timer(TRef, [{async, true}, {info, false}]),
+    State#?MODULE{idle_timers = maps:remove(Conn, Timers0)};
+cancel_idle_timer(_Conn, State) ->
+    State.
 
 format_state(#?MODULE{
     min_size = MinSize,
