@@ -271,8 +271,66 @@ handle_gun_down(Conn, Reason, KilledStreams, #?MODULE{checkouts = Checkouts} = S
     ),
     {noreply, remove_available(Conn, State)}.
 
-handle_info(grow, State0) ->
-    {noreply, grow(State0)};
+%% A connection is down. Replace it unconditionally: the connection was in
+%% use (or at least monitored), so demand exists regardless of whether
+%% anyone is in the Pending queue.
+handle_down(MRef, Pid, #?MODULE{monitors = Monitors} = State0) when
+    is_map_key(Pid, Monitors)
+->
+    Conn = Pid,
+    ?assert(MRef =:= maps:get(Conn, Monitors)),
+    State1 = State0#?MODULE{
+        monitors = maps:remove(Conn, Monitors),
+        created = maps:remove(Conn, State0#?MODULE.created)
+    },
+    State2 = cancel(Conn, State1),
+    {noreply, grow(1, State2)};
+%% A caller process is down while holding a checked-out connection. The
+%% connection may be in any state on the wire (e.g. mid-body in a chunked
+%% PUT if the caller died between `gun:headers/4` and `gun:data/4 fin`).
+%% Reusing it would land a `headers` cast on a connection whose `out` field
+%% is not `head`, crashing gun's gen_statem with `function_clause`. Drop the
+%% connection and grow a replacement.
+%% See: https://github.com/amazon-mq/rabbitmq-stream-s3/issues/177
+handle_down(
+    MRef,
+    _Pid,
+    #?MODULE{checkouts = Checkouts, checkouts_rev = CheckoutsRev} = State0
+) when is_map_key(MRef, CheckoutsRev) ->
+    Conn = maps:get(MRef, CheckoutsRev),
+    State1 = State0#?MODULE{
+        checkouts = maps:remove(Conn, Checkouts),
+        checkouts_rev = maps:remove(MRef, CheckoutsRev)
+    },
+    {noreply, grow(close_connection(Conn, State1))};
+%% A pending caller process is down. Remove it from the pending queue.
+handle_down(_MRef, Pid, #?MODULE{pending = Pending0} = State0) ->
+    Pending1 = queue:delete_with(
+        fun(#pending{from = {P, _}}) -> P =:= Pid end, Pending0
+    ),
+    {noreply, State0#?MODULE{pending = Pending1}}.
+
+%% Closing this connection would drop below min_size. Reset the idle timer
+%% to keep the warm floor intact.
+handle_idle_timeout(
+    Conn,
+    #?MODULE{idle_timers = Timers, monitors = Monitors, min_size = MinSize} = State0
+) when is_map_key(Conn, Timers) andalso map_size(Monitors) =< MinSize ->
+    TRef = erlang:send_after(?IDLE_TIMEOUT_MS, self(), {idle_timeout, Conn}),
+    {noreply, State0#?MODULE{idle_timers = Timers#{Conn := TRef}}};
+%% Connection has been idle too long and the pool is above min_size. Close it.
+handle_idle_timeout(Conn, #?MODULE{idle_timers = Timers} = State0) when
+    is_map_key(Conn, Timers)
+->
+    State1 = State0#?MODULE{idle_timers = maps:remove(Conn, Timers)},
+    State2 = cancel(Conn, State1),
+    {noreply, close_connection(Conn, State2)};
+%% Timer was already cancelled (stale message). Ignore.
+handle_idle_timeout(_Conn, State) ->
+    {noreply, State}.
+
+handle_info(grow, State) ->
+    {noreply, grow(State)};
 handle_info({gun_up, Conn, _Protocol}, State) ->
     handle_gun_up(Conn, State);
 handle_info({gun_down, Conn, _Protocol, Reason, KilledStreams}, State) ->
@@ -287,76 +345,6 @@ handle_info(Message, State) ->
         [Message, 10]
     ),
     {noreply, State}.
-
-handle_down(
-    MRef,
-    Pid,
-    #?MODULE{
-        checkouts = Checkouts0,
-        checkouts_rev = CheckoutsRev0,
-        monitors = Monitors0,
-        pending = Pending0
-    } = State0
-) ->
-    case Monitors0 of
-        #{Pid := MRef} ->
-            %% A connection is down. Replace it unconditionally: the connection
-            %% was in use (or at least monitored), so demand exists regardless
-            %% of whether anyone is in the Pending queue.
-            Conn = Pid,
-            State1 = State0#?MODULE{
-                monitors = maps:remove(Conn, Monitors0),
-                created = maps:remove(Conn, State0#?MODULE.created)
-            },
-            State2 = cancel(Pid, State1),
-            {noreply, grow(1, State2)};
-        _ ->
-            case CheckoutsRev0 of
-                #{MRef := Conn} ->
-                    %% A caller process is down while holding a checked-out
-                    %% connection. The connection may be in any state on the
-                    %% wire (e.g. mid-body in a chunked PUT if the caller
-                    %% died between `gun:headers/4` and `gun:data/4 fin`).
-                    %% Reusing it would land a `headers` cast on a connection
-                    %% whose `out` field is not `head`, crashing gun's
-                    %% gen_statem with `function_clause`. Drop the connection
-                    %% and grow a replacement.
-                    %% See: https://github.com/amazon-mq/rabbitmq-stream-s3/issues/177
-                    State1 = State0#?MODULE{
-                        checkouts = maps:remove(Conn, Checkouts0),
-                        checkouts_rev = maps:remove(MRef, CheckoutsRev0)
-                    },
-                    {noreply, grow(close_connection(Conn, State1))};
-                _ ->
-                    %% A pending caller process is down. Remove it from the
-                    %% pending queue.
-                    Pending = queue:delete_with(
-                        fun(#pending{from = {P, _}}) -> P =:= Pid end, Pending0
-                    ),
-                    State = State0#?MODULE{pending = Pending},
-                    {noreply, State}
-            end
-    end.
-
-handle_idle_timeout(
-    Conn, #?MODULE{idle_timers = Timers, monitors = Monitors, min_size = MinSize} = State0
-) ->
-    case Timers of
-        #{Conn := _} when map_size(Monitors) =< MinSize ->
-            %% Closing this connection would drop below min_size. Reset the
-            %% idle timer to keep the warm floor intact.
-            TRef = erlang:send_after(?IDLE_TIMEOUT_MS, self(), {idle_timeout, Conn}),
-            {noreply, State0#?MODULE{idle_timers = Timers#{Conn := TRef}}};
-        #{Conn := _} ->
-            %% Connection has been idle too long and the pool is above
-            %% min_size. Close it.
-            State1 = State0#?MODULE{idle_timers = maps:remove(Conn, Timers)},
-            State2 = cancel(Conn, State1),
-            {noreply, close_connection(Conn, State2)};
-        _ ->
-            %% Timer was already cancelled (stale message). Ignore.
-            {noreply, State0}
-    end.
 
 format_status(#{state := State0} = Status0) ->
     Status0#{state := format_state(State0)}.
@@ -522,29 +510,22 @@ checkout(
             State0
     end.
 
-cancel(
-    Conn,
-    #?MODULE{
-        available = Available0,
-        checkouts = Checkouts0,
-        checkouts_rev = CheckoutsRev0
-    } = State0
-) ->
-    case Checkouts0 of
-        #{Conn := CallerMRef} ->
-            erlang:demonitor(CallerMRef, [flush]),
-            State0#?MODULE{
-                checkouts = maps:remove(Conn, Checkouts0),
-                checkouts_rev = maps:remove(CallerMRef, CheckoutsRev0)
-            };
-        _ ->
-            case lists:member(Conn, Available0) of
-                true ->
-                    State1 = State0#?MODULE{available = lists:delete(Conn, Available0)},
-                    cancel_idle_timer(Conn, State1);
-                false ->
-                    State0
-            end
+cancel(Conn, #?MODULE{checkouts = Checkouts0, checkouts_rev = CheckoutsRev0} = State0) when
+    is_map_key(Conn, Checkouts0)
+->
+    CallerMRef = maps:get(Conn, Checkouts0),
+    erlang:demonitor(CallerMRef, [flush]),
+    State0#?MODULE{
+        checkouts = maps:remove(Conn, Checkouts0),
+        checkouts_rev = maps:remove(CallerMRef, CheckoutsRev0)
+    };
+cancel(Conn, #?MODULE{available = Available} = State0) ->
+    case lists:member(Conn, Available) of
+        true ->
+            State1 = State0#?MODULE{available = lists:delete(Conn, Available)},
+            cancel_idle_timer(Conn, State1);
+        false ->
+            State0
     end.
 
 %% A connection is usable for a new request only if its gun process is alive
