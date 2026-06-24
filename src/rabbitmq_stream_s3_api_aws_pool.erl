@@ -518,14 +518,10 @@ cancel(Conn, #?MODULE{checkouts = Checkouts0, checkouts_rev = CheckoutsRev0} = S
         checkouts = maps:remove(Conn, Checkouts0),
         checkouts_rev = maps:remove(CallerMRef, CheckoutsRev0)
     };
-cancel(Conn, #?MODULE{available = Available} = State0) ->
-    case lists:member(Conn, Available) of
-        true ->
-            State1 = State0#?MODULE{available = lists:delete(Conn, Available)},
-            cancel_idle_timer(Conn, State1);
-        false ->
-            State0
-    end.
+cancel(Conn, State) ->
+    %% Not checked out; if it is available, removing it from `available` (and
+    %% cancelling its idle timer) is exactly `remove_available/2`.
+    remove_available(Conn, State).
 
 %% A connection is usable for a new request only if its gun process is alive
 %% and in the `connected` state. After S3 closes an idle connection gun clears
