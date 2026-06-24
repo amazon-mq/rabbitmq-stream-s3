@@ -428,19 +428,39 @@ inc(Idx, N) ->
 maybe_evaluate_retention(
     StreamId,
     #manifest{next_offset = OldManifestNextOffset},
-    #manifest{first_offset = ManifestFirstOffset, next_offset = NewManifestNextOffset},
+    #manifest{
+        first_offset = ManifestFirstOffset,
+        first_timestamp = ManifestFirstTimestamp,
+        next_offset = NewManifestNextOffset
+    },
     #state{contexts = Ctxs}
 ) when NewManifestNextOffset > OldManifestNextOffset ->
     case maps:get(StreamId, Ctxs, undefined) of
         #replica_ctx{dir = Dir, shared = Shared, counter = Cnt} ->
             Spec = [{'fun', rabbitmq_stream_s3_hooks:local_retention_fun(StreamId)}],
             EvalFun = fun
-                ({{FstOff, _}, _FstTs, NumSegLeft}) when is_integer(FstOff) ->
+                ({{FstOff, _}, FstTs, NumSegLeft}) when
+                    is_integer(FstOff), is_integer(FstTs)
+                ->
                     osiris_log_shared:set_first_chunk_id(Shared, FstOff),
                     counters:put(
                         Cnt,
                         ?C_OSIRIS_LOG_FIRST_OFFSET,
                         min(FstOff, ManifestFirstOffset)
+                    ),
+                    %% Correct the first timestamp alongside the first offset.
+                    %% osiris sets it from the local tier's oldest surviving
+                    %% segment; the remote tier holds older data here (the
+                    %% manifest advanced), so the oldest message is the
+                    %% manifest's first_timestamp. Without this the UI's oldest
+                    %% message marches forward as local retention deletes
+                    %% segments. The manifest advanced past the old next_offset,
+                    %% so it is non-empty and first_timestamp is a real
+                    %% timestamp, not the empty-manifest -1 sentinel.
+                    counters:put(
+                        Cnt,
+                        ?C_OSIRIS_LOG_FIRST_TIMESTAMP,
+                        min(FstTs, ManifestFirstTimestamp)
                     ),
                     counters:put(Cnt, ?C_OSIRIS_LOG_SEGMENTS, NumSegLeft);
                 (_) ->
