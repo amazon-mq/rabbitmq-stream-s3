@@ -172,34 +172,33 @@ handle_call(Request, From, State) ->
     ?LOG_INFO(?MODULE_STRING " received unexpected call from ~p: ~W", [From, Request, 10]),
     {noreply, State}.
 
-handle_cast(
-    {checkin, Conn},
-    #?MODULE{
-        checkouts = Checkouts0,
-        checkouts_rev = CheckoutsRev0,
-        monitors = Monitors,
-        counter = Cnt
-    } = State0
-) ->
-    case Checkouts0 of
-        #{Conn := MRef} ->
-            counters:add(Cnt, ?C_CHECKINS, 1),
-            erlang:demonitor(MRef, [flush]),
-            State1 = State0#?MODULE{
-                checkouts = maps:remove(Conn, Checkouts0),
-                checkouts_rev = maps:remove(MRef, CheckoutsRev0)
-            },
-            case Monitors of
-                #{Conn := _} ->
-                    %% Connection is still alive as far as we know, and should
-                    %% be reused.
-                    {noreply, make_available(Conn, State1)};
-                _ ->
-                    {noreply, State1}
-            end;
-        _ ->
-            {noreply, State0}
-    end;
+%% Return a checked-in connection to `available` if it is still monitored
+%% (alive as far as we know). Otherwise drop it; the `DOWN` handler owns the
+%% cleanup of a connection that died while checked out.
+maybe_make_available(Conn, #?MODULE{monitors = Monitors} = State) when
+    is_map_key(Conn, Monitors)
+->
+    make_available(Conn, State);
+maybe_make_available(_Conn, State) ->
+    State.
+
+handle_checkin(
+    Conn,
+    #?MODULE{checkouts = Checkouts0, checkouts_rev = CheckoutsRev0, counter = Cnt} = State0
+) when is_map_key(Conn, Checkouts0) ->
+    MRef = maps:get(Conn, Checkouts0),
+    counters:add(Cnt, ?C_CHECKINS, 1),
+    erlang:demonitor(MRef, [flush]),
+    State1 = State0#?MODULE{
+        checkouts = maps:remove(Conn, Checkouts0),
+        checkouts_rev = maps:remove(MRef, CheckoutsRev0)
+    },
+    {noreply, maybe_make_available(Conn, State1)};
+handle_checkin(_Conn, State) ->
+    {noreply, State}.
+
+handle_cast({checkin, Conn}, State) ->
+    handle_checkin(Conn, State);
 handle_cast({cancel_checkout, Checkout}, #?MODULE{pending = Pending0, counter = Cnt} = State0) ->
     Pending = queue:delete_with(
         fun(#pending{checkout = C, mref = MRef}) ->
