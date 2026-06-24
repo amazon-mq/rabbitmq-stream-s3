@@ -85,7 +85,6 @@ the reader pool avoids reader starvation.
 %% API
 -export([
     checkout/2,
-    try_checkout/1,
     checkin/2,
     with/3
 ]).
@@ -123,16 +122,6 @@ checkout(Pool, Timeout) ->
 -spec checkin(pool(), conn()) -> ok.
 checkin(Pool, Conn) ->
     gen_server:cast(Pool, {checkin, Conn}).
-
--doc """
-Non-blocking checkout. Returns `Conn` if a connection is immediately available,
-or `busy` if no connection is available. If the pool has room to grow, the
-grow is kicked off in the background and `busy` is returned immediately so the
-caller can retry on a later event.
-""".
--spec try_checkout(pool()) -> conn() | busy.
-try_checkout(Pool) ->
-    gen_server:call(Pool, try_checkout).
 
 -spec with(pool(), timeout(), fun((conn()) -> term())) -> term().
 with(Pool, Timeout, Fun) ->
@@ -178,50 +167,6 @@ handle_call(
             P = #pending{from = From, checkout = Checkout, mref = MRef},
             State2 = State1#?MODULE{pending = queue:in(P, Pending0)},
             {noreply, grow(State2)}
-    end;
-handle_call(
-    try_checkout,
-    {Pid, _},
-    #?MODULE{
-        max_size = MaxSize,
-        counter = Cnt
-    } = State0
-) ->
-    %% `take_available` may evict down connections, so the busy paths use the
-    %% state it returns, not `State0` whose `available`/`monitors` would then be
-    %% stale.
-    case take_available(Pid, State0) of
-        {ok, Conn, State1} ->
-            counters:add(Cnt, ?C_CHECKOUTS, 1),
-            {reply, Conn, State1};
-        {empty, #?MODULE{monitors = Monitors1} = State2} when map_size(Monitors1) < MaxSize ->
-            ?LOG_DEBUG(
-                "Pool ~p try_checkout: busy, growing"
-                " (available=~b total=~b checked_out=~b max=~b caller=~p)",
-                [
-                    self(),
-                    length(State2#?MODULE.available),
-                    map_size(Monitors1),
-                    map_size(State2#?MODULE.checkouts),
-                    MaxSize,
-                    Pid
-                ]
-            ),
-            {reply, busy, grow(1, State2)};
-        {empty, #?MODULE{monitors = Monitors1} = State3} ->
-            ?LOG_DEBUG(
-                "Pool ~p try_checkout: busy at max"
-                " (available=~b total=~b checked_out=~b max=~b caller=~p)",
-                [
-                    self(),
-                    length(State3#?MODULE.available),
-                    map_size(Monitors1),
-                    map_size(State3#?MODULE.checkouts),
-                    MaxSize,
-                    Pid
-                ]
-            ),
-            {reply, busy, State3}
     end;
 handle_call(Request, From, State) ->
     ?LOG_INFO(?MODULE_STRING " received unexpected call from ~p: ~W", [From, Request, 10]),
@@ -278,16 +223,23 @@ handle_info(grow, State0) ->
     {noreply, grow(State0)};
 handle_info(
     {gun_up, Conn, _Protocol},
-    #?MODULE{monitors = Monitors, available = Available, checkouts = Checkouts} = State0
+    #?MODULE{monitors = Monitors, available = Available, checkouts = Checkouts, created = Created} =
+        State0
 ) ->
     case is_map_key(Conn, Monitors) of
         true ->
+            OpenMs =
+                case Created of
+                    #{Conn := CreatedAt} -> rabbitmq_stream_s3_util:elapsed_ms(CreatedAt);
+                    _ -> undefined
+                end,
             ?LOG_DEBUG(
-                "Pool ~p gun_up: connection ~p ready"
+                "Pool ~p gun_up: connection ~p ready in ~twms"
                 " (available=~b total=~b checked_out=~b)",
                 [
                     self(),
                     Conn,
+                    OpenMs,
                     length(Available),
                     map_size(Monitors),
                     map_size(Checkouts)
@@ -377,11 +329,19 @@ handle_info(
                     {noreply, State}
             end
     end;
-handle_info({idle_timeout, Conn}, #?MODULE{idle_timers = Timers} = State0) ->
+handle_info(
+    {idle_timeout, Conn},
+    #?MODULE{idle_timers = Timers, monitors = Monitors, min_size = MinSize} = State0
+) ->
     case Timers of
+        #{Conn := _} when map_size(Monitors) =< MinSize ->
+            %% Closing this connection would drop below min_size. Reset the
+            %% idle timer to keep the warm floor intact.
+            TRef = erlang:send_after(?IDLE_TIMEOUT_MS, self(), {idle_timeout, Conn}),
+            {noreply, State0#?MODULE{idle_timers = Timers#{Conn := TRef}}};
         #{Conn := _} ->
-            %% Timer is still active (wasn't cancelled by a checkout), so the
-            %% connection has been idle too long. Close it.
+            %% Connection has been idle too long and the pool is above
+            %% min_size. Close it.
             State1 = State0#?MODULE{idle_timers = maps:remove(Conn, Timers)},
             State2 = cancel(Conn, State1),
             {noreply, close_connection(Conn, State2)};
