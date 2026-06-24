@@ -25,7 +25,8 @@ all() ->
         retention_and_append_in_same_broadcast,
         sync_live_manifest_then_broadcast_double_applies,
         manifest_reset_requires_resync,
-        cached_epoch_reflects_writer_epoch
+        cached_epoch_reflects_writer_epoch,
+        retention_evaluated_floors_first_offset_and_timestamp
     ].
 
 init_per_suite(Config) ->
@@ -544,6 +545,59 @@ manifest_reset_requires_resync(_Config) ->
     ?assertEqual(150, Converged#manifest.next_offset),
     ?assertEqual(3000, Converged#manifest.total_size),
     ?assertNotEqual(OldManifest, Converged).
+
+%% After local retention runs, osiris sets the first_offset and first_timestamp
+%% counters from the local tier's oldest surviving segment. on_retention_evaluated/2
+%% must floor both to the remote tier whenever the manifest holds older data, so
+%% the management UI reports the true oldest message rather than letting the
+%% "first timestamp" march forward as local segments are deleted. Both counters
+%% are taken as the min so a smaller local value (an empty/lagging remote tier)
+%% is never clobbered.
+retention_evaluated_floors_first_offset_and_timestamp(_Config) ->
+    Hooks = rabbitmq_stream_s3_hooks,
+    Replica = rabbitmq_stream_s3_manifest_replica,
+
+    %% Remote tier holds older data than the local tier: the oldest message is
+    %% the manifest's first_offset/first_timestamp, not the local segment's.
+    Remote = <<"stream-floor-remote">>,
+    {Manifest, _} = build_manifest([
+        {fragment, #{offset => 50, first_ts => 500, size => 1000}}
+    ]),
+    ?assertEqual(50, Manifest#manifest.first_offset),
+    ?assertEqual(500, Manifest#manifest.first_timestamp),
+    ok = Replica:put_manifest(Remote, Manifest),
+    Cnt = counters:new(5, []),
+    counters:put(Cnt, ?C_OSIRIS_LOG_FIRST_OFFSET, 200),
+    counters:put(Cnt, ?C_OSIRIS_LOG_FIRST_TIMESTAMP, 2000),
+    ok = Hooks:on_retention_evaluated(Cnt, #{name => Remote}),
+    ?assertEqual(50, counters:get(Cnt, ?C_OSIRIS_LOG_FIRST_OFFSET)),
+    ?assertEqual(500, counters:get(Cnt, ?C_OSIRIS_LOG_FIRST_TIMESTAMP)),
+
+    %% Empty remote tier (manifest with no entries, carrying the -1
+    %% first_timestamp sentinel): the counters must be left untouched so the
+    %% sentinel never reaches the UI.
+    Empty = <<"stream-floor-empty">>,
+    ok = Replica:put_manifest(Empty, #manifest{}),
+    CntEmpty = counters:new(5, []),
+    counters:put(CntEmpty, ?C_OSIRIS_LOG_FIRST_OFFSET, 200),
+    counters:put(CntEmpty, ?C_OSIRIS_LOG_FIRST_TIMESTAMP, 2000),
+    ok = Hooks:on_retention_evaluated(CntEmpty, #{name => Empty}),
+    ?assertEqual(200, counters:get(CntEmpty, ?C_OSIRIS_LOG_FIRST_OFFSET)),
+    ?assertEqual(2000, counters:get(CntEmpty, ?C_OSIRIS_LOG_FIRST_TIMESTAMP)),
+
+    %% Local tier is the oldest (remote lags behind it): min keeps the smaller
+    %% local values, it never raises them to the remote tier.
+    Lagging = <<"stream-floor-lagging">>,
+    {LagManifest, _} = build_manifest([
+        {fragment, #{offset => 50, first_ts => 500, size => 1000}}
+    ]),
+    ok = Replica:put_manifest(Lagging, LagManifest),
+    CntLocal = counters:new(5, []),
+    counters:put(CntLocal, ?C_OSIRIS_LOG_FIRST_OFFSET, 10),
+    counters:put(CntLocal, ?C_OSIRIS_LOG_FIRST_TIMESTAMP, 100),
+    ok = Hooks:on_retention_evaluated(CntLocal, #{name => Lagging}),
+    ?assertEqual(10, counters:get(CntLocal, ?C_OSIRIS_LOG_FIRST_OFFSET)),
+    ?assertEqual(100, counters:get(CntLocal, ?C_OSIRIS_LOG_FIRST_TIMESTAMP)).
 
 fake_writer(TestPid) ->
     receive

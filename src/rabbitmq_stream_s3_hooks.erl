@@ -114,20 +114,39 @@ on_retention_updated(Retention, #{name := Name}) ->
     [{'fun', local_retention_fun(StreamId)} | Retention].
 
 -doc """
-Called after retention evaluation sets the first_offset counter.
+Called after retention evaluation sets the first_offset and
+first_timestamp counters.
 
-Overrides `?C_FIRST_OFFSET` with the manifest's first offset when the
-remote tier holds older data than the local tier. Without this, the
-management UI reports only the local segment window as the message count.
+osiris sets both counters from the local tier's oldest surviving segment.
+This overrides them with the manifest's first offset and first timestamp
+when the remote tier holds older data than the local tier. Without this,
+the management UI reports only the local segment window: the message count
+is too low and, because local retention keeps deleting old segments, the
+"first timestamp" (oldest message) keeps marching forward even though that
+data still lives in the remote tier.
+
+The offset and timestamp must be corrected together. They describe the same
+oldest record, so taking the min independently is consistent: the remote
+tier's first offset and first timestamp both belong to the same chunk, which
+is older than anything still on local disk whenever the remote tier is
+non-empty.
 """.
 -spec on_retention_evaluated(counters:counters_ref(), map()) -> ok.
 on_retention_evaluated(Cnt, #{name := Name}) ->
     StreamId = rabbitmq_stream_s3:ensure_stream_id(Name),
-    case rabbitmq_stream_s3_manifest_replica:get_range(StreamId) of
-        {RemoteFirst, _} ->
+    %% An empty manifest (entries = <<>>) carries a sentinel first_timestamp
+    %% of -1, which must never reach the counter. get_range/1 returns `empty`
+    %% in that case, so the override only runs when the remote tier actually
+    %% holds data and its first_timestamp is a real timestamp.
+    case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
+        #manifest{entries = <<>>} ->
+            ok;
+        #manifest{first_offset = RemoteFirst, first_timestamp = RemoteFirstTs} ->
             LocalFirst = counters:get(Cnt, ?C_OSIRIS_LOG_FIRST_OFFSET),
-            counters:put(Cnt, ?C_OSIRIS_LOG_FIRST_OFFSET, min(LocalFirst, RemoteFirst));
-        _ ->
+            counters:put(Cnt, ?C_OSIRIS_LOG_FIRST_OFFSET, min(LocalFirst, RemoteFirst)),
+            LocalFirstTs = counters:get(Cnt, ?C_OSIRIS_LOG_FIRST_TIMESTAMP),
+            counters:put(Cnt, ?C_OSIRIS_LOG_FIRST_TIMESTAMP, min(LocalFirstTs, RemoteFirstTs));
+        undefined ->
             ok
     end.
 
