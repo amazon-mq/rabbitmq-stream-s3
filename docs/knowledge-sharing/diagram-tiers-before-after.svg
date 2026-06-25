@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 500" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L7,3 L0,6 z" fill="#374151"/>
+    </marker>
+    <pattern id="overlap" width="8" height="8" patternTransform="rotate(45)" patternUnits="userSpaceOnUse">
+      <rect width="8" height="8" fill="#dcfce7"/>
+      <line x1="0" y1="0" x2="0" y2="8" stroke="#2563eb" stroke-width="2"/>
+    </pattern>
+  </defs>
+
+  <text x="30" y="40" font-size="24" font-weight="700" fill="#111827">Tiered storage: extend the readable window, not the disk</text>
+
+  <!-- PANEL A: without tiered storage -->
+  <text x="30" y="86" font-size="17" font-weight="700" fill="#374151">Without tiered storage (a stream today)</text>
+
+  <!-- local disk bar -->
+  <rect x="250" y="104" width="560" height="64" rx="6" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+  <text x="530" y="142" font-size="15" font-weight="600" fill="#166534" text-anchor="middle">local disk only</text>
+
+  <!-- retention cliff -->
+  <line x1="250" y1="92" x2="250" y2="182" stroke="#dc2626" stroke-width="3" stroke-dasharray="6 4"/>
+  <text x="244" y="200" font-size="12.5" fill="#b91c1c" text-anchor="end">retention cliff:</text>
+  <text x="244" y="216" font-size="12.5" fill="#b91c1c" text-anchor="end">trimmed data is gone forever</text>
+
+  <!-- publishers append -->
+  <line x1="824" y1="136" x2="868" y2="136" stroke="#374151" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="846" y="120" font-size="12.5" fill="#374151" text-anchor="middle">append</text>
+
+  <!-- blocked consumer -->
+  <circle cx="150" cy="136" r="16" fill="#fee2e2" stroke="#dc2626" stroke-width="2"/>
+  <text x="150" y="141" font-size="14" font-weight="700" fill="#b91c1c" text-anchor="middle">C</text>
+  <line x1="170" y1="136" x2="236" y2="136" stroke="#dc2626" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+  <text x="150" y="174" font-size="12" fill="#b91c1c" text-anchor="middle">wants old data</text>
+  <text x="150" y="189" font-size="12" fill="#b91c1c" text-anchor="middle">→ blocked</text>
+
+  <!-- divider -->
+  <line x1="30" y1="250" x2="870" y2="250" stroke="#e5e7eb" stroke-width="1"/>
+
+  <!-- PANEL B: with tiered storage -->
+  <text x="30" y="290" font-size="17" font-weight="700" fill="#374151">With tiered storage (one continuous stream)</text>
+
+  <!-- remote tier (S3) -->
+  <rect x="70" y="308" width="430" height="64" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+  <text x="270" y="340" font-size="15" font-weight="600" fill="#1d4ed8" text-anchor="middle">remote tier: S3</text>
+  <text x="270" y="358" font-size="12" fill="#1d4ed8" text-anchor="middle">old data · cheap · kept ~indefinitely</text>
+
+  <!-- overlap zone -->
+  <rect x="470" y="308" width="60" height="64" fill="url(#overlap)" stroke="#6b7280" stroke-width="1"/>
+
+  <!-- local tier (disk) -->
+  <rect x="500" y="308" width="310" height="64" rx="6" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+  <text x="670" y="340" font-size="15" font-weight="600" fill="#166534" text-anchor="middle">local tier: disk</text>
+  <text x="670" y="358" font-size="12" fill="#166534" text-anchor="middle">recent data · low latency</text>
+
+  <!-- markers -->
+  <text x="70" y="398" font-size="11.5" fill="#374151" text-anchor="middle">oldest readable</text>
+  <text x="500" y="398" font-size="11.5" fill="#374151" text-anchor="middle">overlap</text>
+  <text x="810" y="398" font-size="11.5" fill="#374151" text-anchor="middle">newest</text>
+
+  <!-- publishers append -->
+  <line x1="824" y1="340" x2="868" y2="340" stroke="#374151" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- consumer reading across the seam -->
+  <line x1="70" y1="430" x2="810" y2="430" stroke="#374151" stroke-width="2" marker-end="url(#arrow)"/>
+  <circle cx="70" cy="430" r="6" fill="#374151"/>
+  <text x="440" y="455" font-size="13" font-weight="600" fill="#111827" text-anchor="middle">a consumer reads across the seam without knowing which tier serves each byte</text>
+
+  <text x="30" y="488" font-size="12" fill="#6b7280">"How much do I keep?" becomes purely a question of time, not disk.</text>
+</svg>
