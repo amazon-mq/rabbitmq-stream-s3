@@ -205,8 +205,12 @@ init([]) ->
 handle_call({put_manifest, StreamId, Manifest, Epoch}, _From, State) ->
     write_manifest(StreamId, Manifest, Epoch),
     {reply, ok, State};
-handle_call({sync, StreamId, Seq, Epoch, Manifest, WriterNode}, _From, #state{seqs = Seqs} = State) ->
-    Seqs1 = maybe_apply_sync(StreamId, Seq, Epoch, Manifest, WriterNode, Seqs),
+handle_call(
+    {sync, StreamId, Seq, Epoch, Manifest, WriterNode},
+    _From,
+    #state{seqs = Seqs, contexts = Ctxs} = State
+) ->
+    Seqs1 = maybe_apply_sync(StreamId, Seq, Epoch, Manifest, WriterNode, Seqs, Ctxs),
     {reply, ok, State#state{seqs = Seqs1}};
 handle_call(
     {apply_edits, StreamId, Edits, Seq, Epoch, WriterNode}, _From, #state{seqs = Seqs} = State
@@ -281,8 +285,11 @@ handle_cast({apply_edit, StreamId, Edit}, State) ->
             ok
     end,
     {noreply, State};
-handle_cast({sync, StreamId, Seq, Epoch, Manifest, WriterNode}, #state{seqs = Seqs} = State) ->
-    Seqs1 = maybe_apply_sync(StreamId, Seq, Epoch, Manifest, WriterNode, Seqs),
+handle_cast(
+    {sync, StreamId, Seq, Epoch, Manifest, WriterNode},
+    #state{seqs = Seqs, contexts = Ctxs} = State
+) ->
+    Seqs1 = maybe_apply_sync(StreamId, Seq, Epoch, Manifest, WriterNode, Seqs, Ctxs),
     {noreply, State#state{seqs = Seqs1}};
 handle_cast({apply_edits, StreamId, Edits, Seq, Epoch, WriterNode}, #state{seqs = Seqs} = State) ->
     case maps:get(StreamId, Seqs, undefined) of
@@ -367,7 +374,7 @@ apply_edits_catching(StreamId, Edits, Manifest0) ->
 %% next gap triggers a re-sync. Drop any sync that is not at least as new as
 %% what is recorded, comparing epoch first and then sequence so a higher epoch
 %% always wins regardless of where its sequence restarted.
-maybe_apply_sync(StreamId, Seq, Epoch, Manifest, WriterNode, Seqs) ->
+maybe_apply_sync(StreamId, Seq, Epoch, Manifest, WriterNode, Seqs, Ctxs) ->
     Recorded = maps:get(StreamId, Seqs, undefined),
     case is_stale_sync(Epoch, Seq, Recorded) of
         true ->
@@ -382,6 +389,7 @@ maybe_apply_sync(StreamId, Seq, Epoch, Manifest, WriterNode, Seqs) ->
             Seqs;
         false ->
             write_manifest(StreamId, Manifest, Epoch),
+            seed_first_offset_counter(StreamId, Manifest, Ctxs),
             Seqs#{StreamId => {Seq, Epoch, WriterNode}}
     end.
 
@@ -474,6 +482,25 @@ maybe_evaluate_retention(
     _StreamId, _OldManifest = #manifest{}, _NewManifest = #manifest{}, #state{}
 ) ->
     ok.
+
+%% Seed the osiris first-offset and first-timestamp counters from the manifest
+%% on sync. Without this, the counters reflect only the local tier until the
+%% first retention evaluation or edit arrives, which may never happen on an idle
+%% stream.
+seed_first_offset_counter(_StreamId, #manifest{entries = <<>>}, _Ctxs) ->
+    ok;
+seed_first_offset_counter(
+    StreamId, #manifest{first_offset = ManifestFirst, first_timestamp = ManifestFirstTs}, Ctxs
+) ->
+    case maps:get(StreamId, Ctxs, undefined) of
+        #replica_ctx{counter = Cnt} ->
+            LocalFirst = counters:get(Cnt, ?C_OSIRIS_LOG_FIRST_OFFSET),
+            counters:put(Cnt, ?C_OSIRIS_LOG_FIRST_OFFSET, min(LocalFirst, ManifestFirst)),
+            LocalFirstTs = counters:get(Cnt, ?C_OSIRIS_LOG_FIRST_TIMESTAMP),
+            counters:put(Cnt, ?C_OSIRIS_LOG_FIRST_TIMESTAMP, min(LocalFirstTs, ManifestFirstTs));
+        undefined ->
+            ok
+    end.
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
