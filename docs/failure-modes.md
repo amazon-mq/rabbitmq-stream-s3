@@ -67,7 +67,7 @@ Discarding remote manifest and restarting from the local log.
 
 **Mitigation.** None. The replica reader handles this automatically on startup.
 
-**Resolution.** The replica reader discards the remote manifest, deletes the stale fragment objects in the background (via the reaper), and resumes normal operation from the local log's first offset. The local log is always authoritative. One sub-case is intentionally left to the ordinary resolution retry rather than triggering a reset: a *completely empty* local log paired with a non-empty manifest, which is more often a transient writer-recovery state than a genuine timeline divergence, and resetting then would prematurely discard recoverable remote data.
+**Resolution.** The replica reader discards the remote manifest, deletes orphaned fragment objects in the background (an async `rabbitmq_stream_s3_gc` sweep that deletes only objects the new manifest no longer references, routed through the reaper), and resumes normal operation from the local log's first offset. The local log is always authoritative. One sub-case is intentionally left to the ordinary resolution retry rather than triggering a reset: a *completely empty* local log paired with a non-empty manifest, which is more often a transient writer-recovery state than a genuine timeline divergence, and resetting then would prematurely discard recoverable remote data.
 
 ---
 

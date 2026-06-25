@@ -61,7 +61,7 @@ Even at very high sustained throughput, producing enough data to matter takes ye
 
 The root is cached in memory. Its size depends on how many entries have not yet been factored into groups.
 
-Worst case: the root has `m - 1 = 1023` fragment entries plus some number of group/kilo-group/mega-group entries. At 34 bytes per entry, the root is at most ~35 KiB of fragment entries plus one entry per group-level bucket. In practice the root is a few KiB for active streams.
+Worst case: the root has `m - 1 = 1023` fragment entries plus some number of group/kilo-group/mega-group entries. At 34 bytes per entry, the root is at most ~34 KiB of fragment entries (1023 * 34 = 34,782 bytes) plus one entry per group-level bucket. In practice the root is a few KiB for active streams.
 
 Group objects are not all cached. They are downloaded on demand during offset resolution and fragment iteration, and may be cached for repeated access (retention evaluation, active consumers reading through a group's range).
 

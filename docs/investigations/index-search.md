@@ -1,5 +1,7 @@
 # Index Lookup: Block Binary Search
 
+> Status update (2026-06-25). The block binary search proposed here was merged upstream (rabbitmq/osiris#219) and is now the production algorithm for single-offset and timestamp resolution at consumer attach (`osiris_log:offset_idx_scan`, `chunk_location_for_timestamp`). Skip search (described below as "the current algorithm") remains in osiris but only for multi-offset sampling, not the attach path this investigation analyzes. The benchmarks and analysis below remain valid and are kept for reference.
+
 This investigation looks at optimizing the approach which Osiris uses to search through index files.
 
 The Osiris index file has one 29-byte record per chunk. Each record contains the chunk's first offset, timestamp, epoch, file position, and type. The file has an 8-byte header followed by records in append order. At the default chunk limit of 256,000 per segment, the index is at most ~7.3 MiB.

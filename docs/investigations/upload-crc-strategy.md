@@ -1,5 +1,7 @@
 # Upload Durability: CRC Strategy
 
+> Historical (superseded, 2026-06-25). This is a point-in-time design exploration. The `crc32_combine` approach it recommends was not adopted, and its "current design" baseline (a writer-side `chunk_written` manifest callback) no longer exists; that callback was removed when the plugin moved to osiris hooks. The shipped upload path computes a full `erlang:crc32` over the fragment bytes as it reads them for upload (`rabbitmq_stream_s3_replica_reader:stream_span/5`) and sends it as `x-amz-checksum-crc32` for server-side verification. The investigation's underlying goal, keeping CRC work out of the writer hot path, was achieved by other means: CRC is now computed once, at upload time, not on every chunk write. The analysis below is preserved for the reasoning it records.
+
 When the remote replica reader uploads a fragment to S3, we want to guarantee that the bytes stored in S3 are identical to what the writer originally wrote. This investigation explores how to achieve that guarantee with minimal CPU cost.
 
 ## Corruption points

@@ -66,7 +66,7 @@ The drain loop must not block on S3 transfers. At 500 MB/s of committed data wit
 
 Additionally, a node may host thousands of streams. Without coordination, each stream's replica reader would independently spawn upload tasks, potentially saturating the network interface with concurrent PUTs. The governor centralizes rate control without centralizing the drain logic.
 
-The per-node governor (`rabbitmq_stream_s3_governor`) uses a token bucket to pace bytes sent to S3. The bucket refills at a configured rate (default unlimited). Transfer tasks consume tokens as they stream bytes. When the bucket is empty, tasks pause until tokens are available.
+The per-node governor (`rabbitmq_stream_s3_governor`) paces fragment transfers to S3. By default (`max_transfer_bytes_per_sec = unlimited`) it does no pacing at all: there is no token bucket and each submission spawns a transfer task immediately. When a byte rate is configured, the governor uses a token bucket (burst defaults to `rate div 5` unless `max_transfer_burst_bytes` is set). Each submission is charged its full fragment size against the bucket once, at admission; if the bucket lacks tokens the submission waits in a FIFO pending queue and is admitted on a later refill. A fragment larger than the burst is admitted on credit (the bucket goes into debt, which later refills repay) so an oversized fragment never deadlocks the governor.
 
 The interaction from the replica reader's perspective:
 
@@ -170,13 +170,16 @@ If local retention deletes a segment between the drain (which read headers) and 
 
 ### Transfer failure
 
-Retriable errors (500, 503, timeout): the core returns `{resubmit_transfer, ...}`. The fragment stays in the in-flight queue.
+Retriable errors (500, 503, timeout, connection errors, and similar transient failures): the core returns `{resubmit_transfer, ...}` and the fragment is retried immediately, staying in the in-flight queue.
 
-Fatal errors (checksum mismatch, segment gone): the core removes the entry from the queue and accepts the gap.
+Non-transient errors (for example a 403, an unexpected status, or an upload-body crash): the fragment must never be abandoned. Dropping it would let the manifest advance `next_offset` over a range that is not durable in S3, after which local-tier cleanup (which keys off `next_offset`) would free the only remaining copy, producing a silent permanent hole in the stream (issue #206). The core instead returns `{resubmit_transfer_delayed, ...}`, keeping the fragment at its place in the queue, and the shell retries it after `upload_retry_delay_ms` (default 1000ms). The upload pipeline stalls at that offset until the fragment is durable. The only case in which the un-uploaded range is given up is when the backing local segment has been permanently deleted by stream retention (local-ahead detection above), which is a distinct mechanism from a transfer failure.
 
 ### Persist conflict
 
-Another writer (from a leadership election) persisted first. The core returns `{reinitialize}`. The shell re-resolves the manifest and restarts. In-flight transfers whose fragments are already in S3 become orphans.
+Persist outcomes other than success are handled by the core's `persist_failed`:
+- A Khepri conflict (another writer, from a leadership election, persisted first) returns `{reinitialize}`. The shell re-resolves the manifest from S3 and restarts. In-flight transfers whose fragments are already in S3 become orphans.
+- A `not_found` when a prior persist had already succeeded (last-persisted revision greater than zero) means the stream's metadata node was deleted (the queue was removed). The core returns `stop` and the reader shuts down rather than re-PUTting an orphan manifest or resurrecting a deleted stream.
+- Any other persist failure (an S3 error, or a transient metadata-store error) retries the persist, falling back to re-arming the persist timer.
 
 ## Test barrier: `await_offset`
 

@@ -9,7 +9,7 @@
   - Retention verification: fails if S3 object count grows monotonically without decrease (gated on cumulative bytes sent exceeding max-length-bytes)
   - Retention first_offset assertion: fails if message count equals total published (retention never advanced first_offset)
   - S3 fallback detection: fails if bytes_received drops to zero during replay (when S3 is populated)
-  - Parallel replay with offset slicing across `[committedOffset - messageCount, committedOffset]`
+  - Parallel replay fan-out: each `--replay-consumers` consumer independently replays `first()`..tail; the pass gate is the slowest consumer reaching the threshold
   - Subscribe retry to work around gen_statem blocking (issue #191)
   - Separate Environment for publish and replay phases (avoids stale subscription state)
   - S3 cleanup before stream deletion (objects deleted before Khepri trigger races)
@@ -18,6 +18,8 @@
   - `creditWhenHalfMessagesProcessed` for wire-level throttling (keeps offset genuinely behind head)
   - Warmup phase: publish until S3 is populated before starting lagging consumer
   - Asserts both consumers make progress, lagging stays behind head, S3 recv observed, no alarms
+- `content-verification` - publish a bounded amount (below `max-length-bytes` so no retention fires), then have each `--replay-consumers` consumer independently replay `first()`..tail and verify per-consumer content with no gaps or duplicates; the reference implementation of the fan-out pattern (see README)
+  - `--max-length-bytes` must exceed the peak un-uploaded backlog (issue #233)
 - `stream-deletion` - publish until S3 is populated, delete the stream, verify all S3 objects removed by Khepri trigger
   - Found bug #196: one dangling fragment from in-flight upload consistently remains after deletion
 - `cleanup` - delete all streams, close connections, optionally clean S3 bucket

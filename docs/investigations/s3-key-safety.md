@@ -18,7 +18,7 @@ The result is used as the stream ID and embedded in S3 keys:
 ```
 rabbitmq/stream/<StreamId>/data/<offset>.<uid>.fragment
 rabbitmq/stream/<StreamId>/metadata/root.<epoch>.<uid>.manifest
-rabbitmq/stream/<StreamId>/metadata/<offset>.<uid>.group
+rabbitmq/stream/<StreamId>/metadata/<offset>.<uid>.{group,kgroup,mgroup}
 ```
 
 S3 object keys have a maximum length of 1,024 bytes. The stream ID is the variable component. In practice, the stream ID is bounded by the filesystem: Osiris uses it as a directory name, and common filesystems (ext4, XFS) limit filenames to 255 bytes. The filesystem rejects overly long stream names before S3 would.
@@ -44,7 +44,7 @@ Two tenants in different vhosts cannot produce colliding stream IDs because:
 
 ### Double encoding in HTTP path
 
-`key_to_path/1` applies `uri_string:quote(Key, "/")` before sending to S3. This percent-encodes the `=` characters from base64url padding in stream IDs. S3 [classifies `=` as requiring special handling](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-keys.html#object-key-guidelines) in key names. The percent-encoding is standard HTTP path behavior: S3 decodes it back to the literal character for storage.
+`key_to_path/1` applies `uri_string:quote(Key, "/")` before sending to S3. This percent-encodes a `=` when one is present in a stream ID (`=` is in the `to_base64uri` allowed character set, so it survives sanitization rather than being introduced as padding). S3 [classifies `=` as requiring special handling](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-keys.html#object-key-guidelines) in key names. The percent-encoding is standard HTTP path behavior: S3 decodes it back to the literal character for storage.
 
 The [safe character set for S3 keys](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-keys.html#object-key-guidelines) is `0-9 a-z A-Z ! - _ . * ' ( )`. Our keys use only `A-Za-z0-9_-=./`, all of which are either safe or handled correctly by percent-encoding in the HTTP request path.
 
