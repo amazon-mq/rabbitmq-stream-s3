@@ -47,7 +47,7 @@ Mirrors [Quorum Queue CMR](https://www.rabbitmq.com/docs/quorum-queues#member-re
 stream_s3.continuous_membership_reconciliation.enabled = true
 
 # The desired size to which stream clusters should grow.
-# Type: positive integer. Default: none.
+# Type: non-negative integer. Default: none.
 stream_s3.continuous_membership_reconciliation.target_group_size = 3
 
 # Whether to remove 'dangling' members which are no longer
@@ -56,13 +56,13 @@ stream_s3.continuous_membership_reconciliation.target_group_size = 3
 stream_s3.continuous_membership_reconciliation.auto_remove = true
 
 # Interval at which membership is evaluated, in milliseconds.
-# Type: positive integer. Default: 360000 (60 minutes).
-stream_s3.continuous_membership_reconciliation.interval = 360000
+# Type: non-negative integer. Default: 3600000 (60 minutes).
+stream_s3.continuous_membership_reconciliation.interval = 3600000
 
 # Delay in milliseconds after which membership is evaluated
 # following any trigger event, for example when a node joins the
 # RabbitMQ cluster.
-# Type: positive integer. Default: 10000 (10 seconds).
+# Type: non-negative integer. Default: 10000 (10 seconds).
 stream_s3.continuous_membership_reconciliation.trigger_interval = 10000
 ```
 

@@ -113,6 +113,6 @@ Each cluster should use its own bucket or its own bucket prefix. The plugin uses
 
 ## Disaster recovery posture
 
-Once a fragment is referenced by a persisted manifest, it is durable in S3 independent of the local cluster. If the cluster is wiped and rebuilt, the data uploaded so far is recoverable from the bucket. (Recovery tooling is not yet built; the design is documented in [`redesign.md`](../redesign.md) under "External readers".)
+Once a fragment is referenced by a persisted manifest, it is durable in S3 independent of the local cluster. If the cluster is wiped and rebuilt, the data uploaded so far is recoverable from the bucket. Recovery tooling for reading the remote tier without the originating cluster is not yet built.
 
 The window of vulnerability is between commit (replicated to a majority of page caches) and persist (manifest written to S3). For the design tradeoff and what "committed" actually means in streams, see [concepts.md](./concepts.md) and [failure-modes.md](./failure-modes.md).

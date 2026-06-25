@@ -58,7 +58,7 @@ A tree structure describing all data stored in the remote tier for a stream. The
 
 ## Manifest cache
 
-A per-node gen_server that caches manifest roots and maintains the `?RANGE_TABLE` ETS entries. Receives manifest edits from the writer node's remote replica reader and keeps log reader routing in sync.
+A per-node store (`rabbitmq_stream_s3_manifest_replica`) that caches manifest roots per stream in a public ETS table (`rabbitmq_stream_s3_manifest_cache`). Readers read the table directly; writes go through the gen_server. Receives manifest edits from the writer node's remote replica reader and keeps log reader routing in sync.
 
 ## Mega-group
 

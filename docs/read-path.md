@@ -56,15 +56,15 @@ Effects that require local data (manifest range lookups, iterator refreshes) are
 
 ### Prefetch
 
-When the remote reader opens a fragment, it issues a range request for the index (at the end of the fragment object, starting at byte `8 + Size`). The index tells it where each chunk starts within the fragment. It then issues range requests for the data, reading ahead of the consumer's position.
+The starting byte position within a fragment is determined once, at offset-spec resolution time, by the log reader (see [Index lookup within a fragment](#index-lookup-within-a-fragment)), not by the remote reader. Once reading begins, the remote reader issues forward range requests only for the chunk-data region `[8 + start, 8 + Size)` (it never re-fetches the index), reading ahead of the consumer's position and walking chunk headers sequentially within the buffered data.
 
-Read size grows using AIMD (additive increase, multiplicative decrease): successful reads grow the window additively, while errors or slow responses shrink it multiplicatively. This avoids wasting bandwidth on consumers that read a few records and disconnect, while allowing sustained sequential readers to approach local-tier throughput.
+Read size grows using AIMD (additive increase, multiplicative decrease). The window starts at `initial_read_size` (4 MiB). After a run of consecutive buffer hits it grows additively (by 1 MiB, capped at `read_size_max`, 64 MiB); a buffer miss (the consumer outrunning the prefetch) halves it (floored at `read_size_min`, 1 MiB). The decrease is driven by buffer misses, not by S3 errors, which instead drive a separate exponential retry-delay backoff. This avoids wasting bandwidth on consumers that read a few records and disconnect, while allowing sustained sequential readers to approach local-tier throughput.
 
 ### Fragment transitions
 
 When the consumer reads past the end of the current fragment:
 
-1. The remote reader calls `next/1` on the fragment iterator to get the next fragment's `{offset, uid, size}`.
+1. The remote reader calls `next/1` on the fragment iterator to get the next fragment as a `#fragment_ref{}` (its `offset`, `uid`, and `size`).
 2. It constructs the S3 key and begins prefetching the next fragment.
 3. Reading continues seamlessly from the new fragment.
 
@@ -96,7 +96,7 @@ The fragment iterator (`rabbitmq_stream_s3_fragment_iterator`) provides forward 
 ```erlang
 -spec init(#manifest{}, osiris:offset(), get_group_fun()) -> iterator().
 -spec next(iterator()) ->
-    {ok, {osiris:offset(), uid(), Size}, iterator()}
+    {ok, #fragment_ref{}, iterator()}
     | end_of_manifest
     | {error, {group_fetch_failed, term()}}.
 ```
@@ -120,13 +120,13 @@ Walking forward: advance the index. If the next entry is a fragment, return it. 
 
 ## Index lookup within a fragment
 
-Once the remote reader has the fragment data, it needs to find the byte position of a specific offset within the fragment. The index (at the end of the fragment object) contains 20-byte records:
+To start reading a fragment at a specific offset, the byte position of that offset within the fragment must be found. This happens once, during offset-spec resolution in the log reader (`find_position/3`), not on every read in the remote reader. The log reader issues a single range request for the index at the tail of the fragment object (starting at byte `8 + Size`), which contains 20-byte records:
 
 ```
 offset:64, timestamp:64, fragment_position:32
 ```
 
-The remote reader binary-searches the index for the target offset and reads chunk data starting at the returned `fragment_position`. This is the same algorithm as local reads (binary search the index, pread the segment), just over HTTP range requests instead of file I/O.
+It binary-searches the index for the target offset and hands the resulting `fragment_position` to the remote reader as the starting position. This is the same algorithm as local reads (binary search the index, then read forward), just over an HTTP range request instead of file I/O. After this starting position is established, the remote reader reads chunk data forward and walks chunk headers sequentially; it does not consult the index again for that fragment.
 
 ## Counters
 

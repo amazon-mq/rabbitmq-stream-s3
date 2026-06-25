@@ -127,7 +127,7 @@ There are three components.
 | Location | Per-occurrence cost | Frequency | Adds a chunk? | Adds an index record? | Consumes an offset? |
 |----------|--------------------|-----------|---------------|----------------------|--------------------|
 | Trailer on user chunk | `N x (10 + len(ID))` bytes | Every batch with pending tracking and user writes | No | No | No |
-| Standalone delta chunk | `~83 + len(ID)` bytes | Batch with tracking but no user writes | Yes | Yes | Yes |
+| Standalone delta chunk | `~91 + len(ID)` bytes | Batch with tracking but no user writes | Yes | Yes | Yes |
 | Snapshot chunk | `~81 + sum(entry blocks)` bytes | Once per segment | Yes | Yes | Yes |
 
 ## Takeaways for this plugin

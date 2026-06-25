@@ -166,22 +166,30 @@ Fragment and group entries share the same 34-byte layout, differentiated by the 
 
 <details><summary>Group...</summary>
 
+A group object has the same 49-byte header layout as the root. The magic differs by kind (`"OSIG"` for a group, `"OSIK"` for a kilo-group, `"OSIM"` for a mega-group), and the next-offset, first-last-timestamp, and total-size fields are written as zero for group objects.
+
 ```
 |0              |1              |2              |3              | Bytes
 |0 1 2 3 4 5 6 7|0 1 2 3 4 5 6 7|0 1 2 3 4 5 6 7|0 1 2 3 4 5 6 7| Bits
 +---------------+---------------+---------------+---------------+
-| Group  magic                                                  |
+| Group magic ("OSIG" / "OSIK" / "OSIM")                        |
 +---------------------------------------------------------------+
 | Group version (0x00000001)                                    |
 +---------------------------------------------------------------+
 | First offset (u64)                                            |
 |                                                               |
 +---------------------------------------------------------------+
+| Next offset (u64, written as 0)                               |
+|                                                               |
++---------------------------------------------------------------+
 | First timestamp (i64)                                         |
 |                                                               |
 +---------------------------------------------------------------+
-| 0 (u72)                                                       |
+| First-last timestamp (i64, written as 0)                      |
 |                                                               |
++----+----------------------------------------------------------+
++ 0  + Total size (u70, written as 0)                           |
++----+                                                          |
 |                                                               |
 |               +-----------------------------------------------|
 +---------------+                                               |
@@ -199,7 +207,7 @@ Fragment and group entries share the same 34-byte layout, differentiated by the 
 
 When the next fragment of stream data has been successfully uploaded, the remote replica reader appends the fragment's metadata to its in-memory copy of the root and evaluates whether the root has grown too large. The remote replica reader debounces uploads of the updated root to the remote tier to keep requests-per-second low. Once the root is too large, it uploads a new group object and once that has been successfully uploaded, replaces the fragments in its cached copy of the root with the new group's metadata.
 
-Periodically the remote replica reader evaluates whether the stream's retention rules should delete fragments. If the root has no groups, it decides which fragments to delete, removes them from the root array, and deletes them in the background. If there are groups, it downloads the first group object and evaluates retention against the fragments within. Once that process completes, it updates the total-size and oldest-last-timestamp metadata in the root. Group objects are never updated after being written, but once all fragments pointed to by a group (or all groups pointed to by a kilo-group, etc.) are deleted, the group object is deleted and removed from the root.
+Periodically the remote replica reader evaluates whether the stream's retention rules should delete fragments. If the root has no groups, it decides which fragments to delete and removes them from the root array. The actual S3 object deletions are deferred until the manifest persist that records their removal succeeds, so a reader never sees a manifest that still references an already-deleted object (issue #166). If there are groups, it downloads the first group object and evaluates retention against the fragments within. Once that process completes, it updates the total-size and oldest-last-timestamp metadata in the root. Group objects are never updated after being written, but once all fragments pointed to by a group (or all groups pointed to by a kilo-group, etc.) are deleted, the group object is deleted and removed from the root.
 
 Changes to the manifest are made only by the remote replica reader on the stream writer's node. Nodes with replica copies receive metadata about changes to each manifest through a generic edit type which can express the three kinds of changes: 1/ appending new fragments, 2/ factoring out groups and 3/ changes caused by retention. Since all stream members know information about the data in the remote tier, all members can perform local retention to evict fully uploaded segments aggressively.
 
@@ -293,7 +301,7 @@ An edit describes a modification to the manifest's entries array using three fie
 - **Truncate** (retention deletes oldest fragments): `pos = 0`, `len = N`, `entries = <<>>`. Removes a prefix.
 - **Replace** (rebalancing factors fragments into a group): `pos = P`, `len = L`, `entries = <group entry>`. Splices a group pointer in place of the factored-out fragment entries.
 
-An edit also carries updated top-level metadata (`first_offset`, `next_offset`, `first_timestamp`, `size`) so the replica can update its manifest root without recomputing from the entries array.
+An edit also carries updated top-level metadata (`first_offset`, `next_offset`, `first_timestamp`) and a signed `size` delta (added to the manifest's `total_size`; negative for retention) so the replica can update its manifest root without recomputing from the entries array.
 
 ### Edit ordering when rebalancing
 

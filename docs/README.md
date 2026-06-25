@@ -81,7 +81,7 @@ Understand enough to modify the plugin or diagnose issues in the code.
 Cover to cover. Follow the developer track, then continue with:
 
 8. [failure-modes.md](./failure-modes.md): failure triggers, system response, operator actions
-9. [log-framing.md](./log-framing.md): binary formats for fragments, index records, chunk headers
+9. [log-framing.md](./log-framing.md): per-message framing and storage overhead in a stream (segment, index, and chunk costs for a single message)
 10. [scale.md](./scale.md): theoretical and practical limits of a single stream
 11. [tla/README.md](../tla/README.md): TLA+ model, what it proves, how to run it
 

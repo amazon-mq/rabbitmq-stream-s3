@@ -76,7 +76,7 @@ After upload, the remote replica reader updates the manifest and notifies replic
 
 ### Local retention
 
-The stream has a max-bytes retention policy. When total local size exceeds the limit, the oldest segment files are deleted. The plugin's retention function also deletes segments whose data has been fully uploaded to S3. Either way, the data is gone from local disk but not from S3.
+The stream has a max-bytes retention policy. When total local size exceeds the limit, the oldest segment files are deleted. The plugin's retention function also deletes segments whose data has been fully uploaded to S3, always keeping the active segment. Either way, the data is gone from local disk but, when it was uploaded first, not from S3.
 
 ### Consume (local)
 
@@ -363,7 +363,7 @@ S3 has no efficient "find the object containing offset X" operation. Listing obj
 
 When a consumer needs offset 1,000,000 and it is not local, the log reader binary-searches the manifest to find which fragment contains that offset, constructs the S3 key, and starts reading. No LIST calls, no scanning.
 
-The manifest also first offset and timestamp to make retention evaluation.
+The manifest also tracks the first offset, first timestamp, and total size so that retention evaluation is cheap.
 
 See [manifest.md](./manifest.md) for the tree structure, binary format, and concurrency control.
 
@@ -384,9 +384,9 @@ With tiered storage there are two retention domains:
 
 **Local retention** has two components:
 1. The user's configured policy (max-bytes, max-age), same as vanilla streams.
-2. The plugin's `{'fun', ...}` spec, which deletes segments whose data has been fully uploaded to S3. This is what makes local disk a sliding window.
+2. The plugin's `{'fun', ...}` spec, which deletes segments whose data has been fully uploaded to S3, always keeping the active segment. This is what makes local disk a sliding window.
 
-Both run independently. The user's policy can delete segments the plugin has not uploaded yet (if S3 is down for a long time). The plugin accepts the resulting gap.
+These are not independent passes: osiris evaluates retention as a single fold over the spec list, and the plugin prepends its fun, so the upload-based reclaim runs first and the user's max-bytes/max-age policy then applies to whatever segments remain. The user's policy can still delete segments the plugin has not uploaded yet (if S3 is down for a long time). The plugin accepts the resulting gap.
 
 **Remote retention** applies the same max-age/max-bytes rules to fragments in S3. The remote replica reader evaluates this periodically.
 

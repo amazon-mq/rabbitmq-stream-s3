@@ -6,14 +6,18 @@ This document describes how the plugin's processes fit together: what starts the
 
 The plugin is enabled via `rabbitmq-plugins enable rabbitmq_stream_s3`. RabbitMQ starts it after the broker is fully up (after `core_started`). On start, the plugin's supervisor initializes all infrastructure and sets the osiris hooks. Streams that already exist at this point are discovered and attached to (see [Stream discovery](#stream-discovery)). Streams created after plugin start are handled by the hooks.
 
-Disabling the plugin stops the supervision tree, kills all replica readers, and clears the osiris hooks (`log_hooks` and `log_reader` are unset from the osiris application environment). Re-enabling rediscovers existing streams and resumes uploading from where the manifest left off.
+Disabling the plugin stops the supervision tree, which shuts down all replica readers (each traps exits and runs `terminate/2`, unregistering from the registry), and clears the osiris hooks (`log_hooks` and `log_reader` are unset from the osiris application environment). Re-enabling rediscovers existing streams and resumes uploading from where the manifest left off.
 
 The plugin never blocks or interferes with the local write path. All upload work happens in background processes. S3 availability is a soft dependency: outages cause uploads to fall behind but do not affect publishing, replication, or local consumption.
 
 ## Supervision tree
 
 ```
-rabbitmq_stream_s3_sup (one_for_one)
+rabbitmq_stream_s3_sup (one_for_one, intensity 3 / period 5)
+├── rabbitmq_stream_s3_api_aws (worker, permanent)
+│     AWS credential server. Fetches and refreshes credentials (instance
+│     role or static) and serves them to the API backend. Returns `ignore`
+│     when the backend is not AWS.
 ├── rabbitmq_stream_s3_manifest_replica (worker, permanent)
 │     Per-node manifest cache. Owns the ETS table of cached manifests.
 │     Receives sequenced edits from writer-node replica readers. Detects
@@ -35,17 +39,23 @@ rabbitmq_stream_s3_sup (one_for_one)
 │     Per-node transfer pacing. Accepts fragment upload submissions from
 │     replica readers, paces them via a token bucket, spawns tasks, and
 │     reports completions back.
-└── rabbitmq_stream_s3_replica_reader_sup (simple_one_for_one)
-      Factory. Its dynamic children are per-stream supervisors, started
-      `temporary` so the factory never restarts them.
-      └── rabbitmq_stream_s3_stream_sup (one per stream)
-            Per-stream supervisor. Owns its own restart-intensity budget
-            and auto-shuts-down when its reader exits normally.
-            └── rabbitmq_stream_s3_replica_reader (per-stream worker)
-                  Owns the full upload lifecycle for one stream: drain
-                  committed chunks, assemble fragments, submit to governor,
-                  apply completions in order, persist manifest, broadcast
-                  edits, evaluate retention.
+├── rabbitmq_stream_s3_replica_reader_sup (simple_one_for_one)
+│     Factory. Its dynamic children are per-stream supervisors, started
+│     `temporary` so the factory never restarts them.
+│     └── rabbitmq_stream_s3_stream_sup (one per stream)
+│           Per-stream supervisor. Owns its own restart-intensity budget
+│           and auto-shuts-down when its reader exits normally.
+│           └── rabbitmq_stream_s3_replica_reader (per-stream worker)
+│                 Owns the full upload lifecycle for one stream: drain
+│                 committed chunks, assemble fragments, submit to governor,
+│                 apply completions in order, persist manifest, broadcast
+│                 edits, evaluate retention.
+└── rabbitmq_stream_s3_reconciler (worker, permanent)
+      Periodic reconciliation. On a timer (default 60s) re-attaches local
+      osiris writers that have no registered replica reader (a parked
+      reader, a writer-restart race, or a reader that never started), so a
+      parked stream is picked back up rather than staying un-tiered.
+      Started last so its dependencies are already up.
 ```
 
 The supervisor init also performs one-time setup: creates the seshat counter group, initializes the API backend, sets the osiris hooks (`log_hooks` and `log_reader`), registers the Khepri deletion trigger, and creates the process registry ETS table.
@@ -58,7 +68,7 @@ The factory (`rabbitmq_stream_s3_replica_reader_sup`) is a `simple_one_for_one` 
 
 The worker is `transient` and `significant`, and the per-stream supervisor sets `auto_shutdown => any_significant`. The replica reader stops with reason `normal` when its osiris writer goes down (the reader monitors the writer; writer DOWN is the normal end of a stream's life on this node, e.g. leadership transfer or stream deletion). `transient` means that normal stop is not restarted; `auto_shutdown` then terminates the now-childless per-stream supervisor, so a departed stream does not leave an idle supervisor behind. A genuine crash is an abnormal exit, which is restarted within the per-stream budget; only after that budget is exhausted does the per-stream supervisor exit (`shutdown`) and the stream park.
 
-Because the per-stream supervisors are `temporary`, the factory never restarts them and never spends its own budget on their termination, whether they park or auto-shut-down. A parked stream has a live writer but no reader, and the supervisor does not re-attach it. Re-attachment happens only when the writer's `on_init` hook runs again (its `osiris_log` is re-initialized, for example on a leadership transfer back to this node) or when `discover/0` runs at plugin start. There is no periodic reconciler, so a stream whose writer keeps running after its reader parked stays un-tiered until one of those triggers fires.
+Because the per-stream supervisors are `temporary`, the factory never restarts them and never spends its own budget on their termination, whether they park or auto-shut-down. A parked stream has a live writer but no reader, and neither the per-stream supervisor nor the factory re-attaches it. Re-attachment happens through three paths: the writer's `on_init` hook running again (its `osiris_log` is re-initialized, for example on a leadership transfer back to this node), `discover/0` at plugin start, and the periodic reconciler (`rabbitmq_stream_s3_reconciler`). The reconciler runs `rabbitmq_stream_s3_hooks:reconcile/0` on a timer (enabled by default; `reconciliation_enabled`, `reconciliation_interval`, default 60s) and re-attaches any local writer that has no registered replica reader, so a parked stream is picked back up on the next tick rather than staying un-tiered indefinitely. The per-stream parking behaviour is deliberately coupled to this reconciler as its recovery mechanism.
 
 ## Process registry
 
@@ -81,7 +91,7 @@ Both are cleared on plugin stop to prevent new writers from calling into dead mo
 
 ### `on_init(writer, Pid, Config)`
 
-Called at the end of `osiris_log:init/1` after the writer's counter and shared atomics are created. The hook:
+Called during `osiris_log:init/2`, after the writer's counter and shared atomics are created but before the retention spec is consumed. The hook:
 1. Extracts the user retention spec (filtering out `{'fun', ...}` entries added by the plugin).
 2. Spawns a replica reader under `rabbitmq_stream_s3_replica_reader_sup` with the stream ID, writer pid, directory, shared atomics, counter ref, queue resource reference, epoch, and user retention spec.
 3. Appends the local retention function to the config's retention spec.
@@ -211,9 +221,9 @@ The plugin manages two retention domains.
 
 ### Local retention
 
-The `{'fun', ...}` retention spec deletes local segments whose data has been fully uploaded to S3. This is what makes local disk a sliding window over the full stream. It runs on both writer and replica nodes, triggered when the manifest's `next_offset` advances.
+The `{'fun', ...}` retention spec deletes local segments whose data has been fully uploaded to S3, always keeping the active segment regardless of upload state. This is what makes local disk a sliding window over the full stream. It runs on both writer and replica nodes, triggered when the manifest's `next_offset` advances.
 
-The user's configured retention (max-bytes, max-age) runs independently alongside the plugin's spec. If user retention deletes segments the plugin has not uploaded, the remote tier has a gap. The replica reader accepts the gap and jumps forward, as described next.
+The plugin's fun and the user's configured retention (max-bytes, max-age) are not independent passes: osiris evaluates retention as a single `lists:foldl` over the spec list, and the plugin prepends its fun, so the fun runs first and the user's specs then apply to whatever segments remain. If user retention deletes segments the plugin has not uploaded, the remote tier has a gap. The replica reader accepts the gap and jumps forward, as described next.
 
 ### Durability versus the local retention bound
 
