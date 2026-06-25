@@ -86,6 +86,7 @@ groups() ->
             on_init_writer_tolerates_already_started,
             two_layer_supervision_structure,
             duplicate_start_child_no_orphan_supervisor,
+            killed_reader_re_registers_and_resumes,
             remote_retention_deletes_fragments,
             remote_retention_on_update,
             remote_retention_survives_multiple_persist_cycles,
@@ -269,6 +270,54 @@ duplicate_start_child_no_orphan_supervisor(Config) ->
     ?assertMatch([_], supervisor:which_children(rabbitmq_stream_s3_replica_reader_sup)),
     %% The original reader is untouched and still registered.
     ?assertEqual(ReaderPid, rabbitmq_stream_s3_registry:whereis_name({StreamId, node()})).
+
+killed_reader_re_registers_and_resumes(Config) ->
+    %% Regression for #222. An untrappable reader death (here exit/2 with kill,
+    %% standing in for an OOM kill or brutal_kill) skips terminate/2, so the
+    %% reader never unregisters and leaves a stale {StreamId, DeadPid} entry in
+    %% the registry. The per-stream supervisor restarts the reader, whose init
+    %% must reclaim that stale entry and re-register. Before the fix the restart
+    %% got `no` from register_name and exited during init, wedging the stream.
+    StreamId = ?config(stream_id, Config),
+
+    Writer = start_writer(Config, #{fragment_target_size => 500}),
+    lists:foreach(
+        fun(_) -> osiris_writer:write(Writer, <<"first generation data">>) end,
+        lists:seq(1, 100)
+    ),
+    ok = await_offset(StreamId, 50),
+    {0, RangeBeforeKill} = get_range(Config),
+
+    OldReader = rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}),
+    ?assert(is_pid(OldReader)),
+
+    %% Kill the reader untrappably: terminate/2 does not run, so the stale entry
+    %% survives and is still pointing at the now-dead pid.
+    ReaderMon = monitor(process, OldReader),
+    true = exit(OldReader, kill),
+    receive
+        {'DOWN', ReaderMon, process, OldReader, killed} -> ok
+    after 5000 ->
+        ct:fail("reader did not die after exit(Pid, kill)")
+    end,
+
+    %% The per-stream supervisor restarts the reader. The new reader reclaims
+    %% the stale entry and re-registers under a fresh pid.
+    ?awaitMatch(
+        P when is_pid(P) andalso P =/= OldReader,
+        rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}),
+        5000
+    ),
+
+    %% The stream keeps tiering: more data uploads and the range advances past
+    %% where it was when the reader died.
+    lists:foreach(
+        fun(_) -> osiris_writer:write(Writer, <<"second generation data">>) end,
+        lists:seq(1, 100)
+    ),
+    ok = await_offset(StreamId, RangeBeforeKill + 50),
+    {0, RangeAfterRestart} = get_range(Config),
+    ?assert(RangeAfterRestart > RangeBeforeKill).
 
 uploads_fragments(Config) ->
     StreamId = ?config(stream_id, Config),

@@ -36,32 +36,43 @@ init() ->
 -spec register_name({stream_id(), node()}, pid()) -> yes | no.
 register_name({StreamId, Node}, Pid) when Node =:= node() ->
     case ets:insert_new(?TABLE, {StreamId, Pid}) of
+        true -> yes;
+        false -> register_over_existing(StreamId, Pid)
+    end.
+
+%% insert_new failed: an entry already exists for the name. If it is a stale
+%% dead pid - a reader that died without unregistering (e.g. a brutal kill) -
+%% reclaim it; otherwise a live reader holds the name, so refuse. Without this a
+%% stale entry permanently blocks re-attaching tiering to the stream.
+-spec register_over_existing(stream_id(), pid()) -> yes | no.
+register_over_existing(StreamId, Pid) ->
+    case ets:lookup(?TABLE, StreamId) of
+        [{_, Existing}] when Existing =/= Pid ->
+            reclaim_if_dead(StreamId, Existing, Pid);
+        _ ->
+            %% Raced away, or already ours; retry once.
+            retry_insert(StreamId, Pid)
+    end.
+
+-spec reclaim_if_dead(stream_id(), pid(), pid()) -> yes | no.
+reclaim_if_dead(StreamId, Existing, Pid) ->
+    case is_process_alive(Existing) of
         true ->
-            yes;
+            no;
         false ->
-            %% An entry already exists. If it is a stale dead pid - a reader that
-            %% died without unregistering (e.g. a brutal kill) - replace it;
-            %% otherwise a live reader holds the name, so refuse. Without this a
-            %% stale entry permanently blocks re-attaching tiering to the stream.
-            case ets:lookup(?TABLE, StreamId) of
-                [{_, Existing}] when Existing =/= Pid ->
-                    case is_process_alive(Existing) of
-                        true ->
-                            no;
-                        false ->
-                            ets:delete_object(?TABLE, {StreamId, Existing}),
-                            case ets:insert_new(?TABLE, {StreamId, Pid}) of
-                                true -> yes;
-                                false -> no
-                            end
-                    end;
-                _ ->
-                    %% Raced away, or already ours; retry once.
-                    case ets:insert_new(?TABLE, {StreamId, Pid}) of
-                        true -> yes;
-                        false -> no
-                    end
-            end
+            %% Swap the pid in place in a single atomic op. Unlike
+            %% delete_object + insert_new there is no window in which the key is
+            %% absent, so a concurrent whereis_name never observes the name as
+            %% momentarily unregistered.
+            true = ets:update_element(?TABLE, StreamId, {2, Pid}),
+            yes
+    end.
+
+-spec retry_insert(stream_id(), pid()) -> yes | no.
+retry_insert(StreamId, Pid) ->
+    case ets:insert_new(?TABLE, {StreamId, Pid}) of
+        true -> yes;
+        false -> no
     end.
 
 -doc "Unregister a name.".
