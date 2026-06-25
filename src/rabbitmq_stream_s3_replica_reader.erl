@@ -2210,9 +2210,20 @@ on_manifest_resolved(#manifest{next_offset = 0}, State) ->
     inc(State, ?C_MANIFESTS_RESOLVED_EMPTY, 1),
     update_manifest_gauges(#manifest{}, State),
     State;
-on_manifest_resolved(#manifest{} = Manifest, State) ->
+on_manifest_resolved(
+    #manifest{first_offset = ManifestFirst, first_timestamp = ManifestFirstTs} = Manifest,
+    #state{cfg = #cfg{counter = Cnt}} = State
+) ->
     inc(State, ?C_MANIFESTS_RESOLVED, 1),
     update_manifest_gauges(Manifest, State),
+    %% Seed the osiris first-offset and first-timestamp counters immediately so
+    %% the management UI reflects the remote tier's range without waiting for the
+    %% first retention evaluation or manifest edit. Without this, an idle stream
+    %% (or one that hasn't persisted yet) reports only the local segment window.
+    LocalFirst = counters:get(Cnt, ?C_OSIRIS_LOG_FIRST_OFFSET),
+    counters:put(Cnt, ?C_OSIRIS_LOG_FIRST_OFFSET, min(LocalFirst, ManifestFirst)),
+    LocalFirstTs = counters:get(Cnt, ?C_OSIRIS_LOG_FIRST_TIMESTAMP),
+    counters:put(Cnt, ?C_OSIRIS_LOG_FIRST_TIMESTAMP, min(LocalFirstTs, ManifestFirstTs)),
     State.
 
 on_remote_retention_deleted(Refs, StreamId, State) ->
