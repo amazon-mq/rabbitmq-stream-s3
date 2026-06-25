@@ -324,7 +324,7 @@ init(
     TargetSize = maps:get(
         fragment_target_size,
         Args,
-        application:get_env(rabbitmq_stream_s3, fragment_target_size, ?MAX_FRAGMENT_SIZE_B)
+        rabbitmq_stream_s3_config:fragment_target_size()
     ),
     Shared = maps:get(shared, Args, undefined),
     {MetricsId, Metrics} = init_metrics(StreamId, Reference),

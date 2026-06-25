@@ -84,6 +84,13 @@ stream_s3.persist_threshold = 5
 # Bounds the persist window when fragments arrive slowly. Default: 2000.
 stream_s3.persist_interval_ms = 2000
 
+# Manifest-tree branching factor: the number of same-kind leading entries in
+# the manifest root that triggers factoring them into a group of the next
+# kind. Smaller values reduce memory footprint but increase remote-tier
+# requests during factoring and search; larger values do the reverse.
+# Default: 1024.
+stream_s3.rebalance_threshold = 1024
+
 # Byte-rate ceiling applied by the per-node governor across all streams.
 # When unlimited, the governor does not pace transfers. Set to a fraction
 # of instance bandwidth on managed deployments to avoid contention with
