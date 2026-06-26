@@ -190,6 +190,16 @@ init(
     } = Config
 ) ->
     logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
+    %% The remote reader holds large refc binaries (the AIMD prefetch buffer,
+    %% up to read_size_max per fragment) and receives data as binaries in its
+    %% mailbox. Force a fullsweep on every GC so those binaries' ProcBin
+    %% references are collected promptly rather than surviving minor GCs, and
+    %% keep the message queue off-heap so a backlog of data messages does not
+    %% bloat the main heap. This mirrors osiris_writer and the connection pool's
+    %% gun sender/receiver processes, which set the same flags for the same
+    %% reason.
+    process_flag(fullsweep_after, 0),
+    process_flag(message_queue_data, off_heap),
     Opts = maps:get(opts, Config, #{}),
     Cfg = build_cfg(Opts),
     {Core0, Effects} = rabbitmq_stream_s3_remote_reader_core:init(
