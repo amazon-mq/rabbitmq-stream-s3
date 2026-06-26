@@ -573,7 +573,8 @@ terminate(
     #state{
         cfg = #cfg{stream = StreamId},
         task_io = Io,
-        metrics_id = MetricsId
+        metrics_id = MetricsId,
+        stopping = Stopping
     } = State
 ) ->
     %% Kill any in-flight commit task to prevent orphaned Khepri writes.
@@ -592,6 +593,16 @@ terminate(
     ok = delete_metrics(MetricsId),
     rabbitmq_stream_s3_registry:unregister_name({StreamId, node()}),
     rabbitmq_stream_s3_manifest:evict_group_cache(StreamId),
+    %% On the writer node the manifest cache row is written by put_manifest and
+    %% has no osiris member registered to monitor it, so it is released here
+    %% when the stream is being torn down. `stopping` is set only when the
+    %% stream's metadata node was deleted; a transient reader restart leaves it
+    %% false so the cache survives (and is reseeded), avoiding a window where a
+    %% consumer resolves the remote tier as absent.
+    case Stopping of
+        true -> rabbitmq_stream_s3_manifest_replica:forget(StreamId);
+        false -> ok
+    end,
     ok.
 
 format_status(#{state := State} = Status) ->

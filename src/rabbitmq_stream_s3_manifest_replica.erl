@@ -68,9 +68,10 @@ No heartbeat or reconnection mechanism is needed because:
     apply_edits/5,
     sync/4,
     sync/5,
-    register_replica_context/4,
+    register_replica_context/5,
     is_context_registered/1,
-    evaluate_local_retention/1
+    evaluate_local_retention/1,
+    forget/1
 ]).
 -export([
     init/1,
@@ -83,14 +84,20 @@ No heartbeat or reconnection mechanism is needed because:
 -record(replica_ctx, {
     dir :: file:filename_all(),
     shared :: atomics:atomics_ref(),
-    counter :: counters:counters_ref()
+    counter :: counters:counters_ref(),
+    %% Monitor ref for the osiris member that registered this context. When the
+    %% member goes down the context is dropped; see handle_info/2.
+    mref :: reference()
 }).
 
 -record(state, {
     %% Per-stream osiris context for replica-side retention.
     contexts = #{} :: #{stream_id() => #replica_ctx{}},
     %% Per-stream last applied {seq, epoch, writer_node} for gap detection.
-    seqs = #{} :: #{stream_id() => {non_neg_integer(), non_neg_integer(), node()}}
+    seqs = #{} :: #{stream_id() => {non_neg_integer(), non_neg_integer(), node()}},
+    %% Reverse index from a member monitor ref to its stream, so a DOWN can find
+    %% which stream to release. Kept in lockstep with the mref in each context.
+    monitors = #{} :: #{reference() => stream_id()}
 }).
 
 %% ------------------------------------------------------------------
@@ -182,13 +189,21 @@ sync(StreamId, Seq, Epoch, Manifest) ->
 
 -doc """
 Register osiris log context for a stream on this node.
-Called from the acceptor hook when a replica starts.
+
+Called from the acceptor hook when a replica starts (and from discovery and
+reconciliation). `MemberPid` is the osiris member that owns the context; it is
+monitored so the context, sequence, and cached row are released when the member
+goes down. osiris has no terminate or delete hook, so this monitor is how
+per-node replica state is reclaimed when a replica moves off the node or the
+stream is deleted. Re-registering for a stream replaces any previous monitor, so
+a member restart re-points the monitor at the new incarnation rather than letting
+its predecessor's DOWN evict the live context.
 """.
 -spec register_replica_context(
-    stream_id(), file:filename_all(), atomics:atomics_ref(), counters:counters_ref()
+    stream_id(), pid(), file:filename_all(), atomics:atomics_ref(), counters:counters_ref()
 ) -> ok.
-register_replica_context(StreamId, Dir, Shared, Counter) ->
-    gen_server:call(?MODULE, {register_replica_context, StreamId, Dir, Shared, Counter}).
+register_replica_context(StreamId, MemberPid, Dir, Shared, Counter) ->
+    gen_server:call(?MODULE, {register_replica_context, StreamId, MemberPid, Dir, Shared, Counter}).
 
 -doc "Whether a replica context is registered for the stream on this node.".
 -spec is_context_registered(stream_id()) -> boolean().
@@ -199,6 +214,19 @@ is_context_registered(StreamId) ->
 -spec evaluate_local_retention(stream_id()) -> ok | {error, term()}.
 evaluate_local_retention(StreamId) ->
     gen_server:call(?MODULE, {evaluate_local_retention, StreamId}).
+
+-doc """
+Release all per-node state for a stream: its retention context (and member
+monitor), its gap-detection sequence, and its cached manifest row.
+
+Replica-side state is released automatically by the member monitor (see
+`register_replica_context/5`). This is the explicit path for the writer node,
+whose cached row is written by `put_manifest/3` and owned by the replica reader,
+which calls this from its `terminate/2` when the stream is torn down.
+""".
+-spec forget(stream_id()) -> ok.
+forget(StreamId) ->
+    gen_server:call(?MODULE, {forget, StreamId}).
 
 %% ------------------------------------------------------------------
 %% gen_server callbacks
@@ -260,12 +288,27 @@ handle_call({apply_edit, StreamId, Edit}, _From, State) ->
         end,
     {reply, Reply, State};
 handle_call(
-    {register_replica_context, StreamId, Dir, Shared, Counter},
+    {register_replica_context, StreamId, MemberPid, Dir, Shared, Counter},
     _From,
-    #state{contexts = Ctxs} = State
+    #state{contexts = Ctxs, monitors = Mons0} = State
 ) ->
-    Ctx = #replica_ctx{dir = Dir, shared = Shared, counter = Counter},
-    {reply, ok, State#state{contexts = Ctxs#{StreamId => Ctx}}};
+    %% Replace any previous registration's monitor first: a member restart
+    %% re-registers, and the old incarnation's DOWN must not evict the new
+    %% context. demonitor with flush drops any DOWN already queued for it.
+    Mons1 =
+        case maps:get(StreamId, Ctxs, undefined) of
+            #replica_ctx{mref = OldRef} ->
+                demonitor(OldRef, [flush]),
+                maps:remove(OldRef, Mons0);
+            undefined ->
+                Mons0
+        end,
+    MRef = monitor(process, MemberPid),
+    Ctx = #replica_ctx{dir = Dir, shared = Shared, counter = Counter, mref = MRef},
+    {reply, ok, State#state{
+        contexts = Ctxs#{StreamId => Ctx},
+        monitors = Mons1#{MRef => StreamId}
+    }};
 handle_call({is_context_registered, StreamId}, _From, #state{contexts = Ctxs} = State) ->
     {reply, maps:is_key(StreamId, Ctxs), State};
 handle_call({evaluate_local_retention, StreamId}, _From, #state{contexts = Ctxs} = State) ->
@@ -289,6 +332,8 @@ handle_call({evaluate_local_retention, StreamId}, _From, #state{contexts = Ctxs}
                 {error, {not_found, StreamId}}
         end,
     {reply, Reply, State};
+handle_call({forget, StreamId}, _From, State) ->
+    {reply, ok, release_stream(StreamId, State)};
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown}, State}.
 
@@ -352,6 +397,16 @@ handle_cast({apply_edits, StreamId, Edits, Seq, Epoch, WriterNode}, #state{seqs 
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
+handle_info({'DOWN', MRef, process, _Pid, _Reason}, #state{monitors = Mons} = State) ->
+    %% A registered osiris member went down. Release its stream's state. A DOWN
+    %% whose ref is not in the map belongs to a registration already superseded
+    %% (re-register demonitored+flushed it) and is ignored.
+    case maps:get(MRef, Mons, undefined) of
+        undefined ->
+            {noreply, State};
+        StreamId ->
+            {noreply, release_stream(StreamId, State)}
+    end;
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -364,6 +419,25 @@ terminate(_Reason, _State) ->
 
 write_manifest(StreamId, Manifest, Epoch) ->
     ets:insert(?TABLE, {StreamId, Manifest, Epoch}).
+
+%% Drop all per-node state for a stream: its context (and member monitor), its
+%% gap-detection sequence, and its cached manifest row. Used by both the member
+%% DOWN handler and the explicit forget/1 (writer reader teardown).
+release_stream(StreamId, #state{contexts = Ctxs, seqs = Seqs, monitors = Mons} = State) ->
+    Mons1 =
+        case maps:get(StreamId, Ctxs, undefined) of
+            #replica_ctx{mref = MRef} ->
+                demonitor(MRef, [flush]),
+                maps:remove(MRef, Mons);
+            undefined ->
+                Mons
+        end,
+    ets:delete(?TABLE, StreamId),
+    State#state{
+        contexts = maps:remove(StreamId, Ctxs),
+        seqs = maps:remove(StreamId, Seqs),
+        monitors = Mons1
+    }.
 
 %% Apply a batch of edits, catching any failure from apply_edit/2. apply_edit/2
 %% raises on a structurally inconsistent edit (a gap, a diverged replica, or a
