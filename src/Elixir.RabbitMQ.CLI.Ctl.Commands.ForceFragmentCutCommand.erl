@@ -73,7 +73,7 @@ output({error, empty_assembly}, _Opts) ->
         <<"Assembly is empty (no chunks accumulated yet).">>};
 output({error, {not_found, _}}, _Opts) ->
     {error, 'Elixir.RabbitMQ.CLI.Core.ExitCodes':exit_software(),
-        <<"Stream not found or replica reader not running on this node.">>};
+        <<"Stream not found, or no replica reader is running for it.">>};
 output({error, Reason}, _Opts) ->
     {error, 'Elixir.RabbitMQ.CLI.Core.ExitCodes':exit_software(),
         erlang:iolist_to_binary(io_lib:format("~tp", [Reason]))}.

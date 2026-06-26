@@ -282,12 +282,20 @@ status(VHost, QueueName) ->
 -doc "Trigger local retention evaluation for a stream on the current node.".
 -spec evaluate_local_retention(stream_id()) -> ok | {error, term()}.
 evaluate_local_retention(StreamId) ->
-    call(StreamId, evaluate_local_retention).
+    case rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}) of
+        Pid when is_pid(Pid) ->
+            gen_server:call(Pid, evaluate_local_retention);
+        undefined ->
+            rabbitmq_stream_s3_manifest_replica:evaluate_local_retention(StreamId)
+    end.
 
 -doc "Trigger local retention evaluation by vhost and queue name.".
 -spec evaluate_local_retention(rabbit_types:vhost(), binary()) -> ok | {error, term()}.
 evaluate_local_retention(VHost, QueueName) ->
-    call(VHost, QueueName, evaluate_local_retention).
+    case resolve_stream_id(VHost, QueueName) of
+        {ok, StreamId} -> evaluate_local_retention(StreamId);
+        {error, _} = Err -> Err
+    end.
 
 -doc "Trigger remote retention evaluation for a stream on the current node.".
 -spec evaluate_remote_retention(stream_id()) -> ok | {error, term()}.
@@ -598,6 +606,7 @@ format_state(#state{
 }) ->
     #{
         stream => StreamId,
+        node => node(),
         fragment_target_size => Target,
         transfer_deadlines_armed => maps:size(Timers),
         core =>
@@ -622,9 +631,9 @@ format_state(#state{
 %% ------------------------------------------------------------------
 
 call(StreamId, Msg) ->
-    case rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}) of
-        undefined -> {error, {not_found, StreamId}};
-        Pid -> gen_server:call(Pid, Msg)
+    case find_reader(StreamId) of
+        {ok, Pid} -> gen_server:call(Pid, Msg);
+        undefined -> {error, {not_found, StreamId}}
     end.
 
 call(VHost, QueueName, Msg) ->
@@ -633,6 +642,18 @@ call(VHost, QueueName, Msg) ->
             call(StreamId, Msg);
         {error, _} = Err ->
             Err
+    end.
+
+-spec find_reader(stream_id()) -> {ok, pid()} | undefined.
+find_reader(StreamId) ->
+    find_reader(StreamId, [node() | nodes()]).
+
+find_reader(_StreamId, []) ->
+    undefined;
+find_reader(StreamId, [Node | Rest]) ->
+    case rabbitmq_stream_s3_registry:whereis_name({StreamId, Node}) of
+        undefined -> find_reader(StreamId, Rest);
+        Pid -> {ok, Pid}
     end.
 
 -doc "Resolve a vhost and queue name to the internal stream id.".

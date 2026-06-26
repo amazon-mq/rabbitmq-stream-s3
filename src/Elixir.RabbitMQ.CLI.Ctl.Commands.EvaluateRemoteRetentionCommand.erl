@@ -67,7 +67,7 @@ output(ok, _Opts) ->
     {ok, <<"Remote retention evaluated successfully.">>};
 output({error, {not_found, _}}, _Opts) ->
     {error, 'Elixir.RabbitMQ.CLI.Core.ExitCodes':exit_software(),
-        <<"Stream not found or replica reader not running on this node.">>};
+        <<"Stream not found, or no replica reader is running for it.">>};
 output({error, {in_progress, Blocker}}, _Opts) ->
     {error, 'Elixir.RabbitMQ.CLI.Core.ExitCodes':exit_tempfail(),
         erlang:iolist_to_binary(

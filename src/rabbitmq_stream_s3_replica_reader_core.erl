@@ -190,7 +190,10 @@ format_state(#state{
         since_persist => SincePersist,
         in_persist_count => InPersistCount,
         persist_in_flight => PersistInFlight,
-        last_persist_ts => LastPersistTs,
+        %% Age rather than the raw timestamp: last_persist_ts is on this node's
+        %% clock, but the CLI renders on a different node, so the duration must
+        %% be computed here against the same clock.
+        last_persist_age_ms => erlang:system_time(millisecond) - LastPersistTs,
         rebalance_in_flight => RebalanceInFlight,
         retention_in_flight => RetentionInFlight,
         waiters => length(Waiters)
