@@ -67,7 +67,7 @@ output(ok, _Opts) ->
     {ok, <<"Local retention evaluated successfully.">>};
 output({error, {not_found, _}}, _Opts) ->
     {error, 'Elixir.RabbitMQ.CLI.Core.ExitCodes':exit_software(),
-        <<"Stream not found or replica reader not running on this node.">>};
+        <<"Stream not found, or no member of it is running on the target node.">>};
 output({error, Reason}, _Opts) ->
     {error, 'Elixir.RabbitMQ.CLI.Core.ExitCodes':exit_software(),
         erlang:iolist_to_binary(io_lib:format("~tp", [Reason]))}.

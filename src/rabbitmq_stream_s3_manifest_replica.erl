@@ -69,7 +69,8 @@ No heartbeat or reconnection mechanism is needed because:
     sync/4,
     sync/5,
     register_replica_context/4,
-    is_context_registered/1
+    is_context_registered/1,
+    evaluate_local_retention/1
 ]).
 -export([
     init/1,
@@ -194,6 +195,11 @@ register_replica_context(StreamId, Dir, Shared, Counter) ->
 is_context_registered(StreamId) ->
     gen_server:call(?MODULE, {is_context_registered, StreamId}).
 
+-doc "Evaluate local-tier retention for a stream on this node.".
+-spec evaluate_local_retention(stream_id()) -> ok | {error, term()}.
+evaluate_local_retention(StreamId) ->
+    gen_server:call(?MODULE, {evaluate_local_retention, StreamId}).
+
 %% ------------------------------------------------------------------
 %% gen_server callbacks
 %% ------------------------------------------------------------------
@@ -262,6 +268,27 @@ handle_call(
     {reply, ok, State#state{contexts = Ctxs#{StreamId => Ctx}}};
 handle_call({is_context_registered, StreamId}, _From, #state{contexts = Ctxs} = State) ->
     {reply, maps:is_key(StreamId, Ctxs), State};
+handle_call({evaluate_local_retention, StreamId}, _From, #state{contexts = Ctxs} = State) ->
+    Reply =
+        case maps:get(StreamId, Ctxs, undefined) of
+            #replica_ctx{} = Ctx ->
+                case get_manifest(StreamId) of
+                    #manifest{entries = <<>>} ->
+                        %% No remote tier yet: nothing has been uploaded, so no
+                        %% local segment is safe to delete. Returning early also
+                        %% avoids feeding the empty manifest's -1 first_timestamp
+                        %% sentinel into the counter (see run_local_retention).
+                        ok;
+                    #manifest{} = Manifest ->
+                        run_local_retention(StreamId, Manifest, Ctx),
+                        ok;
+                    undefined ->
+                        {error, manifest_not_resolved}
+                end;
+            undefined ->
+                {error, {not_found, StreamId}}
+        end,
+    {reply, Reply, State};
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown}, State}.
 
@@ -436,45 +463,12 @@ inc(Idx, N) ->
 maybe_evaluate_retention(
     StreamId,
     #manifest{next_offset = OldManifestNextOffset},
-    #manifest{
-        first_offset = ManifestFirstOffset,
-        first_timestamp = ManifestFirstTimestamp,
-        next_offset = NewManifestNextOffset
-    },
+    #manifest{next_offset = NewManifestNextOffset} = Manifest,
     #state{contexts = Ctxs}
 ) when NewManifestNextOffset > OldManifestNextOffset ->
     case maps:get(StreamId, Ctxs, undefined) of
-        #replica_ctx{dir = Dir, shared = Shared, counter = Cnt} ->
-            Spec = [{'fun', rabbitmq_stream_s3_hooks:local_retention_fun(StreamId)}],
-            EvalFun = fun
-                ({{FstOff, _}, FstTs, NumSegLeft}) when
-                    is_integer(FstOff), is_integer(FstTs)
-                ->
-                    osiris_log_shared:set_first_chunk_id(Shared, FstOff),
-                    counters:put(
-                        Cnt,
-                        ?C_OSIRIS_LOG_FIRST_OFFSET,
-                        min(FstOff, ManifestFirstOffset)
-                    ),
-                    %% Correct the first timestamp alongside the first offset.
-                    %% osiris sets it from the local tier's oldest surviving
-                    %% segment; the remote tier holds older data here (the
-                    %% manifest advanced), so the oldest message is the
-                    %% manifest's first_timestamp. Without this the UI's oldest
-                    %% message marches forward as local retention deletes
-                    %% segments. The manifest advanced past the old next_offset,
-                    %% so it is non-empty and first_timestamp is a real
-                    %% timestamp, not the empty-manifest -1 sentinel.
-                    counters:put(
-                        Cnt,
-                        ?C_OSIRIS_LOG_FIRST_TIMESTAMP,
-                        min(FstTs, ManifestFirstTimestamp)
-                    ),
-                    counters:put(Cnt, ?C_OSIRIS_LOG_SEGMENTS, NumSegLeft);
-                (_) ->
-                    ok
-            end,
-            osiris_retention:eval(StreamId, Dir, Spec, EvalFun);
+        #replica_ctx{} = Ctx ->
+            run_local_retention(StreamId, Manifest, Ctx);
         undefined ->
             ok
     end;
@@ -482,6 +476,46 @@ maybe_evaluate_retention(
     _StreamId, _OldManifest = #manifest{}, _NewManifest = #manifest{}, #state{}
 ) ->
     ok.
+
+%% Evaluate local-tier retention for a stream on this node against `Manifest`.
+%% Deletes local segments whose data is already uploaded (up to the manifest's
+%% next_offset, via local_retention_fun) and corrects the first offset/timestamp
+%% counters. Shared by the automatic edit-driven path (maybe_evaluate_retention)
+%% and the on-demand CLI path (evaluate_local_retention/1). Callers must ensure
+%% the manifest is non-empty so the -1 first_timestamp sentinel never reaches the
+%% counter.
+run_local_retention(
+    StreamId,
+    #manifest{first_offset = ManifestFirstOffset, first_timestamp = ManifestFirstTimestamp},
+    #replica_ctx{dir = Dir, shared = Shared, counter = Cnt}
+) ->
+    Spec = [{'fun', rabbitmq_stream_s3_hooks:local_retention_fun(StreamId)}],
+    EvalFun = fun
+        ({{FstOff, _}, FstTs, NumSegLeft}) when
+            is_integer(FstOff), is_integer(FstTs)
+        ->
+            osiris_log_shared:set_first_chunk_id(Shared, FstOff),
+            counters:put(
+                Cnt,
+                ?C_OSIRIS_LOG_FIRST_OFFSET,
+                min(FstOff, ManifestFirstOffset)
+            ),
+            %% Correct the first timestamp alongside the first offset.
+            %% osiris sets it from the local tier's oldest surviving
+            %% segment; the remote tier holds older data here, so the
+            %% oldest message is the manifest's first_timestamp. Without
+            %% this the UI's oldest message marches forward as local
+            %% retention deletes segments.
+            counters:put(
+                Cnt,
+                ?C_OSIRIS_LOG_FIRST_TIMESTAMP,
+                min(FstTs, ManifestFirstTimestamp)
+            ),
+            counters:put(Cnt, ?C_OSIRIS_LOG_SEGMENTS, NumSegLeft);
+        (_) ->
+            ok
+    end,
+    osiris_retention:eval(StreamId, Dir, Spec, EvalFun).
 
 %% Seed the osiris first-offset and first-timestamp counters from the manifest
 %% on sync. Without this, the counters reflect only the local tier until the

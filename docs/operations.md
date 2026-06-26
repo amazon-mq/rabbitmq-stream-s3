@@ -487,7 +487,7 @@ rabbitmq-streams stream_s3_status my-stream --vhost /
 > [!TIP]
 > Use `--formatter=json` for machine-readable output: `rabbitmq-streams stream_s3_status my-stream --formatter=json`
 
-**Evaluate local retention** triggers the local retention job for a stream. Useful to determine whether retention is correctly reclaiming segments after upload.
+**Evaluate local retention** triggers the local retention job for a stream. Useful to determine whether retention is correctly reclaiming segments after upload. Local retention is node-local: it acts on the local segments of the node the command runs on, so target the node whose disk you want reclaimed with `--node`.
 
 ```bash
 rabbitmq-streams evaluate_local_retention my-stream --vhost /
