@@ -606,6 +606,7 @@ format_state(#state{
 }) ->
     #{
         stream => StreamId,
+        node => node(),
         fragment_target_size => Target,
         transfer_deadlines_armed => maps:size(Timers),
         core =>

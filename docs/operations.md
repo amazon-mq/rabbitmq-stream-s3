@@ -459,53 +459,114 @@ A single `rabbitmq_stream_s3_archival_lag_bytes` metric would not give this deco
 
 The plugin adds commands to `rabbitmq-streams` for debugging the upload pipeline.
 
-**Stream S3 status** shows the current state of the tiered storage replica reader for a stream: manifest offsets, pipeline state, assembly progress, and whether persist/rebalance/retention operations are in flight.
+#### Stream S3 status
+
+Shows the current state of the tiered storage replica reader for a stream: manifest offsets, pipeline state, assembly progress, and whether persist/rebalance/retention operations are in flight.
 
 ```bash
 rabbitmq-streams stream_s3_status my-stream --vhost /
 # Status of tiered storage for stream my-stream in vhost / ...
-# stream:	<<"__my-stream_1781016420026141262">>
-# fragment_target_size:	67108864
-# log_next_offset:	1421556
-# manifest_first_offset:	0
-# manifest_next_offset:	1317635
-# manifest_total_size:	1339723340
-# persisted_next_offset:	1317635
-# transfers_in_flight:	1
-# transfers_pending_order:	0
-# since_persist:	0
-# persist_in_flight:	false
-# rebalance_in_flight:	false
-# retention_in_flight:	false
-# waiters:	0
-# assembly_payload_size:	38043104
-# assembly_target_size:	67108864
-# assembly_num_chunks:	6661
-# assembly_cut:	false
+#
+# Stream
+#
+# Stream ID: __my-stream_1781016420026141262
+# Node: rabbit@host
+# Log next offset: 1,421,556
+#
+# Remote tier
+#
+# First offset: 0
+# Next offset: 1,317,635
+# Persisted next offset: 1,317,635
+# Total size: 1.25 GiB (1,339,723,340 bytes)
+#
+# Upload pipeline
+#
+# Transfers in flight: 1
+# Completed transfers awaiting ordering: 0
+# Transfer deadlines armed: 1
+# Edits since last persist: 4
+# Edits in current persist: 0
+# Last persist: 3s ago
+# Persist in flight: no
+# Rebalance in flight: no
+# Retention in flight: no
+# Consumers awaiting offset: 0
+#
+# Current fragment (assembly)
+#
+# Fragment target size: 64.00 MiB (67,108,864 bytes)
+# First offset: 1,310,974
+# Next offset: 1,421,556
+# Payload size: 36.28 MiB (38,043,104 bytes)
+# On-disk size: 36.29 MiB (38,050,000 bytes)
+# Chunks: 6,661
+# Cut: no
 ```
 
-> [!TIP]
-> Use `--formatter=json` for machine-readable output: `rabbitmq-streams stream_s3_status my-stream --formatter=json`
+The report is grouped into four sections.
 
-**Evaluate local retention** triggers the local retention job for a stream. Useful to determine whether retention is correctly reclaiming segments after upload. Local retention is node-local: it acts on the local segments of the node the command runs on, so target the node whose disk you want reclaimed with `--node`.
+**Stream** identifies the stream and where this report comes from.
+
+- `Stream ID`: the plugin's internal id for the stream.
+- `Node`: the node whose replica reader answered. The command resolves the reader on any cluster node, so this names the node the rest of the report describes.
+- `Log next offset`: the next offset the local log will write, that is, the current tail of the stream.
+
+**Remote tier** describes the committed manifest, the index of data already in S3.
+
+- `First offset` and `Next offset`: the offset range covered by the remote tier. `Next offset` is one past the last uploaded offset.
+- `Persisted next offset`: the `Next offset` of the last manifest that was durably persisted. It lags `Next offset` while a persist is in flight.
+- `Total size`: total bytes stored in the remote tier.
+
+**Upload pipeline** shows in-flight work moving local data to the remote tier.
+
+- `Transfers in flight`: fragments currently uploading to S3.
+- `Completed transfers awaiting ordering`: fragments that finished uploading out of cut order, held until the earlier fragments complete so the manifest is updated in order.
+- `Transfer deadlines armed`: in-flight transfers with a timeout watchdog armed.
+- `Edits since last persist`: manifest edits accumulated since the last durable persist.
+- `Edits in current persist`: edits included in the persist currently in flight.
+- `Last persist`: time since the last durable manifest persist, computed on the reader's node.
+- `Persist in flight`, `Rebalance in flight`, `Retention in flight`: whether each background operation is currently running.
+- `Consumers awaiting offset`: consumers blocked waiting for an offset to become available.
+
+**Current fragment (assembly)** describes the fragment currently being assembled from local chunks.
+
+- `Fragment target size`: the size at which the in-progress fragment is cut and uploaded.
+- `First offset` and `Next offset`: the offset range of the chunks accumulated so far.
+- `Payload size`: uncompressed payload bytes accumulated. This drives the cut decision against the target size.
+- `On-disk size`: on-disk bytes accumulated.
+- `Chunks`: number of chunks accumulated.
+- `Cut`: whether the fragment has reached the cut threshold (or been force-cut) and is pending upload.
+
+A section reads `(not initialized)` before the reader has resolved the manifest (Remote tier and Upload pipeline) or opened the local log and started an assembly (Current fragment).
+
+#### Evaluate local retention
+
+Triggers the local retention job for a stream. Useful to determine whether retention is correctly reclaiming segments after upload. Local retention is node-local: it acts on the local segments of the node the command runs on, so target the node whose disk you want reclaimed with `--node`.
 
 ```bash
 rabbitmq-streams evaluate_local_retention my-stream --vhost /
 ```
 
-**Evaluate remote retention** triggers the remote retention job for a stream. Useful when the retention policy has changed and you want immediate effect, or to verify that remote retention is not stuck.
+#### Evaluate remote retention
+
+Triggers the remote retention job for a stream. Useful when the retention policy has changed and you want immediate effect, or to verify that remote retention is not stuck.
 
 ```bash
 rabbitmq-streams evaluate_remote_retention my-stream --vhost /
 ```
 
-**Force fragment cut** forces the current in-progress fragment to cut and upload immediately, regardless of whether it has reached the target size. Useful to verify that the upload pipeline works end-to-end without waiting for data to accumulate.
+#### Force fragment cut
+
+Forces the current in-progress fragment to cut and upload immediately, regardless of whether it has reached the target size. Useful to verify that the upload pipeline works end-to-end without waiting for data to accumulate.
 
 ```bash
 rabbitmq-streams force_fragment_cut my-stream --vhost /
 ```
 
-**Garbage collection** identifies (and optionally deletes) dangling S3 objects that are not referenced by any manifest. Defaults to `dry_run` mode which reports orphans without deleting them. Pass `--mode delete` to actually remove the objects.
+#### Garbage collection
+
+Identifies (and optionally deletes) dangling S3 objects that are not referenced by any manifest. Defaults to `dry_run` mode which reports orphans without deleting them. Pass `--mode delete` to actually remove the objects.
 
 ```bash
 rabbitmq-streams stream_s3_gc
