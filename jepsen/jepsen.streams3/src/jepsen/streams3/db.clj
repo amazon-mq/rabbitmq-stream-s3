@@ -331,10 +331,13 @@
   []
   (reify db/DB
     (setup! [_ test node]
-      ;; Clean slate for this run's coverage counters and authoritative reads
-      ;; (idempotent across nodes).
+      ;; Clean slate for this run: coverage counters, authoritative reads, and
+      ;; the shared client connection state (so a REPL or test-all multi-run in
+      ;; one JVM does not carry stale stream declarations or publishingId
+      ;; counters against a freshly-wiped cluster). Idempotent across nodes.
       (reset! tiering-stats {})
       (reset! sc/authoritative-reads {})
+      (sc/reset-run-state!)
       (install! test node)
       (start! test node))
 

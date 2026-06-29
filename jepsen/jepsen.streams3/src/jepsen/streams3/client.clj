@@ -139,6 +139,22 @@
       (reset! pub-counters {})
       (swap! env-generation inc))))
 
+(defn reset-run-state!
+  "Resets all run-scoped shared connection state (the Environment, declared
+  streams, producers, publishingId counters, generation) so a second test in the
+  same JVM (a REPL session or `lein run test-all`) starts clean rather than
+  carrying stale stream declarations or publishingId counters against a
+  freshly-wiped cluster. (tiering-stats and authoritative-reads are reset
+  alongside this in db/setup!.)"
+  []
+  (locking shared-env
+    (when-let [e @shared-env] (try (.close e) (catch Exception _)))
+    (reset! shared-env nil)
+    (reset! declared-streams #{})
+    (reset! shared-producers {})
+    (reset! pub-counters {})
+    (reset! env-generation 0)))
+
 (defn ensure-stream! [env k]
   (when-not (contains? @declared-streams k)
     ;; create() is idempotent for a matching stream.
