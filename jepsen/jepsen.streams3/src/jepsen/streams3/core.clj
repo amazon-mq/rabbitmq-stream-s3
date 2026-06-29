@@ -11,6 +11,7 @@
                     [tests :as tests]]
             [jepsen.checker.timeline :as timeline]
             [jepsen.os.debian :as debian]
+            [jepsen.streams3.checker :as s3-checker]
             [jepsen.streams3.db :as db]
             [jepsen.streams3.nemesis :as nem]
             [jepsen.streams3.workload :as workload]))
@@ -45,16 +46,29 @@
        :checker   (checker/compose
                     {:perf     (checker/perf)
                      :timeline (timeline/html)
-                     :workload (:checker wl)})
+                     :workload (:checker wl)
+                     ;; Fails the run unless S3 was actually exercised, so a
+                     ;; green result can't silently stop using the remote tier.
+                     :tiering  (s3-checker/tiering-checker)})
        :generator (gen/phases
                     ;; Main phase: workload ops + faults for the time limit.
                     (->> (:generator wl)
                          (gen/stagger (/ 1 (:rate opts)))
                          (gen/nemesis (nem/nemesis-generator opts))
                          (gen/time-limit (:time-limit opts)))
-                    ;; Heal, let things settle.
-                    (gen/nemesis (gen/once {:type :info :f :stop-partition}))
+                    ;; Heal every fault (the main phase may end mid-fault, and
+                    ;; the nemesis teardown runs only after analysis), then let
+                    ;; things settle before the final reads. The stop ops are
+                    ;; idempotent, so healing an inactive fault is harmless.
+                    (gen/nemesis [{:type :info :f :stop-partition}
+                                  {:type :info :f :stop-s3-outage}
+                                  {:type :info :f :stop-s3-latency}])
                     (gen/sleep 15)
+                    ;; With trimming enabled, trim once more after healing so the
+                    ;; final reads drain from the now-trimmed (S3-only) tier and
+                    ;; actually exercise the read-from-S3 path.
+                    (gen/nemesis (when (contains? (nem/faults opts) "trim")
+                                   {:type :info :f :trim-local}))
                     ;; Final reads: the kafka workload drains everything written.
                     (gen/clients (:final-generator wl)))})))
 

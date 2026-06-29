@@ -41,9 +41,21 @@ docker compose exec control \
 
 The partition nemesis runs against a 5-node cluster with the kafka anomaly checkers and retention wide. A run under partition faults reports `:valid? true`, with fault-induced failures correctly classified as indeterminate rather than lost or duplicate, and broker logs collected back to the control node.
 
+The storage-tier nemeses make data really tier to S3 and exercise the read-from-S3 path under fault. Small segments and fragments plus padded payloads force segments to roll, upload and trim within a short run; MinIO needs a KMS key for the plugin's SSE uploads (see `docker/docker-compose.yml`). The `--faults` option selects `s3-outage` and `s3-latency` (via Toxiproxy) and `trim` (periodic `evaluate_local_retention`, which trims uploaded segments locally so reads of older offsets fall to the S3 tier). A `:tiering` coverage checker scrapes the plugin's S3 counters before teardown and fails the run unless fragments were uploaded, and with `trim` that reads were served from S3, so a regression that silently stops using the remote tier fails rather than passing green.
+
+A run under `partition,s3-outage,s3-latency,trim` stays `:valid? true` while serving thousands of reads from the remote tier:
+
+```sh
+docker compose exec control \
+  lein run test --nodes-file /shared/nodes \
+    --username root --ssh-private-key /shared/ssh_key \
+    --time-limit 150 --rate 50 --concurrency 10 \
+    --faults partition,s3-outage,s3-latency,trim
+```
+
 ## Planned
 
-- Storage-tier nemeses: S3 outage and latency (via Toxiproxy), forced trim, and forced leader move
+- A `leader-move` nemesis (writer fencing) that relocates stream leaders mid-upload, with an authoritative durability checker
 - A bounded-durability checker for aggressive retention (a `force-trim` past the upload seam, with the checker scoped to `[f, n)`)
 - Super-streams (multi-partition)
 - CI (see `ci/`)

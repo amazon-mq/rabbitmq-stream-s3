@@ -35,12 +35,15 @@
 (def log-dir (str base-dir "/var/log/rabbitmq"))
 (def erlang-cookie "JEPSENSTREAMS3COOKIE")
 
-;; The S3 endpoint the broker talks to. region_endpoints maps the region name
-;; to this "TLD"; the AWS backend then forms <bucket>.<endpoint> and connects
-;; over TLS/443. docker-compose must give the Toxiproxy container the network
-;; aliases `s3.jepsen.local` and `jepsen.s3.jepsen.local`.
+;; The AWS backend builds the endpoint host the AWS way: `s3.<region>.<tld>`
+;; (cf. s3.us-east-1.amazonaws.com), where <tld> is the region_endpoints value.
+;; So region=jepsen + tld=local yields connection host `s3.jepsen.local` and
+;; per-request virtual-host `jepsen.s3.jepsen.local`. docker-compose aliases
+;; both `s3.jepsen.local` and `jepsen.s3.jepsen.local` to Toxiproxy, the cert
+;; covers them, and MINIO_DOMAIN=s3.jepsen.local routes the bucket. (Setting the
+;; tld to the full `s3.jepsen.local` would wrongly yield s3.jepsen.s3.jepsen.local.)
 (def s3-region   "jepsen")
-(def s3-endpoint "s3.jepsen.local")
+(def s3-region-tld "local")
 (def s3-bucket   "jepsen")
 (def s3-access-key "jepsenjepsen")
 (def s3-secret-key "jepsenjepsenjepsen")
@@ -77,13 +80,16 @@
          (:nodes test)))
      ;; --- S3 tier: point the AWS backend at MinIO via Toxiproxy ---
      (str "stream_s3.region = " s3-region)
-     (str "stream_s3.region_endpoints." s3-region " = " s3-endpoint)
+     (str "stream_s3.region_endpoints." s3-region " = " s3-region-tld)
      (str "stream_s3.access_key_id = " s3-access-key)
      (str "stream_s3.secret_key = " s3-secret-key)
      (str "stream_s3.bucket = " s3-bucket)
      ;; Small fragments + frequent persists so tiering and manifest replication
-     ;; actually happen within a short test run.
-     "stream_s3.fragment_target_size = 1MB"
+     ;; actually happen within a short test run. Combined with the small stream
+     ;; segment size and padded messages set by the client, this makes data
+     ;; really upload to S3 and local segments really trim, so the S3 nemeses
+     ;; have live traffic to disrupt and reads genuinely fall back to S3.
+     "stream_s3.fragment_target_size = 16KB"
      "stream_s3.persist_interval_ms = 500"
      "stream_s3.verbose_logging = true"
      ;; Keep transfers from saturating the link so S3-latency faults are visible.
@@ -122,6 +128,64 @@
 (defn rabbitmqctl [node & args]
   (apply c/exec :env (concat (env-args node)
                              [(str base-dir "/sbin/rabbitmqctl")] args)))
+
+;; One rabbitmqctl eval that, on the local node, triggers local-retention
+;; evaluation for every jepsen-<k> stream — looping in Erlang rather than
+;; spawning a slow CLI per stream. evaluate_local_retention no-ops where the
+;; node holds no running member, so running this on every node reaches each
+;; stream's writer.
+(def ^:private trim-eval
+  (str "Names = [element(4, amqqueue:get_name(Q)) "
+       "|| Q <- rabbit_amqqueue:list(<<\"/\">>)], "
+       "[catch rabbitmq_stream_s3_replica_reader:evaluate_local_retention(<<\"/\">>, N) "
+       "|| N <- Names, byte_size(N) >= 7, binary:part(N, 0, 7) =:= <<\"jepsen-\">>], ok."))
+
+(defn force-local-trim!
+  "Triggers local-retention evaluation for the jepsen streams on `node`, so
+  segments already uploaded to S3 are trimmed locally and reads of older
+  offsets fall back to the S3 tier. Runs in an SSH context (caller wraps with
+  c/on-nodes)."
+  [node]
+  (util/meh (rabbitmqctl node :eval trim-eval)))
+
+;; The plugin's read/write paths are instrumented, not logged, so these
+;; counters are how the test proves S3 was actually exercised (see the
+;; coverage checker). The management/Prometheus listener is on 15692.
+(def tiering-metrics
+  ["rabbitmq_stream_s3_transfers_completed"  ; fragments uploaded to S3
+   "rabbitmq_stream_s3_get_range"            ; range GETs (remote reads) from S3
+   "rabbitmq_stream_s3_read"                 ; remote_reader read calls
+   "rabbitmq_stream_s3_resolve"])            ; read-path offset resolutions
+
+(defn scrape-tiering-metrics
+  "Scrapes the plugin's Prometheus counters on `node`, returning a map of
+  metric name -> summed value (over all label sets). Runs in an SSH context."
+  [node]
+  (let [out   (try (c/exec :curl :-s "http://localhost:15692/metrics")
+                   (catch Exception _ ""))
+        lines (str/split-lines out)]
+    (into {}
+          (for [m tiering-metrics]
+            [m (->> lines
+                    (keep (fn [l]
+                            (when-let [[_ v] (re-find
+                                               (re-pattern
+                                                 (str "^" m "(?:\\{[^}]*\\})?\\s+([0-9.]+)"))
+                                               l)]
+                              (parse-double v))))
+                    (reduce + 0.0))]))))
+
+;; Cluster-wide S3 counter sums for the run, accumulated across nodes in
+;; log-files (which runs after the workload but before the checker, while the
+;; brokers are still up). The coverage checker reads this. Collecting it here
+;; rather than as a history op keeps it out of the kafka checker's analysis,
+;; which chokes on a trailing non-client op.
+(defonce tiering-stats (atom {}))
+
+(defn record-tiering-stats!
+  "Adds `node`'s S3 counters into the shared per-run totals."
+  [node]
+  (swap! tiering-stats #(merge-with + % (scrape-tiering-metrics node))))
 
 (defn start! [test node]
   (info node "starting broker")
@@ -170,6 +234,8 @@
   []
   (reify db/DB
     (setup! [_ test node]
+      ;; Clean slate for this run's coverage counters (idempotent across nodes).
+      (reset! tiering-stats {})
       (install! test node)
       (start! test node))
 
@@ -185,6 +251,9 @@
 
     db/LogFiles
     (log-files [_ test node]
+      ;; Scrape this node's S3 counters into the run totals (brokers are still
+      ;; up here, before teardown) so the coverage checker can read them.
+      (util/meh (record-tiering-stats! node))
       ;; Broker logs + the S3 plugin's status output for post-mortem.
       (util/meh
         (rabbitmqctl node :stream_s3_status

@@ -26,11 +26,24 @@
   (~cores-sized) thread pool meant to be shared, and one-per-client-per-reopen
   exhausts native threads."
   (:require [jepsen.client :as client])
-  (:import (com.rabbitmq.stream Environment OffsetSpecification)
+  (:import (com.rabbitmq.stream Environment OffsetSpecification ByteCapacity)
            (java.util.concurrent ConcurrentLinkedQueue CountDownLatch TimeUnit)
            (java.util.concurrent.atomic AtomicBoolean AtomicLong)))
 
 (def stream-port 5552)
+
+;; Message bodies are padded so the tiny integer values produce enough volume
+;; to fill stream segments and S3 fragments — otherwise nothing tiers to S3 and
+;; the S3 nemeses have no traffic to disrupt. The body is "<value>|<padding>";
+;; the consumer parses the value before the separator.
+(def ^:private msg-padding (apply str (repeat 1000 \x)))
+(defn- encode-value [v] (.getBytes (str v "|" msg-padding)))
+(defn- decode-value [^bytes body]
+  (let [s (String. body)] (Long/parseLong (subs s 0 (.indexOf s "|")))))
+
+;; Small stream segment size: segments roll over and, once tiered, get trimmed
+;; locally, forcing reads of older offsets to fall back to S3.
+(def ^:private segment-size (ByteCapacity/kB 16))
 
 ;; How long to retry a transient stream operation (create / producer / consumer
 ;; build) before giving up and letting the op fail as indeterminate. Kept short
@@ -84,7 +97,9 @@
 (defn ensure-stream! [env k]
   (when-not (contains? @declared-streams k)
     ;; create() is idempotent for a matching stream.
-    (with-retry #(-> env (.streamCreator) (.stream (stream-name k)) (.create)))
+    (with-retry #(-> env (.streamCreator) (.stream (stream-name k))
+                     (.maxSegmentSizeBytes segment-size)
+                     (.create)))
     (swap! declared-streams conj k)))
 
 (defn get-producer [env k]
@@ -118,7 +133,7 @@
                    (let [n   (.getAndIncrement counter)
                          msg (-> producer (.messageBuilder)
                                  (.publishingId n)
-                                 (.addData (.getBytes (str v)))
+                                 (.addData (encode-value v))
                                  (.build))]
                      (.send producer msg
                             (reify com.rabbitmq.stream.ConfirmationHandler
@@ -152,7 +167,7 @@
                            (reify com.rabbitmq.stream.MessageHandler
                              (handle [_ ctx msg]
                                (.add q [(.offset ctx)
-                                        (Long/parseLong (String. (.getBodyAsBinary msg)))]))))
+                                        (decode-value (.getBodyAsBinary msg))]))))
                          (.build)))]
             (swap! buffers assoc k q)
             (swap! consumers assoc k c)

@@ -58,6 +58,10 @@ services:
       MINIO_ROOT_PASSWORD: jepsenjepsenjepsen
       # Enable virtual-host-style addressing for <bucket>.s3.jepsen.local.
       MINIO_DOMAIN: s3.jepsen.local
+      # The plugin requests SSE (x-amz-server-side-encryption: AES256) on every
+      # fragment PUT. MinIO rejects SSE with 501 unless a KMS backend exists, so
+      # configure a local KMS key. (Value is key-id:base64(32 bytes).)
+      MINIO_KMS_SECRET_KEY: "jepsen-key:MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
     command: server /data --address ":443"
     volumes:
       - ./shared/certs:/root/.minio/certs:ro
