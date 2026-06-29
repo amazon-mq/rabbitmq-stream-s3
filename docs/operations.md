@@ -355,6 +355,8 @@ Owned by `rabbitmq_stream_s3_remote_reader`. One counter set per node, summed ac
 |-------------------------------------|-------------------------------------------------------------------|
 | `rabbitmq_stream_s3_read_size_bytes_bucket`            | Distribution of read sizes from S3                                |
 
+Buckets: 48 B, 128 B, 512 B, 2 KiB, 8 KiB, 32 KiB, 128 KiB, 512 KiB, 2 MiB, 8 MiB, 16 MiB, 32 MiB, 64 MiB, +Inf. The top finite boundary matches the remote reader's 64 MiB AIMD read-size cap, so `+Inf` stays empty in normal operation.
+
 ## Dashboards
 
 A reference Grafana dashboard ships with the plugin at

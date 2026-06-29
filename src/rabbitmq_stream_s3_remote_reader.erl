@@ -52,8 +52,26 @@ synchronous feedback is generated.
     {remote_reader_fatal_errors, ?C_FATAL_ERRORS, counter,
         "Number of remote readers stopped by a non-retryable S3 error"}
 ]).
+%% Upper bucket boundaries span the AIMD read-size range, whose ceiling is
+%% read_size_max (64 MiB). The 16/32/64 MiB buckets resolve the high end where
+%% the prefetch window spends most of its time under sustained reads; without
+%% them every read above 8 MiB collapses into the +Inf bucket. Reads never
+%% exceed the 64 MiB cap, so in normal operation +Inf stays empty.
 -define(READ_SIZE_BUCKETS, [
-    48, 128, 512, 2_048, 8_192, 32_768, 131_072, 524_288, 2_097_152, 8_388_608, infinity
+    48,
+    128,
+    512,
+    2_048,
+    8_192,
+    32_768,
+    131_072,
+    524_288,
+    2_097_152,
+    8_388_608,
+    16_777_216,
+    33_554_432,
+    67_108_864,
+    infinity
 ]).
 
 -type hint() :: chunk_boundary | within_chunk.
