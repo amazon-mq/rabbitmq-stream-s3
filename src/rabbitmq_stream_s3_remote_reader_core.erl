@@ -369,19 +369,7 @@ try_serve(#state{pending = #pending{offset = Offset, bytes = Bytes}} = State) ->
             {State3, Effects} = maybe_start_requests(State2),
             {State3, [{observe, miss, State3#state.read_size} | Effects]};
         {not_found_check_range, State1} ->
-            %% Fragment was 404. Refresh iterator past it. If the iterator
-            %% is exhausted (last fragment in manifest was deleted), fall
-            %% back to refreshing past the current fragment's offset.
-            case next_fragment_offset(State1) of
-                {ok, NotFoundOffset} ->
-                    {State1, [{refresh_iterator, NotFoundOffset}]};
-                end_of_manifest ->
-                    {State1, [{refresh_iterator, current_fragment_offset(State1)}]};
-                group_fetch_failed ->
-                    %% Probing the next entry hit a transient group fetch
-                    %% error. Retry rather than becoming local.
-                    retry_group_fetch(State1)
-            end;
+            not_found_refresh(State1);
         {refresh_iterator, State1} ->
             %% Iterator exhausted. Refresh past current fragment.
             {State1, [{refresh_iterator, current_fragment_offset(State1)}]};
@@ -491,22 +479,46 @@ retry_group_fetch(
 %% Internal: fragment navigation
 %% ------------------------------------------------------------------
 
+%% Decide which offset to refresh the iterator past after a 404. Two paths
+%% reach `not_found_check_range`, and they 404'd different fragments, so they
+%% must refresh past different offsets:
+%%
+%%  1. `try_fragment_transition` matching `next = not_found`: the consumer read
+%%     past the current fragment and the prefetched *next* fragment 404'd. The
+%%     iterator still points at that 404'd next entry, so `next_fragment_offset`
+%%     returns its offset and we refresh past it. `current_not_found` is false.
+%%
+%%  2. `try_read` matching `current_not_found = true`: the *current* fragment
+%%     404'd. The iterator was advanced past the current entry at init, so it
+%%     points at the entry AFTER the 404'd one - a fragment that is still live.
+%%     Refreshing past *that* offset would silently skip the live fragment
+%%     (issue #173), so refresh past the current fragment's own offset instead.
+%%
+%% In both cases the shell's refresh_iterator/2 advances past anything at or
+%% below the given offset and resumes at the first surviving fragment, so
+%% passing the actually-404'd offset is what keeps a live fragment from being
+%% skipped.
+not_found_refresh(#state{current_not_found = true} = State) ->
+    %% Path 2: the current fragment 404'd. Refresh past its own offset.
+    {State, [{refresh_iterator, current_fragment_offset(State)}]};
+not_found_refresh(State) ->
+    %% Path 1: the prefetched next fragment 404'd. Refresh past it, falling
+    %% back to the current offset if the iterator is exhausted (the 404'd
+    %% next was the last entry in the manifest).
+    case next_fragment_offset(State) of
+        {ok, NotFoundOffset} ->
+            {State, [{refresh_iterator, NotFoundOffset}]};
+        end_of_manifest ->
+            {State, [{refresh_iterator, current_fragment_offset(State)}]};
+        group_fetch_failed ->
+            %% Probing the next entry hit a transient group fetch error. Retry
+            %% rather than becoming local.
+            retry_group_fetch(State)
+    end.
+
 %% Returns the offset of the next fragment in the iterator, or
-%% `end_of_manifest` if the iterator is exhausted. Called from the
-%% `not_found_check_range` branch of `try_serve`. There are two paths
-%% into that branch:
-%%
-%%  1. `try_fragment_transition` matching `next = not_found`: the consumer
-%%     read past the current fragment and the prefetched-next 404'd. The
-%%     iterator is positioned at the 404'd entry, so this returns the
-%%     404'd offset.
-%%
-%%  2. `try_read` matching `current_not_found = true`: the *current*
-%%     fragment 404'd while no read was pending; a later read wants bytes
-%%     past the partial buffer. The iterator was already advanced past
-%%     the current fragment, so it points at the entry AFTER the 404'd
-%%     one. If the current fragment was the last in the manifest, the
-%%     iterator is exhausted and this returns `end_of_manifest`.
+%% `end_of_manifest` if the iterator is exhausted (see not_found_refresh/1
+%% for the two paths that use this).
 next_fragment_offset(#state{iterator = Iterator}) ->
     case rabbitmq_stream_s3_fragment_iterator:next(Iterator) of
         {ok, #fragment_ref{offset = Offset}, _} -> {ok, Offset};

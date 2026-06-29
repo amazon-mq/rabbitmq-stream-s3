@@ -47,6 +47,7 @@ all() ->
         deadline_expired_resets_buffer_for_retry,
         fragment_404_emits_refresh_iterator,
         last_fragment_404_no_pending_read_refreshes_past_current,
+        current_fragment_404_no_pending_read_keeps_next_live_fragment,
         observe_effects_emitted_for_hit_miss_and_transition,
         %% A retryable error drops only the failed fragment, not all in-flight
         retryable_error_preserves_co_pending_request,
@@ -296,6 +297,43 @@ not_found_triggers_refresh_iterator(_Config) ->
         S2, {iterator_refreshed, end_of_manifest}
     ),
     ?assertMatch([{reply, {become_local, 0}}], E2).
+
+%% Regression for #173. When the CURRENT fragment 404s while no read is pending
+%% and the manifest has further live fragments, the refresh must advance past
+%% the current (404'd) fragment's own offset, not the next fragment's offset.
+%% The iterator is positioned past the current entry at init, so refreshing past
+%% the next entry's offset would silently skip a live fragment.
+current_fragment_404_no_pending_read_keeps_next_live_fragment(_Config) ->
+    %% Three live fragments. The reader is on the first (offset 0); the iterator
+    %% is positioned at the second (offset 100) after init advances past 0.
+    Entries = [{0, 1_000_000, 1}, {100, 1_000_000, 2}, {200, 1_000_000, 3}],
+    FragRef = frag_ref(0, 1_000_000, 1),
+    Iterator = mock_iterator(Entries),
+    {S0, _} = init(stream_id(), FragRef, 64, Iterator),
+
+    %% The current fragment 404s before any read is pending: no effect yet, the
+    %% reader just records current_not_found.
+    {S1, E0} = rabbitmq_stream_s3_remote_reader_core:step(
+        S0, {request_error, make_ref(), 0, not_found}
+    ),
+    ?assertMatch([], E0),
+
+    %% A later read wants bytes past the (empty) buffer, taking the
+    %% current_not_found path. The refresh must target the current 404'd offset
+    %% (0), NOT the next live fragment's offset (100). Before the fix this was
+    %% {refresh_iterator, 100}, which made the shell skip fragment 100.
+    {S2, E1} = rabbitmq_stream_s3_remote_reader_core:step(
+        S1, {read, 64, 100, chunk_boundary}
+    ),
+    ?assertMatch([{refresh_iterator, 0}], E1),
+
+    %% The shell refreshes past offset 0, leaving the iterator at the live
+    %% fragment 100. The reader resumes there rather than skipping to 200.
+    RefreshedIterator = mock_iterator(Entries),
+    {_S3, E2} = rabbitmq_stream_s3_remote_reader_core:step(
+        S2, {iterator_refreshed, RefreshedIterator}
+    ),
+    ?assertMatch([{reply, {next_fragment, 100}} | _], E2).
 
 %% ------------------------------------------------------------------
 %% AIMD and retry tests
