@@ -67,11 +67,12 @@ docker compose exec control \
     --faults leader-move,trim
 ```
 
+GitHub Actions runs both of these scenarios with the `Jepsen` workflow (`.github/workflows/jepsen.yaml`), on a schedule and on demand. It clones the server, checks the plugin out into the umbrella, and invokes `ci/run-jepsen.sh`, which builds the tarball from the clean tree, brings the cluster up, runs one test, and fails the job if the checker reports anomalies.
+
 ## Planned
 
 - A bounded-durability checker for aggressive retention (a `force-trim` past the upload seam, with the checker scoped to `[f, n)`)
 - Super-streams (multi-partition)
-- CI (see `ci/`)
 
 [kafka]: https://jepsen-io.github.io/jepsen/jepsen.tests.kafka.html
 [rakv]: https://github.com/rabbitmq/ra-kv-store
