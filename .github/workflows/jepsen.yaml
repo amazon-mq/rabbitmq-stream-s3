@@ -43,6 +43,9 @@ concurrency:
 jobs:
   jepsen:
     runs-on: ubuntu-latest
+    # Safety net: a wedged run must fail fast, not burn hours. The build plus a
+    # bounded 120s test settles well inside this.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:

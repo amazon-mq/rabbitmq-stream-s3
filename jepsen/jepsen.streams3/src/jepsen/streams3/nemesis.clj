@@ -165,6 +165,20 @@
   {"trim"        {:type :info :f :trim-local}
    "leader-move" {:type :info :f :move-leaders}})
 
+(def known-faults
+  "Every token --faults accepts (start/stop faults plus background ops)."
+  (into (set (keys fault->events)) (keys fault->bg-op)))
+
+(defn validate-faults!
+  "Throws if any --faults token is unknown, so a typo fails fast at startup
+  rather than silently disabling a fault and passing green."
+  [opts]
+  (let [unknown (remove known-faults (faults opts))]
+    (when (seq unknown)
+      (throw (ex-info (str "Unknown --faults token(s): " (str/join ", " (sort unknown))
+                           "; known: " (str/join ", " (sort known-faults)))
+                      {:unknown (vec unknown) :known known-faults})))))
+
 (defn nemesis-generator
   "Rotates through the enabled start/stop faults one at a time, each led by a
   quiet baseline period (so the workload establishes itself before the first

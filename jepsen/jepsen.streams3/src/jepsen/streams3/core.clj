@@ -39,6 +39,7 @@
 
 (defn streams3-test
   [opts]
+  (nem/validate-faults! opts)
   (let [wl (workload/workload opts)]
     (merge
       tests/noop-test

@@ -100,16 +100,33 @@
 (defonce ^:private pub-counters (atom {}))         ; k -> AtomicLong (next publishingId)
 (defonce ^:private env-generation (atom 0))        ; bumped each Environment rebuild
 
+(defn- retryable?
+  "True when the throwable (or a cause in its chain) is a StreamException -- a
+  transient broker-side condition (stream/leader not yet available right after
+  create or during a partition) worth retrying. A programming error (NPE,
+  ClassCast) is not a StreamException, so it falls through and crashes fast. The
+  walk is nil-safe and depth-bounded so a cyclic or self-referential cause chain
+  (which async stream-client errors can produce) cannot spin forever -- under the
+  leader-move crash storm an unbounded walk hung the whole run."
+  [^Throwable e]
+  (->> (iterate (fn [^Throwable t] (when t (.getCause t))) e)
+       (take 64)
+       (take-while some?)
+       (some #(instance? com.rabbitmq.stream.StreamException %))
+       boolean))
+
 (defn with-retry
-  "Calls thunk, retrying on any exception until op-retry-ms elapses, then
-  rethrows. For transient 'leader/stream not available' errors right after
-  create or during a partition."
+  "Calls thunk, retrying transient stream errors (see retryable?) until
+  op-retry-ms elapses, then rethrows. A non-transient exception is rethrown
+  immediately, so a client bug fails fast instead of after a 10s retry loop."
   [thunk]
   (let [deadline (+ (System/currentTimeMillis) op-retry-ms)]
     (loop []
       (let [r (try {:val (thunk)}
                    (catch Exception e
-                     (if (< (System/currentTimeMillis) deadline) :retry (throw e))))]
+                     (if (and (retryable? e) (< (System/currentTimeMillis) deadline))
+                       :retry
+                       (throw e))))]
         (if (= r :retry) (do (Thread/sleep 250) (recur)) (:val r))))))
 
 (defn get-env ^Environment [test]
