@@ -283,8 +283,8 @@ get(Key, Opts) when is_binary(Key) andalso is_map(Opts) ->
             {ok, Data};
         {ok, #{status := 404}} ->
             {error, not_found};
-        {ok, #{status := Status} = Other} ->
-            log_unexpected_status(?FUNCTION_NAME, Status, Key),
+        {ok, #{status := _} = Other} ->
+            log_unexpected_status(?FUNCTION_NAME, Other, Key),
             {error, Other};
         {error, _} = Err ->
             Err
@@ -317,8 +317,8 @@ get_range(Key, Range, Opts) when is_binary(Key) andalso is_map(Opts) ->
             slice_range(Range, Data);
         {ok, #{status := 404}} ->
             {error, not_found};
-        {ok, #{status := Status} = Other} ->
-            log_unexpected_status(?FUNCTION_NAME, Status, Key),
+        {ok, #{status := _} = Other} ->
+            log_unexpected_status(?FUNCTION_NAME, Other, Key),
             {error, Other};
         {error, _} = Err ->
             Err
@@ -351,8 +351,8 @@ put(Key, Data, Opts) when is_binary(Key) andalso is_map(Opts) ->
     case request(<<"PUT">>, key_to_path(Key), Headers, Data, Opts) of
         {ok, #{status := 200}} ->
             ok;
-        {ok, #{status := Status} = Other} ->
-            log_unexpected_status(?FUNCTION_NAME, Status, Key),
+        {ok, #{status := _} = Other} ->
+            log_unexpected_status(?FUNCTION_NAME, Other, Key),
             {error, Other};
         {error, _} = Err ->
             Err
@@ -462,8 +462,8 @@ stream_finish(
     try await_response(Conn, StreamRef, Timeout) of
         {ok, #{status := 200}} ->
             ok;
-        {ok, #{status := Status} = Other} ->
-            log_unexpected_status(?FUNCTION_NAME, Status),
+        {ok, #{status := _} = Other} ->
+            log_unexpected_status(?FUNCTION_NAME, Other),
             {error, Other};
         {error, _} = Err ->
             Err
@@ -510,8 +510,8 @@ delete(Keys, Opts) when is_list(Keys) andalso is_map(Opts) ->
                 Errors ->
                     {error, {delete_errors, Errors}}
             end;
-        {ok, #{status := Status} = Other} ->
-            log_unexpected_status(?FUNCTION_NAME, Status),
+        {ok, #{status := _} = Other} ->
+            log_unexpected_status(?FUNCTION_NAME, Other),
             {error, Other};
         {error, _} = Err ->
             Err
@@ -521,8 +521,8 @@ delete(Key, Opts) when is_binary(Key) andalso is_map(Opts) ->
     case request(<<"DELETE">>, key_to_path(Key), #{}, <<>>, Opts) of
         {ok, #{status := 204}} ->
             ok;
-        {ok, #{status := Status} = Other} ->
-            log_unexpected_status(?FUNCTION_NAME, Status, Key),
+        {ok, #{status := _} = Other} ->
+            log_unexpected_status(?FUNCTION_NAME, Other, Key),
             {error, Other};
         {error, _} = Err ->
             Err
@@ -563,8 +563,8 @@ list(Prefix, Continuation, Opts) ->
                     _ -> NextToken
                 end,
             {ok, Keys, Next};
-        {ok, #{status := Status} = Other} ->
-            log_unexpected_status(?FUNCTION_NAME, Status),
+        {ok, #{status := _} = Other} ->
+            log_unexpected_status(?FUNCTION_NAME, Other),
             {error, Other};
         {error, _} = Err ->
             Err
@@ -631,11 +631,40 @@ child_text(Name, Content) ->
             <<>>
     end.
 
-log_unexpected_status(Function, Status) ->
-    ?LOG_DEBUG("~ts unexpected HTTP status ~b", [Function, Status]).
+-spec transient_status(non_neg_integer()) -> boolean().
+transient_status(429) -> true;
+transient_status(Status) when Status >= 500, Status =/= 501 -> true;
+transient_status(_) -> false.
 
-log_unexpected_status(Function, Status, Key) ->
-    ?LOG_DEBUG("~ts unexpected HTTP status ~b for key ~ts", [Function, Status, Key]).
+log_unexpected_status(Function, Response) ->
+    log_unexpected_status(Function, Response, undefined).
+
+log_unexpected_status(Function, #{status := Status} = Response, Key) ->
+    case transient_status(Status) of
+        true ->
+            ?LOG_DEBUG(
+                "~ts: S3 returned transient HTTP status ~b~ts; will retry",
+                [Function, Status, format_key_suffix(Key)]
+            );
+        false ->
+            ?LOG_WARNING(
+                "~ts: S3 returned unexpected HTTP status ~b~ts "
+                "(maybe a configuration or compatibility problem). "
+                "Response body: ~ts",
+                [
+                    Function,
+                    Status,
+                    format_key_suffix(Key),
+                    truncate_body(maps:get(body, Response, <<>>))
+                ]
+            )
+    end.
+
+format_key_suffix(undefined) -> <<>>;
+format_key_suffix(Key) -> <<" for key ", Key/binary>>.
+
+truncate_body(Body) when byte_size(Body) =< 1024 -> Body;
+truncate_body(Body) -> <<(binary:part(Body, 0, 1024))/binary, "...">>.
 
 -spec match_async(
     Msg :: term(),
@@ -1805,6 +1834,18 @@ counter() ->
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
+
+transient_status_test() ->
+    %% Retryable: server-side 5xx (except 501) and throttling.
+    ?assert(transient_status(500)),
+    ?assert(transient_status(503)),
+    ?assert(transient_status(429)),
+    %% Not retryable: configuration/compatibility problems.
+    ?assertNot(transient_status(501)),
+    ?assertNot(transient_status(400)),
+    ?assertNot(transient_status(403)),
+    ?assertNot(transient_status(404)),
+    ok.
 
 hex_digits_test() ->
     ?assertEqual(1, hex_digits(0)),
