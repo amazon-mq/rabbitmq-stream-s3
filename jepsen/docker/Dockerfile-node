@@ -1,0 +1,19 @@
+# RabbitMQ broker node. Erlang 27 (matches the target OTP for main / 4.4.x)
+# plus the bits jepsen needs: sshd for control access and iptables/sudo for
+# the partition nemesis. The broker itself is installed at run time by db.clj
+# from /shared/rabbitmq.tar.xz (the generic-unix tarball).
+FROM erlang:27
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        openssh-server sudo iproute2 iptables procps ca-certificates \
+        net-tools logrotate curl \
+    && mkdir -p /var/run/sshd \
+    && echo 'root:root' | chpasswd \
+    && sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config \
+    && sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+
+EXPOSE 22
+# Install the jepsen control key (mounted at /shared/ssh_key.pub) as root's
+# authorized_keys at startup, then run sshd. Key auth is what lets jepsen scp
+# broker logs back to the control node.
+CMD ["bash", "-c", "mkdir -p /root/.ssh && chmod 700 /root/.ssh && cp /shared/ssh_key.pub /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys && exec /usr/sbin/sshd -D"]

@@ -1,0 +1,7 @@
+# Build/run artifacts — never commit
+docker/shared/
+jepsen.streams3/store/
+jepsen.streams3/target/
+jepsen.streams3/classes/
+jepsen.streams3/.clj-kondo/.cache/
+*.tar.xz

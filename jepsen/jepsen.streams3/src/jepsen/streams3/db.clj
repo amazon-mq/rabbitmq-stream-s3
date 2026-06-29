@@ -1,0 +1,351 @@
+(ns jepsen.streams3.db
+  "Installs, configures, starts and stops a RabbitMQ node with the
+  rabbitmq_stream_s3 plugin on each DB node.
+
+  The broker is installed from a *generic-unix* tarball produced by
+  `make package-generic-unix` at the umbrella root (it bundles every deps/
+  plugin, including rabbitmq_stream_s3 — no release is required). The tarball
+  is made available to every node at /shared/rabbitmq.tar.xz via a volume in
+  docker-compose; db setup installs it under /opt/rabbitmq.
+
+  The S3 tier points at the MinIO sidecar. The AWS backend
+  (rabbitmq_stream_s3_api_aws) is hardwired to TLS/443 with verify_peer and
+  uses virtual-hosted-style addressing (Host = <bucket>.<endpoint>), so:
+    * the node trusts the test CA (resources/ca.crt -> system store),
+    * region_endpoints.<region> resolves <bucket>.<endpoint> to Toxiproxy,
+      which L4-passes through to MinIO:443,
+    * static access_key_id/secret_key are configured so the IMDS/container
+      credential paths are never used."
+  (:require [clojure.tools.logging :refer [info]]
+            [clojure.string :as str]
+            [jepsen [control :as c]
+                    [db :as db]
+                    [util :as util]]
+            [jepsen.control.util :as cu]
+            [jepsen.os.debian :as debian]
+            [jepsen.streams3.client :as sc]))
+
+(def base-dir "/opt/rabbitmq")
+(def tarball "file:///shared/rabbitmq.tar.xz")
+(def ca-cert "/shared/ca.crt")
+(def conf-file (str base-dir "/etc/rabbitmq/rabbitmq.conf"))
+;; RABBITMQ_CONFIG_FILE is given WITHOUT the .conf extension; the broker
+;; appends it. The file on disk is conf-file (with .conf).
+(def conf-file-base (str base-dir "/etc/rabbitmq/rabbitmq"))
+(def enabled-plugins-file (str base-dir "/etc/rabbitmq/enabled_plugins"))
+(def log-dir (str base-dir "/var/log/rabbitmq"))
+(def erlang-cookie "JEPSENSTREAMS3COOKIE")
+
+;; The AWS backend builds the endpoint host the AWS way: `s3.<region>.<tld>`
+;; (cf. s3.us-east-1.amazonaws.com), where <tld> is the region_endpoints value.
+;; So region=jepsen + tld=local yields connection host `s3.jepsen.local` and
+;; per-request virtual-host `jepsen.s3.jepsen.local`. docker-compose aliases
+;; both `s3.jepsen.local` and `jepsen.s3.jepsen.local` to Toxiproxy, the cert
+;; covers them, and MINIO_DOMAIN=s3.jepsen.local routes the bucket. (Setting the
+;; tld to the full `s3.jepsen.local` would wrongly yield s3.jepsen.s3.jepsen.local.)
+(def s3-region   "jepsen")
+(def s3-region-tld "local")
+(def s3-bucket   "jepsen")
+(def s3-access-key "jepsenjepsen")
+(def s3-secret-key "jepsenjepsenjepsen")
+
+(defn enabled-plugins []
+  ;; enabled_plugins is an Erlang term: a LIST of plugin atoms.
+  "[rabbitmq_stream,rabbitmq_stream_management,rabbitmq_stream_s3].")
+
+(defn rabbitmq-conf
+  "Renders rabbitmq.conf. `nodes` is the full node list; node 0 is the seed.
+  Retention is intentionally generous: we want data to *tier to S3*
+  (small fragments + tiering) so reads exercise the remote tier, but we do NOT
+  want the local floor to trim past the upload seam, which would lose data the
+  plugin never promised to keep ([f,n) durability only — see docs/invariants.md).
+  Aggressive-retention scenarios are still to come, with a bounded-durability
+  checker."
+  [test node]
+  (str/join
+    "\n"
+    [;; --- listeners ---
+     "listeners.tcp.default = 5672"
+     "stream.listeners.tcp.default = 5552"
+     "management.tcp.port = 15672"
+     ;; The jepsen client connects as guest from the control node (a remote
+     ;; host), so lift the default loopback-only restriction on guest.
+     "loopback_users = none"
+     ;; --- clustering ---
+     "cluster_formation.peer_discovery_backend = classic_config"
+     (str/join
+       "\n"
+       (map-indexed
+         (fn [i n] (str "cluster_formation.classic_config.nodes." (inc i)
+                        " = rabbit@" (name n)))
+         (:nodes test)))
+     ;; --- S3 tier: point the AWS backend at MinIO via Toxiproxy ---
+     (str "stream_s3.region = " s3-region)
+     (str "stream_s3.region_endpoints." s3-region " = " s3-region-tld)
+     (str "stream_s3.access_key_id = " s3-access-key)
+     (str "stream_s3.secret_key = " s3-secret-key)
+     (str "stream_s3.bucket = " s3-bucket)
+     ;; Small fragments + frequent persists so tiering and manifest replication
+     ;; actually happen within a short test run. Combined with the small stream
+     ;; segment size and padded messages set by the client, this makes data
+     ;; really upload to S3 and local segments really trim, so the S3 nemeses
+     ;; have live traffic to disrupt and reads genuinely fall back to S3.
+     "stream_s3.fragment_target_size = 16KB"
+     "stream_s3.persist_interval_ms = 500"
+     "stream_s3.verbose_logging = true"
+     ;; Keep transfers from saturating the link so S3-latency faults are visible.
+     "stream_s3.max_transfer_bytes_per_sec = 50MB"
+     ""]))
+
+(defn install!
+  [test node]
+  (info node "installing RabbitMQ + rabbitmq_stream_s3")
+  ;; Erlang 27 is provided by the node base image (erlang:27); we only need
+  ;; the CA tooling here to trust the test S3 CA.
+  (debian/install [:openssl :ca-certificates])
+  (cu/install-archive! tarball base-dir)
+  ;; Trust the test CA so verify_peer against MinIO's cert succeeds.
+  (c/su
+    (c/exec :cp ca-cert "/usr/local/share/ca-certificates/jepsen-s3-ca.crt")
+    (c/exec :update-ca-certificates))
+  (c/exec :mkdir :-p (str base-dir "/etc/rabbitmq") log-dir)
+  (cu/write-file! (enabled-plugins) enabled-plugins-file)
+  (cu/write-file! (rabbitmq-conf test node) conf-file)
+  ;; Shared Erlang cookie so nodes can cluster.
+  (cu/write-file! erlang-cookie "/root/.erlang.cookie")
+  (c/exec :chmod :600 "/root/.erlang.cookie"))
+
+(defn env-args
+  "Renders the broker environment as `VAR=value` args for `env`."
+  [node]
+  (map (fn [[k v]] (str (name k) "=" v))
+       {:RABBITMQ_BASE base-dir
+        :RABBITMQ_CONFIG_FILE conf-file-base
+        :RABBITMQ_ENABLED_PLUGINS_FILE enabled-plugins-file
+        :RABBITMQ_LOG_BASE log-dir
+        :RABBITMQ_NODENAME (str "rabbit@" (name node))
+        :HOME "/root"}))
+
+(defn rabbitmqctl [node & args]
+  (apply c/exec :env (concat (env-args node)
+                             [(str base-dir "/sbin/rabbitmqctl")] args)))
+
+;; One rabbitmqctl eval that, on the local node, triggers local-retention
+;; evaluation for every jepsen-<k> stream — looping in Erlang rather than
+;; spawning a slow CLI per stream. evaluate_local_retention no-ops where the
+;; node holds no running member, so running this on every node reaches each
+;; stream's writer.
+(def ^:private trim-eval
+  (str "Names = [element(4, amqqueue:get_name(Q)) "
+       "|| Q <- rabbit_amqqueue:list(<<\"/\">>)], "
+       "[catch rabbitmq_stream_s3_replica_reader:evaluate_local_retention(<<\"/\">>, N) "
+       "|| N <- Names, byte_size(N) >= 7, binary:part(N, 0, 7) =:= <<\"jepsen-\">>], ok."))
+
+(defn force-local-trim!
+  "Triggers local-retention evaluation for the jepsen streams on `node`, so
+  segments already uploaded to S3 are trimmed locally and reads of older
+  offsets fall back to the S3 tier. Runs in an SSH context (caller wraps with
+  c/on-nodes)."
+  [node]
+  (util/meh (rabbitmqctl node :eval trim-eval)))
+
+;; One rabbitmqctl eval that transfers every jepsen-<k> stream's leader to its
+;; first replica, moving each writer (and uploader) to a new node and bumping the
+;; stream's epoch. The stream coordinator is cluster-global, so this runs on a
+;; single node. transfer_leadership restarts the stream with the target preferred
+;; as leader; replica_nodes excludes the current leader, so the leader genuinely
+;; moves and the epoch increments.
+;;
+;; All streams at once, repeatedly: this maximizes the number of deposed-writer
+;; races, which is exactly what stresses writer fencing (an in-flight upload from
+;; an old epoch must be rejected, never overwrite the new leader's data). The
+;; resulting subscription churn wedges the push-based workload consumers, so the
+;; kafka workload's offset analyzers go red on artifacts — but that result is
+;; downgraded to advisory under leader-move, and correctness is verified by the
+;; durability checker, which reads each stream fresh after the run.
+(def ^:private leader-move-eval
+  (str "Names = [element(4, amqqueue:get_name(Q)) "
+       "|| Q <- rabbit_amqqueue:list(<<\"/\">>)], "
+       "Jeps = [N || N <- Names, byte_size(N) >= 7, binary:part(N, 0, 7) =:= <<\"jepsen-\">>], "
+       "[begin "
+       "Q = element(2, rabbit_amqqueue:lookup(rabbit_misc:r(<<\"/\">>, queue, N))), "
+       "case maps:get(replica_nodes, amqqueue:get_type_state(Q), []) of "
+       "[Target | _] -> catch rabbit_stream_queue:transfer_leadership(Q, Target); "
+       "[] -> ok "
+       "end "
+       "end || N <- Jeps], ok."))
+
+(defn force-leader-move!
+  "Transfers every jepsen stream's leader to its first replica, moving each
+  writer (and uploader) to a new node and bumping the stream's epoch. This fences
+  the deposed writers: a straggler upload carrying the old epoch must be rejected
+  (a manifest persist conflict), never overwrite the new leader's data. Run on a
+  single node (the coordinator is cluster-global). Runs in an SSH context."
+  [node]
+  (util/meh (rabbitmqctl node :eval leader-move-eval)))
+
+;; The plugin's read/write paths are instrumented, not logged, so these
+;; counters are how the test proves S3 was actually exercised (see the
+;; coverage checker). The management/Prometheus listener is on 15692.
+(def tiering-metrics
+  ["rabbitmq_stream_s3_transfers_completed"  ; fragments uploaded to S3
+   "rabbitmq_stream_s3_get_range"            ; range GETs (remote reads) from S3
+   "rabbitmq_stream_s3_read"                 ; remote_reader read calls
+   "rabbitmq_stream_s3_resolve"              ; read-path offset resolutions
+   ;; Writer-fencing evidence: a deposed leader's straggler upload is rejected
+   ;; on a Khepri epoch conflict, and stale manifest syncs/resyncs are dropped
+   ;; or re-requested when the epoch moves under the leader-move nemesis.
+   "rabbitmq_stream_s3_persist_conflicts"
+   "rabbitmq_stream_s3_syncs_rejected"
+   "rabbitmq_stream_s3_resyncs_requested"])
+
+(defn scrape-tiering-metrics
+  "Scrapes the plugin's Prometheus counters on `node`, returning a map of
+  metric name -> summed value (over all label sets). Runs in an SSH context."
+  [node]
+  (let [out   (try (c/exec :curl :-s "http://localhost:15692/metrics")
+                   (catch Exception _ ""))
+        lines (str/split-lines out)]
+    (into {}
+          (for [m tiering-metrics]
+            [m (->> lines
+                    (keep (fn [l]
+                            (when-let [[_ v] (re-find
+                                               (re-pattern
+                                                 (str "^" m "(?:\\{[^}]*\\})?\\s+([0-9.]+)"))
+                                               l)]
+                              (parse-double v))))
+                    (reduce + 0.0))]))))
+
+;; The maximum stream coordinator epoch across the jepsen streams. The epoch
+;; starts at 1 and increments on every leader move, so it is how the coverage
+;; checker proves the writer-fencing (leader-move) path actually ran. It is a
+;; cluster-global value, so querying any one node suffices.
+(def ^:private max-epoch-eval
+  (str "Names = [element(4, amqqueue:get_name(Q)) "
+       "|| Q <- rabbit_amqqueue:list(<<\"/\">>)], "
+       "Jeps = [N || N <- Names, byte_size(N) >= 7, binary:part(N, 0, 7) =:= <<\"jepsen-\">>], "
+       "Epochs = [maps:get(epoch, amqqueue:get_type_state(element(2, "
+       "rabbit_amqqueue:lookup(rabbit_misc:r(<<\"/\">>, queue, N)))), 1) || N <- Jeps], "
+       "lists:max([1 | Epochs])."))
+
+(defn scrape-max-epoch
+  "Returns the maximum stream coordinator epoch across the jepsen streams on
+  `node` (a cluster-global value). Runs in an SSH context."
+  [node]
+  (let [out (try (rabbitmqctl node :eval max-epoch-eval) (catch Exception _ ""))]
+    (or (some-> (re-find #"\d+" (str out)) parse-long) 0)))
+
+;; Lists the integer keys of the jepsen-<k> streams that exist, so the
+;; durability checker reads exactly the streams the workload wrote to.
+(def ^:private jepsen-keys-eval
+  (str "Names = [element(4, amqqueue:get_name(Q)) "
+       "|| Q <- rabbit_amqqueue:list(<<\"/\">>)], "
+       "[binary_to_integer(binary:part(N, 7, byte_size(N) - 7)) "
+       "|| N <- Names, byte_size(N) >= 8, binary:part(N, 0, 7) =:= <<\"jepsen-\">>]."))
+
+(defn list-jepsen-keys
+  "Returns the integer keys of the jepsen streams on `node`. Runs in an SSH
+  context."
+  [node]
+  (let [out (try (rabbitmqctl node :eval jepsen-keys-eval) (catch Exception _ ""))]
+    (mapv parse-long (re-seq #"\d+" (str out)))))
+
+;; Cluster-wide S3 counter sums for the run, accumulated across nodes in
+;; log-files (which runs after the workload but before the checker, while the
+;; brokers are still up). The coverage checker reads this. Collecting it here
+;; rather than as a history op keeps it out of the kafka checker's analysis,
+;; which chokes on a trailing non-client op.
+(defonce tiering-stats (atom {}))
+
+(defn record-tiering-stats!
+  "Folds `node`'s S3 state into the shared per-run totals: counters are summed
+  across nodes, the epoch is maxed (it is cluster-global, so the max is exact)."
+  [node]
+  (swap! tiering-stats
+         (fn [acc]
+           (-> (merge-with + acc (scrape-tiering-metrics node))
+               (update "max_epoch" (fnil max 0) (scrape-max-epoch node))))))
+
+(defn start! [test node]
+  (info node "starting broker")
+  (apply c/exec :env (concat (env-args node)
+                             [(str base-dir "/sbin/rabbitmq-server") :-detached]))
+  ;; rabbitmq-server -detached returns before the node is reachable (the beam
+  ;; needs a moment to register with epmd), and await_startup errors rather
+  ;; than waiting when it cannot connect. Poll it until the node is both
+  ;; reachable and fully started — which, with classic_config, also covers the
+  ;; window where this node is still joining the cluster.
+  (util/await-fn (fn [] (rabbitmqctl node :await_startup))
+                 {:retry-interval 1000
+                  :timeout 120000
+                  :log-message (str "Waiting for broker on " (name node))}))
+
+(defn stop! [test node]
+  (info node "stopping broker")
+  (util/meh (rabbitmqctl node :shutdown)))
+
+(def probe-stream-url
+  "http://localhost:15672/api/queues/%2F/jepsen-probe-stream")
+
+(defn await-stream-ready
+  "Waits until a stream can actually be created. Right after the cluster forms
+  the stream coordinator may still be electing a leader, so the workload's
+  first creates/producers/consumers would crash; this gates the workload on the
+  subsystem being ready by creating (and deleting) a probe stream via the
+  management API. Run once on the primary via setup-primary!."
+  [node]
+  (util/await-fn
+    (fn []
+      (let [code (c/exec :curl :-s :-o "/dev/null" :-w "%{http_code}"
+                         :-u "guest:guest" :-H "content-type: application/json"
+                         :-X "PUT" probe-stream-url
+                         :-d "{\"durable\":true,\"arguments\":{\"x-queue-type\":\"stream\"}}")]
+        (when-not (#{"201" "204"} code)
+          (throw (ex-info "stream subsystem not ready" {:http-code code})))))
+    {:retry-interval 1000
+     :timeout 120000
+     :log-message (str "Waiting for stream subsystem on " (name node))})
+  (util/meh
+    (c/exec :curl :-s :-o "/dev/null" :-u "guest:guest" :-X "DELETE" probe-stream-url)))
+
+(defn db
+  "RabbitMQ stream_s3 DB. One generic-unix tarball install per node."
+  []
+  (reify db/DB
+    (setup! [_ test node]
+      ;; Clean slate for this run's coverage counters and authoritative reads
+      ;; (idempotent across nodes).
+      (reset! tiering-stats {})
+      (reset! sc/authoritative-reads {})
+      (install! test node)
+      (start! test node))
+
+    (teardown! [_ test node]
+      (stop! test node)
+      (c/su (c/exec :rm :-rf base-dir)))
+
+    db/Primary
+    (primaries [_ test] [(first (:nodes test))])
+    (setup-primary! [_ test node]
+      (info node "waiting for the stream subsystem to be ready")
+      (await-stream-ready node))
+
+    db/LogFiles
+    (log-files [_ test node]
+      ;; Scrape this node's S3 counters into the run totals (brokers are still
+      ;; up here, before teardown) so the coverage checker can read them.
+      (util/meh (record-tiering-stats! node))
+      ;; Authoritatively read every jepsen stream end-to-end for the durability
+      ;; checker, once (on the primary), while the brokers are still up. Uses the
+      ;; Stream client over a fresh Environment, so it needs no SSH context.
+      (when (= node (first (:nodes test)))
+        (util/meh (sc/capture-authoritative-reads! test (list-jepsen-keys node))))
+      ;; Broker logs + the S3 plugin's status output for post-mortem.
+      (util/meh
+        (rabbitmqctl node :stream_s3_status
+                     :> (str log-dir "/stream_s3_status.txt")))
+      ;; NB: cu/ls-full is broken in jepsen 0.3.11 (it calls assoc with two
+      ;; args), so use cu/ls with :full-path? directly.
+      (try (cu/ls log-dir {:full-path? true})
+           (catch Throwable _ [])))))

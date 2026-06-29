@@ -1,0 +1,106 @@
+# Docker topology for the rabbitmq_stream_s3 Jepsen test.
+#
+#   control            runs `lein run test ...`, SSHes into the nodes
+#   n1..n5             RabbitMQ broker nodes (Erlang 27 base, sshd)
+#   minio              S3-compatible store, HTTPS/443, virtual-host routing
+#   toxiproxy          L4 TLS passthrough in front of MinIO (fault injection);
+#                      carries the S3 vhost DNS aliases so the broker's
+#                      <bucket>.<endpoint> requests land here first
+#   minio-init         creates the `jepsen` bucket, then exits
+#
+# The broker reaches S3 as https://jepsen.s3.jepsen.local:443 -> toxiproxy:443
+# -> minio:443. The cert (gen-certs.sh) is valid for *.s3.jepsen.local and
+# s3.jepsen.local; nodes trust ./shared/ca.crt (laid in by db.clj).
+#
+# Bring up:  ./up.sh   (builds the broker tarball + certs, then compose up)
+
+x-node: &node
+  build:
+    context: .
+    dockerfile: Dockerfile-node
+  privileged: true          # jepsen needs to manipulate iptables for partitions
+  volumes:
+    - ./shared:/shared:ro
+  networks:
+    - jepsen
+
+services:
+  control:
+    build:
+      context: .
+      dockerfile: Dockerfile-control
+    volumes:
+      - ../jepsen.streams3:/jepsen
+      - ./shared:/shared:ro
+      # Persist lein's maven cache on the host so deps survive container
+      # recreation (and reuse the host's existing cache).
+      - ${HOME}/.m2:/root/.m2
+    working_dir: /jepsen
+    networks:
+      - jepsen
+    # The RabbitMQ stream client sizes its Netty/scheduler thread pools to the
+    # host's core count (64 here), so the JVM needs far more than the default
+    # 2048-pid cgroup limit. The host ulimit has ample headroom.
+    pids_limit: 32768
+    depends_on: [n1, n2, n3, n4, n5, minio-init]
+    command: ["sleep", "infinity"]
+
+  n1: {<<: *node, hostname: n1, container_name: n1}
+  n2: {<<: *node, hostname: n2, container_name: n2}
+  n3: {<<: *node, hostname: n3, container_name: n3}
+  n4: {<<: *node, hostname: n4, container_name: n4}
+  n5: {<<: *node, hostname: n5, container_name: n5}
+
+  minio:
+    image: minio/minio:latest
+    environment:
+      MINIO_ROOT_USER: jepsenjepsen
+      MINIO_ROOT_PASSWORD: jepsenjepsenjepsen
+      # Enable virtual-host-style addressing for <bucket>.s3.jepsen.local.
+      MINIO_DOMAIN: s3.jepsen.local
+      # The plugin requests SSE (x-amz-server-side-encryption: AES256) on every
+      # fragment PUT. MinIO rejects SSE with 501 unless a KMS backend exists, so
+      # configure a local KMS key. (Value is key-id:base64(32 bytes).)
+      MINIO_KMS_SECRET_KEY: "jepsen-key:MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+    command: server /data --address ":443"
+    volumes:
+      - ./shared/certs:/root/.minio/certs:ro
+    networks:
+      jepsen:
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:latest
+    # The toxiproxy image is FROM scratch (no shell), so the passthrough proxy
+    # is declared in a config file loaded at startup rather than created by an
+    # init container. -host=0.0.0.0 exposes the admin API (8474) for S3 fault
+    # injection.
+    command: ["-host=0.0.0.0", "-config=/toxiproxy.json"]
+    volumes:
+      - ./toxiproxy.json:/toxiproxy.json:ro
+    networks:
+      jepsen:
+        # The broker resolves the S3 vhost names to Toxiproxy, which passes
+        # through to MinIO. This is what makes S3 faults injectable.
+        aliases:
+          - s3.jepsen.local
+          - jepsen.s3.jepsen.local
+    depends_on: [minio]
+
+  minio-init:
+    # Creates the bucket. mc is invoked directly (no shell): the MinIO endpoint
+    # comes from MC_HOST_j, and we talk path-style to minio:443 with --insecure
+    # (the cert is for *.s3.jepsen.local, not "minio"). restart: on-failure
+    # retries until MinIO is accepting connections, then exits 0.
+    image: minio/mc:latest
+    environment:
+      MC_HOST_j: "https://jepsenjepsen:jepsenjepsenjepsen@minio:443"
+    entrypoint: ["mc"]
+    command: ["mb", "--insecure", "--ignore-existing", "j/jepsen"]
+    restart: on-failure
+    networks:
+      jepsen:
+    depends_on: [minio]
+
+networks:
+  jepsen:
+    driver: bridge

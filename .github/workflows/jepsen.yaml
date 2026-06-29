@@ -1,0 +1,92 @@
+name: Jepsen
+
+# Black-box, real-cluster Jepsen test for rabbitmq_stream_s3. It builds the
+# broker tarball, brings up a 5-node cluster with MinIO behind Toxiproxy via
+# docker compose, drives the kafka workload under faults, and fails the build if
+# the checker reports anomalies. See jepsen/README.md.
+#
+# This is a heavy test (a full server build plus a multi-node cluster), so it
+# runs on demand, on a schedule, and on changes to the harness itself, rather
+# than on every pull request; the scheduled run is what catches plugin
+# regressions over time. It builds the broker from a fresh clone rather than the
+# Build-RMQ cache, because package-generic-unix must run on a clean source tree
+# (a pre-compiled tree duplicates entries in the CLI escript and fails to zip).
+
+on:
+  workflow_dispatch:
+    inputs:
+      time-limit:
+        description: 'Seconds to run the workload'
+        default: '120'
+      rate:
+        description: 'Approximate request rate per second'
+        default: '100'
+      concurrency:
+        description: 'Number of concurrent workers'
+        default: '20'
+  schedule:
+    - cron: '0 6 * * 1' # Weekly, Mondays 06:00 UTC
+  pull_request:
+    paths:
+      - 'jepsen/**'
+      - '.github/workflows/jepsen.yaml'
+
+permissions:
+  contents: read
+
+# Jepsen runs are expensive and each binds the same host ports, so never run two
+# for the same ref at once.
+concurrency:
+  group: jepsen-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  jepsen:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rmq-version: ['streams-tiered-storage']
+        # One job per scenario: storage-tier faults, and writer fencing.
+        faults:
+          - 'partition,s3-outage,s3-latency,trim'
+          - 'leader-move,trim'
+        include:
+          - rmq-version: 'streams-tiered-storage'
+            otp-version: 27
+            elixir-version: 1.18
+    steps:
+      - name: Free up disk space
+        # A full server build plus five brokers, MinIO and Toxiproxy is
+        # disk-hungry; drop preinstalled toolchains the job does not need.
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/.ghcup
+          df -h /
+      - uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
+        with:
+          otp-version: ${{ matrix.otp-version }}
+          elixir-version: ${{ matrix.elixir-version }}
+      - name: Clone rabbitmq-server
+        run: git clone --depth 1 --branch ${{ matrix.rmq-version }} https://github.com/amazon-mq/upstream-to-rabbitmq-server.git ${{ github.workspace }}/rabbitmq-server
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: rabbitmq-server/deps/rabbitmq_stream_s3
+      - name: Run Jepsen
+        working-directory: rabbitmq-server/deps/rabbitmq_stream_s3
+        run: jepsen/ci/run-jepsen.sh
+        env:
+          FAULTS: ${{ matrix.faults }}
+          TIME_LIMIT: ${{ github.event.inputs.time-limit || '120' }}
+          RATE: ${{ github.event.inputs.rate || '100' }}
+          CONCURRENCY: ${{ github.event.inputs.concurrency || '20' }}
+      - name: Upload Jepsen store
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: jepsen-store-${{ strategy.job-index }}
+          if-no-files-found: ignore
+          path: rabbitmq-server/deps/rabbitmq_stream_s3/jepsen/jepsen.streams3/store/
+      - name: Tear down cluster
+        if: always()
+        working-directory: rabbitmq-server/deps/rabbitmq_stream_s3/jepsen/docker
+        run: docker compose down -v || true
