@@ -1,0 +1,66 @@
+(ns jepsen.streams3.core
+  "Entry point and test assembly for the RabbitMQ stream_s3 Jepsen test.
+
+  Usage:
+    lein run test --nodes-file nodes --time-limit 300 --rate 200 --concurrency 20
+
+  See jepsen/README.md for the full docker-based run procedure."
+  (:require [jepsen [cli :as cli]
+                    [checker :as checker]
+                    [generator :as gen]
+                    [tests :as tests]]
+            [jepsen.checker.timeline :as timeline]
+            [jepsen.os.debian :as debian]
+            [jepsen.streams3.db :as db]
+            [jepsen.streams3.nemesis :as nem]
+            [jepsen.streams3.workload :as workload]))
+
+(def cli-opts
+  "Extra CLI options for this test."
+  [[nil "--rate HZ" "Approximate request rate, per second"
+    :default 200 :parse-fn read-string]
+   [nil "--key-count N" "Number of streams (topic-partitions)"
+    :default 8 :parse-fn parse-long]
+   [nil "--nemesis-interval SEC" "Seconds between fault transitions"
+    :default 15 :parse-fn parse-long]
+   [nil "--faults FAULTS" "Comma-separated faults (phase 1: partition)"
+    :default "partition"]])
+
+(defn streams3-test
+  [opts]
+  (let [wl (workload/workload opts)]
+    (merge
+      tests/noop-test
+      opts
+      ;; The kafka workload's generator/checker/client read these options from
+      ;; the *test map*. Merge only the scalar options — merging the whole
+      ;; workload map would drag in un-serializable generator Delays that break
+      ;; jepsen's fressian store.
+      (select-keys wl [:sub-via :txn? :crash-clients? :crash-client-interval])
+      {:name      "rabbitmq-stream-s3"
+       :os        debian/os
+       :db        (db/db)
+       :client    (:client wl)
+       :nemesis   (nem/full-nemesis)
+       :checker   (checker/compose
+                    {:perf     (checker/perf)
+                     :timeline (timeline/html)
+                     :workload (:checker wl)})
+       :generator (gen/phases
+                    ;; Main phase: workload ops + faults for the time limit.
+                    (->> (:generator wl)
+                         (gen/stagger (/ 1 (:rate opts)))
+                         (gen/nemesis (nem/nemesis-generator opts))
+                         (gen/time-limit (:time-limit opts)))
+                    ;; Heal, let things settle.
+                    (gen/nemesis (gen/once {:type :info :f :stop-partition}))
+                    (gen/sleep 15)
+                    ;; Final reads: the kafka workload drains everything written.
+                    (gen/clients (:final-generator wl)))})))
+
+(defn -main [& args]
+  (cli/run!
+    (merge (cli/single-test-cmd {:test-fn streams3-test
+                                 :opt-spec cli-opts})
+           (cli/serve-cmd))
+    args))

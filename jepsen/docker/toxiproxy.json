@@ -1,0 +1,8 @@
+[
+  {
+    "name": "s3",
+    "listen": "0.0.0.0:443",
+    "upstream": "minio:443",
+    "enabled": true
+  }
+]
