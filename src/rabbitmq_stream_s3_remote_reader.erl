@@ -58,8 +58,20 @@ synchronous feedback is generated.
 %% them every read above 8 MiB collapses into the +Inf bucket. Reads never
 %% exceed the 64 MiB cap, so in normal operation +Inf stays empty.
 -define(READ_SIZE_BUCKETS, [
-    48, 128, 512, 2_048, 8_192, 32_768, 131_072, 524_288,
-    2_097_152, 8_388_608, 16_777_216, 33_554_432, 67_108_864, infinity
+    48,
+    128,
+    512,
+    2_048,
+    8_192,
+    32_768,
+    131_072,
+    524_288,
+    2_097_152,
+    8_388_608,
+    16_777_216,
+    33_554_432,
+    67_108_864,
+    infinity
 ]).
 
 -type hint() :: chunk_boundary | within_chunk.
