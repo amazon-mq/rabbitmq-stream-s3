@@ -73,6 +73,11 @@ init([]) ->
 handle_batch(Ops, State) ->
     Keys = collect(Ops),
     _ = delete_batched(Keys),
+    %% Reply to any flush barrier in this batch only after the deletes above
+    %% have run. gen_batch_server processes a batch in order and a caller's
+    %% {delete, _} casts are enqueued before its flush call, so a returning
+    %% flush guarantees those deletes are complete (see list_and_delete/1).
+    _ = [gen:reply(From, ok) || {call, From, flush} <- Ops],
     {ok, State}.
 
 terminate(_Reason, _State) ->
@@ -125,11 +130,43 @@ delete_batch(Batch) ->
 
 list_and_delete(StreamId) ->
     Prefix = rabbitmq_stream_s3:stream_prefix(StreamId),
+    %% Record the tombstone before sweeping. This runs in the reaper's spawned
+    %% task (a normal process), not the Khepri trigger sproc, so it can write to
+    %% Khepri. The tombstone is the durable "stream deleted" signal that lets GC
+    %% reclaim a fragment whose upload completes after this one-shot sweep lists
+    %% the prefix (issue #196). Best effort: if it fails the sweep still runs,
+    %% and the worst case is the pre-existing leak this addresses.
+    _ = rabbitmq_stream_s3_db:write_tombstone(StreamId),
     Result = list_and_delete_loop(Prefix, start),
     case Result of
-        ok -> inc(?C_STREAMS_DELETED, 1);
-        _ -> ok
+        ok ->
+            inc(?C_STREAMS_DELETED, 1),
+            maybe_clear_tombstone(StreamId, Prefix);
+        _ ->
+            %% The sweep hit a LIST error and is incomplete; leave the tombstone
+            %% so GC reclaims whatever remains and clears it later.
+            ok
     end.
+
+%% After a clean sweep, confirm the prefix is empty and drop the tombstone so it
+%% does not accumulate. The deletes are async casts to this server, so flush
+%% first to ensure they have run, then re-LIST. If anything remains (an upload
+%% that completed after the sweep listed its page, the #196 race), keep the
+%% tombstone: GC will reclaim the straggler and clear the tombstone then.
+maybe_clear_tombstone(StreamId, Prefix) ->
+    _ = flush(),
+    case rabbitmq_stream_s3_api:list(Prefix, start) of
+        {ok, [], done} ->
+            _ = rabbitmq_stream_s3_db:delete_tombstone(StreamId),
+            ok;
+        _ ->
+            ok
+    end.
+
+%% Synchronous barrier: returns only after all delete casts enqueued before it
+%% have been processed by handle_batch/2.
+flush() ->
+    gen_batch_server:call(?MODULE, flush).
 
 list_and_delete_loop(_Prefix, done) ->
     ok;

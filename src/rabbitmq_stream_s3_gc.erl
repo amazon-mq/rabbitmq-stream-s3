@@ -42,7 +42,7 @@ signal without Khepri restructuring).
 
 -type mode() :: dry_run | delete.
 -type config() :: #{mode => mode(), writer_epoch => non_neg_integer()}.
--type reason() :: below_first_offset | stale_epoch.
+-type reason() :: below_first_offset | stale_epoch | stream_deleted.
 -type finding() :: #{stream_id := stream_id(), key := rabbitmq_stream_s3:key(), reason := reason()}.
 
 -export_type([mode/0, config/0, finding/0]).
@@ -59,8 +59,13 @@ run(Config) when is_map(Config) ->
     Mode = maps:get(mode, Config, dry_run),
     {ok, Streams} = rabbitmq_stream_s3_db:list(),
     Lookup = build_lookup(Streams),
+    Tombstones = load_tombstones(),
     Fun = make_handler(Mode),
-    Findings = list_and_classify(<<"rabbitmq/stream/">>, start, Lookup, Fun, []),
+    Findings = list_and_classify(<<"rabbitmq/stream/">>, start, Lookup, Tombstones, Fun, []),
+    %% Clear tombstones for deleted streams whose prefix this delete-mode sweep
+    %% fully reclaimed, so they do not accumulate. Only in delete mode (a dry run
+    %% removed nothing) and only when the prefix is now empty.
+    maybe_clear_swept_tombstones(Mode, Tombstones),
     ?LOG_INFO("GC ~ts complete: ~b dangling object(s)", [Mode, length(Findings)]),
     {ok, Findings}.
 
@@ -77,7 +82,10 @@ run_stream(StreamId, Config) when is_binary(StreamId), is_map(Config) ->
         {ok, Lookup} ->
             Prefix = rabbitmq_stream_s3:stream_prefix(StreamId),
             Fun = make_handler(Mode),
-            Findings = list_and_classify(Prefix, start, Lookup, Fun, []),
+            %% The single-stream path runs against a live stream (the reset
+            %% recovery), so it carries no tombstones: a deleted stream has no
+            %% reader to invoke this. Pass an empty tombstone set.
+            Findings = list_and_classify(Prefix, start, Lookup, #{}, Fun, []),
             ?LOG_INFO(
                 "GC ~ts for stream ~ts complete: ~b dangling object(s)",
                 [Mode, StreamId, length(Findings)]
@@ -102,6 +110,40 @@ run_stream(VHost, QueueName, Config) when
         {error, _} = Err ->
             Err
     end.
+
+%% Load the set of deleted-stream tombstones. A failure to read them is not
+%% fatal to a sweep: treat it as no tombstones (the pre-existing behaviour of
+%% skipping unknown-stream prefixes), so GC stays conservative rather than
+%% deleting on a bad read.
+load_tombstones() ->
+    case rabbitmq_stream_s3_db:list_tombstones() of
+        {ok, Tombstones} ->
+            Tombstones;
+        {error, Reason} ->
+            ?LOG_INFO("GC: could not read deletion tombstones (~p); none applied", [Reason]),
+            #{}
+    end.
+
+%% After a delete-mode full sweep, drop the tombstone of any deleted stream whose
+%% prefix is now empty, so tombstones do not accumulate. A stream whose prefix
+%% still has objects (a delete that failed, or an upload still completing) keeps
+%% its tombstone for the next sweep.
+maybe_clear_swept_tombstones(delete, Tombstones) ->
+    maps:foreach(
+        fun(StreamId, _Data) ->
+            Prefix = rabbitmq_stream_s3:stream_prefix(StreamId),
+            case rabbitmq_stream_s3_api:list(Prefix, start) of
+                {ok, [], done} ->
+                    _ = rabbitmq_stream_s3_db:delete_tombstone(StreamId),
+                    ok;
+                _ ->
+                    ok
+            end
+        end,
+        Tombstones
+    );
+maybe_clear_swept_tombstones(_Mode, _Tombstones) ->
+    ok.
 
 make_handler(dry_run) ->
     fun(Finding, Acc) ->
@@ -146,6 +188,16 @@ make_handler(delete) ->
 -spec still_dangling(finding()) -> boolean().
 still_dangling(#{reason := stale_epoch}) ->
     true;
+still_dangling(#{reason := stream_deleted, stream_id := StreamId}) ->
+    %% The whole stream was deleted, so every object under its prefix is an
+    %% orphan. Re-validate that the tombstone is still present immediately
+    %% before deleting: a recreated stream gets a distinct id (its name embeds a
+    %% nanosecond timestamp), so a surviving tombstone for this exact id means
+    %% the stream is genuinely gone and nothing live can be under this prefix.
+    case rabbitmq_stream_s3_db:list_tombstones() of
+        {ok, Tombstones} -> is_map_key(StreamId, Tombstones);
+        {error, _} -> false
+    end;
 still_dangling(#{reason := below_first_offset, stream_id := StreamId, key := Key}) ->
     case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
         #manifest{first_offset = FirstOffset} = Manifest ->
@@ -353,25 +405,25 @@ epoch_permits_sweep(CommittedEpoch, #{writer_epoch := WriterEpoch}) ->
 epoch_permits_sweep(_CommittedEpoch, _Config) ->
     true.
 
-list_and_classify(_Prefix, done, _Lookup, _Fun, Acc) ->
+list_and_classify(_Prefix, done, _Lookup, _Tombstones, _Fun, Acc) ->
     lists:reverse(Acc);
-list_and_classify(Prefix, Continuation, Lookup, Fun, Acc) ->
+list_and_classify(Prefix, Continuation, Lookup, Tombstones, Fun, Acc) ->
     case rabbitmq_stream_s3_api:list(Prefix, Continuation) of
         {ok, [], done} ->
             lists:reverse(Acc);
         {ok, Keys, NextContinuation} ->
-            Orphans = classify_page(Keys, Lookup),
+            Orphans = classify_page(Keys, Lookup, Tombstones),
             NewAcc = lists:foldl(Fun, Acc, Orphans),
-            list_and_classify(Prefix, NextContinuation, Lookup, Fun, NewAcc);
+            list_and_classify(Prefix, NextContinuation, Lookup, Tombstones, Fun, NewAcc);
         {error, Reason} ->
             ?LOG_WARNING("GC: failed to list objects under ~ts: ~p", [Prefix, Reason]),
             lists:reverse(Acc)
     end.
 
-classify_page(Keys, Lookup) ->
+classify_page(Keys, Lookup, Tombstones) ->
     lists:filtermap(
         fun(Key) ->
-            case classify(Key, Lookup) of
+            case classify(Key, Lookup, Tombstones) of
                 {ok, Finding} -> {true, Finding};
                 skip -> false
             end
@@ -379,37 +431,75 @@ classify_page(Keys, Lookup) ->
         Keys
     ).
 
+-ifdef(TEST).
+%% classify/2 keeps the no-tombstone behaviour for the eunit tests that classify
+%% against the live lookup only. Equivalent to classify/3 with an empty tombstone
+%% set. Test-only: production always classifies with the tombstone set.
 -spec classify(rabbitmq_stream_s3:key(), map()) -> {ok, finding()} | skip.
 classify(Key, Lookup) ->
+    classify(Key, Lookup, #{}).
+-endif.
+
+-spec classify(rabbitmq_stream_s3:key(), map(), #{stream_id() => term()}) ->
+    {ok, finding()} | skip.
+classify(Key, Lookup, Tombstones) ->
     case parse_key(Key) of
         {data, StreamId, Offset} ->
             case Lookup of
-                #{StreamId := #{first_offset := FirstOffset}} when Offset < FirstOffset ->
-                    {ok, #{stream_id => StreamId, key => Key, reason => below_first_offset}};
+                #{StreamId := Info} ->
+                    classify_live(data, StreamId, Offset, Key, Info);
                 _ ->
-                    skip
+                    classify_against_tombstone(StreamId, Key, Tombstones)
             end;
         {group, StreamId, Offset} ->
             case Lookup of
-                #{StreamId := #{first_offset := FirstOffset} = Info} when Offset < FirstOffset ->
-                    classify_group(StreamId, Key, Info);
+                #{StreamId := Info} ->
+                    classify_live(group, StreamId, Offset, Key, Info);
                 _ ->
-                    skip
+                    classify_against_tombstone(StreamId, Key, Tombstones)
             end;
         {manifest, StreamId, Epoch} ->
             case Lookup of
-                #{StreamId := #{epoch := CurrentEpoch}} when Epoch < CurrentEpoch ->
-                    {ok, #{stream_id => StreamId, key => Key, reason => stale_epoch}};
+                #{StreamId := Info} ->
+                    classify_live(manifest, StreamId, Epoch, Key, Info);
                 _ ->
-                    skip
+                    classify_against_tombstone(StreamId, Key, Tombstones)
             end;
         unknown ->
-            %% Key belongs to a stream not in the lookup (either unknown to
-            %% Khepri or missing a local manifest replica). Not safe to delete
-            %% without a positive "stream deleted" signal. See #149 for the
-            %% planned Khepri restructuring that would make stream-prefix
-            %% sweep safe.
+            %% Key does not parse to a stream prefix (a stray object under
+            %% rabbitmq/stream/). Never delete it.
             skip
+    end.
+
+%% Classify a key whose stream IS present in the live lookup (Info is its lookup
+%% entry), by the normal offset/epoch rules. A tombstone is never consulted
+%% here: a live stream's objects are governed solely by its live manifest, so a
+%% stale tombstone for a still-present stream can never cause a live object to
+%% be deleted.
+classify_live(data, StreamId, Offset, Key, #{first_offset := FirstOffset}) when
+    Offset < FirstOffset
+->
+    {ok, #{stream_id => StreamId, key => Key, reason => below_first_offset}};
+classify_live(group, StreamId, Offset, Key, #{first_offset := FirstOffset} = Info) when
+    Offset < FirstOffset
+->
+    classify_group(StreamId, Key, Info);
+classify_live(manifest, StreamId, Epoch, Key, #{epoch := CurrentEpoch}) when
+    Epoch < CurrentEpoch
+->
+    {ok, #{stream_id => StreamId, key => Key, reason => stale_epoch}};
+classify_live(_Kind, _StreamId, _OffsetOrEpoch, _Key, _Info) ->
+    skip.
+
+%% A key whose stream is absent from the live lookup: delete it only if the
+%% stream has a deletion tombstone, the positive "stream deleted" signal. The
+%% stream entry is gone from Khepri after deletion, so without the tombstone a
+%% deleted stream's leftover object is indistinguishable from one belonging to a
+%% live stream this node merely cannot see, and must be skipped (issue #196).
+classify_against_tombstone(StreamId, Key, Tombstones) ->
+    case is_map_key(StreamId, Tombstones) of
+        true -> {ok, #{stream_id => StreamId, key => Key, reason => stream_deleted}};
+        false -> skip
     end.
 
 %% A group object below first_offset is an orphan and safe to delete unless it
@@ -667,10 +757,55 @@ classify_manifest_current_epoch_test() ->
     ?assertEqual(skip, classify(Key, Lookup)).
 
 classify_unknown_stream_skipped_test() ->
-    %% Stream not in lookup -> skip (not safe to delete).
+    %% Stream not in lookup and no tombstone -> skip (not safe to delete).
     Lookup = #{},
     Key = <<"rabbitmq/stream/unknown/data/00000000000000000100.deadbeef.fragment">>,
     ?assertEqual(skip, classify(Key, Lookup)).
+
+%% #196: a key whose stream is gone from the lookup but has a deletion tombstone
+%% is an orphan and is reclaimed. This is the leftover from an upload that
+%% completed after the deletion sweep listed the prefix.
+classify_tombstoned_stream_data_deletes_test() ->
+    StreamId = <<"gone">>,
+    Lookup = #{},
+    Tombstones = #{StreamId => #{deleted_at => 0}},
+    Key = <<"rabbitmq/stream/gone/data/00000000000000000100.deadbeef.fragment">>,
+    ?assertMatch(
+        {ok, #{reason := stream_deleted}}, classify(Key, Lookup, Tombstones)
+    ).
+
+%% A tombstone covers every object kind under the deleted stream's prefix, not
+%% just fragments.
+classify_tombstoned_stream_metadata_deletes_test() ->
+    StreamId = <<"gone">>,
+    Tombstones = #{StreamId => #{deleted_at => 0}},
+    GroupKey = <<"rabbitmq/stream/gone/metadata/00000000000000000010.00000099.group">>,
+    ManifestKey = <<"rabbitmq/stream/gone/metadata/root.00000005.deadbeef.manifest">>,
+    ?assertMatch({ok, #{reason := stream_deleted}}, classify(GroupKey, #{}, Tombstones)),
+    ?assertMatch({ok, #{reason := stream_deleted}}, classify(ManifestKey, #{}, Tombstones)).
+
+%% A tombstone for one stream does not authorise deleting another unknown
+%% stream's objects: only the tombstoned prefix is swept.
+classify_tombstone_does_not_affect_other_streams_test() ->
+    Tombstones = #{<<"gone">> => #{deleted_at => 0}},
+    OtherKey = <<"rabbitmq/stream/other/data/00000000000000000100.deadbeef.fragment">>,
+    ?assertEqual(skip, classify(OtherKey, #{}, Tombstones)).
+
+%% A live stream (present in the lookup) is classified by the normal rules even
+%% if a stale tombstone somehow exists for its id: the lookup match wins, so a
+%% fragment at or above the live floor is kept.
+classify_live_stream_ignores_tombstone_test() ->
+    StreamId = <<"s">>,
+    Lookup = #{StreamId => #{first_offset => 100, epoch => 1}},
+    Tombstones = #{StreamId => #{deleted_at => 0}},
+    %% Above the floor: kept (not an orphan), despite the tombstone.
+    KeptKey = <<"rabbitmq/stream/s/data/00000000000000000150.0000002a.fragment">>,
+    ?assertEqual(skip, classify(KeptKey, Lookup, Tombstones)),
+    %% Below the floor: the normal below_first_offset rule still applies.
+    OrphanKey = <<"rabbitmq/stream/s/data/00000000000000000050.0000002a.fragment">>,
+    ?assertMatch(
+        {ok, #{reason := below_first_offset}}, classify(OrphanKey, Lookup, Tombstones)
+    ).
 
 %% A candidate deletion is re-validated against the live first_offset just before
 %% deleting. A remote-tier-ahead reset lowers first_offset and re-tiers live

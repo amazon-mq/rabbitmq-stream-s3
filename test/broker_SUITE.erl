@@ -19,6 +19,7 @@ groups() ->
         {cluster_size_3, [shuffle], [
             publish_uploads_to_remote_tier,
             stream_deletion_cleans_remote_tier,
+            stream_deletion_straggler_reclaimed_by_gc,
             consumer_reads_across_tiers,
             leadership_transfer_continues_upload,
             plugin_disable_reenable,
@@ -112,6 +113,54 @@ stream_deletion_cleans_remote_tier(Config) ->
     amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
 
     ?awaitMatch([], list_fragment_keys(Config, WriterNode, StreamId), 5000),
+    ok.
+
+%% #196: an upload that completes after the deletion sweep listed the prefix
+%% leaves a straggler object. Because the deletion records a tombstone, GC
+%% reclaims the straggler (the stream is gone from Khepri, so without the
+%% tombstone GC would skip it as an unknown-stream prefix) and clears the
+%% tombstone once the prefix is empty.
+%%
+%% The reaper's own fast path clears the tombstone as soon as its sweep drains
+%% the prefix, so a real deletion followed by a straggler is a timing race that
+%% does not reproduce deterministically. This test drives the GC path directly:
+%% a tombstone plus a straggler object for a stream that does not exist in
+%% Khepri (a distinct, never-created stream id), exactly the post-deletion
+%% state, and asserts GC reclaims the straggler and clears the tombstone.
+stream_deletion_straggler_reclaimed_by_gc(Config) ->
+    Node = hd(rabbit_ct_broker_helpers:get_node_configs(Config, nodename)),
+    %% A stream id that was never created, standing in for one already deleted
+    %% (and so absent from the Khepri lookup), with a unique suffix.
+    StreamId = <<"__gc_straggler_stream_1780000000000000000">>,
+
+    %% Record the deletion tombstone (as the reaper does on deletion) and leave a
+    %% straggler fragment under the prefix (the upload that finished after the
+    %% sweep).
+    ok = rabbit_ct_broker_helpers:rpc(
+        Config, Node, rabbitmq_stream_s3_db, write_tombstone, [StreamId]
+    ),
+    StragglerKey = rabbitmq_stream_s3:fragment_key(StreamId, 999, 16#deadbeef),
+    ok = rabbit_ct_broker_helpers:rpc(
+        Config, Node, rabbitmq_stream_s3_api, put, [StragglerKey, <<"orphan">>]
+    ),
+    ?assert(list_fragment_keys(Config, Node, StreamId) =/= []),
+
+    %% GC in delete mode reclaims the straggler via the tombstone, then clears
+    %% the tombstone because the prefix is now empty.
+    {ok, _} = rabbit_ct_broker_helpers:rpc(
+        Config, Node, rabbitmq_stream_s3_gc, run, [#{mode => delete}]
+    ),
+    ?awaitMatch([], list_fragment_keys(Config, Node, StreamId), 5000),
+    ?awaitMatch(
+        false,
+        begin
+            {ok, Ts} = rabbit_ct_broker_helpers:rpc(
+                Config, Node, rabbitmq_stream_s3_db, list_tombstones, []
+            ),
+            maps:is_key(StreamId, Ts)
+        end,
+        5000
+    ),
     ok.
 
 consumer_reads_across_tiers(Config) ->

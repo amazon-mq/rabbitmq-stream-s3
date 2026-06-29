@@ -27,6 +27,17 @@ writer cannot make progress anymore.
 -include_lib("rabbit_common/include/resource.hrl").
 
 -define(PATH(StreamId), ?RABBITMQ_KHEPRI_ROOT_PATH([rabbitmq_stream_s3, StreamId])).
+%% Tombstone path for a deleted stream. Deliberately under a separate root from
+%% ?PATH/1 and with no keep-while condition, so it survives the keep-while
+%% removal of the stream entry (that removal is what fires the deletion trigger).
+%% A tombstone records that a stream's remote-tier prefix holds no live data and
+%% may be swept in full, the positive "stream deleted" signal that lets GC
+%% reclaim objects left by an upload that completed after the deletion sweep
+%% (issue #196). StreamIds embed a nanosecond timestamp, so a recreated stream
+%% gets a distinct id and cannot alias an existing tombstone.
+-define(TOMBSTONE_PATH(StreamId),
+    ?RABBITMQ_KHEPRI_ROOT_PATH([rabbitmq_stream_s3_deleted, StreamId])
+).
 -define(STREAM_QUEUE_DELETION_TRIGGER_ID, rabbitmq_stream_s3_db_sq_deletion).
 %% Bounds a consistent read so it cannot block indefinitely waiting for a quorum
 %% that will not form (for example on a minority partition); timing out there
@@ -46,11 +57,16 @@ Zero indicates that the manifest has not been created yet.
     revision := revision()
 }.
 
--export_type([revision/0, entry/0]).
+%% Payload of a deletion tombstone. Carries whatever is useful for diagnosis or
+%% a future expiry policy; `deleted_at` is wall-clock milliseconds at deletion.
+-type tombstone() :: #{deleted_at := integer()}.
+
+-export_type([revision/0, entry/0, tombstone/0]).
 
 -export([setup/0]).
 
 -export([get/1, get_consistent/1, list/0, count/0, put/5, queue_path/1]).
+-export([write_tombstone/1, list_tombstones/0, delete_tombstone/1]).
 
 -define(C_SPROC_TRIGGERS, 1).
 -define(C_GETS, 2).
@@ -116,6 +132,13 @@ handle_queue_deletion(#{path := ?PATH(StreamId)}) ->
     %% Khepri leader node. This may not be the same node as the stream's writer
     %% process. And in larger clusters (5, 7, 9 nodes, etc..) this might not
     %% be a node of a replica either.
+    %%
+    %% The sproc runs synchronously inside the single khepri_event_handler
+    %% gen_server (Khepri dispatches triggered sprocs there via a mod_call
+    %% effect). A synchronous khepri:put from here would block that one handler
+    %% on its own Ra command and stall all trigger processing, so the tombstone
+    %% is written from the reaper's independent task process instead; see
+    %% rabbitmq_stream_s3_reaper:delete_stream/1.
     ok = rabbitmq_stream_s3_reaper:delete_stream(StreamId).
 
 -doc "Gets the latest-known manifest root UID and revision with a low-latency local read.".
@@ -169,6 +192,45 @@ list() ->
 -spec count() -> {ok, non_neg_integer()} | {error, any()}.
 count() ->
     rabbit_khepri:count(?PATH(#if_has_data{})).
+
+-doc """
+Write a tombstone marking a stream as deleted.
+
+Recorded by the queue-deletion trigger before the remote-tier sweep. The payload
+is a map of whatever is useful for diagnosis and a possible future expiry; for
+now the wall-clock deletion time. The tombstone is removed once the prefix is
+confirmed empty (by the reaper after its sweep, or by GC after reclaiming a
+straggler). See ?TOMBSTONE_PATH and issue #196.
+""".
+-spec write_tombstone(stream_id()) -> ok | {error, any()}.
+write_tombstone(StreamId) ->
+    Tombstone = #{deleted_at => erlang:system_time(millisecond)},
+    khepri:put(rabbit_khepri:get_store_id(), ?TOMBSTONE_PATH(StreamId), Tombstone).
+
+-doc "Lists the stream IDs that currently have a deletion tombstone.".
+-spec list_tombstones() -> {ok, #{stream_id() => tombstone()}} | {error, any()}.
+list_tombstones() ->
+    case rabbit_khepri:adv_get_many(?TOMBSTONE_PATH(#if_has_data{})) of
+        {ok, NodeProps} ->
+            Tombstones =
+                #{
+                    StreamId => Data
+                 || ?TOMBSTONE_PATH(StreamId) := #{data := Data} <- NodeProps
+                },
+            {ok, Tombstones};
+        {error, _} = Err ->
+            Err
+    end.
+
+-doc """
+Remove a stream's deletion tombstone.
+
+Called once the stream's remote-tier prefix is confirmed empty, so tombstones do
+not accumulate. Idempotent: deleting an absent tombstone is a no-op.
+""".
+-spec delete_tombstone(stream_id()) -> ok | {error, any()}.
+delete_tombstone(StreamId) ->
+    khepri:delete(rabbit_khepri:get_store_id(), ?TOMBSTONE_PATH(StreamId)).
 
 -doc """
 Sets the UID for the given stream ID if the current revision matches the given
