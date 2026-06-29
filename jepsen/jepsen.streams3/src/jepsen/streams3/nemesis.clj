@@ -63,6 +63,17 @@
         resp (.send (HttpClient/newHttpClient) req (HttpResponse$BodyHandlers/ofString))]
     {:status (.statusCode resp) :body (.body resp)}))
 
+;; Toxiproxy answers 2xx on success, 404 for a missing proxy/toxic, and 409 when
+;; a toxic already exists. A silent no-op (misnamed proxy, 404/409) would inject
+;; nothing yet leave the run green, so assert the status and fail loudly. Removes
+;; tolerate 404 (deleting an absent toxic is a harmless idempotent heal).
+(defn- toxiproxy-checked! [resp what allow-404?]
+  (let [status (:status resp)]
+    (when-not (or (<= 200 status 299) (and allow-404? (= status 404)))
+      (throw (ex-info (str "Toxiproxy " what " returned unexpected status " status)
+                      {:what what :status status :body (:body resp)}))))
+  resp)
+
 (defn- set-s3-enabled! [enabled?]
   (toxiproxy! :post "/proxies/s3" (json (assoc s3-proxy :enabled enabled?))))
 
@@ -86,10 +97,14 @@
     (invoke! [_ _test op]
       (assoc op :value
              (case (:f op)
-               :start-s3-outage  (do (info "S3 outage: disabling proxy") (set-s3-enabled! false))
-               :stop-s3-outage   (do (info "S3 outage: re-enabling proxy") (set-s3-enabled! true))
-               :start-s3-latency (do (info "S3 latency: adding toxic") (add-s3-latency! 2000 1000))
-               :stop-s3-latency  (do (info "S3 latency: removing toxic") (remove-s3-latency!)))))
+               :start-s3-outage  (do (info "S3 outage: disabling proxy")
+                                     (toxiproxy-checked! (set-s3-enabled! false) "disable s3 proxy" false))
+               :stop-s3-outage   (do (info "S3 outage: re-enabling proxy")
+                                     (toxiproxy-checked! (set-s3-enabled! true) "enable s3 proxy" false))
+               :start-s3-latency (do (info "S3 latency: adding toxic")
+                                     (toxiproxy-checked! (add-s3-latency! 2000 1000) "add s3 latency" false))
+               :stop-s3-latency  (do (info "S3 latency: removing toxic")
+                                     (toxiproxy-checked! (remove-s3-latency!) "remove s3 latency" true)))))
     (teardown! [this _test]
       (try (set-s3-enabled! true) (catch Exception _))
       (try (remove-s3-latency!) (catch Exception _))

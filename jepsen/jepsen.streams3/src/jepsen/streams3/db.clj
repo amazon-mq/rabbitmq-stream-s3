@@ -197,7 +197,14 @@
    ;; or re-requested when the epoch moves under the leader-move nemesis.
    "rabbitmq_stream_s3_persist_conflicts"
    "rabbitmq_stream_s3_syncs_rejected"
-   "rabbitmq_stream_s3_resyncs_requested"])
+   "rabbitmq_stream_s3_resyncs_requested"
+   ;; S3-disruption evidence, reported for visibility (not asserted): the plugin
+   ;; tolerates an s3-outage gracefully (writes stay local, uploads pause and
+   ;; retry), so these often stay 0 even when the link is cut. The Toxiproxy
+   ;; status check (nemesis.clj) is what proves the outage was actually injected.
+   "rabbitmq_stream_s3_transfers_failed"
+   "rabbitmq_stream_s3_put_errors"
+   "rabbitmq_stream_s3_request_timeouts"])
 
 (defn scrape-tiering-metrics
   "Scrapes the plugin's Prometheus counters on `node`, returning a map of
