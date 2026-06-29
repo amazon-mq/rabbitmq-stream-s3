@@ -41,6 +41,12 @@ See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for build commands, test invocati
 
 3. **Fix the code.** Only after you understand the root cause and its design implications. If the fix requires a design decision (e.g. when to fire an offset listener, what happens on recovery), stop and consult.
 
+### A green run must exercise the path
+
+A test that passes without running the code it targets is worthless. If the feature silently no-ops (a rejected request, a misbuilt endpoint, an error swallowed by a soft dependency) the data still flows by some other route, nothing fails, and the test goes green while validating nothing. A hollow green is worse than a red: a red is a question, a hollow green is a false answer.
+
+Assert positive evidence that the target path actually ran, not merely that the run finished without error: a counter advanced, an object was written, the expected branch was taken. When the behavior under test is an external effect such as an upload, a remote read, or a retention trim, check that the effect happened. A regression that stops using the path should turn the test red, not leave it green.
+
 ### Rules
 
 - Never change test semantics to make a test green.
