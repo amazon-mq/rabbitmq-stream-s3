@@ -26,7 +26,10 @@ all() ->
         sync_live_manifest_then_broadcast_double_applies,
         manifest_reset_requires_resync,
         cached_epoch_reflects_writer_epoch,
-        retention_evaluated_floors_first_offset_and_timestamp
+        retention_evaluated_floors_first_offset_and_timestamp,
+        member_down_releases_state,
+        forget_releases_writer_row,
+        reregister_repoints_monitor
     ].
 
 init_per_suite(Config) ->
@@ -48,6 +51,95 @@ end_per_testcase(_TC, Config) ->
 %% ------------------------------------------------------------------
 %% Tests
 %% ------------------------------------------------------------------
+
+%% osiris has no terminate/delete hook, so manifest_replica monitors the member
+%% that registered a context and releases the context, sequence, and cached row
+%% when it goes down. This is how per-node replica state is reclaimed when a
+%% replica moves off the node or the stream is deleted.
+member_down_releases_state(_Config) ->
+    Replica = rabbitmq_stream_s3_manifest_replica,
+    Stream = <<"down-stream">>,
+    Shared = atomics:new(1, []),
+    Counter = counters:new(5, []),
+    {Manifest, _} = build_manifest([{fragment, #{offset => 0, size => 1000}}]),
+    Member = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+
+    ok = Replica:register_replica_context(Stream, Member, <<"/tmp/s">>, Shared, Counter),
+    ok = Replica:sync(Stream, 0, 1, Manifest),
+    ?assert(Replica:is_context_registered(Stream)),
+    ?assertNotEqual(undefined, Replica:get_manifest(Stream)),
+
+    %% The member dies: its DOWN releases context, sequence, and cached row.
+    exit(Member, kill),
+    ok = await(fun() -> not Replica:is_context_registered(Stream) end),
+    ?assertEqual(undefined, Replica:get_manifest(Stream)).
+
+%% The writer node's cached row is written by put_manifest and has no member to
+%% monitor; the replica reader releases it explicitly via forget/1 on teardown.
+forget_releases_writer_row(_Config) ->
+    Replica = rabbitmq_stream_s3_manifest_replica,
+    Stream = <<"writer-stream">>,
+    {Manifest, _} = build_manifest([{fragment, #{offset => 0, size => 1000}}]),
+
+    ok = Replica:put_manifest(Stream, Manifest, 1),
+    ?assertNotEqual(undefined, Replica:get_manifest(Stream)),
+    ok = Replica:forget(Stream),
+    ?assertEqual(undefined, Replica:get_manifest(Stream)).
+
+%% A member restart re-registers the context. The old incarnation's monitor must
+%% be dropped so its later DOWN cannot evict the new context.
+reregister_repoints_monitor(_Config) ->
+    Replica = rabbitmq_stream_s3_manifest_replica,
+    Stream = <<"restart-stream">>,
+    Shared = atomics:new(1, []),
+    Counter = counters:new(5, []),
+    Old = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    New = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+
+    ok = Replica:register_replica_context(Stream, Old, <<"/tmp/s">>, Shared, Counter),
+    ok = Replica:register_replica_context(Stream, New, <<"/tmp/s">>, Shared, Counter),
+
+    %% The old member dies. Its monitor was dropped on re-registration, so this
+    %% must not release the context now owned by the new member.
+    OwnRef = monitor(process, Old),
+    exit(Old, kill),
+    receive
+        {'DOWN', OwnRef, process, Old, _} -> ok
+    after 2000 -> ct:fail(old_member_did_not_exit)
+    end,
+    %% A synchronous call is processed after any message already enqueued in
+    %% manifest_replica; the context must still be registered.
+    ?assert(Replica:is_context_registered(Stream)),
+
+    %% The new member dies: now the context is released.
+    exit(New, kill),
+    ok = await(fun() -> not Replica:is_context_registered(Stream) end).
+
+await(Fun) ->
+    await(Fun, 2000).
+
+await(_Fun, Remaining) when Remaining =< 0 ->
+    {error, timeout};
+await(Fun, Remaining) ->
+    case Fun() of
+        true ->
+            ok;
+        false ->
+            timer:sleep(20),
+            await(Fun, Remaining - 20)
+    end.
 
 unknown_stream(_Config) ->
     ?assertEqual(undefined, rabbitmq_stream_s3_manifest_replica:get_manifest(<<"unknown">>)),

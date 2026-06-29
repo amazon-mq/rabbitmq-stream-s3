@@ -80,7 +80,7 @@ on_init(writer, Pid, #{name := Name, dir := Dir, shared := Shared, counter := Co
             )
     end,
     append_retention(StreamId, Config);
-on_init(acceptor, _Pid, #{name := Name, leader_pid := LeaderPid, counter := Counter} = Config) ->
+on_init(acceptor, Pid, #{name := Name, leader_pid := LeaderPid, counter := Counter} = Config) ->
     StreamId = rabbitmq_stream_s3:ensure_stream_id(Name),
     WriterNode = node(LeaderPid),
     gen_server:cast(
@@ -89,13 +89,17 @@ on_init(acceptor, _Pid, #{name := Name, leader_pid := LeaderPid, counter := Coun
     ),
     Shared = maps:get(shared, Config),
     Dir = maps:get(dir, Config),
-    rabbitmq_stream_s3_manifest_replica:register_replica_context(StreamId, Dir, Shared, Counter),
+    rabbitmq_stream_s3_manifest_replica:register_replica_context(
+        StreamId, Pid, Dir, Shared, Counter
+    ),
     append_retention(StreamId, Config);
-on_init(acceptor, _Pid, #{name := Name, counter := Counter} = Config) ->
+on_init(acceptor, Pid, #{name := Name, counter := Counter} = Config) ->
     StreamId = rabbitmq_stream_s3:ensure_stream_id(Name),
     Shared = maps:get(shared, Config),
     Dir = maps:get(dir, Config),
-    rabbitmq_stream_s3_manifest_replica:register_replica_context(StreamId, Dir, Shared, Counter),
+    rabbitmq_stream_s3_manifest_replica:register_replica_context(
+        StreamId, Pid, Dir, Shared, Counter
+    ),
     append_retention(StreamId, Config).
 
 -doc """
@@ -267,7 +271,7 @@ register_replica_context(Pid, StreamId) ->
         osiris_util:get_reader_context(Pid),
     Counter = osiris_counters:fetch({osiris_replica, Reference}),
     rabbitmq_stream_s3_manifest_replica:register_replica_context(
-        StreamId, Dir, Shared, Counter
+        StreamId, Pid, Dir, Shared, Counter
     ).
 
 append_retention(StreamId, Config) ->
@@ -349,7 +353,9 @@ attach_replica(Pid) ->
     StreamId = rabbitmq_stream_s3:ensure_stream_id(Name),
     %% Seshat registers replica counters under {osiris_replica, Reference}.
     Counter = osiris_counters:fetch({osiris_replica, Reference}),
-    rabbitmq_stream_s3_manifest_replica:register_replica_context(StreamId, Dir, Shared, Counter),
+    rabbitmq_stream_s3_manifest_replica:register_replica_context(
+        StreamId, Pid, Dir, Shared, Counter
+    ),
     %% Register with the writer's replica reader for manifest broadcast.
     %% If the writer's replica reader isn't up yet, the cast is dropped;
     %% the replica reader will proactively sync us on its startup.
