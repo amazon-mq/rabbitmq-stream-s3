@@ -243,20 +243,30 @@
   (let [out (try (rabbitmqctl node :eval max-epoch-eval) (catch Exception _ ""))]
     (or (some-> (re-find #"\d+" (str out)) parse-long) 0)))
 
-;; Lists the integer keys of the jepsen-<k> streams that exist, so the
-;; durability checker reads exactly the streams the workload wrote to.
-(def ^:private jepsen-keys-eval
+;; For each jepsen-<k> stream, the integer key and its committed offset (the
+;; last durably-committed offset, -1 if empty). The durability checker reads
+;; exactly these streams, and the authoritative read waits until each consumer
+;; reaches this offset rather than guessing the tail from idle time.
+(def ^:private committed-offsets-eval
   (str "Names = [element(4, amqqueue:get_name(Q)) "
        "|| Q <- rabbit_amqqueue:list(<<\"/\">>)], "
-       "[binary_to_integer(binary:part(N, 7, byte_size(N) - 7)) "
-       "|| N <- Names, byte_size(N) >= 8, binary:part(N, 0, 7) =:= <<\"jepsen-\">>]."))
+       "Jeps = [N || N <- Names, byte_size(N) >= 8, binary:part(N, 0, 7) =:= <<\"jepsen-\">>], "
+       "[begin "
+       "K = binary_to_integer(binary:part(N, 7, byte_size(N) - 7)), "
+       "Co = case catch rabbit_stream_queue:status(<<\"/\">>, N) of "
+       "L when is_list(L) -> lists:max([-1 | [proplists:get_value(committed_offset, M, -1) || M <- L]]); "
+       "_ -> -1 "
+       "end, "
+       "{K, Co} "
+       "end || N <- Jeps]."))
 
-(defn list-jepsen-keys
-  "Returns the integer keys of the jepsen streams on `node`. Runs in an SSH
-  context."
+(defn committed-offsets
+  "Returns {key -> committed offset} for the jepsen streams on `node` (-1 for an
+  empty stream). Runs in an SSH context."
   [node]
-  (let [out (try (rabbitmqctl node :eval jepsen-keys-eval) (catch Exception _ ""))]
-    (mapv parse-long (re-seq #"\d+" (str out)))))
+  (let [out  (try (rabbitmqctl node :eval committed-offsets-eval) (catch Exception _ ""))
+        ints (map parse-long (re-seq #"-?\d+" (str out)))]
+    (into {} (map vec (partition 2 ints)))))
 
 ;; Cluster-wide S3 counter sums for the run, accumulated across nodes in
 ;; log-files (which runs after the workload but before the checker, while the
@@ -344,10 +354,12 @@
       ;; up here, before teardown) so the coverage checker can read them.
       (util/meh (record-tiering-stats! node))
       ;; Authoritatively read every jepsen stream end-to-end for the durability
-      ;; checker, once (on the primary), while the brokers are still up. Uses the
-      ;; Stream client over a fresh Environment, so it needs no SSH context.
+      ;; checker, once (on the primary), while the brokers are still up. The read
+      ;; waits for each consumer to reach the stream's committed offset, so query
+      ;; those (over SSH) and hand them to the read (which uses the Stream client
+      ;; over a fresh Environment, no SSH context).
       (when (= node (first (:nodes test)))
-        (util/meh (sc/capture-authoritative-reads! test (list-jepsen-keys node))))
+        (util/meh (sc/capture-authoritative-reads! test (committed-offsets node))))
       ;; Broker logs + the S3 plugin's status output for post-mortem.
       (util/meh
         (rabbitmqctl node :stream_s3_status

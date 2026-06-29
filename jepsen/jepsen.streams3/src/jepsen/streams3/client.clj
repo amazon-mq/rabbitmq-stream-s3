@@ -253,11 +253,11 @@
 ;; Authoritative end-to-end read (for the durability checker)
 ;; ---------------------------------------------------------------------------
 
-;; Reading the whole history of ~90 streams, some served from S3, needs a far
-;; more generous quiescence wait than the steady-state catch-up above.
-(def auth-quiet-ms 3000)    ; deliveries idle this long => every stream at its tail
-(def auth-grace-ms 8000)    ; tolerate this long before any delivery (S3 warm-up)
-(def auth-cap-ms 180000)    ; hard cap so a genuinely stuck stream cannot hang
+;; Default cap on the authoritative read (overridable via --auth-read-timeout-sec).
+;; The read waits for an observable target (each consumer reaching the stream's
+;; committed offset), not idle time, so it cannot truncate mid-backfill; the cap
+;; only bounds a stream that genuinely never reaches its target.
+(def auth-read-cap-ms-default 180000)
 
 ;; The authoritative read of every jepsen stream, captured once after the run
 ;; while the brokers are still up (db/log-files), for the durability checker:
@@ -266,53 +266,59 @@
 ;; offsets unreliable.
 (defonce authoritative-reads (atom {}))
 
-(defn- await-quiescent!
-  "Waits until the total buffered count across queues holds steady for
-  auth-quiet-ms (every stream reached its tail), bounded by auth-cap-ms, with an
-  auth-grace-ms grace before the first delivery for streams served from S3."
-  [queues]
-  (let [total (fn [] (reduce (fn [a ^java.util.Collection q] (+ a (.size q))) 0 queues))
-        start (System/currentTimeMillis)
-        deadline (+ start auth-cap-ms)]
-    (loop [last-total (total), last-change start]
-      (let [now (System/currentTimeMillis)
-            t   (total)]
-        (cond
-          (>= now deadline) nil
-          (not= t last-total) (do (Thread/sleep 100) (recur t now))
-          (and (> (- now last-change) auth-quiet-ms)
-               (or (pos? t) (> (- now start) auth-grace-ms))) nil
-          :else (do (Thread/sleep 100) (recur t last-change)))))))
+(defn- await-targets!
+  "Waits until every stream's max delivered offset reaches its committed-offset
+  target, bounded by cap-ms. `state` is {key {:q queue :maxoff AtomicLong}};
+  `targets` is {key committed-offset}. A stream that never reaches its target
+  waits out the cap, after which the durability checker reports the loss."
+  [state targets cap-ms]
+  (let [deadline (+ (System/currentTimeMillis) cap-ms)
+        met? (fn [] (every? (fn [[k {:keys [^AtomicLong maxoff]}]]
+                              (>= (.get maxoff) (get targets k -1)))
+                            state))]
+    (loop []
+      (when (and (not (met?)) (< (System/currentTimeMillis) deadline))
+        (Thread/sleep 100)
+        (recur)))))
 
 (defn read-streams-fully
-  "Authoritative end-to-end read of stream keys `ks` for the durability checker.
-  Builds a FRESH Environment (the run's shared one may be wedged from topology
-  churn), subscribes each stream from the beginning, waits for deliveries to go
-  quiet (every stream at its tail), and returns {key -> vector of [offset value]
-  in delivery order}. Closes the Environment before returning."
-  [test ks]
-  (let [uris (java.util.ArrayList.
-               (map #(str "rabbitmq-stream://guest:guest@" (name %) ":" stream-port)
-                    (:nodes test)))
-        env    (-> (Environment/builder) (.uris uris) (.build))
-        queues (reduce (fn [m k] (assoc m k (ConcurrentLinkedQueue.))) {} ks)]
+  "Authoritative end-to-end read of the streams in `targets` (key -> committed
+  offset) for the durability checker. Builds a FRESH Environment (the run's
+  shared one may be wedged from topology churn), subscribes each stream from the
+  beginning, and waits until each consumer has delivered up to the stream's
+  committed offset -- an observable target rather than an idle-time guess, so a
+  mid-backfill quiet period cannot truncate the read and report false loss.
+  Returns {key -> vector of [offset value] in delivery order}. Closes the
+  Environment before returning."
+  [test targets]
+  (let [cap-ms (* 1000 (or (:auth-read-timeout-sec test)
+                           (quot auth-read-cap-ms-default 1000)))
+        uris  (java.util.ArrayList.
+                (map #(str "rabbitmq-stream://guest:guest@" (name %) ":" stream-port)
+                     (:nodes test)))
+        env   (-> (Environment/builder) (.uris uris) (.build))
+        state (into {} (map (fn [k] [k {:q (ConcurrentLinkedQueue.) :maxoff (AtomicLong. -1)}])
+                            (keys targets)))]
     (try
-      (doseq [[k q] queues]
+      (doseq [[k {:keys [^ConcurrentLinkedQueue q ^AtomicLong maxoff]}] state]
         (-> env (.consumerBuilder) (.stream (stream-name k))
             (.offset (OffsetSpecification/first))
             (.messageHandler
               (reify com.rabbitmq.stream.MessageHandler
                 (handle [_ ctx msg]
-                  (.add q [(.offset ctx) (decode-value (.getBodyAsBinary msg))]))))
+                  ;; Deliveries arrive in offset order from `first`, so set wins.
+                  (.add q [(.offset ctx) (decode-value (.getBodyAsBinary msg))])
+                  (.set maxoff (.offset ctx)))))
             (.build)))
-      (await-quiescent! (vals queues))
-      (into {} (map (fn [[k q]] [k (drain! q)]) queues))
+      (await-targets! state targets cap-ms)
+      (into {} (map (fn [[k {:keys [^ConcurrentLinkedQueue q]}]] [k (drain! q)]) state))
       (finally (.close env)))))
 
 (defn capture-authoritative-reads!
-  "Reads keys `ks` end-to-end and stores the result in authoritative-reads."
-  [test ks]
-  (reset! authoritative-reads (read-streams-fully test ks)))
+  "Reads the streams in `targets` (key -> committed offset) end-to-end and stores
+  the result in authoritative-reads."
+  [test targets]
+  (reset! authoritative-reads (read-streams-fully test targets)))
 
 (defrecord Client [node ^Environment env env-gen consumers buffers assigned]
   client/Client
