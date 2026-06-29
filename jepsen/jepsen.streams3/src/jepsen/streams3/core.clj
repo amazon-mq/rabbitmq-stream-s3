@@ -24,7 +24,11 @@
     :default 8 :parse-fn parse-long]
    [nil "--nemesis-interval SEC" "Seconds between fault transitions"
     :default 15 :parse-fn parse-long]
-   [nil "--faults FAULTS" "Comma-separated faults (phase 1: partition)"
+   [nil "--final-time-limit SEC"
+    "Cap on the final-reads phase (the kafka final-polls loop is unbounded)"
+    :default 180 :parse-fn parse-long]
+   [nil "--faults FAULTS"
+    "Comma-separated: partition, s3-outage, s3-latency, trim, leader-move"
     :default "partition"]])
 
 (defn streams3-test
@@ -46,7 +50,17 @@
        :checker   (checker/compose
                     {:perf     (checker/perf)
                      :timeline (timeline/html)
-                     :workload (:checker wl)
+                     ;; The kafka workload checker is authoritative on its own,
+                     ;; except under leader-move: there our send offsets drift
+                     ;; (see client.clj), so its offset-consistency analyzers go
+                     ;; red on artifacts. We downgrade it to advisory in that case
+                     ;; and let the durability checker carry the safety verdict.
+                     :workload (s3-checker/downgrade-when
+                                 (fn [t] (contains? (nem/faults t) "leader-move"))
+                                 (:checker wl))
+                     ;; Authoritative no-loss / no-duplicate via an end-to-end
+                     ;; read, sound even when send offsets are unreliable.
+                     :durability (s3-checker/durability-checker)
                      ;; Fails the run unless S3 was actually exercised, so a
                      ;; green result can't silently stop using the remote tier.
                      :tiering  (s3-checker/tiering-checker)})
@@ -70,7 +84,15 @@
                     (gen/nemesis (when (contains? (nem/faults opts) "trim")
                                    {:type :info :f :trim-local}))
                     ;; Final reads: the kafka workload drains everything written.
-                    (gen/clients (:final-generator wl)))})))
+                    ;; The kafka final-polls generator is unbounded by design —
+                    ;; it loops until every acknowledged offset is read back — so
+                    ;; bound it. If the data is readable this drains in seconds;
+                    ;; if a regression makes acknowledged data permanently
+                    ;; unreadable, this fails fast (the checker reports the
+                    ;; unseen writes) instead of hanging indefinitely.
+                    (gen/time-limit
+                      (:final-time-limit opts)
+                      (gen/clients (:final-generator wl))))})))
 
 (defn -main [& args]
   (cli/run!

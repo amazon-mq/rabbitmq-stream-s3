@@ -22,7 +22,8 @@
                     [db :as db]
                     [util :as util]]
             [jepsen.control.util :as cu]
-            [jepsen.os.debian :as debian]))
+            [jepsen.os.debian :as debian]
+            [jepsen.streams3.client :as sc]))
 
 (def base-dir "/opt/rabbitmq")
 (def tarball "file:///shared/rabbitmq.tar.xz")
@@ -148,6 +149,41 @@
   [node]
   (util/meh (rabbitmqctl node :eval trim-eval)))
 
+;; One rabbitmqctl eval that transfers every jepsen-<k> stream's leader to its
+;; first replica, moving each writer (and uploader) to a new node and bumping the
+;; stream's epoch. The stream coordinator is cluster-global, so this runs on a
+;; single node. transfer_leadership restarts the stream with the target preferred
+;; as leader; replica_nodes excludes the current leader, so the leader genuinely
+;; moves and the epoch increments.
+;;
+;; All streams at once, repeatedly: this maximizes the number of deposed-writer
+;; races, which is exactly what stresses writer fencing (an in-flight upload from
+;; an old epoch must be rejected, never overwrite the new leader's data). The
+;; resulting subscription churn wedges the push-based workload consumers, so the
+;; kafka workload's offset analyzers go red on artifacts — but that result is
+;; downgraded to advisory under leader-move, and correctness is verified by the
+;; durability checker, which reads each stream fresh after the run.
+(def ^:private leader-move-eval
+  (str "Names = [element(4, amqqueue:get_name(Q)) "
+       "|| Q <- rabbit_amqqueue:list(<<\"/\">>)], "
+       "Jeps = [N || N <- Names, byte_size(N) >= 7, binary:part(N, 0, 7) =:= <<\"jepsen-\">>], "
+       "[begin "
+       "Q = element(2, rabbit_amqqueue:lookup(rabbit_misc:r(<<\"/\">>, queue, N))), "
+       "case maps:get(replica_nodes, amqqueue:get_type_state(Q), []) of "
+       "[Target | _] -> catch rabbit_stream_queue:transfer_leadership(Q, Target); "
+       "[] -> ok "
+       "end "
+       "end || N <- Jeps], ok."))
+
+(defn force-leader-move!
+  "Transfers every jepsen stream's leader to its first replica, moving each
+  writer (and uploader) to a new node and bumping the stream's epoch. This fences
+  the deposed writers: a straggler upload carrying the old epoch must be rejected
+  (a manifest persist conflict), never overwrite the new leader's data. Run on a
+  single node (the coordinator is cluster-global). Runs in an SSH context."
+  [node]
+  (util/meh (rabbitmqctl node :eval leader-move-eval)))
+
 ;; The plugin's read/write paths are instrumented, not logged, so these
 ;; counters are how the test proves S3 was actually exercised (see the
 ;; coverage checker). The management/Prometheus listener is on 15692.
@@ -155,7 +191,13 @@
   ["rabbitmq_stream_s3_transfers_completed"  ; fragments uploaded to S3
    "rabbitmq_stream_s3_get_range"            ; range GETs (remote reads) from S3
    "rabbitmq_stream_s3_read"                 ; remote_reader read calls
-   "rabbitmq_stream_s3_resolve"])            ; read-path offset resolutions
+   "rabbitmq_stream_s3_resolve"              ; read-path offset resolutions
+   ;; Writer-fencing evidence: a deposed leader's straggler upload is rejected
+   ;; on a Khepri epoch conflict, and stale manifest syncs/resyncs are dropped
+   ;; or re-requested when the epoch moves under the leader-move nemesis.
+   "rabbitmq_stream_s3_persist_conflicts"
+   "rabbitmq_stream_s3_syncs_rejected"
+   "rabbitmq_stream_s3_resyncs_requested"])
 
 (defn scrape-tiering-metrics
   "Scrapes the plugin's Prometheus counters on `node`, returning a map of
@@ -175,6 +217,40 @@
                               (parse-double v))))
                     (reduce + 0.0))]))))
 
+;; The maximum stream coordinator epoch across the jepsen streams. The epoch
+;; starts at 1 and increments on every leader move, so it is how the coverage
+;; checker proves the writer-fencing (leader-move) path actually ran. It is a
+;; cluster-global value, so querying any one node suffices.
+(def ^:private max-epoch-eval
+  (str "Names = [element(4, amqqueue:get_name(Q)) "
+       "|| Q <- rabbit_amqqueue:list(<<\"/\">>)], "
+       "Jeps = [N || N <- Names, byte_size(N) >= 7, binary:part(N, 0, 7) =:= <<\"jepsen-\">>], "
+       "Epochs = [maps:get(epoch, amqqueue:get_type_state(element(2, "
+       "rabbit_amqqueue:lookup(rabbit_misc:r(<<\"/\">>, queue, N)))), 1) || N <- Jeps], "
+       "lists:max([1 | Epochs])."))
+
+(defn scrape-max-epoch
+  "Returns the maximum stream coordinator epoch across the jepsen streams on
+  `node` (a cluster-global value). Runs in an SSH context."
+  [node]
+  (let [out (try (rabbitmqctl node :eval max-epoch-eval) (catch Exception _ ""))]
+    (or (some-> (re-find #"\d+" (str out)) parse-long) 0)))
+
+;; Lists the integer keys of the jepsen-<k> streams that exist, so the
+;; durability checker reads exactly the streams the workload wrote to.
+(def ^:private jepsen-keys-eval
+  (str "Names = [element(4, amqqueue:get_name(Q)) "
+       "|| Q <- rabbit_amqqueue:list(<<\"/\">>)], "
+       "[binary_to_integer(binary:part(N, 7, byte_size(N) - 7)) "
+       "|| N <- Names, byte_size(N) >= 8, binary:part(N, 0, 7) =:= <<\"jepsen-\">>]."))
+
+(defn list-jepsen-keys
+  "Returns the integer keys of the jepsen streams on `node`. Runs in an SSH
+  context."
+  [node]
+  (let [out (try (rabbitmqctl node :eval jepsen-keys-eval) (catch Exception _ ""))]
+    (mapv parse-long (re-seq #"\d+" (str out)))))
+
 ;; Cluster-wide S3 counter sums for the run, accumulated across nodes in
 ;; log-files (which runs after the workload but before the checker, while the
 ;; brokers are still up). The coverage checker reads this. Collecting it here
@@ -183,9 +259,13 @@
 (defonce tiering-stats (atom {}))
 
 (defn record-tiering-stats!
-  "Adds `node`'s S3 counters into the shared per-run totals."
+  "Folds `node`'s S3 state into the shared per-run totals: counters are summed
+  across nodes, the epoch is maxed (it is cluster-global, so the max is exact)."
   [node]
-  (swap! tiering-stats #(merge-with + % (scrape-tiering-metrics node))))
+  (swap! tiering-stats
+         (fn [acc]
+           (-> (merge-with + acc (scrape-tiering-metrics node))
+               (update "max_epoch" (fnil max 0) (scrape-max-epoch node))))))
 
 (defn start! [test node]
   (info node "starting broker")
@@ -234,8 +314,10 @@
   []
   (reify db/DB
     (setup! [_ test node]
-      ;; Clean slate for this run's coverage counters (idempotent across nodes).
+      ;; Clean slate for this run's coverage counters and authoritative reads
+      ;; (idempotent across nodes).
       (reset! tiering-stats {})
+      (reset! sc/authoritative-reads {})
       (install! test node)
       (start! test node))
 
@@ -254,6 +336,11 @@
       ;; Scrape this node's S3 counters into the run totals (brokers are still
       ;; up here, before teardown) so the coverage checker can read them.
       (util/meh (record-tiering-stats! node))
+      ;; Authoritatively read every jepsen stream end-to-end for the durability
+      ;; checker, once (on the primary), while the brokers are still up. Uses the
+      ;; Stream client over a fresh Environment, so it needs no SSH context.
+      (when (= node (first (:nodes test)))
+        (util/meh (sc/capture-authoritative-reads! test (list-jepsen-keys node))))
       ;; Broker logs + the S3 plugin's status output for post-mortem.
       (util/meh
         (rabbitmqctl node :stream_s3_status

@@ -1,5 +1,5 @@
 (ns jepsen.streams3.nemesis
-  "Fault injection: network partitions plus the storage-tier
+  "Fault injection: network partitions plus the storage-tier and writer-fencing
   faults that are the whole point of testing this plugin. Currently:
 
     partition   - network partition (random halves)
@@ -9,9 +9,13 @@
                   already-tiered data failing then recovering
     s3-latency  - a Toxiproxy latency toxic on the S3 link: uploads fall behind
                   and manifests age while writes continue
+    leader-move - relocate every stream's leader to a replica mid-upload: the
+                  writer (and uploader) moves and the stream epoch bumps, fencing
+                  the deposed writer (its straggler uploads must be rejected on an
+                  epoch conflict, never overwrite the new leader's data)
 
   Still stubbed (see bottom): force-trim (needs the bounded-durability
-  checker) and leader-move (writer fencing)."
+  checker)."
   (:require [clojure.string :as str]
             [clojure.tools.logging :refer [info]]
             [jepsen [control :as c]
@@ -104,6 +108,20 @@
       (assoc op :value :trimmed))
     (teardown! [this _test] this)))
 
+(defn leader-move-nemesis
+  "Not a network fault: gracefully relocates every jepsen stream's leader to a
+  replica, moving the writer/uploader and bumping the stream epoch, which fences
+  the deposed writer. Run on one node only (the stream coordinator is cluster-
+  global), so each leadership transfer issues once rather than once per node."
+  []
+  (reify nemesis/Nemesis
+    (setup! [this _test] this)
+    (invoke! [_ test op]
+      (c/on-nodes test [(first (:nodes test))]
+                  (fn [_test node] (db/force-leader-move! node)))
+      (assoc op :value :leaders-moved))
+    (teardown! [this _test] this)))
+
 (defn full-nemesis
   "Composes all nemeses; the generator decides which faults actually fire."
   []
@@ -112,7 +130,8 @@
       :stop-partition  :stop}        (nemesis/partition-random-halves)
      #{:start-s3-outage :stop-s3-outage
        :start-s3-latency :stop-s3-latency} (s3-nemesis)
-     #{:trim-local}                  (trim-nemesis)}))
+     #{:trim-local}                  (trim-nemesis)
+     #{:move-leaders}                (leader-move-nemesis)}))
 
 ;; ---------------------------------------------------------------------------
 ;; Generator
@@ -123,24 +142,33 @@
    "s3-outage"  [:start-s3-outage :stop-s3-outage]
    "s3-latency" [:start-s3-latency :stop-s3-latency]})
 
+;; Background single-shot ops (not start/stop faults): a retention trim and a
+;; leader move. Each, when selected, runs steadily throughout the test — spread
+;; across the inter-fault gaps and, on its own, when no start/stop fault is
+;; enabled.
+(def ^:private fault->bg-op
+  {"trim"        {:type :info :f :trim-local}
+   "leader-move" {:type :info :f :move-leaders}})
+
 (defn nemesis-generator
-  "Rotates through the enabled faults one at a time, each led by a quiet
-  baseline period (so the workload establishes itself before the first fault,
-  and recovers between faults). When `trim` is selected (via --faults), a
-  steady local-retention trim runs throughout — between fault transitions and,
-  on its own, when no faults are enabled — so uploaded data is trimmed locally
-  and reads fall to the S3 tier. With nothing selected, an empty generator —
-  never a long sleep, which would deadlock a phase barrier on the nemesis."
+  "Rotates through the enabled start/stop faults one at a time, each led by a
+  quiet baseline period (so the workload establishes itself before the first
+  fault, and recovers between faults). Background single-shot ops selected via
+  --faults (`trim`, `leader-move`) run steadily throughout — between fault
+  transitions and, on their own, when no start/stop fault is enabled — so the
+  S3 read path and the writer-fencing path stay exercised. With nothing
+  selected, an empty generator — never a long sleep, which would deadlock a
+  phase barrier on the nemesis."
   [opts]
   (let [fs           (faults opts)
         interval     (or (:nemesis-interval opts) 15)
-        trim?        (contains? fs "trim")
-        fault-events (keep fault->events (sort (disj fs "trim")))
-        ;; One inter-fault gap: either a couple of trims spread across the
-        ;; interval, or just a quiet sleep.
-        spacer       (if trim?
-                       [(gen/sleep (/ interval 2)) {:type :info :f :trim-local}
-                        (gen/sleep (/ interval 2)) {:type :info :f :trim-local}]
+        bg-ops       (keep fault->bg-op (sort fs))
+        fault-events (keep fault->events (sort fs))
+        ;; One inter-fault gap: fire each background op twice across the
+        ;; interval, or, with no background op, just a quiet sleep.
+        spacer       (if (seq bg-ops)
+                       (let [gap (gen/sleep (/ interval (count bg-ops) 2))]
+                         (vec (mapcat (fn [op] [gap op gap op]) bg-ops)))
                        [(gen/sleep interval)])]
     (cond
       (seq fault-events)
@@ -149,8 +177,8 @@
                         spacer [{:type :info :f stop}]))
               (cycle fault-events))
 
-      trim?
-      (gen/stagger (/ interval 2) (repeat {:type :info :f :trim-local}))
+      (seq bg-ops)
+      (gen/stagger (/ interval 2) (cycle bg-ops))
 
       :else [])))
 
@@ -162,6 +190,3 @@
 ;;                n: drives reads to S3 (Tier overlap / Exactly-once) and, when
 ;;                pushed past un-uploaded data, Reset safety + bounded loss.
 ;;                Needs the bounded-durability checker first.
-;; leader-move  — relocate a stream leader mid-upload: deposed-writer uploads
-;;                must become GC orphans, never overwrite (key disjointness +
-;;                epoch monotonicity / writer fencing).
