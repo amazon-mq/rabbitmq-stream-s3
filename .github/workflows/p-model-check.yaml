@@ -30,6 +30,7 @@ jobs:
       gc_reset_multinode: ${{ steps.filter.outputs.gc_reset_multinode }}
       gc_leading_group: ${{ steps.filter.outputs.gc_leading_group }}
       gc_reset_leading_group: ${{ steps.filter.outputs.gc_reset_leading_group }}
+      delete_stream_anchor: ${{ steps.filter.outputs.delete_stream_anchor }}
       read_resolution: ${{ steps.filter.outputs.read_resolution }}
       trimmed_segment: ${{ steps.filter.outputs.trimmed_segment }}
       orphan_leak: ${{ steps.filter.outputs.orphan_leak }}
@@ -52,11 +53,13 @@ jobs:
           echo "gc_reset_multinode=false" >> "$GITHUB_OUTPUT"
           echo "gc_leading_group=false" >> "$GITHUB_OUTPUT"
           echo "gc_reset_leading_group=false" >> "$GITHUB_OUTPUT"
+          echo "delete_stream_anchor=false" >> "$GITHUB_OUTPUT"
           echo "read_resolution=false" >> "$GITHUB_OUTPUT"
           echo "$CHANGED" | grep -q '^p/gc-reset/' && echo "gc_reset=true" >> "$GITHUB_OUTPUT" || true
           echo "$CHANGED" | grep -q '^p/gc-reset-multinode/' && echo "gc_reset_multinode=true" >> "$GITHUB_OUTPUT" || true
           echo "$CHANGED" | grep -q '^p/gc-leading-group/' && echo "gc_leading_group=true" >> "$GITHUB_OUTPUT" || true
           echo "$CHANGED" | grep -q '^p/gc-reset-leading-group/' && echo "gc_reset_leading_group=true" >> "$GITHUB_OUTPUT" || true
+          echo "$CHANGED" | grep -q '^p/delete-stream-anchor/' && echo "delete_stream_anchor=true" >> "$GITHUB_OUTPUT" || true
           echo "$CHANGED" | grep -q '^p/read-resolution/' && echo "read_resolution=true" >> "$GITHUB_OUTPUT" || true
           echo "trimmed_segment=false" >> "$GITHUB_OUTPUT"
           echo "$CHANGED" | grep -q '^p/trimmed-segment/' && echo "trimmed_segment=true" >> "$GITHUB_OUTPUT" || true
@@ -71,6 +74,7 @@ jobs:
             echo "gc_reset_multinode=true" >> "$GITHUB_OUTPUT"
             echo "gc_leading_group=true" >> "$GITHUB_OUTPUT"
             echo "gc_reset_leading_group=true" >> "$GITHUB_OUTPUT"
+            echo "delete_stream_anchor=true" >> "$GITHUB_OUTPUT"
             echo "read_resolution=true" >> "$GITHUB_OUTPUT"
             echo "trimmed_segment=true" >> "$GITHUB_OUTPUT"
             echo "orphan_leak=true" >> "$GITHUB_OUTPUT"
@@ -274,6 +278,59 @@ jobs:
           fi
           echo "Gate satisfied: the offset-only re-check deletes the live leading group."
           echo "::endgroup::"
+
+  delete-stream-anchor:
+    needs: changes
+    if: needs.changes.outputs.delete_stream_anchor == 'true' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2 # v5.3.0
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install the P checker
+        run: |
+          dotnet tool install --global P --version 3.1.0 --configfile "$GITHUB_WORKSPACE/p/NuGet.config"
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+      - name: Compile
+        run: |
+          cd p/delete-stream-anchor
+          p compile
+      - name: Tests that must hold
+        run: |
+          cd p/delete-stream-anchor
+          for tc in tcAnchorReclaimsAcrossCrash tcAnchorExplore; do
+            echo "::group::$tc (expect hold)"
+            p check -tc "$tc" -i 5000
+            echo "::endgroup::"
+          done
+          # PCT surfaces rare interleavings the random strategy misses.
+          echo "::group::tcAnchorExplore (PCT)"
+          p check -tc tcAnchorExplore --sch-pct 10 -i 5000
+          echo "::endgroup::"
+      - name: Validation gate (a stale read or out-of-order anchor must reap live data)
+        run: |
+          cd p/delete-stream-anchor
+          # Both MUST fail with the NOREAPLIVE counterexample. A green here means
+          # the model no longer reaches the live-data reap, i.e. the consistent-read
+          # or anchor-before-fragment requirement is no longer load-bearing in the
+          # model and the by-construction result is not trustworthy.
+          for tc in tcAnchorStaleReadReapsLive tcAnchorOrderingViolated; do
+            rm -rf PCheckerOutput/
+            echo "::group::$tc (expect the live-reap counterexample)"
+            if p check -tc "$tc" -i 2000; then
+              echo "ERROR: $tc passed; the model no longer reaps live data."
+              echo "A stale anchor read (or a fragment written before the anchor) must reap a live"
+              echo "stream, otherwise the consistent-read / ordering requirement is not load-bearing."
+              exit 1
+            fi
+            if ! grep -rqF 'INV NOREAPLIVE violated' PCheckerOutput/BugFinding/; then
+              echo "ERROR: $tc failed, but not with the expected NOREAPLIVE counterexample."
+              exit 1
+            fi
+            echo "Gate satisfied: $tc reaps live data as expected."
+            echo "::endgroup::"
+          done
 
   read-resolution:
     needs: changes
