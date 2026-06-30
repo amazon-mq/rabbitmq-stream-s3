@@ -1,7 +1,8 @@
 # Jepsen control node: runs `lein run test ...` and drives the DB nodes over
 # SSH. Needs a JDK (for the Stream Java client + jepsen), leiningen, and an
 # SSH client.
-FROM clojure:temurin-21-lein
+# Pinned by digest for supply-chain reproducibility (clojure:temurin-21-lein).
+FROM clojure@sha256:f5ef76151930464b31b97d518469b802de1c82507d6205d6ecf96cf6cb6d17d2
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git openssh-client sshpass iputils-ping dnsutils gnuplot graphviz \
