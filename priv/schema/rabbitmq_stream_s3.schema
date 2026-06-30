@@ -161,6 +161,22 @@ end}.
     {datatype, integer}, {validators, ["non_negative_integer"]}
 ]}.
 
+%%
+%% Bucket accessibility checks
+%%
+
+%% Whether the configured bucket's accessibility is periodically probed. A
+%% wrong or unreachable bucket is surfaced via logs, the bucket_accessible
+%% metric, and the stream_s3_status CLI command; it never blocks publishers.
+
+{mapping, "stream_s3.bucket_check.enabled", "rabbitmq_stream_s3.bucket_check_enabled", [
+    {datatype, {enum, [true, false]}}
+]}.
+
+{mapping, "stream_s3.bucket_check.interval", "rabbitmq_stream_s3.bucket_check_interval", [
+    {datatype, integer}, {validators, ["non_negative_integer"]}
+]}.
+
 %% Verbose logging — when enabled, log messages that normally truncate
 %% large terms (such as S3 error responses) will print them in full.
 

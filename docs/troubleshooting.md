@@ -56,3 +56,19 @@ On the leader this shows a high, flat plateau followed by a cliff to a dead-flat
 - **Stay within baseline when benchmarking the plugin.** Cap the producer rate below the egress baseline so the measurement reflects plugin behavior rather than the NIC.
 
 **Prevention.** When capacity planning, treat the writer node's network egress as the shared, contended resource it is, and confirm the chosen instance type can sustain (not just burst to) the required leader egress. See [operations.md](./operations.md#capacity-planning) for request-rate and disk planning, and the "Slow replica reader (upload lag)" entry in [failure-modes.md](./failure-modes.md) for the plugin-side view of upload lag.
+
+## Nothing is tiered to the remote tier
+
+**Symptom.** Streams work normally but no data appears in the bucket. The upload-path metrics (`rabbitmq_stream_s3_transfers_completed`, `rabbitmq_stream_s3_bytes_transferred`) stay flat, or `rabbitmq_stream_s3_transfers_failed` climbs steadily.
+
+**Trigger.** The configured bucket does not exist, or the node's credentials cannot access it. A wrong or unreachable bucket does not stop a stream: it keeps running on local disk, and uploads fail and retry indefinitely. The condition is therefore nearly silent without monitoring.
+
+**Diagnosis.** Check the bucket accessibility signal:
+
+- The `rabbitmq_stream_s3_bucket_accessible` metric is `0`.
+- An `ERROR` log states whether the bucket does not exist or access was denied.
+- `rabbitmq-streams stream_s3_status <stream>` reports `Accessible: no (<reason>)` in its "Remote tier bucket" section.
+
+A `403` (access denied) also increments `rabbitmq_stream_s3_response_403`. A nonexistent bucket can itself report `access denied` rather than `does not exist` when the credentials lack `s3:ListBucket` on it, so treat either reason as "the configured bucket is not usable" and check both the bucket name and the IAM permissions.
+
+**Resolution.** Correct `stream_s3.bucket` (and `stream_s3.region`) in `rabbitmq.conf`, or grant the node's IAM role the required S3 permissions on the bucket. The monitor re-probes on its interval (`stream_s3.bucket_check.interval`, default 5 minutes) and clears the signal with an `INFO` log once access is restored; tiering resumes automatically from where it stalled.

@@ -66,6 +66,20 @@ stream_s3.continuous_membership_reconciliation.interval = 3600000
 stream_s3.continuous_membership_reconciliation.trigger_interval = 10000
 ```
 
+### Bucket accessibility checks
+
+The plugin periodically probes whether the configured bucket exists and is usable with the current credentials (a `HeadBucket` request). A wrong or unreachable bucket does not stop a stream working: it keeps running on local disk and uploads fail and retry indefinitely, so the misconfiguration is otherwise nearly silent. The probe surfaces the condition via an `ERROR` log on the transition, the `rabbitmq_stream_s3_bucket_accessible` metric, and the `stream_s3_status` CLI command. It never blocks publishers, so a tiering misconfiguration cannot become a publishing outage.
+
+```ini
+# Whether the configured bucket's accessibility is periodically probed.
+# Type: boolean. Default: true.
+stream_s3.bucket_check.enabled = true
+
+# Interval at which the bucket is probed, in milliseconds.
+# Type: non-negative integer. Default: 300000 (5 minutes).
+stream_s3.bucket_check.interval = 300000
+```
+
 ### Tuning the upload path
 
 ```ini
@@ -293,6 +307,14 @@ Owned by `rabbitmq_stream_s3_api_aws`.
 | `rabbitmq_stream_s3_response_503`                      | counter | HTTP 503 responses                                                |
 | `rabbitmq_stream_s3_request_timeouts`                  | counter | Request timeouts                                                  |
 
+### Bucket monitor (per-node)
+
+Owned by `rabbitmq_stream_s3_bucket_monitor`. One counter set per node.
+
+| Metric                              | Type    | Description                                                       |
+|-------------------------------------|---------|-------------------------------------------------------------------|
+| `rabbitmq_stream_s3_bucket_accessible`                 | gauge   | Whether the configured bucket exists and is usable with the current credentials: 1 when accessible, 0 when not (it does not exist or access was denied). Starts at 1 until the first probe completes |
+
 ### HTTP connection pools (per-node, per-pool)
 
 Owned by `rabbitmq_stream_s3_api_aws_pool`. Each metric is labeled with `pool` (the pool name).
@@ -379,6 +401,7 @@ The numbers below are starting points. Tune for your traffic patterns.
 - **Local log ahead recoveries.** `rate(rabbitmq_stream_s3_local_log_ahead_recoveries[1h]) > 0` for any stream. Indicates local retention is racing ahead of uploads. See [failure-modes.md](./failure-modes.md).
 - **Khepri conflicts.** `rate(rabbitmq_stream_s3_put_conflicts[5m]) > 0` matches `rabbitmq_stream_s3_persist_conflicts` above and surfaces the same problem from the metadata store side.
 - **S3 errors.** `rate(rabbitmq_stream_s3_response_500[5m]) > 0` or `rate(rabbitmq_stream_s3_response_503[5m]) > 0`. The plugin retries automatically; sustained high rates indicate an S3-side incident.
+- **Inaccessible bucket.** `rabbitmq_stream_s3_bucket_accessible == 0`. The configured bucket does not exist or the credentials cannot access it. Streams keep running on local disk but nothing is tiered until this is resolved. The accompanying `ERROR` log states which of the two it is.
 
 The pipeline gauges (`rabbitmq_stream_s3_bytes_in_assembly`, `rabbitmq_stream_s3_bytes_in_transfer`, `rabbitmq_stream_s3_bytes_in_persist`) are diagnostic rather than alerting metrics. Their absolute values depend on stream count and fragment target size, so static thresholds do not generalise across deployments. Use them after a disk capacity or transfer-failure alert fires to identify which streams contribute most and which pipeline stage is stuck.
 

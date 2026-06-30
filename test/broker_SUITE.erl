@@ -22,7 +22,8 @@ groups() ->
             consumer_reads_across_tiers,
             leadership_transfer_continues_upload,
             plugin_disable_reenable,
-            prometheus_metrics
+            prometheus_metrics,
+            bucket_monitor_reports_accessible
         ]}
     ].
 
@@ -403,6 +404,36 @@ prometheus_metrics(Config) ->
 
     amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
     rabbit_ct_client_helpers:close_channel(Ch),
+    ok.
+
+bucket_monitor_reports_accessible(Config) ->
+    %% With the file-system backend the bucket (its data directory) is always
+    %% accessible, so the node-level monitor must converge to `accessible`, both
+    %% in its status API and in the exposed Prometheus gauge. Nudge the monitor
+    %% to probe now instead of waiting for its slow timer.
+    Node = 0,
+    rabbit_ct_broker_helpers:rpc(
+        Config, Node, erlang, send, [rabbitmq_stream_s3_bucket_monitor, check]
+    ),
+    ?awaitMatch(
+        #{status := accessible},
+        rabbit_ct_broker_helpers:rpc(
+            Config, Node, rabbitmq_stream_s3_bucket_monitor, status, []
+        ),
+        5000
+    ),
+
+    %% The gauge is emitted on the default /metrics endpoint with no queue label.
+    NodeName = rabbit_ct_broker_helpers:get_node_config(Config, Node, nodename),
+    Metrics = scrape(Config, NodeName, "/metrics"),
+    ?assertMatch(
+        match,
+        re:run(
+            Metrics,
+            <<"^rabbitmq_stream_s3_bucket_accessible\\{[^}]*\\} 1">>,
+            [{capture, none}, multiline]
+        )
+    ),
     ok.
 
 scrape(Config, Node, Path) ->

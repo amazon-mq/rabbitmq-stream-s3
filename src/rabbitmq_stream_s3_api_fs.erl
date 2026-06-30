@@ -24,6 +24,7 @@ associated file in that folder.
     stream_abort/1,
     delete/2,
     list/3,
+    check_bucket/1,
     match_async/3,
     handle_async/3,
     cancel_async/2
@@ -187,6 +188,17 @@ list(Prefix, _Continuation, _Opts) when is_binary(Prefix) ->
         not filelib:is_dir(F)
     ],
     {ok, Keys, done}.
+
+%% The file-system backend's "bucket" is its data directory. It is accessible
+%% when the directory exists or can be created, mirroring the on-demand
+%% directory creation that stream_put/3 performs.
+-spec check_bucket(rabbitmq_stream_s3_api:request_opts()) ->
+    ok | {error, no_such_bucket | access_denied | term()}.
+check_bucket(_Opts) ->
+    case filelib:ensure_path(data_dir()) of
+        ok -> ok;
+        {error, _} = Err -> Err
+    end.
 
 -spec match_async(
     Msg :: term(),

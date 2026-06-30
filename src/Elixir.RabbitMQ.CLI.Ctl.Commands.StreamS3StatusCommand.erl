@@ -48,13 +48,38 @@ usage_additional() ->
     ].
 
 run([Name], #{node := NodeName, vhost := VHost, timeout := Timeout}) ->
-    rabbit_misc:rpc_call(
-        NodeName,
-        rabbitmq_stream_s3_replica_reader,
-        status,
-        [VHost, Name],
-        Timeout
-    ).
+    case
+        rabbit_misc:rpc_call(
+            NodeName,
+            rabbitmq_stream_s3_replica_reader,
+            status,
+            [VHost, Name],
+            Timeout
+        )
+    of
+        {ok, Info} ->
+            {ok, Info#{bucket => bucket_status(NodeName, Timeout)}};
+        Other ->
+            Other
+    end.
+
+%% The bucket accessibility check is node-level, so query the monitor on the
+%% same target node and fold its result into the per-stream status. A node
+%% without the monitor (older node, monitor disabled or restarting) yields
+%% `undefined`, rendered as "unknown".
+bucket_status(NodeName, Timeout) ->
+    case
+        rabbit_misc:rpc_call(
+            NodeName,
+            rabbitmq_stream_s3_bucket_monitor,
+            status,
+            [],
+            Timeout
+        )
+    of
+        #{status := _} = Status -> Status;
+        _ -> undefined
+    end.
 
 banner([Name], #{vhost := VHost}) ->
     erlang:iolist_to_binary(
@@ -68,6 +93,7 @@ output({ok, Info}, #{formatter := <<"json">>}) ->
     {ok, flatten(Info)};
 output({ok, Info}, _Opts) ->
     Sections = [
+        bucket_section(Info),
         stream_section(Info),
         remote_tier_section(Info),
         upload_pipeline_section(Info),
@@ -89,6 +115,27 @@ formatter() ->
 %% ------------------------------------------------------------------
 %% Human-readable sections
 %% ------------------------------------------------------------------
+
+bucket_section(Info) ->
+    Bucket = maps:get(bucket, Info, undefined),
+    [
+        header(<<"Remote tier bucket">>),
+        <<>>,
+        kv(<<"Accessible">>, bucket_accessible(Bucket))
+    ].
+
+%% Render the node-level bucket accessibility into a single line: "yes",
+%% "no (<reason>)", or "unknown" when it has not been determined yet.
+bucket_accessible(#{status := accessible}) ->
+    <<"yes">>;
+bucket_accessible(#{status := inaccessible, reason := Reason}) ->
+    erlang:iolist_to_binary([<<"no (">>, bucket_reason(Reason), <<")">>]);
+bucket_accessible(_) ->
+    <<"unknown">>.
+
+bucket_reason(no_such_bucket) -> <<"does not exist">>;
+bucket_reason(access_denied) -> <<"access denied">>;
+bucket_reason(Other) -> erlang:iolist_to_binary(io_lib:format("~tp", [Other])).
 
 stream_section(#{stream := StreamId, node := Node, log_next_offset := LogNext}) ->
     [
@@ -252,7 +299,17 @@ flatten(
         {transfer_deadlines_armed, maps:get(transfer_deadlines_armed, Info)},
         {log_next_offset, LogNext}
     ],
-    Base ++ flatten_core(Core) ++ flatten_assembly(Assembly).
+    Base ++ flatten_bucket(maps:get(bucket, Info, undefined)) ++
+        flatten_core(Core) ++ flatten_assembly(Assembly).
+
+flatten_bucket(#{status := Status} = Bucket) ->
+    [
+        {bucket_accessible, Status =:= accessible},
+        {bucket_status, Status},
+        {bucket_reason, maps:get(reason, Bucket, undefined)}
+    ];
+flatten_bucket(_) ->
+    [{bucket_status, unknown}].
 
 flatten_core(undefined) ->
     [{core, <<"not initialized">>}];

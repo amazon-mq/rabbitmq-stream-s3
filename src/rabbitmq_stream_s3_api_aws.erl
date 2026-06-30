@@ -26,6 +26,7 @@ A wrapper around the AWS S3 HTTP API.
     stream_abort/1,
     delete/2,
     list/3,
+    check_bucket/1,
     match_async/3,
     handle_async/3,
     cancel_async/2
@@ -563,6 +564,41 @@ list(Prefix, Continuation, Opts) ->
                     _ -> NextToken
                 end,
             {ok, Keys, Next};
+        {ok, #{status := _} = Other} ->
+            log_unexpected_status(?FUNCTION_NAME, Other),
+            {error, Other};
+        {error, _} = Err ->
+            Err
+    end.
+
+-doc """
+Probe the bucket with a HeadBucket request.
+
+See <https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadBucket.html>. A
+HEAD on the bucket root returns 200 when the bucket exists and the credentials
+may access it, 404 when it does not exist, and 403 when access is denied. A
+missing-credentials or transient error is returned verbatim so the caller can
+distinguish it from a definitive misconfiguration.
+
+Note that a nonexistent bucket can surface as 403 rather than 404 when the
+credentials lack `s3:ListBucket` on it, so `access_denied` does not strictly
+imply the bucket exists. Both are definitive "not usable" outcomes with the
+same operator remedy (fix the bucket name, region, or IAM permissions), so the
+monitor treats them the same way and only the reported reason differs.
+""".
+-spec check_bucket(request_opts()) ->
+    ok | {error, no_such_bucket | access_denied | term()}.
+check_bucket(Opts) when is_map(Opts) ->
+    case request(<<"HEAD">>, <<"/">>, #{}, <<>>, Opts) of
+        {ok, #{status := 200}} ->
+            ok;
+        {ok, #{status := 404}} ->
+            {error, no_such_bucket};
+        {ok, #{status := 403}} ->
+            %% May be a genuine permission denial or a nonexistent bucket the
+            %% credentials cannot list; both are definitive "not usable" with
+            %% the same remedy (see the moduledoc above).
+            {error, access_denied};
         {ok, #{status := _} = Other} ->
             log_unexpected_status(?FUNCTION_NAME, Other),
             {error, Other};
