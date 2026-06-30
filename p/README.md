@@ -20,7 +20,7 @@ The models target five global invariants of the tiered-storage design:
 | Invariant | Property | Model |
 | --- | --- | --- |
 | INV#1 | no lost acked data | `gc-reset/` |
-| INV#2 | no dangling reference (GC never deletes a live object) | `gc-reset/`, `gc-leading-group/` |
+| INV#2 | no dangling reference (GC never deletes a live object) | `gc-reset/`, `gc-leading-group/`, `gc-decision/` |
 | INV#3 | no unbounded orphan leak (liveness) | `orphan-leak/` |
 | INV#4 | tier resolution total / gap-free | `read-resolution/`, `tier-routing/` |
 | INV#5 | monotonic frontier except a labeled reset | `gc-reset/`, `trimmed-segment/` |
@@ -46,6 +46,18 @@ protects the one leading group that straddles `first_offset` (retention advanced
 the floor into it on partial expiry) while deleting other groups below the floor.
 Verifies that removing the `referenced_group_key` carve-out deletes a live group.
 See [`gc-leading-group/README.md`](gc-leading-group/README.md).
+
+### `gc-decision/`
+
+The whole `rabbitmq_stream_s3_gc` reap decision in one state space: build_lookup,
+classify, and still_dangling composed, with all three classify reasons (data and
+group below the floor, stale-epoch manifest) and the guards interacting rather
+than isolated. Re-proves each shipped guard load-bearing in the composed decision,
+and surfaces a gap the single-axis models miss: a reset that commits after the
+sweep snapshots, on a node whose cache has not applied the sync, reaps a live
+re-tier even with every shipped guard on (the epoch gate is sampled once and
+still_dangling re-reads only the floor). Models a proposed execute-time epoch
+re-validation that closes it. See [`gc-decision/README.md`](gc-decision/README.md).
 
 ### `read-resolution/`
 
