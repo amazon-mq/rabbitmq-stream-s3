@@ -139,12 +139,27 @@
   when an osiris member departs a node permanently mid-sync, which graceful
   leader-move does not cause, so it ships as a cheap always-on guard, not
   something the current faults reproduce. Reliably exercising it needs a hard-kill
-  / stream-churn nemesis (see jepsen/BACKLOG.md)."
+  / stream-churn nemesis (see jepsen/BACKLOG.md).
+
+  A converged-floor verdict only means something if the run actually drove the
+  caches apart and the sync machinery pulled them back. The result therefore
+  reports syncs_rejected (a stale sync dropped) and resyncs_requested (a gap
+  triggered a resync) from the run's counters as :divergence-exercised?, and
+  flags :convergence-hollow? when the check passed but neither ever ticked — a
+  green that proves nothing rather than a failure."
   []
   (reify checker/Checker
     (check [_ _test _history _opts]
       (let [per-node  @db/replica-floors
             committed @db/committed-offsets-snapshot
+            stats     @db/tiering-stats
+            ;; Evidence the run actually stressed the sync machinery: a stale
+            ;; sync was dropped, or a detected gap requested a resync. With both
+            ;; at zero nothing ever diverged, so a converged-floor verdict is
+            ;; hollow. Reported, not failed: a quiet schedule is not a bug.
+            syncs-rejected        (long (get stats "rabbitmq_stream_s3_syncs_rejected" 0))
+            resyncs-requested     (long (get stats "rabbitmq_stream_s3_resyncs_requested" 0))
+            divergence-exercised? (or (pos? syncs-rejected) (pos? resyncs-requested))
             ;; stream key -> {node -> rec} over only the nodes that cache it.
             by-stream (reduce-kv
                         (fn [acc node kmap]
@@ -177,12 +192,16 @@
                         (seq diverged)    (conj :replicas-diverged)
                         (seq stale)       (conj :stale-floor-served)
                         (seq leaked)      (conj :leaked-replica-row))]
-        {:valid?            (empty? problems)
-         :problems          problems
-         :streams-cached    (count by-stream)
-         :diverged          (vec diverged)
-         :stale-floors      (vec stale)
-         :leaked-rows       (vec leaked)}))))
+        {:valid?                (empty? problems)
+         :problems              problems
+         :streams-cached        (count by-stream)
+         :diverged              (vec diverged)
+         :stale-floors          (vec stale)
+         :leaked-rows           (vec leaked)
+         :syncs-rejected        syncs-rejected
+         :resyncs-requested     resyncs-requested
+         :divergence-exercised? divergence-exercised?
+         :convergence-hollow?   (and (empty? problems) (not divergence-exercised?))}))))
 
 (defn downgrade-when
   "Wraps a checker so that when (pred test) holds its result cannot invalidate
