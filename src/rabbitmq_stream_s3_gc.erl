@@ -37,9 +37,17 @@ floor a concurrent sweep already snapshotted. Three guards keep the sweep safe:
      epoch is compared against the cached epoch, and the delete is skipped when
      they differ. A genuine orphan skipped here is reclaimed by a later sweep.
 
-Streams with no local manifest replica are skipped (cannot verify first_offset).
-Unknown stream prefixes (stream not in Khepri) are skipped (no safe deletion
-signal without Khepri restructuring).
+For a stream that is in the committed lookup, objects are classified against its
+first_offset and epoch as above. For an object whose stream is NOT in the lookup
+(a deleted stream, a stream that never committed a manifest, or one missing a
+local manifest replica) the per-stream anchor decides: the anchor
+(rabbitmq_stream_s3_db, written before the first fragment, kept alive by a
+keep_while on the stream queue) is present for a live stream and absent only once
+the queue is gone. A strongly-consistent read of the anchor that returns absent is
+a positive "stream deleted" signal, so the object is reaped (reason no_anchor); a
+present anchor, or a read that cannot reach a quorum, fails closed and skips. The
+consistent read is load-bearing: a stale local read could report a live stream's
+anchor absent and reap it.
 """.
 
 -include("include/rabbitmq_stream_s3.hrl").
@@ -50,7 +58,7 @@ signal without Khepri restructuring).
 
 -type mode() :: dry_run | delete.
 -type config() :: #{mode => mode(), writer_epoch => non_neg_integer()}.
--type reason() :: below_first_offset | stale_epoch.
+-type reason() :: below_first_offset | stale_epoch | no_anchor.
 -type finding() :: #{stream_id := stream_id(), key := rabbitmq_stream_s3:key(), reason := reason()}.
 
 -export_type([mode/0, config/0, finding/0]).
@@ -68,7 +76,9 @@ run(Config) when is_map(Config) ->
     {ok, Streams} = rabbitmq_stream_s3_db:list(),
     Lookup = build_lookup(Streams),
     Fun = make_handler(Mode),
-    Findings = list_and_classify(<<"rabbitmq/stream/">>, start, Lookup, Fun, []),
+    Findings = list_and_classify(
+        <<"rabbitmq/stream/">>, start, Lookup, Fun, fun anchor_absent/1, []
+    ),
     ?LOG_INFO("GC ~ts complete: ~b dangling object(s)", [Mode, length(Findings)]),
     {ok, Findings}.
 
@@ -85,7 +95,7 @@ run_stream(StreamId, Config) when is_binary(StreamId), is_map(Config) ->
         {ok, Lookup} ->
             Prefix = rabbitmq_stream_s3:stream_prefix(StreamId),
             Fun = make_handler(Mode),
-            Findings = list_and_classify(Prefix, start, Lookup, Fun, []),
+            Findings = list_and_classify(Prefix, start, Lookup, Fun, fun anchor_absent/1, []),
             ?LOG_INFO(
                 "GC ~ts for stream ~ts complete: ~b dangling object(s)",
                 [Mode, StreamId, length(Findings)]
@@ -158,6 +168,11 @@ make_handler(delete) ->
 -spec fresh_enough_to_delete(reason(), stream_id()) -> boolean().
 fresh_enough_to_delete(stale_epoch, _StreamId) ->
     true;
+fresh_enough_to_delete(no_anchor, _StreamId) ->
+    %% classify_page/3 already confirmed the anchor absent with a consistent read,
+    %% and a deleted stream's anchor never returns (stream_id is unique per
+    %% incarnation), so the absence is permanent.
+    true;
 fresh_enough_to_delete(below_first_offset, StreamId) ->
     case rabbitmq_stream_s3_db:get_consistent(StreamId) of
         {ok, #{epoch := CommittedEpoch}} ->
@@ -222,6 +237,10 @@ cache_epoch(undefined) ->
 %% carve-out from the live manifest closes that.
 -spec still_dangling(finding()) -> boolean().
 still_dangling(#{reason := stale_epoch}) ->
+    true;
+still_dangling(#{reason := no_anchor}) ->
+    %% The anchor was confirmed absent (consistent read) in classify_page/3 and
+    %% the absence is permanent, so there is nothing to re-validate.
     true;
 still_dangling(#{reason := below_first_offset, stream_id := StreamId, key := Key}) ->
     case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
@@ -430,32 +449,68 @@ epoch_permits_sweep(CommittedEpoch, #{writer_epoch := WriterEpoch}) ->
 epoch_permits_sweep(_CommittedEpoch, _Config) ->
     true.
 
-list_and_classify(_Prefix, done, _Lookup, _Fun, Acc) ->
+list_and_classify(_Prefix, done, _Lookup, _Fun, _AnchorAbsent, Acc) ->
     lists:reverse(Acc);
-list_and_classify(Prefix, Continuation, Lookup, Fun, Acc) ->
+list_and_classify(Prefix, Continuation, Lookup, Fun, AnchorAbsent, Acc) ->
     case rabbitmq_stream_s3_api:list(Prefix, Continuation) of
         {ok, [], done} ->
             lists:reverse(Acc);
         {ok, Keys, NextContinuation} ->
-            Orphans = classify_page(Keys, Lookup),
+            Orphans = classify_page(Keys, Lookup, AnchorAbsent),
             NewAcc = lists:foldl(Fun, Acc, Orphans),
-            list_and_classify(Prefix, NextContinuation, Lookup, Fun, NewAcc);
+            list_and_classify(Prefix, NextContinuation, Lookup, Fun, AnchorAbsent, NewAcc);
         {error, Reason} ->
             ?LOG_WARNING("GC: failed to list objects under ~ts: ~p", [Prefix, Reason]),
             lists:reverse(Acc)
     end.
 
-classify_page(Keys, Lookup) ->
-    lists:filtermap(
-        fun(Key) ->
+%% AnchorAbsent is fun((stream_id()) -> boolean()): true only on a strongly
+%% consistent read that confirms the anchor is absent (a deleted stream). A
+%% no_anchor candidate is kept only when its stream's anchor is confirmed absent;
+%% each distinct stream is checked once per page.
+-spec classify_page([rabbitmq_stream_s3:key()], map(), fun((stream_id()) -> boolean())) ->
+    [finding()].
+classify_page(Keys, Lookup, AnchorAbsent) ->
+    {Definite, Candidates} = lists:foldr(
+        fun(Key, {Def, Cand}) ->
             case classify(Key, Lookup) of
-                {ok, Finding} -> {true, Finding};
-                skip -> false
+                {ok, #{reason := no_anchor} = Finding} -> {Def, [Finding | Cand]};
+                {ok, Finding} -> {[Finding | Def], Cand};
+                skip -> {Def, Cand}
             end
         end,
+        {[], []},
         Keys
-    ).
+    ),
+    Streams = lists:usort([StreamId || #{stream_id := StreamId} <- Candidates]),
+    AbsentStreams = [StreamId || StreamId <- Streams, AnchorAbsent(StreamId)],
+    Confirmed = [
+        Finding
+     || #{stream_id := StreamId} = Finding <- Candidates, lists:member(StreamId, AbsentStreams)
+    ],
+    Definite ++ Confirmed.
 
+%% Strongly-consistent anchor read for the no_anchor backstop. True only when the
+%% read confirms the anchor is absent; a present anchor or a read that cannot reach
+%% a quorum fails closed (false), so a live or unverifiable stream is never reaped.
+-spec anchor_absent(stream_id()) -> boolean().
+anchor_absent(StreamId) ->
+    case rabbitmq_stream_s3_db:anchor_exists_consistent(StreamId) of
+        {ok, Exists} ->
+            not Exists;
+        {error, Reason} ->
+            ?LOG_INFO(
+                "GC: not reaping the prefix of stream ~ts: could not read its anchor "
+                "with quorum (~p); failing closed",
+                [StreamId, Reason]
+            ),
+            false
+    end.
+
+%% A stream that is in the lookup is classified against its floor/epoch. A
+%% well-formed key whose stream is NOT in the lookup becomes a no_anchor
+%% CANDIDATE, resolved against the anchor in classify_page/3. Only an unrecognised
+%% key format is skipped outright.
 -spec classify(rabbitmq_stream_s3:key(), map()) -> {ok, finding()} | skip.
 classify(Key, Lookup) ->
     case parse_key(Key) of
@@ -463,31 +518,36 @@ classify(Key, Lookup) ->
             case Lookup of
                 #{StreamId := #{first_offset := FirstOffset}} when Offset < FirstOffset ->
                     {ok, #{stream_id => StreamId, key => Key, reason => below_first_offset}};
+                #{StreamId := _} ->
+                    skip;
                 _ ->
-                    skip
+                    no_anchor_candidate(StreamId, Key)
             end;
         {group, StreamId, Offset} ->
             case Lookup of
                 #{StreamId := #{first_offset := FirstOffset} = Info} when Offset < FirstOffset ->
                     classify_group(StreamId, Key, Info);
+                #{StreamId := _} ->
+                    skip;
                 _ ->
-                    skip
+                    no_anchor_candidate(StreamId, Key)
             end;
         {manifest, StreamId, Epoch} ->
             case Lookup of
                 #{StreamId := #{epoch := CurrentEpoch}} when Epoch < CurrentEpoch ->
                     {ok, #{stream_id => StreamId, key => Key, reason => stale_epoch}};
+                #{StreamId := _} ->
+                    skip;
                 _ ->
-                    skip
+                    no_anchor_candidate(StreamId, Key)
             end;
         unknown ->
-            %% Key belongs to a stream not in the lookup (either unknown to
-            %% Khepri or missing a local manifest replica). Not safe to delete
-            %% without a positive "stream deleted" signal. See #149 for the
-            %% planned Khepri restructuring that would make stream-prefix
-            %% sweep safe.
+            %% Unrecognised key format: nothing safe to do with it.
             skip
     end.
+
+no_anchor_candidate(StreamId, Key) ->
+    {ok, #{stream_id => StreamId, key => Key, reason => no_anchor}}.
 
 %% A group object below first_offset is an orphan and safe to delete unless it
 %% is the manifest's referenced leading group, or the stream is in conservative
@@ -743,11 +803,54 @@ classify_manifest_current_epoch_test() ->
     Key = <<"rabbitmq/stream/s/metadata/root.3.aabb0011.manifest">>,
     ?assertEqual(skip, classify(Key, Lookup)).
 
-classify_unknown_stream_skipped_test() ->
-    %% Stream not in lookup -> skip (not safe to delete).
+%% An unrecognised key format is skipped outright.
+classify_unrecognised_key_skipped_test() ->
+    ?assertEqual(skip, classify(<<"rabbitmq/stream/s/other/file">>, #{})),
+    ?assertEqual(skip, classify(<<"some/other/key">>, #{})).
+
+%% A well-formed key whose stream is not in the lookup becomes a no_anchor
+%% candidate, resolved against the anchor in classify_page/3.
+classify_unknown_stream_is_no_anchor_candidate_test() ->
     Lookup = #{},
-    Key = <<"rabbitmq/stream/unknown/data/00000000000000000100.deadbeef.fragment">>,
+    DataKey = <<"rabbitmq/stream/gone/data/00000000000000000100.deadbeef.fragment">>,
+    ?assertEqual(
+        {ok, #{stream_id => <<"gone">>, key => DataKey, reason => no_anchor}},
+        classify(DataKey, Lookup)
+    ),
+    GroupKey = <<"rabbitmq/stream/gone/metadata/00000000000000000500.aabbccdd.group">>,
+    ?assertMatch({ok, #{reason := no_anchor}}, classify(GroupKey, Lookup)),
+    ManifestKey = <<"rabbitmq/stream/gone/metadata/root.3.aabb0011.manifest">>,
+    ?assertMatch({ok, #{reason := no_anchor}}, classify(ManifestKey, Lookup)).
+
+%% An in-lookup object at or above the floor is live and skipped, not a candidate.
+classify_in_lookup_live_object_skipped_test() ->
+    Lookup = #{<<"s">> => #{epoch => 5, first_offset => 100}},
+    Key = <<"rabbitmq/stream/s/data/00000000000000000150.deadbeef.fragment">>,
     ?assertEqual(skip, classify(Key, Lookup)).
+
+%% classify_page keeps a no_anchor candidate only when its stream's anchor is
+%% confirmed absent, and checks each distinct stream exactly once.
+classify_page_no_anchor_resolution_test() ->
+    GoneKey1 = <<"rabbitmq/stream/gone/data/00000000000000000100.deadbeef.fragment">>,
+    GoneKey2 = <<"rabbitmq/stream/gone/data/00000000000000000200.deadbeef.fragment">>,
+    LiveKey = <<"rabbitmq/stream/live/data/00000000000000000100.deadbeef.fragment">>,
+    Self = self(),
+    AnchorAbsent = fun(StreamId) ->
+        Self ! {checked, StreamId},
+        StreamId =:= <<"gone">>
+    end,
+    Findings = classify_page([GoneKey1, GoneKey2, LiveKey], #{}, AnchorAbsent),
+    Keys = lists:sort([K || #{key := K} <- Findings]),
+    %% Both objects of the deleted stream are reaped; the live stream's object is kept.
+    ?assertEqual(lists:sort([GoneKey1, GoneKey2]), Keys),
+    %% Each distinct stream is checked once.
+    ?assertEqual(lists:sort([<<"gone">>, <<"live">>]), lists:sort(drain_checks([]))).
+
+drain_checks(Acc) ->
+    receive
+        {checked, StreamId} -> drain_checks([StreamId | Acc])
+    after 0 -> Acc
+    end.
 
 %% A candidate deletion is re-validated against the live first_offset just before
 %% deleting. A remote-tier-ahead reset lowers first_offset and re-tiers live
