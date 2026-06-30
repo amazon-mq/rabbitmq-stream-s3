@@ -43,6 +43,9 @@ concurrency:
 jobs:
   jepsen:
     runs-on: ubuntu-latest
+    # Safety net: a wedged run must fail fast, not burn hours. The build plus a
+    # bounded 120s test settles well inside this.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -67,10 +70,28 @@ jobs:
           otp-version: ${{ matrix.otp-version }}
           elixir-version: ${{ matrix.elixir-version }}
       - name: Clone rabbitmq-server
-        run: git clone --depth 1 --branch ${{ matrix.rmq-version }} https://github.com/amazon-mq/upstream-to-rabbitmq-server.git ${{ github.workspace }}/rabbitmq-server
+        # The server is built and run as part of the cluster, so pin it to a
+        # commit SHA rather than the mutable streams-tiered-storage branch tip:
+        # a CI run then builds exactly the server it was tested against, and a
+        # force-push to the branch cannot change what executes here. Bump this
+        # SHA periodically to track the branch (that re-introduces server-drift
+        # coverage at a controlled point). Shallow-fetch the SHA directly so the
+        # checkout keeps working once the branch tip has moved past the pin.
+        env:
+          RMQ_SERVER_SHA: 91051d3c678faa6cc68a75d6b561ceca05e12025
+        run: |
+          git init -q "${{ github.workspace }}/rabbitmq-server"
+          git -C "${{ github.workspace }}/rabbitmq-server" remote add origin \
+            https://github.com/amazon-mq/upstream-to-rabbitmq-server.git
+          git -C "${{ github.workspace }}/rabbitmq-server" fetch -q --depth 1 origin "$RMQ_SERVER_SHA"
+          git -C "${{ github.workspace }}/rabbitmq-server" checkout -q "$RMQ_SERVER_SHA"
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           path: rabbitmq-server/deps/rabbitmq_stream_s3
+          # The job then runs a full server build plus a lein dependency
+          # download and a RabbitMQ cluster; do not leave the token in .git/config
+          # for that third-party code to read.
+          persist-credentials: false
       - name: Run Jepsen
         working-directory: rabbitmq-server/deps/rabbitmq_stream_s3
         run: jepsen/ci/run-jepsen.sh

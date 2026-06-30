@@ -27,12 +27,19 @@
    [nil "--final-time-limit SEC"
     "Cap on the final-reads phase (the kafka final-polls loop is unbounded)"
     :default 180 :parse-fn parse-long]
+   [nil "--final-settle-sec SEC"
+    "Quiet settle period after healing faults, before the final reads"
+    :default 15 :parse-fn parse-long]
+   [nil "--auth-read-timeout-sec SEC"
+    "Cap on the durability checker's end-to-end read (per committed-offset target)"
+    :default 180 :parse-fn parse-long]
    [nil "--faults FAULTS"
     "Comma-separated: partition, s3-outage, s3-latency, trim, leader-move"
     :default "partition"]])
 
 (defn streams3-test
   [opts]
+  (nem/validate-faults! opts)
   (let [wl (workload/workload opts)]
     (merge
       tests/noop-test
@@ -77,7 +84,7 @@
                     (gen/nemesis [{:type :info :f :stop-partition}
                                   {:type :info :f :stop-s3-outage}
                                   {:type :info :f :stop-s3-latency}])
-                    (gen/sleep 15)
+                    (gen/sleep (:final-settle-sec opts))
                     ;; With trimming enabled, trim once more after healing so the
                     ;; final reads drain from the now-trimmed (S3-only) tier and
                     ;; actually exercise the read-from-S3 path.

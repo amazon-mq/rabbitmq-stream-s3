@@ -130,6 +130,20 @@
   (apply c/exec :env (concat (env-args node)
                              [(str base-dir "/sbin/rabbitmqctl")] args)))
 
+;; Seconds to bound an Erlang eval. rabbitmqctl eval has no timeout, so a broker
+;; wedged by leader-move churn would hang the eval (and the whole test) forever.
+(def ^:private eval-timeout-secs "30")
+
+(defn rabbitmqctl-eval
+  "Runs an Erlang eval on `node`, bounded by the `timeout` command so a wedged
+  broker fails the eval (exit 124) instead of hanging the test; the broker-side
+  eval may keep running, harmlessly. Returns stdout; throws on timeout, so
+  callers wrap with util/meh or try/catch."
+  [node eval-str]
+  (apply c/exec :timeout eval-timeout-secs :env
+         (concat (env-args node)
+                 [(str base-dir "/sbin/rabbitmqctl") :eval eval-str])))
+
 ;; One rabbitmqctl eval that, on the local node, triggers local-retention
 ;; evaluation for every jepsen-<k> stream — looping in Erlang rather than
 ;; spawning a slow CLI per stream. evaluate_local_retention no-ops where the
@@ -147,42 +161,46 @@
   offsets fall back to the S3 tier. Runs in an SSH context (caller wraps with
   c/on-nodes)."
   [node]
-  (util/meh (rabbitmqctl node :eval trim-eval)))
+  (util/meh (rabbitmqctl-eval node trim-eval)))
 
-;; One rabbitmqctl eval that transfers every jepsen-<k> stream's leader to its
-;; first replica, moving each writer (and uploader) to a new node and bumping the
-;; stream's epoch. The stream coordinator is cluster-global, so this runs on a
-;; single node. transfer_leadership restarts the stream with the target preferred
-;; as leader; replica_nodes excludes the current leader, so the leader genuinely
-;; moves and the epoch increments.
+;; One rabbitmqctl eval that transfers ONE randomly chosen jepsen-<k> stream's
+;; leader to its first replica, moving that writer (and uploader) to a new node
+;; and bumping the stream's epoch. The stream coordinator is cluster-global, so
+;; this runs on a single node. transfer_leadership restarts the stream with the
+;; target preferred as leader; replica_nodes excludes the current leader, so the
+;; leader genuinely moves and the epoch increments.
 ;;
-;; All streams at once, repeatedly: this maximizes the number of deposed-writer
-;; races, which is exactly what stresses writer fencing (an in-flight upload from
-;; an old epoch must be rejected, never overwrite the new leader's data). The
-;; resulting subscription churn wedges the push-based workload consumers, so the
-;; kafka workload's offset analyzers go red on artifacts — but that result is
-;; downgraded to advisory under leader-move, and correctness is verified by the
-;; durability checker, which reads each stream fresh after the run.
+;; One stream per tick, not all of them: moving every stream at once repeatedly
+;; keeps the whole cluster's subscriptions in perpetual recovery and can wedge it
+;; so a run hangs before the final reads. One at a time still fences a writer
+;; each tick (and over a run bumps epochs past 1, which the tiering checker
+;; requires), while leaving the cluster room to recover between moves. Fencing
+;; correctness is verified by the durability checker, which reads each stream
+;; fresh after the run regardless of how aggressive the churn was.
 (def ^:private leader-move-eval
   (str "Names = [element(4, amqqueue:get_name(Q)) "
        "|| Q <- rabbit_amqqueue:list(<<\"/\">>)], "
        "Jeps = [N || N <- Names, byte_size(N) >= 7, binary:part(N, 0, 7) =:= <<\"jepsen-\">>], "
-       "[begin "
+       "case Jeps of "
+       "[] -> ok; "
+       "_ -> "
+       "N = lists:nth(rand:uniform(length(Jeps)), Jeps), "
        "Q = element(2, rabbit_amqqueue:lookup(rabbit_misc:r(<<\"/\">>, queue, N))), "
        "case maps:get(replica_nodes, amqqueue:get_type_state(Q), []) of "
        "[Target | _] -> catch rabbit_stream_queue:transfer_leadership(Q, Target); "
        "[] -> ok "
        "end "
-       "end || N <- Jeps], ok."))
+       "end, ok."))
 
 (defn force-leader-move!
-  "Transfers every jepsen stream's leader to its first replica, moving each
-  writer (and uploader) to a new node and bumping the stream's epoch. This fences
-  the deposed writers: a straggler upload carrying the old epoch must be rejected
-  (a manifest persist conflict), never overwrite the new leader's data. Run on a
-  single node (the coordinator is cluster-global). Runs in an SSH context."
+  "Transfers one randomly chosen jepsen stream's leader to its first replica,
+  moving that writer (and uploader) to a new node and bumping the stream's epoch.
+  This fences the deposed writer: a straggler upload carrying the old epoch must
+  be rejected (a manifest persist conflict), never overwrite the new leader's
+  data. Run on a single node (the coordinator is cluster-global). Runs in an SSH
+  context."
   [node]
-  (util/meh (rabbitmqctl node :eval leader-move-eval)))
+  (util/meh (rabbitmqctl-eval node leader-move-eval)))
 
 ;; The plugin's read/write paths are instrumented, not logged, so these
 ;; counters are how the test proves S3 was actually exercised (see the
@@ -197,7 +215,14 @@
    ;; or re-requested when the epoch moves under the leader-move nemesis.
    "rabbitmq_stream_s3_persist_conflicts"
    "rabbitmq_stream_s3_syncs_rejected"
-   "rabbitmq_stream_s3_resyncs_requested"])
+   "rabbitmq_stream_s3_resyncs_requested"
+   ;; S3-disruption evidence, reported for visibility (not asserted): the plugin
+   ;; tolerates an s3-outage gracefully (writes stay local, uploads pause and
+   ;; retry), so these often stay 0 even when the link is cut. The Toxiproxy
+   ;; status check (nemesis.clj) is what proves the outage was actually injected.
+   "rabbitmq_stream_s3_transfers_failed"
+   "rabbitmq_stream_s3_put_errors"
+   "rabbitmq_stream_s3_request_timeouts"])
 
 (defn scrape-tiering-metrics
   "Scrapes the plugin's Prometheus counters on `node`, returning a map of
@@ -233,23 +258,33 @@
   "Returns the maximum stream coordinator epoch across the jepsen streams on
   `node` (a cluster-global value). Runs in an SSH context."
   [node]
-  (let [out (try (rabbitmqctl node :eval max-epoch-eval) (catch Exception _ ""))]
+  (let [out (try (rabbitmqctl-eval node max-epoch-eval) (catch Exception _ ""))]
     (or (some-> (re-find #"\d+" (str out)) parse-long) 0)))
 
-;; Lists the integer keys of the jepsen-<k> streams that exist, so the
-;; durability checker reads exactly the streams the workload wrote to.
-(def ^:private jepsen-keys-eval
+;; For each jepsen-<k> stream, the integer key and its committed offset (the
+;; last durably-committed offset, -1 if empty). The durability checker reads
+;; exactly these streams, and the authoritative read waits until each consumer
+;; reaches this offset rather than guessing the tail from idle time.
+(def ^:private committed-offsets-eval
   (str "Names = [element(4, amqqueue:get_name(Q)) "
        "|| Q <- rabbit_amqqueue:list(<<\"/\">>)], "
-       "[binary_to_integer(binary:part(N, 7, byte_size(N) - 7)) "
-       "|| N <- Names, byte_size(N) >= 8, binary:part(N, 0, 7) =:= <<\"jepsen-\">>]."))
+       "Jeps = [N || N <- Names, byte_size(N) >= 8, binary:part(N, 0, 7) =:= <<\"jepsen-\">>], "
+       "[begin "
+       "K = binary_to_integer(binary:part(N, 7, byte_size(N) - 7)), "
+       "Co = case catch rabbit_stream_queue:status(<<\"/\">>, N) of "
+       "L when is_list(L) -> lists:max([-1 | [proplists:get_value(committed_offset, M, -1) || M <- L]]); "
+       "_ -> -1 "
+       "end, "
+       "{K, Co} "
+       "end || N <- Jeps]."))
 
-(defn list-jepsen-keys
-  "Returns the integer keys of the jepsen streams on `node`. Runs in an SSH
-  context."
+(defn committed-offsets
+  "Returns {key -> committed offset} for the jepsen streams on `node` (-1 for an
+  empty stream). Runs in an SSH context."
   [node]
-  (let [out (try (rabbitmqctl node :eval jepsen-keys-eval) (catch Exception _ ""))]
-    (mapv parse-long (re-seq #"\d+" (str out)))))
+  (let [out  (try (rabbitmqctl-eval node committed-offsets-eval) (catch Exception _ ""))
+        ints (map parse-long (re-seq #"-?\d+" (str out)))]
+    (into {} (map vec (partition 2 ints)))))
 
 ;; Cluster-wide S3 counter sums for the run, accumulated across nodes in
 ;; log-files (which runs after the workload but before the checker, while the
@@ -314,10 +349,13 @@
   []
   (reify db/DB
     (setup! [_ test node]
-      ;; Clean slate for this run's coverage counters and authoritative reads
-      ;; (idempotent across nodes).
+      ;; Clean slate for this run: coverage counters, authoritative reads, and
+      ;; the shared client connection state (so a REPL or test-all multi-run in
+      ;; one JVM does not carry stale stream declarations or publishingId
+      ;; counters against a freshly-wiped cluster). Idempotent across nodes.
       (reset! tiering-stats {})
       (reset! sc/authoritative-reads {})
+      (sc/reset-run-state!)
       (install! test node)
       (start! test node))
 
@@ -337,10 +375,12 @@
       ;; up here, before teardown) so the coverage checker can read them.
       (util/meh (record-tiering-stats! node))
       ;; Authoritatively read every jepsen stream end-to-end for the durability
-      ;; checker, once (on the primary), while the brokers are still up. Uses the
-      ;; Stream client over a fresh Environment, so it needs no SSH context.
+      ;; checker, once (on the primary), while the brokers are still up. The read
+      ;; waits for each consumer to reach the stream's committed offset, so query
+      ;; those (over SSH) and hand them to the read (which uses the Stream client
+      ;; over a fresh Environment, no SSH context).
       (when (= node (first (:nodes test)))
-        (util/meh (sc/capture-authoritative-reads! test (list-jepsen-keys node))))
+        (util/meh (sc/capture-authoritative-reads! test (committed-offsets node))))
       ;; Broker logs + the S3 plugin's status output for post-mortem.
       (util/meh
         (rabbitmqctl node :stream_s3_status

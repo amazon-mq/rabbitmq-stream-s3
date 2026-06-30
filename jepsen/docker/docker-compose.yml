@@ -52,7 +52,8 @@ services:
   n5: {<<: *node, hostname: n5, container_name: n5}
 
   minio:
-    image: minio/minio:latest
+    # Pinned by digest for supply-chain reproducibility (was minio/minio:latest).
+    image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
     environment:
       MINIO_ROOT_USER: jepsenjepsen
       MINIO_ROOT_PASSWORD: jepsenjepsenjepsen
@@ -69,7 +70,8 @@ services:
       jepsen:
 
   toxiproxy:
-    image: ghcr.io/shopify/toxiproxy:latest
+    # Pinned by digest (was ghcr.io/shopify/toxiproxy:latest).
+    image: ghcr.io/shopify/toxiproxy@sha256:9378ed52a28bc50edc1350f936f518f31fa95f0d15917d6eb40b8e376d1a214e
     # The toxiproxy image is FROM scratch (no shell), so the passthrough proxy
     # is declared in a config file loaded at startup rather than created by an
     # init container. -host=0.0.0.0 exposes the admin API (8474) for S3 fault
@@ -91,7 +93,8 @@ services:
     # comes from MC_HOST_j, and we talk path-style to minio:443 with --insecure
     # (the cert is for *.s3.jepsen.local, not "minio"). restart: on-failure
     # retries until MinIO is accepting connections, then exits 0.
-    image: minio/mc:latest
+    # Pinned by digest (was minio/mc:latest).
+    image: minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
     environment:
       MC_HOST_j: "https://jepsenjepsen:jepsenjepsenjepsen@minio:443"
     entrypoint: ["mc"]
