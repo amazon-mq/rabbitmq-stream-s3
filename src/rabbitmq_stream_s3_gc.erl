@@ -17,7 +17,7 @@ less safe.
 The one break in that monotonicity is a remote-tier-ahead reset, which rebuilds
 the manifest from the local log floor after a timeline change and can *lower*
 first_offset, re-tiering live fragments (with fresh UIDs) at offsets below a
-floor a concurrent sweep already snapshotted. Two guards keep the sweep safe:
+floor a concurrent sweep already snapshotted. Three guards keep the sweep safe:
 
   1. Each candidate deletion is re-validated against the live first_offset
      immediately before the object is deleted (see still_dangling/1) and skipped
@@ -28,6 +28,14 @@ floor a concurrent sweep already snapshotted. Two guards keep the sweep safe:
      strongly-consistent metadata read, so a partitioned or deposed node that
      cannot reach a quorum fails closed and skips rather than deleting on a stale
      local view.
+  3. That metadata read in build_lookup/1 is sampled once, up front. A reset that
+     commits *after* the snapshot, on a node whose manifest cache has not yet
+     applied the sync, leaves still_dangling/1 re-reading a stale-high floor while
+     the committed epoch has moved on, so guards 1 and 2 both pass. Each
+     offset-based deletion is therefore re-validated once more at the point of
+     deletion (see fresh_enough_to_delete/2): a fresh quorum read of the committed
+     epoch is compared against the cached epoch, and the delete is skipped when
+     they differ. A genuine orphan skipped here is reclaimed by a later sweep.
 
 Streams with no local manifest replica are skipped (cannot verify first_offset).
 Unknown stream prefixes (stream not in Khepri) are skipped (no safe deletion
@@ -109,12 +117,23 @@ make_handler(dry_run) ->
         [Finding | Acc]
     end;
 make_handler(delete) ->
-    fun(#{stream_id := StreamId, key := Key} = Finding, Acc) ->
+    fun(#{stream_id := StreamId, key := Key, reason := Reason} = Finding, Acc) ->
         case still_dangling(Finding) of
             true ->
-                log_finding(Finding),
-                rabbitmq_stream_s3_reaper:delete_objects(StreamId, [Key]),
-                [Finding | Acc];
+                %% still_dangling/1 passed against the live cache floor, but that
+                %% floor is trustworthy only if the cache is at the committed epoch
+                %% (a reset may have committed after the sweep snapshot). The
+                %% quorum read here runs only for an object already judged
+                %% deletable, so it is bounded by the number of orphans, not the
+                %% number of listed objects.
+                case fresh_enough_to_delete(Reason, StreamId) of
+                    true ->
+                        log_finding(Finding),
+                        rabbitmq_stream_s3_reaper:delete_objects(StreamId, [Key]),
+                        [Finding | Acc];
+                    false ->
+                        Acc
+                end;
             false ->
                 ?LOG_INFO(
                     "GC: not deleting ~ts (stream=~ts): it is no longer below the "
@@ -125,6 +144,64 @@ make_handler(delete) ->
                 Acc
         end
     end.
+
+%% Re-validate cache freshness against the committed epoch immediately before an
+%% offset-based deletion. build_lookup/1 (and build_stream_lookup/2) sampled the
+%% committed epoch once, at the start of the sweep; a remote-tier-ahead reset that
+%% commits after that snapshot, on a node whose manifest cache has not yet applied
+%% the sync, leaves the cached floor stale-high at the old epoch while the
+%% committed epoch has advanced. A fresh quorum read of the committed epoch
+%% compared against the cached epoch closes that window: delete only when the
+%% cache is at the committed epoch, otherwise fail closed (a later sweep reclaims a
+%% genuine orphan). Epoch-based (stale manifest) findings need no check: a higher
+%% committed epoch only confirms the manifest is stale.
+-spec fresh_enough_to_delete(reason(), stream_id()) -> boolean().
+fresh_enough_to_delete(stale_epoch, _StreamId) ->
+    true;
+fresh_enough_to_delete(below_first_offset, StreamId) ->
+    case rabbitmq_stream_s3_db:get_consistent(StreamId) of
+        {ok, #{epoch := CommittedEpoch}} ->
+            CacheResult = rabbitmq_stream_s3_manifest_replica:get_manifest_and_epoch(StreamId),
+            case cache_at_committed_epoch(CacheResult, CommittedEpoch) of
+                true ->
+                    true;
+                false ->
+                    ?LOG_INFO(
+                        "GC: not deleting under stream ~ts: local manifest cache "
+                        "epoch ~p does not match the committed epoch ~p; a reset "
+                        "committed after the sweep snapshot and this node has not "
+                        "applied it. A later sweep reclaims a genuine orphan.",
+                        [StreamId, cache_epoch(CacheResult), CommittedEpoch]
+                    ),
+                    false
+            end;
+        {error, Reason} ->
+            ?LOG_INFO(
+                "GC: not deleting under stream ~ts: could not re-read the committed "
+                "epoch with quorum (~p); failing closed",
+                [StreamId, Reason]
+            ),
+            false
+    end.
+
+%% Pure decision for fresh_enough_to_delete/2: the cache must hold a manifest at
+%% exactly the committed epoch. A cache behind the committed epoch (the
+%% reset-after-snapshot window), a cache with no recorded epoch (a legacy
+%% put_manifest/2 entry), or no manifest at all all fail closed.
+-spec cache_at_committed_epoch(
+    {#manifest{}, osiris:epoch() | undefined} | undefined, osiris:epoch()
+) -> boolean().
+cache_at_committed_epoch({#manifest{}, CommittedEpoch}, CommittedEpoch) ->
+    true;
+cache_at_committed_epoch(_CacheResult, _CommittedEpoch) ->
+    false.
+
+-spec cache_epoch({#manifest{}, osiris:epoch() | undefined} | undefined) ->
+    osiris:epoch() | undefined.
+cache_epoch({#manifest{}, Epoch}) ->
+    Epoch;
+cache_epoch(undefined) ->
+    undefined.
 
 %% Re-validate an offset-based finding against the live manifest immediately
 %% before deleting it. The sweep's safety argument is that first_offset only
@@ -796,5 +873,31 @@ still_dangling_without_manifest_keeps_object_test_() ->
             },
             [?_assertNot(still_dangling(Finding))]
         end}.
+
+%% fresh_enough_to_delete/2 (see the moduledoc, guard 3): an offset-based finding
+%% is deletable only when the local manifest cache is at the committed epoch. A
+%% cache behind the committed epoch is the reset-after-snapshot window and must
+%% fail closed.
+cache_at_committed_epoch_matches_test() ->
+    ?assert(cache_at_committed_epoch({#manifest{first_offset = 100}, 7}, 7)).
+
+%% A cache behind the committed epoch (a reset committed after the sweep snapshot,
+%% sync not yet applied) fails closed.
+cache_at_committed_epoch_stale_test() ->
+    ?assertNot(cache_at_committed_epoch({#manifest{first_offset = 100}, 6}, 7)).
+
+%% A legacy put_manifest/2 entry has no recorded epoch: fail closed.
+cache_at_committed_epoch_undefined_epoch_test() ->
+    ?assertNot(cache_at_committed_epoch({#manifest{first_offset = 100}, undefined}, 7)).
+
+%% No manifest at all: fail closed.
+cache_at_committed_epoch_no_manifest_test() ->
+    ?assertNot(cache_at_committed_epoch(undefined, 7)).
+
+%% Stale-manifest (epoch-based) findings are not floor-based: a higher committed
+%% epoch only confirms staleness, so the freshness re-check is skipped and they
+%% remain deletable.
+fresh_enough_to_delete_stale_epoch_test() ->
+    ?assert(fresh_enough_to_delete(stale_epoch, <<"any-stream">>)).
 
 -endif.
