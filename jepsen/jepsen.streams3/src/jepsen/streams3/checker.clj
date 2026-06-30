@@ -101,6 +101,89 @@
          :keys-read   (count reads)
          :violations  (vec errs)}))))
 
+(defn replica-consistency-checker
+  "Asserts the per-node manifest-replica caches stay consistent under churn,
+  reading the snapshots db captured after the run quiesced (db/replica-floors,
+  the per-node cache; db/committed-offsets-snapshot, the committed-offset oracle).
+  Black-box analogue of the manifest-replica model's convergence, stale-floor and
+  NOLEAK properties. Three problems:
+
+    :replicas-diverged   - some stream's cached floor is not identical across the
+                           nodes that cache it. After the final settle and reads
+                           the caches must have converged on the floor; a lingering
+                           disagreement means a sync or edit was lost or applied
+                           out of order. The cached epoch is reported alongside for
+                           diagnosis but is NOT part of the equality: a deposed
+                           leader's cache legitimately keeps the older epoch on an
+                           idle stream until the next edit, and the plugin's GC
+                           explicitly tolerates a cache that lags the committed
+                           epoch (get_manifest_and_epoch/1), so an epoch lag is not
+                           a convergence violation.
+    :stale-floor-served  - the cross-node-agreed floor sits beyond the stream's
+                           committed offset (floor > committed + 1). The remote
+                           tier cannot start past committed data and retention is
+                           wide, so a floor ahead of the committed tail is a stale
+                           or corrupt cached floor. An empty stream reports a
+                           committed offset of -1, so its bound is 0.
+    :leaked-replica-row  - a cache row on a node that is NOT the stream's leader
+                           has no replica context registered. A replica row is
+                           created alongside a monitored osiris member, so a
+                           contextless one is a row a sync re-created after the
+                           member's DOWN released it, with no monitor to reclaim
+                           it. The leader's own row is written by the writer path
+                           (no replica context) and is legitimate, so the leader
+                           node is excluded to avoid a false positive.
+
+  Honesty note: convergence and the stale-floor bound are genuinely exercised by
+  the s3-outage / leader-move / partition faults. The leaked-row guard only fires
+  when an osiris member departs a node permanently mid-sync, which graceful
+  leader-move does not cause, so it ships as a cheap always-on guard, not
+  something the current faults reproduce. Reliably exercising it needs a hard-kill
+  / stream-churn nemesis (see jepsen/BACKLOG.md)."
+  []
+  (reify checker/Checker
+    (check [_ _test _history _opts]
+      (let [per-node  @db/replica-floors
+            committed @db/committed-offsets-snapshot
+            ;; stream key -> {node -> rec} over only the nodes that cache it.
+            by-stream (reduce-kv
+                        (fn [acc node kmap]
+                          (reduce-kv (fn [a k rec]
+                                       (if (:cached? rec)
+                                         (assoc-in a [k node] rec)
+                                         a))
+                                     acc kmap))
+                        {} per-node)
+            diverged  (for [[k node->rec] by-stream
+                            :let [floors (set (map (fn [[_ r]] (:floor r)) node->rec))]
+                            :when (> (count floors) 1)]
+                        {:key k
+                         :node->floor-epoch
+                         (into {} (map (fn [[n r]] [n [(:floor r) (:epoch r)]]) node->rec))})
+            ;; Only meaningful when the floor itself converged (a divergent floor
+            ;; is already reported above); compare that agreed floor to committed.
+            stale     (for [[k node->rec] by-stream
+                            :let [floors (set (map (fn [[_ r]] (:floor r)) node->rec))
+                                  agreed (when (= 1 (count floors)) (first floors))
+                                  c      (get committed k -1)]
+                            :when (and agreed (> agreed (inc c)))]
+                        {:key k :agreed-floor agreed :committed-offset c})
+            leaked    (for [[k node->rec] by-stream
+                            [node rec] node->rec
+                            :when (and (not (:leader? rec)) (not (:ctx? rec)))]
+                        {:key k :node node})
+            problems  (cond-> []
+                        (empty? per-node) (conj :no-replica-cache-collected)
+                        (seq diverged)    (conj :replicas-diverged)
+                        (seq stale)       (conj :stale-floor-served)
+                        (seq leaked)      (conj :leaked-replica-row))]
+        {:valid?            (empty? problems)
+         :problems          problems
+         :streams-cached    (count by-stream)
+         :diverged          (vec diverged)
+         :stale-floors      (vec stale)
+         :leaked-rows       (vec leaked)}))))
+
 (defn downgrade-when
   "Wraps a checker so that when (pred test) holds its result cannot invalidate
   the run: anomalies are kept for inspection but :valid? is forced true. Used for

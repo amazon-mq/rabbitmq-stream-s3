@@ -286,6 +286,64 @@
         ints (map parse-long (re-seq #"-?\d+" (str out)))]
     (into {} (map vec (partition 2 ints)))))
 
+;; For each jepsen-<k> stream, this node's view of the manifest-replica cache
+;; (ETS table rabbitmq_stream_s3_manifest_cache, rows {StreamId, Manifest, Epoch})
+;; plus the stream's cluster-global leader. Per stream we emit six integers:
+;;   {K, Cached, Floor, Epoch, Ctx, IsLeader}
+;; where
+;;   * Cached   1 if this node holds a cache row for the stream, else 0
+;;   * Floor    the cached manifest's first_offset (the remote-tier floor), read
+;;              via get_range/1 whose first element IS the manifest first_offset;
+;;              0 for an empty (entries = <<>>) cached manifest, -1 if not cached
+;;   * Epoch    the writer epoch the row was stored at (-1 if cached without one)
+;;   * Ctx      1 if a replica context (a monitored osiris member) is registered
+;;              on this node for the stream, else 0
+;;   * IsLeader 1 if this node is the stream's current leader, else 0
+;; The leader's own cache row is written by the writer path (put_manifest), not by
+;; a monitored replica context, so it legitimately has Ctx = 0; IsLeader lets the
+;; checker exclude it from the leaked-row test. All-integer output so it parses the
+;; same way as committed-offsets-eval.
+(def ^:private replica-cache-eval
+  (str "Qs = [Q || Q <- rabbit_amqqueue:list(<<\"/\">>), "
+       "begin N = element(4, amqqueue:get_name(Q)), "
+       "byte_size(N) >= 8 andalso binary:part(N, 0, 7) =:= <<\"jepsen-\">> end], "
+       "Mod = rabbitmq_stream_s3_manifest_replica, Self = node(), "
+       "[begin "
+       "Name = element(4, amqqueue:get_name(Q)), "
+       "K = binary_to_integer(binary:part(Name, 7, byte_size(Name) - 7)), "
+       "TS = amqqueue:get_type_state(Q), "
+       ;; The stream_id is the manifest cache's ETS key, a binary; type_state
+       ;; carries it as a char list, so coerce it or every lookup misses.
+       "SId = iolist_to_binary(maps:get(name, TS)), "
+       "IsLeader = case maps:get(leader_node, TS, undefined) of Self -> 1; _ -> 0 end, "
+       "{Cached, Floor, Epoch, Ctx} = "
+       "case catch Mod:get_manifest_and_epoch(SId) of "
+       "{_M, E} -> "
+       "Fl = case catch Mod:get_range(SId) of {Fst, _} -> Fst; _ -> 0 end, "
+       "Ep = case E of Ei when is_integer(Ei) -> Ei; _ -> -1 end, "
+       "Cx = case catch Mod:is_context_registered(SId) of true -> 1; _ -> 0 end, "
+       "{1, Fl, Ep, Cx}; "
+       "_ -> {0, -1, -1, 0} "
+       "end, "
+       "{K, Cached, Floor, Epoch, Ctx, IsLeader} "
+       "end || Q <- Qs]."))
+
+(defn replica-cache
+  "Returns {key -> {:cached? :floor :epoch :ctx? :leader?}} describing the
+  manifest-replica cache state on `node` for each jepsen stream, where :leader?
+  is whether `node` is the stream's current leader (a cluster-global fact). Runs
+  in an SSH context."
+  [node]
+  (let [out  (try (rabbitmqctl-eval node replica-cache-eval) (catch Exception _ ""))
+        ints (map parse-long (re-seq #"-?\d+" (str out)))]
+    (into {}
+          (for [[k cached floor epoch ctx leader] (partition 6 ints)]
+            [k {:cached? (= 1 cached)
+                :floor   floor
+                :epoch   epoch
+                :ctx?    (= 1 ctx)
+                :leader? (= 1 leader)}]))))
+
 ;; Cluster-wide S3 counter sums for the run, accumulated across nodes in
 ;; log-files (which runs after the workload but before the checker, while the
 ;; brokers are still up). The coverage checker reads this. Collecting it here
@@ -301,6 +359,23 @@
          (fn [acc]
            (-> (merge-with + acc (scrape-tiering-metrics node))
                (update "max_epoch" (fnil max 0) (scrape-max-epoch node))))))
+
+;; Per-node manifest-replica cache snapshots for the run, captured in log-files
+;; (brokers still up) alongside record-tiering-stats!. node -> {key -> {:cached?
+;; :floor :epoch :ctx? :leader?}}. The replica-consistency checker reads this to
+;; assert the caches converged and served no stale floor or leaked row.
+(defonce replica-floors (atom {}))
+
+;; The committed offset of each jepsen stream at the end of the run (the same
+;; scrape capture-authoritative-reads! uses), captured once on the primary in
+;; log-files. The replica-consistency checker reads this as the oracle for the
+;; stale-floor test. key -> committed offset (-1 for an empty stream).
+(defonce committed-offsets-snapshot (atom {}))
+
+(defn record-replica-cache!
+  "Stores `node`'s manifest-replica cache snapshot into the shared per-run map."
+  [node]
+  (swap! replica-floors assoc node (replica-cache node)))
 
 (defn start! [test node]
   (info node "starting broker")
@@ -354,6 +429,8 @@
       ;; one JVM does not carry stale stream declarations or publishingId
       ;; counters against a freshly-wiped cluster). Idempotent across nodes.
       (reset! tiering-stats {})
+      (reset! replica-floors {})
+      (reset! committed-offsets-snapshot {})
       (reset! sc/authoritative-reads {})
       (sc/reset-run-state!)
       (install! test node)
@@ -374,13 +451,21 @@
       ;; Scrape this node's S3 counters into the run totals (brokers are still
       ;; up here, before teardown) so the coverage checker can read them.
       (util/meh (record-tiering-stats! node))
+      ;; Snapshot this node's manifest-replica cache (floor, epoch, context and
+      ;; leadership per jepsen stream) for the replica-consistency checker, while
+      ;; the brokers are still up.
+      (util/meh (record-replica-cache! node))
       ;; Authoritatively read every jepsen stream end-to-end for the durability
       ;; checker, once (on the primary), while the brokers are still up. The read
       ;; waits for each consumer to reach the stream's committed offset, so query
       ;; those (over SSH) and hand them to the read (which uses the Stream client
-      ;; over a fresh Environment, no SSH context).
+      ;; over a fresh Environment, no SSH context). The same committed offsets are
+      ;; the replica-consistency checker's stale-floor oracle, so snapshot them.
       (when (= node (first (:nodes test)))
-        (util/meh (sc/capture-authoritative-reads! test (committed-offsets node))))
+        (util/meh
+          (let [co (committed-offsets node)]
+            (reset! committed-offsets-snapshot co)
+            (sc/capture-authoritative-reads! test co))))
       ;; Broker logs + the S3 plugin's status output for post-mortem.
       (util/meh
         (rabbitmqctl node :stream_s3_status

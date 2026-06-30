@@ -70,7 +70,10 @@
                      :durability (s3-checker/durability-checker)
                      ;; Fails the run unless S3 was actually exercised, so a
                      ;; green result can't silently stop using the remote tier.
-                     :tiering  (s3-checker/tiering-checker)})
+                     :tiering  (s3-checker/tiering-checker)
+                     ;; Asserts the per-node manifest-replica caches converge and
+                     ;; serve no stale floor or leaked (contextless) row.
+                     :replica  (s3-checker/replica-consistency-checker)})
        :generator (gen/phases
                     ;; Main phase: workload ops + faults for the time limit.
                     (->> (:generator wl)
