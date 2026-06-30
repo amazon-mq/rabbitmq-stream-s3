@@ -576,6 +576,24 @@ handle_info({persist_result, Gen, Result}, #state{tasks = Tasks0} = State0) ->
         {persist_result, Gen, Result}, Tasks0
     ),
     apply_persist_decisions(Decisions, PersistedBytes, State0#state{tasks = Tasks});
+handle_info({anchor_write_result, ok}, #state{core = Core0} = State0) ->
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:anchor_write_complete(Core0),
+    {noreply, execute_effects(Effects, State0#state{core = Core})};
+handle_info(
+    {anchor_write_result, {error, Reason}},
+    #state{cfg = #cfg{stream = StreamId}} = State
+) ->
+    Delay = rabbitmq_stream_s3_config:upload_retry_delay_ms(),
+    ?LOG_WARNING(
+        "~ts anchor write failed (~p); retrying in ~bms. Fragment uploads are "
+        "held until the anchor is durable.",
+        [StreamId, Reason, Delay]
+    ),
+    erlang:send_after(Delay, self(), retry_anchor_write),
+    {noreply, State};
+handle_info(retry_anchor_write, #state{core = Core0} = State0) ->
+    {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:anchor_write_failed(Core0),
+    {noreply, execute_effects(Effects, State0#state{core = Core})};
 handle_info({'DOWN', Mon, process, _Pid, Reason}, State) ->
     %% A monitored async task crashed. Its 'DOWN' carries the monitor ref, which
     %% identifies the family (and, via the model's slot, its generation): a crash
@@ -925,6 +943,23 @@ execute_effects([Effect | Rest], State0) ->
     State = execute_effect(Effect, State0),
     execute_effects(Rest, State).
 
+execute_effect({write_anchor, StreamId, Reference}, State) ->
+    %% Write the per-stream anchor asynchronously, then feed the result back into
+    %% the core. The core holds the fragments' submit_transfer effects until
+    %% anchor_write_complete is fed in, so the anchor commits before the first
+    %% fragment PUT. The spawned process always reports a result (failures included)
+    %% so the core is never left waiting.
+    Self = self(),
+    _ = spawn(fun() ->
+        Result =
+            try
+                rabbitmq_stream_s3_db:put_anchor(StreamId, Reference)
+            catch
+                Class:Reason -> {error, {Class, Reason}}
+            end,
+        Self ! {anchor_write_result, Result}
+    end),
+    State;
 execute_effect({submit_transfer, Ref, _StreamId, Dir, Meta}, #state{cfg = Cfg} = State0) ->
     StreamId = Cfg#cfg.stream,
     submit_upload(Ref, Dir, StreamId, Meta),
