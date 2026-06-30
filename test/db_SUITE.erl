@@ -19,7 +19,9 @@ all() ->
         update_with_correct_revision,
         conflict_on_stale_revision,
         epoch_fencing,
-        keep_while_deletes_on_queue_removal
+        keep_while_deletes_on_queue_removal,
+        put_anchor_present_and_absent,
+        anchor_removed_on_queue_removal
     ].
 
 init_per_suite(Config) ->
@@ -92,3 +94,33 @@ keep_while_deletes_on_queue_removal(_Config) ->
     %% Delete the queue node. Khepri should automatically remove our entry.
     ok = khepri:delete(rabbitmq_metadata, rabbitmq_stream_s3_db:queue_path(QueueRef)),
     ?awaitMatch({error, not_found}, rabbitmq_stream_s3_db:get(StreamId), 1000).
+
+put_anchor_present_and_absent(_Config) ->
+    StreamId = <<"db_suite_anchor">>,
+    %% No anchor yet.
+    ?assertEqual({ok, false}, rabbitmq_stream_s3_db:anchor_exists_consistent(StreamId)),
+    ok = rabbitmq_stream_s3_db:put_anchor(StreamId, StreamId),
+    ?assertEqual({ok, true}, rabbitmq_stream_s3_db:anchor_exists_consistent(StreamId)),
+    %% An unrelated stream still has no anchor.
+    ?assertEqual(
+        {ok, false}, rabbitmq_stream_s3_db:anchor_exists_consistent(<<"db_suite_anchor_other">>)
+    ).
+
+%% A never-committed stream (anchor written, no manifest pointer) is still cleaned
+%% up when its queue is removed: the keep_while on the container removes the whole
+%% subtree, anchor included. This is the window the anchor closes.
+anchor_removed_on_queue_removal(_Config) ->
+    StreamId = <<"db_suite_anchor_kw">>,
+    QueueRef = #resource{
+        virtual_host = <<"/">>, kind = queue, name = <<"test-queue-anchor-kw">>
+    },
+    ok = khepri:put(rabbitmq_metadata, rabbitmq_stream_s3_db:queue_path(QueueRef), queue_exists),
+    ok = rabbitmq_stream_s3_db:put_anchor(StreamId, QueueRef),
+    ?assertEqual({ok, true}, rabbitmq_stream_s3_db:anchor_exists_consistent(StreamId)),
+    %% Never committed: the anchor exists but there is no manifest pointer.
+    ?assertEqual({error, not_found}, rabbitmq_stream_s3_db:get(StreamId)),
+    %% Removing the queue removes the container subtree and the anchor with it.
+    ok = khepri:delete(rabbitmq_metadata, rabbitmq_stream_s3_db:queue_path(QueueRef)),
+    ?awaitMatch(
+        {ok, false}, rabbitmq_stream_s3_db:anchor_exists_consistent(StreamId), 1000
+    ).
