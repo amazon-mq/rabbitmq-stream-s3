@@ -80,12 +80,18 @@
                               lost    (sort (remove present vs))
                               dups    (->> vals frequencies
                                            (keep (fn [[v c]] (when (> c 1) v)))
-                                           sort)]
+                                           sort)
+                              ;; Offsets each duplicated value sits at, so we can
+                              ;; tell a real stream duplicate (distinct offsets)
+                              ;; from a read redelivery (the same offset twice).
+                              dup-offsets (into {}
+                                                (for [v dups]
+                                                  [v (mapv first (filter #(= (second %) v) pairs))]))]
                         :when (or (nil? pairs) (seq lost) (seq dups))]
                     (cond-> {:key k}
                       (nil? pairs) (assoc :not-read true)
                       (seq lost)   (assoc :lost lost)
-                      (seq dups)   (assoc :duplicated dups)))
+                      (seq dups)   (assoc :duplicated dups :duplicate-offsets dup-offsets)))
             problems (cond-> []
                        (empty? reads) (conj :no-authoritative-reads)
                        (seq errs)     (conj :acked-writes-lost-or-duplicated))]
