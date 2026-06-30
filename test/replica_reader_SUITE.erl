@@ -44,6 +44,7 @@ have a way to form a barrier. To assert the results of retention we use the
     start_replica_reader/3,
     flush_writer/1,
     seed_log/2,
+    build_manifest/1,
     await_offset/2,
     list_fragment_offsets/1,
     list_segment_offsets/1,
@@ -69,6 +70,7 @@ groups() ->
             fragment_spans_segment_boundary,
             range_advances_monotonically,
             retention_reclaims_uploaded_segments,
+            sync_triggers_local_retention_on_idle_replica,
             message_count_reflects_remote_tier,
             resumes_after_restart,
             lost_transfer_result_recovered_by_deadline,
@@ -421,6 +423,54 @@ retention_reclaims_uploaded_segments(Config) ->
 
     %% Retention will eventually reclaim everything but the current segment.
     ?awaitMatch([_], list_segment_offsets(Config), 1_000).
+
+sync_triggers_local_retention_on_idle_replica(Config) ->
+    %% #75 (replica node, the scenario the issue describes). A replica that was
+    %% offline, rejoins and receives a full manifest sync, then sees its stream
+    %% go idle, must reclaim the local segments already durable in the remote
+    %% tier. On a replica, retention is otherwise only driven by edits that
+    %% advance next_offset; a sync establishes the manifest wholesale and so
+    %% never triggered retention before this fix.
+    StreamId = ?config(stream_id, Config),
+
+    %% Seed a real multi-segment local log: three older segments plus an active
+    %% one. seed_log writes directly to disk, bypassing the writer.
+    #{next_offset := NextOffset} = seed_log(Config, [
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]},
+        {segment, [{chunk, #{records => 5, size => 600}}]}
+    ]),
+    ?assert(length(list_segment_offsets(Config)) > 1),
+
+    %% Register a replica context for this stream pointing at the seeded log,
+    %% as the acceptor hook does on a replica node.
+    WriterCfg = ?config(writer_cfg, Config),
+    OsirisDir = ?config(osiris_dir, Config),
+    Dir = filename:join(OsirisDir, maps:get(name, WriterCfg)),
+    Shared = osiris_log_shared:new(),
+    Counter = counters:new(5, []),
+    Member = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    ok = rabbitmq_stream_s3_manifest_replica:register_replica_context(
+        StreamId, Member, Dir, Shared, Counter
+    ),
+
+    %% Build a manifest covering all the seeded data (next_offset = end of log)
+    %% and sync it, as a writer would to a rejoining replica. No edits follow.
+    {Manifest, _} = build_manifest([
+        {fragment, #{offset => 0, size => 1000}}
+    ]),
+    Covering = Manifest#manifest{next_offset = NextOffset},
+    ok = rabbitmq_stream_s3_manifest_replica:sync(StreamId, 0, 1, Covering),
+
+    %% The sync alone (no edits, no new writes) reclaims the older local
+    %% segments: only the active segment remains.
+    ?awaitMatch([_], list_segment_offsets(Config), 5000),
+    exit(Member, kill).
 
 message_count_reflects_remote_tier(Config) ->
     StreamId = ?config(stream_id, Config),

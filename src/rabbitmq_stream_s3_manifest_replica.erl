@@ -491,8 +491,36 @@ maybe_apply_sync(StreamId, Seq, Epoch, Manifest, WriterNode, Seqs, Ctxs) ->
         false ->
             write_manifest(StreamId, Manifest, Epoch),
             seed_first_offset_counter(StreamId, Manifest, Ctxs),
+            %% Evaluate local retention once against the freshly synced manifest.
+            %% On a replica, retention is otherwise only driven by edits that
+            %% advance next_offset; a replica that was offline (an upgrade, say),
+            %% receives a full sync on rejoin, and whose stream then stops
+            %% publishing would never reclaim the local segments already durable
+            %% in the remote tier. This one-shot pass reclaims them. It is a no-op
+            %% for an empty manifest or a stream with no registered context here
+            %% (issue #75).
+            maybe_evaluate_retention_on_sync(StreamId, Manifest, Ctxs),
             Seqs#{StreamId => {Seq, Epoch, WriterNode}}
     end.
+
+%% Run local retention against a just-synced manifest, guarding on the same
+%% conditions run_local_retention requires: a registered replica context on this
+%% node and a non-empty manifest (next_offset > 0, so the first_timestamp
+%% sentinel never reaches the counters). Unlike the edit-driven
+%% maybe_evaluate_retention/4 this does not require next_offset to have advanced,
+%% because a sync establishes the manifest wholesale rather than moving it
+%% forward.
+maybe_evaluate_retention_on_sync(StreamId, #manifest{next_offset = Next} = Manifest, Ctxs) when
+    Next > 0
+->
+    case maps:get(StreamId, Ctxs, undefined) of
+        #replica_ctx{} = Ctx ->
+            run_local_retention(StreamId, Manifest, Ctx);
+        undefined ->
+            ok
+    end;
+maybe_evaluate_retention_on_sync(_StreamId, #manifest{}, _Ctxs) ->
+    ok.
 
 %% A sync is stale only when an entry is already recorded and the incoming
 %% (epoch, seq) is strictly older. Epoch dominates sequence so a higher epoch is

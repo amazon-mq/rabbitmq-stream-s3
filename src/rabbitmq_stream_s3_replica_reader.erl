@@ -2256,6 +2256,16 @@ on_manifest_resolved(
     counters:put(Cnt, ?C_OSIRIS_LOG_FIRST_OFFSET, min(LocalFirst, ManifestFirst)),
     LocalFirstTs = counters:get(Cnt, ?C_OSIRIS_LOG_FIRST_TIMESTAMP),
     counters:put(Cnt, ?C_OSIRIS_LOG_FIRST_TIMESTAMP, min(LocalFirstTs, ManifestFirstTs)),
+    %% Evaluate local retention once against the just-resolved manifest. Local
+    %% retention is otherwise only triggered by a persist (which a new publish
+    %% drives), so a stream that resolves a non-empty manifest and then stays
+    %% idle - for example a replica that was offline for an upgrade, caught up
+    %% from the writer, and whose stream then stopped publishing - would never
+    %% reclaim the local segments already durable in the remote tier. This
+    %% one-shot pass reclaims them. It only deletes segments fully below the
+    %% manifest's next_offset, which is where the reader opens, so it cannot
+    %% trim data the reader is about to read (issue #75).
+    maybe_evaluate_retention(Manifest, State),
     State.
 
 on_remote_retention_deleted(Refs, StreamId, State) ->
