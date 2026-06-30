@@ -36,6 +36,7 @@ all() ->
         transfer_failed_retriable_resubmits,
         transfer_failed_status_map_retriable_resubmits,
         transfer_failed_fatal_retries_no_gap,
+        transfer_failed_attempt_counter_escalates_and_resets,
         fatal_failure_does_not_drain_subsequent,
         fatal_failure_retry_then_complete_no_gap,
         fatal_failure_mid_sequence,
@@ -309,7 +310,7 @@ transfer_failed_retriable_resubmits(_Config) ->
     %% slow_down is the S3 API layer's term for a 503 (the real shape; the old
     %% {http, 503} term was never constructed by any code).
     {_S2, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(Ref, slow_down, S1),
-    ?assertMatch([{resubmit_transfer, Ref, _, _, _}], Effects).
+    ?assertMatch([{resubmit_transfer, Ref, _, _, _, 1}], Effects).
 
 transfer_failed_status_map_retriable_resubmits(_Config) ->
     %% A non-special-cased transient status arrives as #{status => _}; a 5xx
@@ -319,7 +320,7 @@ transfer_failed_status_map_retriable_resubmits(_Config) ->
     {_S2, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(
         Ref, #{status => 504, headers => []}, S1
     ),
-    ?assertMatch([{resubmit_transfer, Ref, _, _, _}], Effects).
+    ?assertMatch([{resubmit_transfer, Ref, _, _, _, 1}], Effects).
 
 transfer_failed_fatal_retries_no_gap(_Config) ->
     %% A non-transient upload failure must NOT advance the manifest. The
@@ -331,13 +332,32 @@ transfer_failed_fatal_retries_no_gap(_Config) ->
         Ref, checksum_mismatch, S1
     ),
     ?assertMatch(
-        [{resubmit_transfer_delayed, Ref, _, _, _, checksum_mismatch}], Effects
+        [{resubmit_transfer_delayed, Ref, _, _, _, checksum_mismatch, 1}], Effects
     ),
     %% The manifest must not have advanced.
     ?assertEqual(0, manifest_next_offset(S2)),
     %% A subsequent successful retry of the same fragment applies it.
     {S3, _} = rabbitmq_stream_s3_replica_reader_core:transfer_complete(Ref, 1001, S2),
     ?assertEqual(100, manifest_next_offset(S3)).
+
+transfer_failed_attempt_counter_escalates_and_resets(_Config) ->
+    %% The per-fragment attempt counter increments across consecutive failures
+    %% (so the shell can back off), and resets once the fragment is durable.
+    {S0, _} = init_core(),
+    {S1, Ref, _} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(0, 100), S0),
+    {S2, Effects1} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(Ref, slow_down, S1),
+    ?assertMatch([{resubmit_transfer, Ref, _, _, _, 1}], Effects1),
+    {S3, Effects2} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(Ref, slow_down, S2),
+    ?assertMatch([{resubmit_transfer, Ref, _, _, _, 2}], Effects2),
+    {S4, Effects3} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(Ref, slow_down, S3),
+    ?assertMatch([{resubmit_transfer, Ref, _, _, _, 3}], Effects3),
+    %% Once the fragment succeeds and drains, its attempt history is cleared. A
+    %% subsequent fragment's first failure therefore starts again at attempt 1,
+    %% confirming the counter does not leak across fragments.
+    {S5, _} = rabbitmq_stream_s3_replica_reader_core:transfer_complete(Ref, 1001, S4),
+    {S6, Ref2, _} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(100, 200), S5),
+    {_S7, Effects4} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(Ref2, slow_down, S6),
+    ?assertMatch([{resubmit_transfer, Ref2, _, _, _, 1}], Effects4).
 
 fatal_failure_does_not_drain_subsequent(_Config) ->
     %% The previously buggy behavior: dropping a fatally-failed fragment and
@@ -372,7 +392,7 @@ fatal_failure_retry_then_complete_no_gap(_Config) ->
     {S5, BEffects} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(
         RefB, {open_failed, "seg", enoent}, S4
     ),
-    ?assertMatch([{resubmit_transfer_delayed, RefB, _, _, _, _}], BEffects),
+    ?assertMatch([{resubmit_transfer_delayed, RefB, _, _, _, _, _}], BEffects),
     ?assertEqual(100, manifest_next_offset(S5)),
     %% C completes but is buffered behind B; still no advance.
     {S6, _} = rabbitmq_stream_s3_replica_reader_core:transfer_complete(RefC, 3003, S5),
@@ -562,7 +582,7 @@ fatal_failure_mid_sequence(_Config) ->
     ?assertEqual(100, manifest_next_offset(S7)),
     %% Fragment 2 fails fatally. 3 and 4 must NOT drain.
     {S8, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(Ref2, enoent, S7),
-    ?assertMatch([{resubmit_transfer_delayed, Ref2, _, _, _, enoent}], Effects),
+    ?assertMatch([{resubmit_transfer_delayed, Ref2, _, _, _, enoent, _}], Effects),
     ?assertEqual(100, manifest_next_offset(S8)),
     %% Fragment 2's retry succeeds. Now 2, 3 and 4 drain to 400.
     {S9, _} = rabbitmq_stream_s3_replica_reader_core:transfer_complete(Ref2, 1002, S8),
@@ -609,7 +629,7 @@ fatal_only_transfer_retries_keeps_queue(_Config) ->
     {S0, _} = init_core(#{persist_threshold => 10}),
     {S1, Ref, _} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(0, 100), S0),
     {S2, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(Ref, enoent, S1),
-    ?assertMatch([{resubmit_transfer_delayed, Ref, _, _, _, enoent}], Effects),
+    ?assertMatch([{resubmit_transfer_delayed, Ref, _, _, _, enoent, _}], Effects),
     ?assertEqual(0, manifest_next_offset(S2)),
     %% The retry of the same fragment eventually succeeds and applies.
     {S3, _} = rabbitmq_stream_s3_replica_reader_core:transfer_complete(Ref, 1001, S2),

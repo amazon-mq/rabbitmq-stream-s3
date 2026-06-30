@@ -74,7 +74,11 @@ testable without mocks or timing.
     %% Whether a retention evaluation is currently in flight (async group download).
     retention_in_flight = false :: boolean(),
     %% All edits (appends, rebalance, retention) since last persist, in order.
-    edits_since_persist = [] :: [#edit{}]
+    edits_since_persist = [] :: [#edit{}],
+    %% Consecutive failed upload attempts per in-flight transfer, keyed by Ref.
+    %% Incremented on each transfer_failed and used to drive the resubmit
+    %% backoff; cleared when the transfer is drained (success) or on reinit.
+    transfer_attempts = #{} :: #{reference() => pos_integer()}
 }).
 
 -opaque state() :: #state{}.
@@ -94,8 +98,10 @@ testable without mocks or timing.
     | {reply_waiters, [{gen_server:from(), ok}]}
     | {start_persist_timer, non_neg_integer()}
     | cancel_persist_timer
-    | {resubmit_transfer, reference(), stream_id(), directory(), fragment_meta()}
-    | {resubmit_transfer_delayed, reference(), stream_id(), directory(), fragment_meta(), term()}
+    | {resubmit_transfer, reference(), stream_id(), directory(), fragment_meta(),
+        Attempt :: pos_integer()}
+    | {resubmit_transfer_delayed, reference(), stream_id(), directory(), fragment_meta(),
+        Reason :: term(), Attempt :: pos_integer()}
     | reinitialize
     %% Stop the reader: the stream's metadata node was deleted, so there is
     %% nothing left to persist to.
@@ -230,12 +236,18 @@ transfer_complete(Ref, Uid, #state{pending_completions = PC} = State0) ->
     drain_completions(State1).
 
 -spec transfer_failed(reference(), term(), state()) -> {state(), [core_effect()]}.
-transfer_failed(Ref, Reason, #state{cfg = Cfg} = State) ->
-    Meta = get_meta(Ref, State),
+transfer_failed(Ref, Reason, #state{cfg = Cfg, transfer_attempts = Attempts} = State0) ->
+    Meta = get_meta(Ref, State0),
+    %% Count this failure as the Nth consecutive attempt for the fragment. The
+    %% count survives resubmits (Ref is stable) and drives the backoff; it is
+    %% cleared when the fragment is drained on success, or on reinit.
+    Attempt = maps:get(Ref, Attempts, 0) + 1,
+    State = State0#state{transfer_attempts = Attempts#{Ref => Attempt}},
     case is_retriable(Reason) of
         true ->
-            %% Transient error. Retry immediately.
-            {State, [{resubmit_transfer, Ref, Cfg#cfg.stream, Cfg#cfg.dir, Meta}]};
+            %% Transient error. Retry with a (jittered) backoff applied by the
+            %% shell from the attempt count.
+            {State, [{resubmit_transfer, Ref, Cfg#cfg.stream, Cfg#cfg.dir, Meta, Attempt}]};
         false ->
             %% A confirmed fragment must never be abandoned. Dropping it would
             %% let drain_completions advance next_offset over the subsequent
@@ -246,7 +258,9 @@ transfer_failed(Ref, Reason, #state{cfg = Cfg} = State) ->
             %% in the middle of the stream (see issue #206). Instead, keep the
             %% fragment at its place in the queue and retry it with a backoff
             %% delay, stalling the pipeline until it is durable.
-            {State, [{resubmit_transfer_delayed, Ref, Cfg#cfg.stream, Cfg#cfg.dir, Meta, Reason}]}
+            {State, [
+                {resubmit_transfer_delayed, Ref, Cfg#cfg.stream, Cfg#cfg.dir, Meta, Reason, Attempt}
+            ]}
     end.
 
 -spec persist_complete(rabbitmq_stream_s3_db:revision(), state()) -> {state(), [core_effect()]}.
@@ -524,7 +538,10 @@ drain_completions(#state{in_flight = Q, pending_completions = PC} = State0) ->
                     State1 = apply_fragment(Uid, Meta, State0),
                     State2 = State1#state{
                         in_flight = queue:drop(State1#state.in_flight),
-                        pending_completions = maps:remove(Ref, State1#state.pending_completions)
+                        pending_completions = maps:remove(Ref, State1#state.pending_completions),
+                        %% The fragment is durable; forget its retry history so a
+                        %% later transfer reusing this Ref starts at attempt 1.
+                        transfer_attempts = maps:remove(Ref, State1#state.transfer_attempts)
                     },
                     %% Continue draining contiguous completions.
                     {State3, Effects} = drain_completions(State2),
