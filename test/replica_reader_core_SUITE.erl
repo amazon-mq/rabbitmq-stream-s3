@@ -91,7 +91,9 @@ all() ->
         anchor_holds_multiple_then_releases_in_order,
         anchor_failed_reemits_write_anchor_keeps_holding,
         anchor_done_cuts_submit_normally,
-        no_submit_transfer_before_anchor_complete
+        no_submit_transfer_before_anchor_complete,
+        anchor_pending_for_empty_manifest,
+        anchor_done_for_non_empty_manifest
     ].
 
 init_per_suite(Config) -> Config.
@@ -1616,6 +1618,38 @@ no_submit_transfer_before_anchor_complete(_Config) ->
 
 submit_refs(Effects) ->
     [Ref || {submit_transfer, Ref, _Stream, _Dir, _Meta} <- Effects].
+
+%% A brand-new stream (empty resolved manifest) starts pending: the first fragment
+%% requests the anchor and holds the upload.
+anchor_pending_for_empty_manifest(_Config) ->
+    {S0, _} = rabbitmq_stream_s3_replica_reader_core:init(#manifest{}, base_opts()),
+    {_S1, _Ref, Effects} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(0, 100), S0),
+    ?assertMatch([{write_anchor, _, _} | _], Effects),
+    ?assertEqual([], submit_refs(Effects)).
+
+%% A reader resuming an established stream (non-empty resolved manifest) starts
+%% done: the anchor already exists, so the first fragment submits immediately with
+%% no write_anchor and no hold. This keeps the restart path off the Khepri round-trip.
+anchor_done_for_non_empty_manifest(_Config) ->
+    Entry = ?ENTRY(0, 0, 0, ?MANIFEST_KIND_FRAGMENT, 1000, 1),
+    NonEmpty = #manifest{entries = Entry, first_offset = 0, next_offset = 1},
+    {S0, _} = rabbitmq_stream_s3_replica_reader_core:init(NonEmpty, base_opts()),
+    {_S1, Ref, Effects} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(1, 100), S0),
+    ?assertMatch([{submit_transfer, Ref, _, _, _} | _], Effects),
+    ?assertEqual([], [E || {write_anchor, _, _} = E <- Effects]).
+
+%% Base init opts WITHOUT an anchor override, so init derives the anchor state
+%% from the manifest.
+base_opts() ->
+    #{
+        stream => <<"stream">>,
+        dir => <<"/dir">>,
+        epoch => 1,
+        reference => test_ref,
+        persist_threshold => 5,
+        persist_interval_ms => 2000,
+        rebalance_threshold => 1024
+    }.
 
 %% ------------------------------------------------------------------
 %% Helpers

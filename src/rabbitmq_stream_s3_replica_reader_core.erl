@@ -155,11 +155,20 @@ init(Manifest, Opts) ->
         last_persisted_manifest = Manifest,
         persisting_manifest = undefined,
         waiters = [],
-        %% Defaults to `pending`: the anchor is written before the first fragment.
-        %% Tests that exercise the steady-state pipeline pass `done`.
-        anchor = maps:get(anchor, Opts, pending)
+        %% A non-empty resolved manifest witnesses that a fragment was already
+        %% tiered, so the anchor already exists (it precedes the first fragment):
+        %% start `done` and skip re-writing it, e.g. on a reader restart. Only a
+        %% brand-new stream (empty manifest) starts `pending` and writes the anchor
+        %% on its genuine first fragment. Tests may override.
+        anchor = maps:get(anchor, Opts, initial_anchor(Manifest))
     },
     {State, []}.
+
+%% The anchor already exists iff the stream has already tiered a fragment, which a
+%% non-empty manifest witnesses. A re-write would be idempotent but adds a Khepri
+%% round-trip to the restart path, so skip it when the manifest already has data.
+initial_anchor(#manifest{entries = <<>>}) -> pending;
+initial_anchor(#manifest{}) -> done.
 
 -spec manifest(state()) -> #manifest{}.
 manifest(#state{manifest = Manifest}) ->
