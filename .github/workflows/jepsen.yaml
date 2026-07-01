@@ -78,7 +78,7 @@ jobs:
         # coverage at a controlled point). Shallow-fetch the SHA directly so the
         # checkout keeps working once the branch tip has moved past the pin.
         env:
-          RMQ_SERVER_SHA: 91051d3c678faa6cc68a75d6b561ceca05e12025
+          RMQ_SERVER_SHA: 2f3527a84b549aa922693a96c1b6e7dc951caebe
         run: |
           git init -q "${{ github.workspace }}/rabbitmq-server"
           git -C "${{ github.workspace }}/rabbitmq-server" remote add origin \
