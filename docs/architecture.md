@@ -155,7 +155,7 @@ Each stream on the writer node has exactly one replica reader. Its lifecycle:
 2. **Resolve manifest.** Fetches the current manifest state to determine where to resume uploading. If S3 is unreachable, retries with backoff. The writer is unaffected.
 3. **Open data reader.** Calls `osiris_writer:init_data_reader/3` starting at the manifest's `next_offset`.
 4. **Drain loop.** On each `{osiris_offset, ...}` notification, reads committed chunk headers via `osiris_log:read_header/1`. Accumulates metadata in the fragment assembly.
-5. **Cut.** When the assembly reaches the size target (default 64 MiB), the fragment is sealed. The core assigns a reference and returns a `{submit_transfer, ...}` effect.
+5. **Cut.** When the assembly reaches the size target (default 64 MiB), the fragment is sealed. The core assigns a reference and returns a `{submit_transfer, ...}` effect. On a brand-new stream the very first cut instead returns a `{write_anchor, ...}` effect and holds the fragment's submit: the shell writes the per-stream anchor to Khepri, and the core releases the held submits only once the anchor is durable, so no S3 object can exist under a prefix whose anchor is absent (this is what makes deleted-stream GC safe; see [operations.md](./operations.md#safety-guarantee-the-anchor)). A reader resuming an established stream already has the anchor and skips this step.
 6. **Submit.** The shell submits the transfer to the governor. The drain loop continues immediately without waiting for the upload to complete.
 7. **Transfer complete.** The governor reports completion. The core applies the completion in cut order (buffering out-of-order arrivals). When a contiguous prefix of completions is ready, they are applied to the in-memory manifest.
 8. **Durable persist.** When the persist threshold is reached (N fragments applied, or timer fires), the shell spawns a task that PUTs the manifest root to S3 and writes to Khepri (optimistic lock).
@@ -176,13 +176,13 @@ When the rate is configured as `unlimited` (the default), the governor imposes n
 
 When a stream queue is deleted:
 1. RabbitMQ removes the queue from `rabbit_db_queue` in Khepri.
-2. The plugin's keep-while condition on its Khepri entry fires, removing the entry.
+2. The plugin's keep-while condition on the per-stream container node fires, removing the container and the subtree below it (the manifest pointer and the anchor).
 3. The stored procedure `handle_queue_deletion` runs, calling `rabbitmq_stream_s3_reaper:delete_stream(StreamId)`.
 4. The reaper spawns a short-lived task that pages through `rabbitmq_stream_s3_api:list/2` on the stream's prefix.
 5. Each page of keys is sent back to the reaper as a delete cast.
 6. The reaper batches keys (up to 1000) and calls `rabbitmq_stream_s3_api:delete/1`.
 
-If the task crashes or S3 is unavailable, the orphan detection mechanism eventually cleans up.
+If the task crashes or S3 is unavailable, the objects are left behind, but the anchor is already gone (step 2 removed the whole subtree), so a later GC run reaps the prefix via the no-anchor path. See [operations.md](./operations.md#garbage-collection).
 
 ## Read path (consumer side)
 
