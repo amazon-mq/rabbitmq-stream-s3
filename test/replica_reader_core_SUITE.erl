@@ -84,7 +84,16 @@ all() ->
         retention_complete_rechecks_deferred_rebalance,
         retention_failed_rechecks_deferred_rebalance,
         retention_deletes_all_entries,
-        new_fragment_after_empty_manifest
+        new_fragment_after_empty_manifest,
+        %% Anchor before first fragment
+        anchor_first_cut_emits_write_anchor_holds_submit,
+        anchor_complete_releases_held_submit,
+        anchor_holds_multiple_then_releases_in_order,
+        anchor_failed_reemits_write_anchor_keeps_holding,
+        anchor_done_cuts_submit_normally,
+        no_submit_transfer_before_anchor_complete,
+        anchor_pending_for_empty_manifest,
+        anchor_done_for_non_empty_manifest
     ].
 
 init_per_suite(Config) -> Config.
@@ -1540,6 +1549,109 @@ new_fragment_after_empty_manifest(_Config) ->
     ?assertEqual(300, M2#manifest.next_offset).
 
 %% ------------------------------------------------------------------
+%% Anchor before first fragment
+%%
+%% The anchor must commit before the first fragment is uploaded, so no S3 object
+%% can exist under a prefix whose anchor is absent. In the core this means no
+%% submit_transfer is emitted before anchor_write_complete/1.
+%% ------------------------------------------------------------------
+
+%% The first fragment requests the anchor and holds its upload; the persist timer
+%% still starts.
+anchor_first_cut_emits_write_anchor_holds_submit(_Config) ->
+    {S0, _} = init_core(#{anchor => pending}),
+    {_S1, _Ref, Effects} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(0, 100), S0),
+    ?assertMatch([{write_anchor, <<"stream">>, test_ref} | _], Effects),
+    ?assertEqual([], submit_refs(Effects)),
+    ?assertMatch([{start_persist_timer, _}], [E || {start_persist_timer, _} = E <- Effects]).
+
+%% Once the anchor is durable, the held upload is released.
+anchor_complete_releases_held_submit(_Config) ->
+    {S0, _} = init_core(#{anchor => pending}),
+    {S1, Ref, _} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(0, 100), S0),
+    {_S2, Effects} = rabbitmq_stream_s3_replica_reader_core:anchor_write_complete(S1),
+    ?assertMatch([{submit_transfer, Ref, <<"stream">>, <<"/dir">>, _}], Effects).
+
+%% Every fragment cut while the anchor is being written is held, then released in
+%% cut order, with write_anchor emitted exactly once.
+anchor_holds_multiple_then_releases_in_order(_Config) ->
+    {S0, _} = init_core(#{anchor => pending}),
+    {S1, Ref1, E1} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(0, 100), S0),
+    {S2, Ref2, E2} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(100, 200), S1),
+    {S3, Ref3, E3} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(200, 300), S2),
+    ?assertEqual([], submit_refs(E1 ++ E2 ++ E3)),
+    ?assertEqual(1, length([E || {write_anchor, _, _} = E <- E1 ++ E2 ++ E3])),
+    {_S4, Effects} = rabbitmq_stream_s3_replica_reader_core:anchor_write_complete(S3),
+    ?assertEqual([Ref1, Ref2, Ref3], submit_refs(Effects)).
+
+%% A failed anchor write re-emits write_anchor and keeps the uploads held.
+anchor_failed_reemits_write_anchor_keeps_holding(_Config) ->
+    {S0, _} = init_core(#{anchor => pending}),
+    {S1, Ref, _} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(0, 100), S0),
+    {S2, FailEffects} = rabbitmq_stream_s3_replica_reader_core:anchor_write_failed(S1),
+    ?assertEqual([{write_anchor, <<"stream">>, test_ref}], FailEffects),
+    {_S3, Effects} = rabbitmq_stream_s3_replica_reader_core:anchor_write_complete(S2),
+    ?assertMatch([{submit_transfer, Ref, _, _, _}], Effects).
+
+%% After the anchor is done, later cuts submit immediately with no write_anchor.
+anchor_done_cuts_submit_normally(_Config) ->
+    {S0, _} = init_core(#{anchor => pending}),
+    {S1, _Ref1, _} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(0, 100), S0),
+    {S2, _} = rabbitmq_stream_s3_replica_reader_core:anchor_write_complete(S1),
+    {_S3, Ref2, Effects} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(100, 200), S2),
+    ?assertMatch([{submit_transfer, Ref2, _, _, _} | _], Effects),
+    ?assertEqual([], [E || {write_anchor, _, _} = E <- Effects]).
+
+%% The invariant as a small deterministic harness: across cuts and a failed anchor
+%% write, no submit_transfer is emitted until anchor_write_complete; then all held
+%% fragments are released.
+no_submit_transfer_before_anchor_complete(_Config) ->
+    {S0, _} = init_core(#{anchor => pending}),
+    {S1, _, E1} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(0, 100), S0),
+    {S2, _, E2} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(100, 200), S1),
+    {S3, _, E3} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(200, 300), S2),
+    {S4, E4} = rabbitmq_stream_s3_replica_reader_core:anchor_write_failed(S3),
+    {S5, _, E5} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(300, 400), S4),
+    ?assertEqual([], submit_refs(E1 ++ E2 ++ E3 ++ E4 ++ E5)),
+    {_S6, Effects} = rabbitmq_stream_s3_replica_reader_core:anchor_write_complete(S5),
+    ?assertEqual(4, length(submit_refs(Effects))).
+
+submit_refs(Effects) ->
+    [Ref || {submit_transfer, Ref, _Stream, _Dir, _Meta} <- Effects].
+
+%% A brand-new stream (empty resolved manifest) starts pending: the first fragment
+%% requests the anchor and holds the upload.
+anchor_pending_for_empty_manifest(_Config) ->
+    {S0, _} = rabbitmq_stream_s3_replica_reader_core:init(#manifest{}, base_opts()),
+    {_S1, _Ref, Effects} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(0, 100), S0),
+    ?assertMatch([{write_anchor, _, _} | _], Effects),
+    ?assertEqual([], submit_refs(Effects)).
+
+%% A reader resuming an established stream (non-empty resolved manifest) starts
+%% done: the anchor already exists, so the first fragment submits immediately with
+%% no write_anchor and no hold. This keeps the restart path off the Khepri round-trip.
+anchor_done_for_non_empty_manifest(_Config) ->
+    Entry = ?ENTRY(0, 0, 0, ?MANIFEST_KIND_FRAGMENT, 1000, 1),
+    NonEmpty = #manifest{entries = Entry, first_offset = 0, next_offset = 1},
+    {S0, _} = rabbitmq_stream_s3_replica_reader_core:init(NonEmpty, base_opts()),
+    {_S1, Ref, Effects} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(1, 100), S0),
+    ?assertMatch([{submit_transfer, Ref, _, _, _} | _], Effects),
+    ?assertEqual([], [E || {write_anchor, _, _} = E <- Effects]).
+
+%% Base init opts WITHOUT an anchor override, so init derives the anchor state
+%% from the manifest.
+base_opts() ->
+    #{
+        stream => <<"stream">>,
+        dir => <<"/dir">>,
+        epoch => 1,
+        reference => test_ref,
+        persist_threshold => 5,
+        persist_interval_ms => 2000,
+        rebalance_threshold => 1024
+    }.
+
+%% ------------------------------------------------------------------
 %% Helpers
 %% ------------------------------------------------------------------
 
@@ -1561,7 +1673,10 @@ init_core_with_manifest(Manifest, Overrides) ->
             reference => test_ref,
             persist_threshold => 5,
             persist_interval_ms => 2000,
-            rebalance_threshold => 1024
+            rebalance_threshold => 1024,
+            %% Default to the post-anchor steady state so the pipeline tests are
+            %% unaffected by the anchor gate; the anchor tests override to pending.
+            anchor => done
         },
         Overrides
     ),

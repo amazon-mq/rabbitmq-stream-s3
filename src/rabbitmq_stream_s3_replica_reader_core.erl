@@ -19,6 +19,8 @@ testable without mocks or timing.
     pending_prefix_rewrite/1,
     format_state/1,
     fragment_cut/2,
+    anchor_write_complete/1,
+    anchor_write_failed/1,
     transfer_complete/3,
     transfer_failed/3,
     group_upload_complete/2,
@@ -78,14 +80,22 @@ testable without mocks or timing.
     %% Consecutive failed upload attempts per in-flight transfer, keyed by Ref.
     %% Incremented on each transfer_failed and used to drive the resubmit
     %% backoff; cleared when the transfer is drained (success) or on reinit.
-    transfer_attempts = #{} :: #{reference() => pos_integer()}
+    transfer_attempts = #{} :: #{reference() => pos_integer()},
+    %% Whether the per-stream anchor (written before the first remote-tier
+    %% fragment) has been committed. Fragment uploads are held until it is `done`,
+    %% so no S3 object can exist under a prefix whose anchor is absent:
+    %%   pending  - no fragment cut yet, anchor not requested
+    %%   writing  - first fragment cut, write_anchor emitted, uploads held
+    %%   done     - anchor committed, uploads released and flowing normally
+    anchor = pending :: pending | writing | done
 }).
 
 -opaque state() :: #state{}.
 -type cfg() :: #cfg{}.
 
 -type core_effect() ::
-    {submit_transfer, reference(), stream_id(), directory(), fragment_meta()}
+    {write_anchor, stream_id(), term()}
+    | {submit_transfer, reference(), stream_id(), directory(), fragment_meta()}
     | {start_persist, #manifest{}, non_neg_integer(), term(), rabbitmq_stream_s3_db:revision(), [
         #edit{}
     ]}
@@ -144,9 +154,21 @@ init(Manifest, Opts) ->
         persist_in_flight = false,
         last_persisted_manifest = Manifest,
         persisting_manifest = undefined,
-        waiters = []
+        waiters = [],
+        %% A non-empty resolved manifest witnesses that a fragment was already
+        %% tiered, so the anchor already exists (it precedes the first fragment):
+        %% start `done` and skip re-writing it, e.g. on a reader restart. Only a
+        %% brand-new stream (empty manifest) starts `pending` and writes the anchor
+        %% on its genuine first fragment. Tests may override.
+        anchor = maps:get(anchor, Opts, initial_anchor(Manifest))
     },
     {State, []}.
+
+%% The anchor already exists iff the stream has already tiered a fragment, which a
+%% non-empty manifest witnesses. A re-write would be idempotent but adds a Khepri
+%% round-trip to the restart path, so skip it when the manifest already has data.
+initial_anchor(#manifest{entries = <<>>}) -> pending;
+initial_anchor(#manifest{}) -> done.
 
 -spec manifest(state()) -> #manifest{}.
 manifest(#state{manifest = Manifest}) ->
@@ -184,9 +206,11 @@ format_state(#state{
     persist_in_flight = PersistInFlight,
     rebalance_in_flight = RebalanceInFlight,
     retention_in_flight = RetentionInFlight,
-    waiters = Waiters
+    waiters = Waiters,
+    anchor = Anchor
 }) ->
     #{
+        anchor => Anchor,
         manifest_first_offset => FirstOff,
         manifest_next_offset => NextOff,
         manifest_total_size => TotalSize,
@@ -206,7 +230,23 @@ format_state(#state{
     }.
 
 -spec fragment_cut(fragment_meta(), state()) -> {state(), reference(), [core_effect()]}.
-fragment_cut(Meta, #state{cfg = Cfg, in_flight = Q, since_persist = 0} = State) ->
+fragment_cut(Meta, #state{anchor = done} = State) ->
+    fragment_cut_submit(Meta, State);
+fragment_cut(Meta, #state{anchor = AnchorStatus, cfg = Cfg} = State0) ->
+    %% The anchor must commit before the first fragment is uploaded. Track the
+    %% fragment in in_flight as usual, but hold its submit_transfer: it is
+    %% re-derived from in_flight in anchor_write_complete/1 once the anchor is
+    %% durable. On the very first fragment also emit the write_anchor effect.
+    {State1, Ref, Effects0} = fragment_cut_submit(Meta, State0),
+    Held = [E || E <- Effects0, not is_submit_transfer(E)],
+    AnchorEffect =
+        case AnchorStatus of
+            pending -> [{write_anchor, Cfg#cfg.stream, Cfg#cfg.reference}];
+            writing -> []
+        end,
+    {State1#state{anchor = writing}, Ref, AnchorEffect ++ Held}.
+
+fragment_cut_submit(Meta, #state{cfg = Cfg, in_flight = Q, since_persist = 0} = State) ->
     case queue:is_empty(Q) of
         true ->
             %% First fragment since last persist. Start the timer.
@@ -220,8 +260,36 @@ fragment_cut(Meta, #state{cfg = Cfg, in_flight = Q, since_persist = 0} = State) 
         false ->
             do_fragment_cut(Meta, State)
     end;
-fragment_cut(Meta, State) ->
+fragment_cut_submit(Meta, State) ->
     do_fragment_cut(Meta, State).
+
+is_submit_transfer({submit_transfer, _Ref, _Stream, _Dir, _Meta}) -> true;
+is_submit_transfer(_) -> false.
+
+-doc """
+The per-stream anchor has been durably written. Release the fragment uploads that
+were held while it was being written: each is in in_flight (in cut order) but was
+never submitted. Subsequent fragments are submitted as they are cut.
+""".
+-spec anchor_write_complete(state()) -> {state(), [core_effect()]}.
+anchor_write_complete(#state{anchor = writing, cfg = Cfg, in_flight = Q} = State) ->
+    Effects = [
+        {submit_transfer, Ref, Cfg#cfg.stream, Cfg#cfg.dir, Meta}
+     || {Ref, Meta} <- queue:to_list(Q)
+    ],
+    {State#state{anchor = done}, Effects};
+anchor_write_complete(State) ->
+    {State, []}.
+
+-doc """
+The per-stream anchor write failed. Re-emit the write_anchor effect so the shell
+retries it; uploads stay held until the anchor commits.
+""".
+-spec anchor_write_failed(state()) -> {state(), [core_effect()]}.
+anchor_write_failed(#state{anchor = writing, cfg = Cfg} = State) ->
+    {State, [{write_anchor, Cfg#cfg.stream, Cfg#cfg.reference}]};
+anchor_write_failed(State) ->
+    {State, []}.
 
 do_fragment_cut(Meta, #state{cfg = Cfg, in_flight = Q} = State) ->
     Ref = make_ref(),

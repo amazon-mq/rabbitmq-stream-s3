@@ -636,28 +636,39 @@ curl http://node:15692/metrics/per-object | grep 'queue="my-stream"'
 
 ## Garbage collection
 
-Objects in S3 can become orphaned (not referenced by any manifest) in several scenarios: a deposed writer uploads a fragment but loses the Khepri race, a manifest persist fails or the process crashes before completion, or retention deletes entries from the manifest but the corresponding object deletion does not complete.
+Objects in S3 can become orphaned (not referenced by any manifest) in several scenarios: a deposed writer uploads a fragment but loses the Khepri race, a manifest persist fails or the process crashes before completion, retention deletes entries from the manifest but the corresponding object deletion does not complete, or a stream is deleted (or its Khepri metadata is wiped) and its objects outlive the metadata that referenced them.
 
 The GC mechanism identifies these orphans by listing S3 objects and comparing their keys against current authoritative state. It is invoked on demand via the CLI.
 
 ### Safety guarantee: monotonicity
 
-The correctness of GC depends on a single structural property: the values used as barriers (`first_offset`, `epoch`) only ever increase. This makes false positives (deleting a live object) structurally impossible, regardless of timing or consistency:
+For an object whose stream is still in the committed lookup, correctness rests on a structural property: the values used as barriers (`first_offset`, `epoch`) only ever increase. This makes false positives (deleting a live object) structurally impossible, regardless of timing or consistency:
 
 - `first_offset` advances monotonically as retention removes data from the front of the manifest. An object whose offset is below first_offset was already removed by retention. It can never become live again.
 - `epoch` advances monotonically with each new writer. A manifest root whose epoch is below the current epoch belongs to a deposed writer. The new writer's manifest is authoritative and the old root can never become active again.
 
 Eventually-consistent reads (from Khepri or the manifest replica ETS cache) can only return stale values that are lower than or equal to the true current value. A stale barrier is more conservative: it classifies fewer objects as garbage. The GC may miss orphans on a given run (false negatives) but can never delete live objects (false positives).
 
+### Safety guarantee: the anchor
+
+Monotonicity covers objects whose stream is still in the committed lookup. An object whose stream is absent from the lookup (a deleted stream, a stream that never committed a manifest, or one missing a local manifest replica) has no offset or epoch barrier to classify it against. These are resolved against the per-stream anchor instead.
+
+Before the first remote-tier fragment is uploaded, the replica reader writes an anchor node in Khepri, kept alive by a `keep_while` condition on the stream queue. Two properties make it a correct-by-construction signal:
+
+- Anchor-before-fragment ordering: no S3 object can exist under a stream's prefix unless that stream's anchor committed first. An object under a prefix with no anchor is therefore junk.
+- Atomic removal: the `keep_while` removes the anchor in the same transaction that deletes the queue, so the "stream deleted" signal is permanent and cannot be lost to a crash.
+
+An object whose stream is not in the lookup is reaped only when a strongly-consistent (quorum-requiring) read reports its anchor absent. A present anchor, or a read that cannot reach a quorum, fails closed and the object is skipped. The consistent read is load-bearing: a stale local read could report a live stream's anchor absent and reap it. This safety rests on ordering and consistency rather than on the monotonicity argument above, and it is what lets a deleted stream's objects be reclaimed automatically rather than by hand.
+
 ### Classifying garbage
 
 | Object type   | Key format                                                  | Condition for "garbage"
 |---            |---                                                          |---
-| Fragment      | `rabbitmq/stream/<id>/data/<offset>.<uid>.fragment`         | offset < manifest first_offset
-| Group         | `rabbitmq/stream/<id>/metadata/<offset>.<uid>.<kind>`       | offset < manifest first_offset
-| Manifest root | `rabbitmq/stream/<id>/metadata/root.<epoch>.<uid>.manifest` | epoch < current epoch according to Khepri
+| Fragment      | `rabbitmq/stream/<id>/data/<offset>.<uid>.fragment`         | offset < manifest first_offset, or the stream's anchor is absent
+| Group         | `rabbitmq/stream/<id>/metadata/<offset>.<uid>.<kind>`       | offset < manifest first_offset, or the stream's anchor is absent
+| Manifest root | `rabbitmq/stream/<id>/metadata/root.<epoch>.<uid>.manifest` | epoch < current epoch according to Khepri, or the stream's anchor is absent
 
-Note that objects belonging to an unknown stream ID are not currently considered garbage. Handling this case is planned.
+A well-formed key whose stream is not in the committed lookup is classified against the per-stream anchor, described under [Safety guarantee: the anchor](#safety-guarantee-the-anchor) above: it is reaped (reason `no_anchor`) only when a strongly-consistent read confirms the anchor absent, which reclaims the objects of a deleted stream. A key whose format is unrecognised is skipped outright.
 
 ### Modes
 
@@ -671,7 +682,8 @@ With `--formatter json`, the output is a JSON array of objects:
 ```json
 [
   {"stream_id": "...", "key": "rabbitmq/stream/.../00000000000000000042.abcd1234.fragment", "reason": "below_first_offset"},
-  {"stream_id": "...", "key": "rabbitmq/stream/.../metadata/root.1.deadbeef.manifest", "reason": "stale_epoch"}
+  {"stream_id": "...", "key": "rabbitmq/stream/.../metadata/root.1.deadbeef.manifest", "reason": "stale_epoch"},
+  {"stream_id": "...", "key": "rabbitmq/stream/.../00000000000000000042.abcd1234.fragment", "reason": "no_anchor"}
 ]
 ```
 

@@ -203,7 +203,7 @@ Committed data (offsets 76-100, confirmed to publishers) is lost. This requires 
 - Deposed replica reader uploaded a fragment that was never applied to the manifest.
 - Manifest truncation removed entries but object deletion failed or is pending.
 - Stream deletion cleanup was interrupted.
-- A node's data directory was wiped (e.g. during node replacement or disaster recovery) and RabbitMQ restarted. The Khepri database is recreated from scratch and any streams that existed before the wipe are gone from Khepri, but not via a delete operation, so the keep-while condition that triggers S3 cleanup never evaluates and the S3 objects remain.
+- A node's data directory was wiped (e.g. during node replacement or disaster recovery) and RabbitMQ restarted. The Khepri database is recreated from scratch and any streams that existed before the wipe are gone from Khepri, but not via a delete operation, so the keep-while condition that triggers S3 cleanup never evaluates and the S3 objects remain. The per-stream anchor is also gone with the wiped database, so a GC run reclaims these objects via the no-anchor path (see Resolution below).
 
 **Impact assessment.** Wasted S3 storage. No correctness impact. No impact on consumers or publishers.
 
@@ -216,7 +216,7 @@ Committed data (offsets 76-100, confirmed to publishers) is lost. This requires 
 aws s3 ls "s3://${BUCKET}/rabbitmq/stream/${STREAM_ID}/data/" --recursive
 ```
 
-**Mitigation.** None needed urgently. Orphans do not affect operation. For unbounded accumulation (typically only after data-directory resets), operators can manually delete S3 prefixes for streams that no longer exist in Khepri.
+**Mitigation.** None needed urgently. Orphans do not affect operation.
 
 **Resolution.** The `rabbitmq_stream_s3_gc` module identifies and optionally deletes orphaned objects. Run it via the CLI:
 
@@ -226,4 +226,4 @@ rabbitmq-streams stream_s3_gc --formatter json
 rabbitmq-streams stream_s3_gc --mode delete
 ```
 
-See [operations.md](./operations.md#garbage-collection) for details on the GC mechanism, its safety guarantees, and current scope limitations.
+Objects whose stream is still live are classified against its first_offset and epoch. Objects whose stream is gone from Khepri (a deleted stream, or one whose metadata was wiped) are classified against the per-stream anchor: with the stream gone the anchor is absent, so a GC run reaps them via the no-anchor path rather than requiring manual deletion. See [operations.md](./operations.md#garbage-collection) for details on the GC mechanism and its safety guarantees.

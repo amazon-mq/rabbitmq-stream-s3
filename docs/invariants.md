@@ -69,6 +69,16 @@ Append, rebalance, and retention keep the remote tier a contiguous extension bel
 |---|---|---|
 | Reset safety | When `f_local > n`, the writer discards `M` and installs the empty manifest at the floor: `f := n := f_local` and `Frag := ∅`. Coverage and Durability hold vacuously, since `Cov = ∅ = [f, n)`; the step advances `n` over `[n, f_local)` only while emptying coverage, so it never claims durability it lacks. This is the inverse of the #206 hole, which advanced `n` while claiming coverage. `f` and `n` are non-decreasing, and the seam is restored at `f_local`, so Tier overlap holds again with the remote tier empty and the local segments covering `[f_local, T)`. The discarded range `[f, f_local)` is lost by design: it is the un-uploaded tail together with the now-disconnected durable prefix, which cannot be kept without a hole in `M`. | [architecture.md](./architecture.md) (Durability versus the local retention bound) |
 
+## Garbage collection
+
+GC reaps an S3 object only when it can prove the object is not live. For an object whose stream is still in the committed lookup that proof is the monotonic offset/epoch barrier. For an object whose stream is absent from the lookup (deleted, never committed, or missing a local replica) the proof is the per-stream anchor.
+
+| Invariant | Statement | Where |
+|---|---|---|
+| Anchor ordering | A stream's anchor is committed to Khepri before its first S3 object is written, so no object can exist under a prefix whose anchor is absent. The anchor's presence therefore witnesses a live stream, and its absence witnesses a prefix that is safe to reap. | [operations.md](./operations.md#safety-guarantee-the-anchor) |
+| Anchor removal | The anchor is kept alive by a `keep_while` on the stream queue, so it is removed in the same transaction that deletes the queue. The "stream deleted" signal is permanent and cannot be lost to a crash. | [operations.md](./operations.md#safety-guarantee-the-anchor) |
+| Anchor read | An object whose stream is absent from the lookup is reaped only when a strongly-consistent read reports its anchor absent; a present anchor or a non-quorum read fails closed. A stale local read could report a live stream's anchor absent, so the consistent read is load-bearing. Modeled in [PR #311](https://github.com/amazon-mq/rabbitmq-stream-s3/pull/311). | [operations.md](./operations.md#safety-guarantee-the-anchor) |
+
 ## Read path
 
 | Invariant | Statement | Where |
