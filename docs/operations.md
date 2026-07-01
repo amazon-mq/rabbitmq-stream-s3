@@ -163,12 +163,15 @@ Owned by `rabbitmq_stream_s3_replica_reader`. Each writer-node replica reader ow
 |-------------------------------------|---------|-------------------------------------------------------------------|
 | `rabbitmq_stream_s3_transfers_completed`               | counter | Fragment uploads that succeeded                                   |
 | `rabbitmq_stream_s3_transfers_failed`                  | counter | Fragment uploads that failed for any reason                       |
+| `rabbitmq_stream_s3_transfer_retries`                  | counter | Fragment upload retries scheduled (transient and non-transient errors) |
+| `rabbitmq_stream_s3_nontransient_transfer_retries`     | counter | Fragment upload retries for a confirmed-but-non-transient error (a checksum mismatch, an unexpected 4xx); the pipeline stalls at that offset until the fragment is durable |
 | `rabbitmq_stream_s3_bytes_transferred`                 | counter | Total payload bytes uploaded                                      |
 | `rabbitmq_stream_s3_groups_created`                    | counter | Group manifest objects uploaded                                   |
 | `rabbitmq_stream_s3_kilo_groups_created`               | counter | Kilo-group manifest objects uploaded                              |
 | `rabbitmq_stream_s3_mega_groups_created`               | counter | Mega-group manifest objects uploaded                              |
 | `rabbitmq_stream_s3_roots_created`                     | counter | Root manifest objects uploaded (one per successful persist)       |
 | `rabbitmq_stream_s3_transfers_in_flight`               | gauge   | Fragments cut and submitted that have not yet completed           |
+| `rabbitmq_stream_s3_upload_stalled_offset`             | gauge   | Offset at which the pipeline is stalled on a non-transient error, or 0 when not stalled |
 
 #### Pipeline (drain to persist)
 
@@ -372,6 +375,7 @@ The numbers below are starting points. Tune for your traffic patterns.
 - **Persistent transfer failures.** `rate(rabbitmq_stream_s3_transfers_failed[5m]) > 0` for more than ten minutes. Sustained failures usually mean S3 connectivity, throttling, or credentials problems.
 - **Persist conflicts.** `rate(rabbitmq_stream_s3_persist_conflicts[5m]) > 0`. A non-zero rate indicates competing writers, likely from a partition or a struggling leader election.
 - **Stuck uploads.** `rabbitmq_stream_s3_transfers_in_flight` non-zero and `rate(rabbitmq_stream_s3_transfers_completed[5m]) == 0` together. Drain loop is producing fragments but the governor is not flushing them.
+- **Stalled pipeline (non-transient error).** `rabbitmq_stream_s3_upload_stalled_offset > 0`, or `rate(rabbitmq_stream_s3_nontransient_transfer_retries[5m]) > 0`. A fragment is failing with a confirmed-fatal error (for example a persistent checksum mismatch or an unexpected 4xx) and the pipeline is stuck at that offset, retrying with a backoff. Inspect the accompanying WARNING log for the error and offset.
 - **Local log ahead recoveries.** `rate(rabbitmq_stream_s3_local_log_ahead_recoveries[1h]) > 0` for any stream. Indicates local retention is racing ahead of uploads. See [failure-modes.md](./failure-modes.md).
 - **Khepri conflicts.** `rate(rabbitmq_stream_s3_put_conflicts[5m]) > 0` matches `rabbitmq_stream_s3_persist_conflicts` above and surfaces the same problem from the metadata store side.
 - **S3 errors.** `rate(rabbitmq_stream_s3_response_500[5m]) > 0` or `rate(rabbitmq_stream_s3_response_503[5m]) > 0`. The plugin retries automatically; sustained high rates indicate an S3-side incident.

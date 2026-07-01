@@ -27,6 +27,20 @@ For the concepts behind these scenarios, see [concepts.md](./concepts.md). For t
 
 ---
 
+## Upload retry strategy
+
+A failed fragment upload is always retried; the fragment is never abandoned, because dropping it would advance the manifest over a range that is not durable in S3 and leave a silent hole (issue #206). How the retry is paced depends on the error class.
+
+**Transient errors** (throttling, 5xx, timeouts, connection errors) are expected to clear quickly. The first retry is immediate, preserving responsiveness for a one-off blip. Successive consecutive failures of the same fragment back off exponentially from `stream_s3.task_retry_delay_constant` (10ms) by a factor of `stream_s3.task_retry_delay_exponent` (2), capped at `stream_s3.task_retry_delay_max_ms` (5s).
+
+**Non-transient errors** (a confirmed checksum mismatch, an unexpected 4xx) are unlikely to clear on a tight retry, so the pipeline stalls at the failed offset and retries with a backoff starting at `upload_retry_delay_ms` (1000ms), growing to `upload_retry_delay_max_ms` (30s). Local-tier cleanup also stalls at that offset, so the only durable copy is retained until the upload succeeds.
+
+Both profiles apply equal jitter (the delay is uniformly distributed in `[delay/2, delay]`) so that many streams stalled by a shared incident do not retry against S3 in lockstep. The per-fragment attempt counter resets once the fragment is durable.
+
+**Detection.** `rate(rabbitmq_stream_s3_transfer_retries[5m])` rising means uploads are not succeeding on the first try. `rate(rabbitmq_stream_s3_nontransient_transfer_retries[5m]) > 0` or `rabbitmq_stream_s3_upload_stalled_offset > 0` means a fragment is failing with a confirmed-fatal error and the pipeline is wedged at that offset; the accompanying WARNING log names the error and offset.
+
+---
+
 ## Leader election
 
 **Trigger.** Writer node fails or is shut down. A new writer is elected.

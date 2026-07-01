@@ -98,19 +98,22 @@ returned by the functional core module.
 -define(C_REMOTE_TIER_RETENTION_FAILURES, 22).
 -define(C_MANIFEST_RESOLUTION_FAILURES, 23).
 -define(C_REMOTE_TIER_AHEAD_RECOVERIES, 24).
+-define(C_TRANSFER_RETRIES, 25).
+-define(C_NONTRANSIENT_TRANSFER_RETRIES, 26).
 %% Counters above; gauges below. The macro ?NODE_COUNTERS filters by
 %% type, and seshat requires counter indexes to be 1..N sequential. Add
 %% new counters before this divider and renumber the gauges that follow.
--define(C_TRANSFERS_IN_FLIGHT, 25).
--define(C_LAST_PERSIST_TIMESTAMP_MS, 26).
--define(C_MANIFEST_FIRST_OFFSET, 27).
--define(C_MANIFEST_NEXT_OFFSET, 28).
--define(C_MANIFEST_FIRST_TIMESTAMP_MS, 29).
--define(C_REMOTE_BYTES, 30).
--define(C_REMOTE_MESSAGES, 31).
--define(C_BYTES_IN_ASSEMBLY, 32).
--define(C_BYTES_IN_TRANSFER, 33).
--define(C_BYTES_IN_PERSIST, 34).
+-define(C_TRANSFERS_IN_FLIGHT, 27).
+-define(C_LAST_PERSIST_TIMESTAMP_MS, 28).
+-define(C_MANIFEST_FIRST_OFFSET, 29).
+-define(C_MANIFEST_NEXT_OFFSET, 30).
+-define(C_MANIFEST_FIRST_TIMESTAMP_MS, 31).
+-define(C_REMOTE_BYTES, 32).
+-define(C_REMOTE_MESSAGES, 33).
+-define(C_BYTES_IN_ASSEMBLY, 34).
+-define(C_BYTES_IN_TRANSFER, 35).
+-define(C_BYTES_IN_PERSIST, 36).
+-define(C_UPLOAD_STALLED_OFFSET, 37).
 
 -define(STREAM_COUNTERS, [
     {transfers_completed, ?C_TRANSFERS_COMPLETED, counter,
@@ -169,6 +172,14 @@ returned by the functional core module.
         "Number of times manifest resolution could not reach the metadata store or "
         "object store and scheduled a retry, rather than treating the remote tier as "
         "empty. A sustained non-zero rate means a stream cannot start tiering."},
+    {transfer_retries, ?C_TRANSFER_RETRIES, counter,
+        "Fragment upload retries scheduled (both transient and non-transient errors). "
+        "A sustained non-zero rate means uploads are not succeeding on the first try."},
+    {nontransient_transfer_retries, ?C_NONTRANSIENT_TRANSFER_RETRIES, counter,
+        "Fragment upload retries scheduled for a confirmed-but-non-transient error "
+        "(for example a checksum mismatch or an unexpected 4xx). The pipeline stalls "
+        "at the offset until the fragment is durable, so a sustained non-zero rate "
+        "means a stream's tiering is wedged."},
     {transfers_in_flight, ?C_TRANSFERS_IN_FLIGHT, gauge,
         "Fragments cut and submitted to the governor that have not yet completed"},
     {last_persist_timestamp_ms, ?C_LAST_PERSIST_TIMESTAMP_MS, gauge,
@@ -192,7 +203,11 @@ returned by the functional core module.
         "stage 2."},
     {bytes_in_persist, ?C_BYTES_IN_PERSIST, gauge,
         "Bytes in fragments uploaded to S3 whose manifest update has not yet "
-        "succeeded. Pipeline stage 3."}
+        "succeeded. Pipeline stage 3."},
+    {upload_stalled_offset, ?C_UPLOAD_STALLED_OFFSET, gauge,
+        "The offset at which the upload pipeline is currently stalled on a "
+        "non-transient error, or 0 when not stalled. The pipeline retries this "
+        "fragment with a backoff and makes no forward progress until it is durable."}
 ]).
 
 %% Node-level shadow counter set. Per-stream counters are dropped from
@@ -248,6 +263,12 @@ returned by the functional core module.
     %% completes. This eliminates the race where a reader sees a stale
     %% manifest pointing to already-deleted objects (issue #166).
     deferred_deletions = [] :: [#fragment_ref{} | #group_ref{}],
+    %% Fragments currently being retried after a non-transient (confirmed-fatal)
+    %% upload error, keyed by transfer Ref with their first offset. The pipeline
+    %% stalls head-of-line, but several fragments can each hit a non-transient
+    %% error, so this is a set; the upload_stalled_offset gauge reflects the
+    %% lowest (head) stalled offset, or 0 when empty.
+    stalled_transfers = #{} :: #{reference() => osiris:offset()},
     %% Set when the core asks to shut down (the stream's metadata node was
     %% deleted). The handler that executed the effect returns {stop, normal}.
     stopping = false :: boolean()
@@ -908,28 +929,43 @@ execute_effect({submit_transfer, Ref, _StreamId, Dir, Meta}, #state{cfg = Cfg} =
     StreamId = Cfg#cfg.stream,
     submit_upload(Ref, Dir, StreamId, Meta),
     on_transfer_submitted(Ref, maps:get(size, Meta), State0);
-execute_effect({resubmit_transfer, Ref, _StreamId, Dir, Meta}, #state{cfg = Cfg} = State0) ->
+execute_effect({resubmit_transfer, Ref, _StreamId, Dir, Meta, Attempt}, #state{cfg = Cfg} = State0) ->
     StreamId = Cfg#cfg.stream,
-    submit_upload(Ref, Dir, StreamId, Meta),
+    inc(State0, ?C_TRANSFER_RETRIES, 1),
+    Delay = transient_retry_delay(Attempt),
+    _ =
+        case Delay of
+            0 ->
+                %% First transient retry: resubmit immediately, preserving the
+                %% prior behaviour for a one-off blip.
+                submit_upload(Ref, Dir, StreamId, Meta);
+            _ ->
+                erlang:send_after(Delay, self(), {retry_transfer, Ref, Dir, Meta})
+        end,
     %% The failure already removed Ref from the model. Re-add it (a fresh slot
     %% with a new deadline token) so the eventual completion is accounted for.
     on_transfer_submitted(Ref, maps:get(size, Meta), State0);
 execute_effect(
-    {resubmit_transfer_delayed, Ref, _StreamId, Dir, Meta, Reason}, #state{cfg = Cfg} = State0
+    {resubmit_transfer_delayed, Ref, _StreamId, Dir, Meta, Reason, Attempt},
+    #state{cfg = Cfg} = State0
 ) ->
     StreamId = Cfg#cfg.stream,
-    Delay = rabbitmq_stream_s3_config:upload_retry_delay_ms(),
+    inc(State0, ?C_TRANSFER_RETRIES, 1),
+    inc(State0, ?C_NONTRANSIENT_TRANSFER_RETRIES, 1),
+    Offset = maps:get(first_offset, Meta),
+    State1 = mark_transfer_stalled(Ref, Offset, State0),
+    Delay = nontransient_retry_delay(Attempt),
     ?LOG_WARNING(
-        "~ts fragment upload at offset ~b failed with non-transient error ~p; "
-        "retrying in ~bms. The upload pipeline and local-tier cleanup are "
-        "stalled at this offset until the fragment is durable in S3.",
-        [StreamId, maps:get(first_offset, Meta), Reason, Delay]
+        "~ts fragment upload at offset ~b failed with non-transient error ~p "
+        "(attempt ~b); retrying in ~bms. The upload pipeline and local-tier "
+        "cleanup are stalled at this offset until the fragment is durable in S3.",
+        [StreamId, Offset, Reason, Attempt, Delay]
     ),
     erlang:send_after(Delay, self(), {retry_transfer, Ref, Dir, Meta}),
     %% The failure already removed Ref from the model. Re-add it now (the fragment
     %% is still pending and its bytes are still in the pipeline); the retry_transfer
     %% timer above triggers the actual re-upload after the backoff.
-    on_transfer_submitted(Ref, maps:get(size, Meta), State0);
+    on_transfer_submitted(Ref, maps:get(size, Meta), State1);
 execute_effect(
     {upload_group, StreamId, Kind, Entries, _Pos, _Len},
     #state{tasks = Tasks0, task_io = Io} = State0
@@ -1811,6 +1847,32 @@ dec(#state{metrics = Cnt}, Idx, N) when is_integer(N), N > 0 ->
 dec(_, _, _) ->
     ok.
 
+%% Backoff (with equal jitter) before resubmitting a transient upload failure.
+%% Attempt 1 retries immediately, preserving the prior behaviour for a one-off
+%% blip; attempts 2+ back off exponentially from task_retry_delay_constant up to
+%% task_retry_delay_max_ms.
+transient_retry_delay(1) ->
+    0;
+transient_retry_delay(Attempt) when Attempt > 1 ->
+    Base = rabbitmq_stream_s3_config:task_retry_delay_constant(),
+    Exp = rabbitmq_stream_s3_config:task_retry_delay_exponent(),
+    Max = rabbitmq_stream_s3_config:task_retry_delay_max_ms(),
+    %% Attempt - 1 so the first backed-off retry (attempt 2) uses Base.
+    rabbitmq_stream_s3_util:equal_jitter(
+        rabbitmq_stream_s3_util:backoff_delay(Attempt - 1, Base, Exp, Max)
+    ).
+
+%% Backoff (with equal jitter) before resubmitting a non-transient upload
+%% failure. A confirmed-fatal error is unlikely to clear on a tight retry, so
+%% the backoff starts at upload_retry_delay_ms and grows to a higher ceiling.
+nontransient_retry_delay(Attempt) when Attempt >= 1 ->
+    Base = rabbitmq_stream_s3_config:upload_retry_delay_ms(),
+    Exp = rabbitmq_stream_s3_config:task_retry_delay_exponent(),
+    Max = rabbitmq_stream_s3_config:upload_retry_delay_max_ms(),
+    rabbitmq_stream_s3_util:equal_jitter(
+        rabbitmq_stream_s3_util:backoff_delay(Attempt, Base, Exp, Max)
+    ).
+
 %% Submit a fragment upload to the governor. Shared by the initial submit
 %% and the immediate/delayed retry paths.
 submit_upload(Ref, Dir, StreamId, Meta) ->
@@ -1885,6 +1947,35 @@ derive_gauges(#state{tasks = Tasks} = State) ->
     ),
     State.
 
+%% Record a fragment as stalled on a non-transient error and republish the
+%% stalled-offset gauge (the lowest stalled offset is the head-of-line stall).
+mark_transfer_stalled(Ref, Offset, #state{stalled_transfers = Stalled} = State) ->
+    State1 = State#state{stalled_transfers = Stalled#{Ref => Offset}},
+    set_stalled_gauge(State1),
+    State1.
+
+%% Clear a fragment's stall once it is durable and republish the gauge. A Ref
+%% that was never stalled (the common case) is a no-op.
+clear_transfer_stalled(Ref, #state{stalled_transfers = Stalled} = State) ->
+    case maps:is_key(Ref, Stalled) of
+        false ->
+            State;
+        true ->
+            State1 = State#state{stalled_transfers = maps:remove(Ref, Stalled)},
+            set_stalled_gauge(State1),
+            State1
+    end.
+
+%% The gauge is the lowest stalled offset (the fragment blocking the pipeline
+%% head), or 0 when nothing is stalled.
+set_stalled_gauge(#state{stalled_transfers = Stalled} = State) ->
+    Offset =
+        case maps:values(Stalled) of
+            [] -> 0;
+            Offsets -> lists:min(Offsets)
+        end,
+    set(State, ?C_UPLOAD_STALLED_OFFSET, Offset).
+
 %% Carry out the transfer task model's decision. The transferred byte size is
 %% read before the step for the cumulative counter on success.
 apply_transfer_decisions(
@@ -1893,8 +1984,11 @@ apply_transfer_decisions(
     State1 = cancel_transfer_timer(Ref, State0),
     inc(State1, ?C_TRANSFERS_COMPLETED, 1),
     inc(State1, ?C_BYTES_TRANSFERRED, Size),
+    %% This fragment is durable; if it was being retried after a non-transient
+    %% error, clear its stall (the gauge falls to the next stalled offset, or 0).
+    State2 = clear_transfer_stalled(Ref, State1),
     {Core, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_complete(Ref, Uid, Core0),
-    {noreply, derive_gauges(execute_effects(Effects, State1#state{core = Core}))};
+    {noreply, derive_gauges(execute_effects(Effects, State2#state{core = Core}))};
 apply_transfer_decisions([{deliver, transfer_failed, {Ref, Reason}}], _Size, State0) ->
     handle_transfer_failure(Ref, Reason, State0);
 apply_transfer_decisions([{drop, _Reason}], _Size, State) ->
@@ -2029,6 +2123,9 @@ reset_for_recovery(
     #state{transfer_timers = Timers0, persist_timer = PersistTimer, tasks = Tasks0} = State0
 ) ->
     set(State0, ?C_BYTES_IN_ASSEMBLY, 0),
+    %% Recovery replaces the core, so no stalled fragment carries over; clear the
+    %% stall set and its gauge.
+    set(State0, ?C_UPLOAD_STALLED_OFFSET, 0),
     %% Cancel the per-transfer liveness deadline timers (a late deadline message
     %% is dropped by the model after recover clears the transfer map) and the
     %% persist tick (the core is about to be replaced).
@@ -2048,7 +2145,8 @@ reset_for_recovery(
         assembly = undefined,
         transfer_timers = #{},
         persist_timer = undefined,
-        deferred_deletions = []
+        deferred_deletions = [],
+        stalled_transfers = #{}
     }).
 
 %% Demonitor (flushing the queued 'DOWN') and kill the task process if its pid
@@ -2513,5 +2611,51 @@ reset_manifest_carries_floor_as_first_and_next_test() ->
     ?assertEqual(M#manifest.first_offset, M#manifest.next_offset),
     ?assertEqual(<<>>, M#manifest.entries),
     ?assertEqual(7, M#manifest.revision).
+
+%% The transient retry profile retries the first attempt immediately and backs
+%% off (within the configured ceiling, jitter included) on later attempts. The
+%% non-transient profile starts at its base delay even on the first attempt.
+retry_delay_profiles_test() ->
+    %% Use defaults: transient base 10ms, max 5000ms; non-transient base 1000ms,
+    %% max 30000ms; exponent 2.
+    ?assertEqual(0, transient_retry_delay(1)),
+    %% Attempt 2 uses the base (10ms) before jitter; equal jitter keeps it in
+    %% [base/2, base].
+    D2 = transient_retry_delay(2),
+    ?assert(D2 >= 5 andalso D2 =< 10),
+    %% A very high attempt is capped at the transient ceiling (5000ms), jitter
+    %% keeping it within [max/2, max].
+    DHigh = transient_retry_delay(100),
+    ?assert(DHigh >= 2500 andalso DHigh =< 5000),
+    %% Non-transient starts at its base (1000ms) on attempt 1, never immediate.
+    DN1 = nontransient_retry_delay(1),
+    ?assert(DN1 >= 500 andalso DN1 =< 1000),
+    DNHigh = nontransient_retry_delay(100),
+    ?assert(DNHigh >= 15000 andalso DNHigh =< 30000).
+
+%% The stalled-offset gauge reflects the lowest stalled offset (head-of-line),
+%% so an out-of-order completion of a later fragment does not prematurely clear
+%% it; only draining the head does.
+stalled_offset_gauge_tracks_head_of_line_test() ->
+    {ok, _} = application:ensure_all_started(seshat),
+    _ = seshat:new_group(rabbitmq_stream_s3),
+    Cnt = seshat:new(rabbitmq_stream_s3, {?MODULE, test_stalled}, ?STREAM_COUNTERS, #{}),
+    State0 = #state{cfg = #cfg{stream = <<"s">>}, metrics = Cnt},
+    Gauge = fun() -> counters:get(Cnt, ?C_UPLOAD_STALLED_OFFSET) end,
+    ?assertEqual(0, Gauge()),
+    RefA = make_ref(),
+    RefB = make_ref(),
+    %% Two fragments stall; the gauge tracks the lower offset.
+    State1 = mark_transfer_stalled(RefA, 100, State0),
+    ?assertEqual(100, Gauge()),
+    State2 = mark_transfer_stalled(RefB, 200, State1),
+    ?assertEqual(100, Gauge()),
+    %% The later fragment (B) becoming durable does not clear the head stall.
+    State3 = clear_transfer_stalled(RefB, State2),
+    ?assertEqual(100, Gauge()),
+    %% Only when the head (A) drains does the gauge fall to 0.
+    _State4 = clear_transfer_stalled(RefA, State3),
+    ?assertEqual(0, Gauge()),
+    seshat:delete(rabbitmq_stream_s3, {?MODULE, test_stalled}).
 
 -endif.

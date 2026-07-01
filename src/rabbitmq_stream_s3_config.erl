@@ -39,6 +39,7 @@ lives here. Callers use these functions instead of calling
     task_retry_delay_max_ms/0,
     task_retry_delay_constant/0,
     task_retry_delay_exponent/0,
+    upload_retry_delay_max_ms/0,
     verbose_logging/0,
     segment_upload_timeout/0,
     upload_retry_delay_ms/0,
@@ -193,12 +194,21 @@ verbose_logging() ->
 segment_upload_timeout() ->
     application:get_env(?APP, segment_upload_timeout, 45_000).
 
-%% Delay before retrying a fragment upload that failed with a non-transient
+%% Base delay before retrying a fragment upload that failed with a non-transient
 %% error. The upload pipeline stalls at the failed offset until the retry
-%% succeeds, so this bounds how often a persistently failing upload is retried.
+%% succeeds. Successive non-transient retries back off exponentially from this
+%% base (using task_retry_delay_exponent) up to upload_retry_delay_max_ms, so a
+%% persistently failing upload is not retried tightly.
 -spec upload_retry_delay_ms() -> non_neg_integer().
 upload_retry_delay_ms() ->
     application:get_env(?APP, upload_retry_delay_ms, 1000).
+
+%% Ceiling for the non-transient upload-retry backoff. A confirmed-fatal error
+%% (a checksum mismatch, an unexpected 4xx) is unlikely to clear on a tight
+%% retry, so the backoff is allowed to grow well beyond the transient ceiling.
+-spec upload_retry_delay_max_ms() -> non_neg_integer().
+upload_retry_delay_max_ms() ->
+    application:get_env(?APP, upload_retry_delay_max_ms, 30_000).
 
 %% Deadline for a submitted fragment transfer to report a result back to the
 %% replica reader. The reader submits each transfer to the per-node governor
@@ -280,6 +290,7 @@ defaults_test_() ->
         ?_assertEqual(false, verbose_logging()),
         ?_assertEqual(45_000, segment_upload_timeout()),
         ?_assertEqual(1000, upload_retry_delay_ms()),
+        ?_assertEqual(30_000, upload_retry_delay_max_ms()),
         ?_assertEqual(180_000, transfer_deadline_ms()),
         ?_assertEqual(60_000, retention_task_timeout()),
         ?_assertEqual(5000, tick_timeout_milliseconds()),
