@@ -37,6 +37,7 @@ jobs:
       orphan_leak: ${{ steps.filter.outputs.orphan_leak }}
       tier_routing: ${{ steps.filter.outputs.tier_routing }}
       writer_fencing: ${{ steps.filter.outputs.writer_fencing }}
+      manifest_replica_lifecycle: ${{ steps.filter.outputs.manifest_replica_lifecycle }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -72,6 +73,8 @@ jobs:
           echo "$CHANGED" | grep -q '^p/tier-routing/' && echo "tier_routing=true" >> "$GITHUB_OUTPUT" || true
           echo "writer_fencing=false" >> "$GITHUB_OUTPUT"
           echo "$CHANGED" | grep -q '^p/writer-fencing/' && echo "writer_fencing=true" >> "$GITHUB_OUTPUT" || true
+          echo "manifest_replica_lifecycle=false" >> "$GITHUB_OUTPUT"
+          echo "$CHANGED" | grep -q '^p/manifest-replica-lifecycle/' && echo "manifest_replica_lifecycle=true" >> "$GITHUB_OUTPUT" || true
           if echo "$CHANGED" | grep -q '^\.github/workflows/p-model-check\.yaml'; then
             echo "gc_reset=true" >> "$GITHUB_OUTPUT"
             echo "gc_reset_multinode=true" >> "$GITHUB_OUTPUT"
@@ -84,6 +87,7 @@ jobs:
             echo "orphan_leak=true" >> "$GITHUB_OUTPUT"
             echo "tier_routing=true" >> "$GITHUB_OUTPUT"
             echo "writer_fencing=true" >> "$GITHUB_OUTPUT"
+            echo "manifest_replica_lifecycle=true" >> "$GITHUB_OUTPUT"
           fi
 
   gc-reset:
@@ -369,6 +373,74 @@ jobs:
           fi
           echo "Gate satisfied: PCT reaches the reset-after-snapshot live deletion."
           echo "::endgroup::"
+
+  manifest-replica-lifecycle:
+    needs: changes
+    if: needs.changes.outputs.manifest_replica_lifecycle == 'true' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install the P checker
+        run: |
+          dotnet tool install --global P --version 3.1.0 --configfile "$GITHUB_WORKSPACE/p/NuGet.config"
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+      - name: Compile
+        run: |
+          cd p/manifest-replica-lifecycle
+          p compile
+      - name: Tests that must hold
+        run: |
+          cd p/manifest-replica-lifecycle
+          for tc in tcCleanupGuarded tcStaleSyncGuarded tcReregisterGuarded \
+                    tcConvergenceGuarded tcForgetReleasesWriterRow tcSyncAfterExitFixed \
+                    tcStartupRaceContextFirst tcReconcileRaceResync tcExplore; do
+            echo "::group::$tc (expect hold)"
+            p check -tc "$tc" -i 5000
+            echo "::endgroup::"
+          done
+          # PCT surfaces rare interleavings the random strategy misses.
+          echo "::group::tcExplore (PCT)"
+          p check -tc tcExplore --sch-pct 10 -i 5000
+          echo "::endgroup::"
+      - name: Validation gate (each guard is load-bearing)
+        run: |
+          cd p/manifest-replica-lifecycle
+          # Each gate removes one guard and must reproduce its specific failure,
+          # otherwise the guarded results above are not trustworthy. A gate that
+          # passes means the guard is no longer load-bearing, or the model rotted.
+          check_gate() {
+            tc="$1"; expected="$2"
+            rm -rf PCheckerOutput/
+            echo "::group::$tc (expect failure: $expected)"
+            if p check -tc "$tc" -i 2000; then
+              echo "ERROR: $tc passed with the guard removed; the model no longer reproduces the failure."
+              exit 1
+            fi
+            if ! grep -rqF "$expected" PCheckerOutput/BugFinding/; then
+              echo "ERROR: $tc failed, but not with the expected counterexample: $expected"
+              exit 1
+            fi
+            echo "Gate satisfied: $tc reproduces the failure as expected."
+            echo "::endgroup::"
+          }
+          # The three shipped guards: member-DOWN cleanup, stale-sync ordering,
+          # and the re-registration monitor repoint.
+          check_gate tcCleanupUnguarded 'NOLEAK violated: replica holds per-node state for stream 0 with no live reader'
+          check_gate tcStaleSyncUnguarded 'STALEFLOOR violated: cache for stream 0 regressed to (epoch=1, sn=1) below already-applied (epoch=2, sn=2)'
+          check_gate tcReregisterUnguarded 'RETAIN violated: replica dropped per-node state for stream 0 that still has a live reader (a superseded member DOWN evicted the live context)'
+          # The gap this model surfaces: a sync after a member DOWN re-strands the
+          # row (the shipped-in-this-branch A2 guard closes it in tcSyncAfterExitFixed).
+          check_gate tcSyncAfterExitStrands 'NOLEAK violated: replica holds per-node state for stream 0 with no live reader'
+          # Liveness: syncs dropped forever (tcConvergenceStuck), and the two
+          # startup triggers that starve the cache without recovery - the
+          # WriterFirst acceptor race (A1 fixes it) and the writer-driven reconcile
+          # race (only A1' can, since the node's attach ordering cannot reach it).
+          check_gate tcConvergenceStuck "ReplicaConverges detected liveness bug in hot state 'Lagging'"
+          check_gate tcStartupRaceWriterFirst "ReplicaConverges detected liveness bug in hot state 'Lagging'"
+          check_gate tcReconcileRaceNoResync "ReplicaConverges detected liveness bug in hot state 'Lagging'"
 
   delete-stream-anchor:
     needs: changes
