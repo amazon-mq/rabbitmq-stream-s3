@@ -10,7 +10,9 @@ For a detailed description of the design, start with [docs/README.md](docs/READM
 
 ## Project Maturity
 
-rabbitmq-stream-s3 is not stable, with frequent changes in design and functionality.
+`rabbitmq-stream-s3` has matured considerably and is now at a beta level of stability. The core design has settled and the main subsystems (upload path, read path, garbage collection, retention, and manifest replication) are implemented and exercised by an extensive test suite, formal models, and a Jepsen harness.
+
+It remains pre-1.0, so some interfaces and behavior may still change.
 
 ## Important: `rabbitmq_prometheus` dependency
 
