@@ -216,6 +216,12 @@
    "rabbitmq_stream_s3_persist_conflicts"
    "rabbitmq_stream_s3_syncs_rejected"
    "rabbitmq_stream_s3_resyncs_requested"
+   ;; The manifest-replica sync-context fix's gated path: a sync arriving for a
+   ;; stream with no registered replica context is dropped (rather than
+   ;; re-creating an unmonitored cache row) and a resync is requested once a
+   ;; context registers. The replica-consistency checker reports this as evidence
+   ;; the A2 guard actually engaged.
+   "rabbitmq_stream_s3_syncs_dropped_no_context"
    ;; S3-disruption evidence, reported for visibility (not asserted): the plugin
    ;; tolerates an s3-outage gracefully (writes stay local, uploads pause and
    ;; retry), so these often stay 0 even when the link is cut. The Toxiproxy

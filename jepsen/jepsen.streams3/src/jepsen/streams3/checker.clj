@@ -143,9 +143,11 @@
 
   A converged-floor verdict only means something if the run actually drove the
   caches apart and the sync machinery pulled them back. The result therefore
-  reports syncs_rejected (a stale sync dropped) and resyncs_requested (a gap
-  triggered a resync) from the run's counters as :divergence-exercised?, and
-  flags :convergence-hollow? when the check passed but neither ever ticked — a
+  reports syncs_rejected (a stale sync dropped), syncs_dropped_no_context (the
+  manifest-replica fix's A2 guard dropped a sync that raced ahead of a reader
+  context) and resyncs_requested (a gap, or a context registering with a sync
+  pending, triggered a resync) from the run's counters as :divergence-exercised?,
+  and flags :convergence-hollow? when the check passed but none ever ticked — a
   green that proves nothing rather than a failure."
   []
   (reify checker/Checker
@@ -154,12 +156,17 @@
             committed @db/committed-offsets-snapshot
             stats     @db/tiering-stats
             ;; Evidence the run actually stressed the sync machinery: a stale
-            ;; sync was dropped, or a detected gap requested a resync. With both
-            ;; at zero nothing ever diverged, so a converged-floor verdict is
-            ;; hollow. Reported, not failed: a quiet schedule is not a bug.
+            ;; sync was dropped, the A2 guard dropped a contextless sync, or a
+            ;; detected gap (or a context registering with a sync pending)
+            ;; requested a resync. With all three at zero nothing ever diverged,
+            ;; so a converged-floor verdict is hollow. Reported, not failed: a
+            ;; quiet schedule is not a bug.
             syncs-rejected        (long (get stats "rabbitmq_stream_s3_syncs_rejected" 0))
+            syncs-dropped-noctx   (long (get stats "rabbitmq_stream_s3_syncs_dropped_no_context" 0))
             resyncs-requested     (long (get stats "rabbitmq_stream_s3_resyncs_requested" 0))
-            divergence-exercised? (or (pos? syncs-rejected) (pos? resyncs-requested))
+            divergence-exercised? (or (pos? syncs-rejected)
+                                      (pos? syncs-dropped-noctx)
+                                      (pos? resyncs-requested))
             ;; stream key -> {node -> rec} over only the nodes that cache it.
             by-stream (reduce-kv
                         (fn [acc node kmap]
@@ -192,16 +199,17 @@
                         (seq diverged)    (conj :replicas-diverged)
                         (seq stale)       (conj :stale-floor-served)
                         (seq leaked)      (conj :leaked-replica-row))]
-        {:valid?                (empty? problems)
-         :problems              problems
-         :streams-cached        (count by-stream)
-         :diverged              (vec diverged)
-         :stale-floors          (vec stale)
-         :leaked-rows           (vec leaked)
-         :syncs-rejected        syncs-rejected
-         :resyncs-requested     resyncs-requested
-         :divergence-exercised? divergence-exercised?
-         :convergence-hollow?   (and (empty? problems) (not divergence-exercised?))}))))
+        {:valid?                   (empty? problems)
+         :problems                 problems
+         :streams-cached           (count by-stream)
+         :diverged                 (vec diverged)
+         :stale-floors             (vec stale)
+         :leaked-rows              (vec leaked)
+         :syncs-rejected           syncs-rejected
+         :syncs-dropped-no-context syncs-dropped-noctx
+         :resyncs-requested        resyncs-requested
+         :divergence-exercised?    divergence-exercised?
+         :convergence-hollow?      (and (empty? problems) (not divergence-exercised?))}))))
 
 (defn downgrade-when
   "Wraps a checker so that when (pred test) holds its result cannot invalidate

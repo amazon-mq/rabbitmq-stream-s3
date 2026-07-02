@@ -17,9 +17,11 @@ Reliably exercising it needs a nemesis that makes members genuinely leave a node
 
 Until then the convergence and stale-floor assertions carry the meaningful verdict for this scenario.
 
-## Run this scenario as a regression check once the manifest-replica fix lands
+## Regression check for the manifest-replica fix (validated)
 
-The manifest-replica sync-context fix (branch `manifest-replica-lifecycle`: drop a sync for a stream with no reader context, and request a resync when a context registers) changes the replica cache's write path. Once it lands on `main`, run this scenario against a cluster carrying it and confirm the convergence, stale-floor, and durability assertions still hold, with the run's `:divergence-exercised?` telemetry and the `syncs_dropped_no_context` and `resyncs_requested` counters confirming the gated and recovery paths were actually taken. This is regression coverage only: it does not positively prove the fix closes the leak, because `:leaked-replica-row` does not fire without the hard-kill or stream-churn nemesis above. The fix itself is validated by the `p/manifest-replica-lifecycle` model's gates and the module's unit tests.
+The manifest-replica sync-context fix (drop a sync for a stream with no reader context, and request a resync when a context registers) landed on `main` and changed the replica cache's write path. This scenario was run against a cluster carrying it under `s3-outage,leader-move` and confirmed the convergence, stale-floor, and durability assertions all still hold (`:diverged`, `:stale-floors`, `:leaked-rows` and durability violations all empty, 49/49 keys). The gated and recovery paths were genuinely exercised, not merely present: `syncs_dropped_no_context` and `resyncs_requested` both ticked 240 times over the run, so `:divergence-exercised?` was true and `:convergence-hollow?` false. The matched counts are the fix end to end, every contextless sync the A2 guard dropped was recovered by an A1' resync once a context registered.
+
+This is regression coverage only: it does not positively prove the fix closes the leak, because `:leaked-replica-row` still does not fire without the hard-kill or stream-churn nemesis above (it stayed empty here, as expected under graceful leader-move). The fix itself is validated by the `p/manifest-replica-lifecycle` model's gates and the module's unit tests.
 
 ## Super-streams (multi-partition)
 
