@@ -28,7 +28,7 @@ floor a concurrent sweep already snapshotted. Three guards keep the sweep safe:
      strongly-consistent metadata read, so a partitioned or deposed node that
      cannot reach a quorum fails closed and skips rather than deleting on a stale
      local view.
-  3. That metadata read in build_lookup/1 is sampled once, up front. A reset that
+  3. That metadata read in build_lookup/2 is sampled once, up front. A reset that
      commits *after* the snapshot, on a node whose manifest cache has not yet
      applied the sync, leaves still_dangling/1 re-reading a stale-high floor while
      the committed epoch has moved on, so guards 1 and 2 both pass. Each
@@ -61,7 +61,30 @@ anchor absent and reap it.
 -type reason() :: below_first_offset | stale_epoch | no_anchor.
 -type finding() :: #{stream_id := stream_id(), key := rabbitmq_stream_s3:key(), reason := reason()}.
 
+%% The results of the two live reads the sweep depends on. The read-performing
+%% shells (build_lookup/2, build_stream_lookup/2, fresh_enough_to_delete/2,
+%% anchor_absent/1) hand these to pure decision functions, so every guard is a
+%% total function of read results, testable without a live db or replica cache.
+-type consistent_result() :: {ok, rabbitmq_stream_s3_db:entry()} | {error, term()}.
+-type cache_result() :: {#manifest{}, osiris:epoch() | undefined} | undefined.
+
 -export_type([mode/0, config/0, finding/0]).
+
+-ifdef(TEST).
+%% Exposed to prop_SUITE, which property-tests the pure reap decision against the
+%% same invariants the P models in p/ verify. These are the functional cores of
+%% the read-performing shells, taking read results as inputs.
+-export([
+    classify/2,
+    still_dangling/1,
+    lookup_entry/4,
+    stream_lookup_decision/5,
+    fresh_enough_decision/3,
+    anchor_decision/2,
+    cache_at_committed_epoch/2,
+    epoch_permits_sweep/2
+]).
+-endif.
 
 run() ->
     run(#{mode => dry_run}).
@@ -74,7 +97,7 @@ deleting. In `delete` mode, deletes identified orphans via the reaper.
 run(Config) when is_map(Config) ->
     Mode = maps:get(mode, Config, dry_run),
     {ok, Streams} = rabbitmq_stream_s3_db:list(),
-    Lookup = build_lookup(Streams),
+    Lookup = build_lookup(Streams, Config),
     Fun = make_handler(Mode),
     Findings = list_and_classify(
         <<"rabbitmq/stream/">>, start, Lookup, Fun, fun anchor_absent/1, []
@@ -156,7 +179,7 @@ make_handler(delete) ->
     end.
 
 %% Re-validate cache freshness against the committed epoch immediately before an
-%% offset-based deletion. build_lookup/1 (and build_stream_lookup/2) sampled the
+%% offset-based deletion. build_lookup/2 (and build_stream_lookup/2) sampled the
 %% committed epoch once, at the start of the sweep; a remote-tier-ahead reset that
 %% commits after that snapshot, on a node whose manifest cache has not yet applied
 %% the sync, leaves the cached floor stale-high at the old epoch while the
@@ -174,30 +197,35 @@ fresh_enough_to_delete(no_anchor, _StreamId) ->
     %% incarnation), so the absence is permanent.
     true;
 fresh_enough_to_delete(below_first_offset, StreamId) ->
-    case rabbitmq_stream_s3_db:get_consistent(StreamId) of
-        {ok, #{epoch := CommittedEpoch}} ->
-            CacheResult = rabbitmq_stream_s3_manifest_replica:get_manifest_and_epoch(StreamId),
-            case cache_at_committed_epoch(CacheResult, CommittedEpoch) of
-                true ->
-                    true;
-                false ->
-                    ?LOG_INFO(
-                        "GC: not deleting under stream ~ts: local manifest cache "
-                        "epoch ~p does not match the committed epoch ~p; a reset "
-                        "committed after the sweep snapshot and this node has not "
-                        "applied it. A later sweep reclaims a genuine orphan.",
-                        [StreamId, cache_epoch(CacheResult), CommittedEpoch]
-                    ),
-                    false
-            end;
-        {error, Reason} ->
+    Consistent = rabbitmq_stream_s3_db:get_consistent(StreamId),
+    fresh_enough_decision(StreamId, Consistent, read_cache_after(Consistent, StreamId)).
+
+%% Pure decision for the offset-based freshness re-check: given the
+%% committed-epoch read and the cache read, delete only when the cache holds a
+%% manifest at exactly the committed epoch. A quorum-read failure or a cache
+%% that lags the committed epoch both fail closed.
+-spec fresh_enough_decision(stream_id(), consistent_result(), cache_result()) -> boolean().
+fresh_enough_decision(StreamId, {ok, #{epoch := CommittedEpoch}}, CacheResult) ->
+    case cache_at_committed_epoch(CacheResult, CommittedEpoch) of
+        true ->
+            true;
+        false ->
             ?LOG_INFO(
-                "GC: not deleting under stream ~ts: could not re-read the committed "
-                "epoch with quorum (~p); failing closed",
-                [StreamId, Reason]
+                "GC: not deleting under stream ~ts: local manifest cache "
+                "epoch ~p does not match the committed epoch ~p; a reset "
+                "committed after the sweep snapshot and this node has not "
+                "applied it. A later sweep reclaims a genuine orphan.",
+                [StreamId, cache_epoch(CacheResult), CommittedEpoch]
             ),
             false
-    end.
+    end;
+fresh_enough_decision(StreamId, {error, Reason}, _CacheResult) ->
+    ?LOG_INFO(
+        "GC: not deleting under stream ~ts: could not re-read the committed "
+        "epoch with quorum (~p); failing closed",
+        [StreamId, Reason]
+    ),
+    false.
 
 %% Pure decision for fresh_enough_to_delete/2: the cache must hold a manifest at
 %% exactly the committed epoch. A cache behind the committed epoch (the
@@ -277,59 +305,98 @@ live_leading_group(StreamId, Key, Manifest) ->
 %% Internal
 %% ------------------------------------------------------------------
 
-build_lookup(Streams) ->
+-doc """
+Cross-stream sweep lookup.
+
+Gates each stream on a strongly-consistent metadata read so a partitioned or
+deposed node that cannot reach a quorum fails closed and skips, rather than
+deleting on a stale local view. The committed epoch from that read is also
+more authoritative than the local db:list/0 snapshot. The per-stream decision
+is shared with the single-stream path via stream_lookup_decision/5; here it
+runs with no empty-manifest allowance (an empty manifest has nothing in the
+remote tier to sweep against).
+""".
+build_lookup(Streams, Config) ->
     maps:fold(
         fun(StreamId, _LocalEntry, Acc) ->
-            %% Like the single-stream path (build_stream_lookup/2), gate each
-            %% stream on a strongly-consistent metadata read so a partitioned or
-            %% deposed node that cannot reach a quorum fails closed and skips,
-            %% rather than deleting on a stale local view. The committed epoch
-            %% from this read is also more authoritative than the local db:list/0
-            %% snapshot. This makes a full sweep do one quorum read per stream,
-            %% which is acceptable for an infrequent operator-driven sweep.
-            case rabbitmq_stream_s3_db:get_consistent(StreamId) of
-                {ok, #{epoch := Epoch}} ->
-                    %% The floor comes from the local replica cache, but the
-                    %% committed epoch comes from the quorum read above. On a node
-                    %% that has not yet applied a floor-lowering reset's sync, the
-                    %% cache still holds the pre-reset high floor at the old epoch,
-                    %% and still_dangling/1 would re-read that same stale floor.
-                    %% Sweep only when the cached manifest's epoch matches the
-                    %% committed epoch; otherwise fail closed (the cache lags the
-                    %% committed reset). The `Epoch` in the matching clause is the
-                    %% committed epoch bound above, so the clause only matches an
-                    %% up-to-date cache.
-                    case rabbitmq_stream_s3_manifest_replica:get_manifest_and_epoch(StreamId) of
-                        {#manifest{entries = <<>>}, _} ->
-                            %% Empty manifest: nothing in the remote tier to
-                            %% compare against (matches the prior get_range/1
-                            %% `empty` skip).
-                            Acc;
-                        {#manifest{first_offset = FirstOffset} = Manifest, Epoch} ->
-                            Acc#{StreamId => lookup_entry(StreamId, Epoch, FirstOffset, Manifest)};
-                        {#manifest{}, CacheEpoch} ->
-                            ?LOG_INFO(
-                                "GC for stream ~ts skipped: local manifest cache epoch ~p "
-                                "does not match the committed epoch ~p; the cache lags the "
-                                "committed reset, so its floor may be stale-high",
-                                [StreamId, CacheEpoch, Epoch]
-                            ),
-                            Acc;
-                        undefined ->
-                            Acc
-                    end;
-                {error, Reason} ->
-                    ?LOG_INFO(
-                        "GC for stream ~ts skipped: could not read committed "
-                        "metadata with quorum (~p); not sweeping",
-                        [StreamId, Reason]
-                    ),
-                    Acc
+            Consistent = rabbitmq_stream_s3_db:get_consistent(StreamId),
+            CacheResult = read_cache_after(Consistent, StreamId),
+            case stream_lookup_decision(StreamId, Consistent, CacheResult, Config, false) of
+                {ok, Entry} -> Acc#{StreamId => Entry};
+                skip -> Acc
             end
         end,
         #{},
         Streams
     ).
+
+%% Read the local replica cache only when the quorum read succeeded, mirroring
+%% the original control flow (a quorum failure fails closed before any cache
+%% read).
+-spec read_cache_after(consistent_result(), stream_id()) -> cache_result().
+read_cache_after({ok, _}, StreamId) ->
+    rabbitmq_stream_s3_manifest_replica:get_manifest_and_epoch(StreamId);
+read_cache_after({error, _}, _StreamId) ->
+    undefined.
+
+%% Pure per-stream lookup decision shared by the cross-stream and
+%% single-stream sweeps. Given the committed-epoch read and the cache read, it
+%% yields the lookup entry to sweep against or skips (fails closed).
+%%
+%% The floor comes from the local replica cache but the committed epoch comes from
+%% the quorum read: on a node that has not applied a floor-lowering reset's sync,
+%% the cache still holds the pre-reset high floor at the old epoch, and
+%% still_dangling/1 would re-read that same stale floor. So the entry is built only
+%% when the cached manifest's epoch equals the committed epoch (the CommittedEpoch
+%% reused in the matching clause of stream_lookup_from_cache/4); otherwise the
+%% cache lags the committed reset and the stream is skipped.
+%%
+%% AllowEmpty distinguishes the callers: the cross-stream sweep skips an empty
+%% manifest, while the single-stream reset path keeps it (the reset installs an
+%% empty manifest whose first_offset is the floor the orphans sit below).
+-spec stream_lookup_decision(
+    stream_id(), consistent_result(), cache_result(), config(), boolean()
+) -> {ok, map()} | skip.
+stream_lookup_decision(StreamId, {ok, #{epoch := CommittedEpoch}}, CacheResult, Config, AllowEmpty) ->
+    case epoch_permits_sweep(CommittedEpoch, Config) of
+        true ->
+            stream_lookup_from_cache(StreamId, CommittedEpoch, CacheResult, AllowEmpty);
+        false ->
+            ?LOG_INFO(
+                "GC for stream ~ts skipped: writer epoch ~p is behind the "
+                "committed epoch ~p, this writer has been deposed",
+                [StreamId, maps:get(writer_epoch, Config, undefined), CommittedEpoch]
+            ),
+            skip
+    end;
+stream_lookup_decision(StreamId, {error, Reason}, _CacheResult, _Config, _AllowEmpty) ->
+    ?LOG_INFO(
+        "GC for stream ~ts skipped: could not read committed "
+        "metadata with quorum (~p); not sweeping",
+        [StreamId, Reason]
+    ),
+    skip.
+
+-spec stream_lookup_from_cache(stream_id(), osiris:epoch(), cache_result(), boolean()) ->
+    {ok, map()} | skip.
+stream_lookup_from_cache(_StreamId, _CommittedEpoch, {#manifest{entries = <<>>}, _}, false) ->
+    %% Cross-stream sweep: empty manifest, nothing in the remote tier to compare
+    %% against (matches the prior get_range/1 `empty` skip).
+    skip;
+stream_lookup_from_cache(
+    StreamId, CommittedEpoch, {#manifest{first_offset = FirstOffset} = Manifest, CommittedEpoch}, _
+) ->
+    {ok, lookup_entry(StreamId, CommittedEpoch, FirstOffset, Manifest)};
+stream_lookup_from_cache(StreamId, CommittedEpoch, {#manifest{}, CacheEpoch}, _AllowEmpty) ->
+    ?LOG_INFO(
+        "GC for stream ~ts skipped: local manifest cache epoch ~p "
+        "does not match the committed epoch ~p; the cache lags the "
+        "committed reset, so its floor may be stale-high",
+        [StreamId, CacheEpoch, CommittedEpoch]
+    ),
+    skip;
+stream_lookup_from_cache(_StreamId, _CommittedEpoch, undefined, _AllowEmpty) ->
+    skip.
 
 %% Build a per-stream lookup entry. Besides the epoch and first_offset used for
 %% the offset/epoch heuristics, it records the leading group's object key (the
@@ -378,66 +445,32 @@ leading_group_info(StreamId, #manifest{entries = Entries}) ->
             {none, true}
     end.
 
+-doc """
+Single-stream sweep lookup.
+
+Reads the committed epoch with a strongly consistent (quorum-requiring) read.
+the sweep deletes data objects below a floor taken from the local just-reset
+manifest, which sits above the committed floor, and a deposed writer that read
+stale local state would delete a successor's live fragments in that gap. The
+consistent read makes a deposed minority writer, which cannot reach a quorum,
+fail closed and skip; when the caller pins its own writer epoch,
+`epoch_permits_sweep/2` additionally makes a deposed writer that can still
+reach a quorum skip.
+
+Runs the shared decision with AllowEmpty = true: a manifest reset installs an
+empty manifest whose first_offset is the local floor the orphaned fragments sit
+below, and reading first_offset from that record (rather than via get_range/1,
+which reports `empty`) is precisely what lets this path reclaim them. On the
+reset path the writer's own cache was just updated synchronously at this epoch,
+so the cache-epoch gate is a no-op there; it fails closed for any caller
+reading a node whose cache lags the committed reset.
+""".
 build_stream_lookup(StreamId, Config) ->
-    %% Read the committed epoch with a strongly consistent (quorum-requiring)
-    %% read, not the default low-latency local read. The sweep deletes data
-    %% objects below a floor taken from the local just-reset manifest, which sits
-    %% above the committed floor. A deposed writer that read stale local state
-    %% would delete a successor's live fragments in that gap. A consistent read
-    %% makes a deposed minority writer, which cannot reach a quorum, fail closed
-    %% and skip. When the caller supplies its own writer epoch (the reset path),
-    %% additionally require the committed epoch to equal it, so a deposed writer
-    %% that can still reach a quorum also skips.
-    case rabbitmq_stream_s3_db:get_consistent(StreamId) of
-        {ok, #{epoch := CommittedEpoch}} ->
-            case epoch_permits_sweep(CommittedEpoch, Config) of
-                true ->
-                    %% Read first_offset from the manifest record directly rather
-                    %% than via get_range/1, which reports `empty` whenever the
-                    %% entries array is empty. A manifest reset (the caller of
-                    %% run_stream/2) installs exactly such an empty manifest with
-                    %% first_offset at the local floor, and that floor is precisely
-                    %% what the orphaned fragments sit below. Using get_range/1
-                    %% here would skip the stream and reclaim nothing.
-                    %% Sweep only against a cache at the committed epoch (see
-                    %% build_lookup/1). On the reset path the writer's own cache
-                    %% was just updated synchronously at this epoch, so this is a
-                    %% no-op there; it fails closed for any caller reading a node
-                    %% whose cache lags the committed reset. The matching clause
-                    %% reuses CommittedEpoch, so it only matches an up-to-date cache.
-                    case rabbitmq_stream_s3_manifest_replica:get_manifest_and_epoch(StreamId) of
-                        {#manifest{first_offset = FirstOffset} = Manifest, CommittedEpoch} ->
-                            {ok, #{
-                                StreamId => lookup_entry(
-                                    StreamId, CommittedEpoch, FirstOffset, Manifest
-                                )
-                            }};
-                        {#manifest{}, CacheEpoch} ->
-                            ?LOG_INFO(
-                                "GC for stream ~ts skipped: local manifest cache epoch ~p "
-                                "does not match the committed epoch ~p; the cache lags the "
-                                "committed reset, so its floor may be stale-high",
-                                [StreamId, CacheEpoch, CommittedEpoch]
-                            ),
-                            skip;
-                        undefined ->
-                            skip
-                    end;
-                false ->
-                    ?LOG_INFO(
-                        "GC for stream ~ts skipped: writer epoch ~p is behind the "
-                        "committed epoch ~p, this writer has been deposed",
-                        [StreamId, maps:get(writer_epoch, Config, undefined), CommittedEpoch]
-                    ),
-                    skip
-            end;
-        {error, Reason} ->
-            ?LOG_INFO(
-                "GC for stream ~ts skipped: could not read committed metadata "
-                "with quorum (~p); not sweeping",
-                [StreamId, Reason]
-            ),
-            skip
+    Consistent = rabbitmq_stream_s3_db:get_consistent(StreamId),
+    CacheResult = read_cache_after(Consistent, StreamId),
+    case stream_lookup_decision(StreamId, Consistent, CacheResult, Config, true) of
+        {ok, Entry} -> {ok, #{StreamId => Entry}};
+        skip -> skip
     end.
 
 %% On the reset path the caller pins its writer epoch, and the sweep is permitted
@@ -495,17 +528,22 @@ classify_page(Keys, Lookup, AnchorAbsent) ->
 %% a quorum fails closed (false), so a live or unverifiable stream is never reaped.
 -spec anchor_absent(stream_id()) -> boolean().
 anchor_absent(StreamId) ->
-    case rabbitmq_stream_s3_db:anchor_exists_consistent(StreamId) of
-        {ok, Exists} ->
-            not Exists;
-        {error, Reason} ->
-            ?LOG_INFO(
-                "GC: not reaping the prefix of stream ~ts: could not read its anchor "
-                "with quorum (~p); failing closed",
-                [StreamId, Reason]
-            ),
-            false
-    end.
+    anchor_decision(StreamId, rabbitmq_stream_s3_db:anchor_exists_consistent(StreamId)).
+
+%% Pure decision for the no_anchor backstop: the anchor is "absent" (the stream is
+%% deleted, so its prefix is reapable) only on a consistent read that positively
+%% reports it gone. A present anchor, or any read that cannot reach a quorum, fails
+%% closed, so a live or unverifiable stream is never reaped.
+-spec anchor_decision(stream_id(), {ok, boolean()} | {error, term()}) -> boolean().
+anchor_decision(_StreamId, {ok, Exists}) ->
+    not Exists;
+anchor_decision(StreamId, {error, Reason}) ->
+    ?LOG_INFO(
+        "GC: not reaping the prefix of stream ~ts: could not read its anchor "
+        "with quorum (~p); failing closed",
+        [StreamId, Reason]
+    ),
+    false.
 
 %% A stream that is in the lookup is classified against its floor/epoch. A
 %% well-formed key whose stream is NOT in the lookup becomes a no_anchor
