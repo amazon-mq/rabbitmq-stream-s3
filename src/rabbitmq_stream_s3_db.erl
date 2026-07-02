@@ -72,7 +72,7 @@ Zero indicates that the manifest has not been created yet.
 
 -export([setup/0]).
 
--export([get/1, get_consistent/1, list/0, count/0, put/5, queue_path/1]).
+-export([get/1, get_consistent/1, list/0, list_consistent/0, count/0, put/5, queue_path/1]).
 -export([put_anchor/2, anchor_exists_consistent/1]).
 
 -define(C_SPROC_TRIGGERS, 1).
@@ -175,10 +175,23 @@ do_get(StreamId, Options) ->
             Err
     end.
 
--doc "Lists all streams known to the metadata store.".
+-doc "Lists all streams known to the metadata store with a low-latency local read.".
 -spec list() -> {ok, #{stream_id() => entry()}} | {error, any()}.
 list() ->
-    case rabbit_khepri:adv_get_many(?MANIFEST_PATH(?KHEPRI_WILDCARD_STAR)) of
+    do_list(#{}).
+
+-doc """
+Lists all streams known to the metadata store with a consistent read.
+
+A consistent read ensures that the query either reflects the latest possible
+information across the cluster, or fails.
+""".
+-spec list_consistent() -> {ok, #{stream_id() => entry()}} | {error, any()}.
+list_consistent() ->
+    do_list(#{favor => consistency, timeout => ?CONSISTENT_READ_TIMEOUT_MS}).
+
+do_list(Options) ->
+    case rabbit_khepri:adv_get_many(?MANIFEST_PATH(?KHEPRI_WILDCARD_STAR), Options) of
         {ok, NodeProps} ->
             Entries =
                 #{

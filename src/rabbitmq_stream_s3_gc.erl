@@ -24,18 +24,20 @@ floor a concurrent sweep already snapshotted. Three guards keep the sweep safe:
      if the floor has dropped to at or below its offset. The reset lowers the
      cached floor before it re-uploads, so a re-tiered fragment is always at or
      above the live floor by the time it exists.
-  2. The cross-stream sweep, like the single-stream path, gates each stream on a
-     strongly-consistent metadata read, so a partitioned or deposed node that
-     cannot reach a quorum fails closed and skips rather than deleting on a stale
-     local view.
-  3. That metadata read in build_lookup/2 is sampled once, up front. A reset that
-     commits *after* the snapshot, on a node whose manifest cache has not yet
-     applied the sync, leaves still_dangling/1 re-reading a stale-high floor while
-     the committed epoch has moved on, so guards 1 and 2 both pass. Each
-     offset-based deletion is therefore re-validated once more at the point of
-     deletion (see fresh_enough_to_delete/2): a fresh quorum read of the committed
-     epoch is compared against the cached epoch, and the delete is skipped when
-     they differ. A genuine orphan skipped here is reclaimed by a later sweep.
+  2. The cross-stream sweep gates on a single strongly-consistent wildcard read of
+     every stream's committed metadata (db:list_consistent/0, in run/1), and the
+     single-stream path on a per-stream consistent read, so a partitioned or
+     deposed node that cannot reach a quorum fails closed rather than deleting on a
+     stale local view.
+  3. That metadata read (the single wildcard quorum read in run/1) is sampled
+     once, up front. A reset that commits after the snapshot, on a node whose
+     manifest cache has not yet applied the sync, leaves still_dangling/1
+     re-reading a stale-high floor while the committed epoch has moved on, so
+     guards 1 and 2 both pass. Each offset-based deletion is therefore
+     re-validated once more at the point of deletion (see
+     `fresh_enough_to_delete/2`): a fresh quorum read of the committed epoch is
+     compared against the cached epoch, and the delete is skipped when they
+     differ. A orphan skipped here is reclaimed by a later sweep.
 
 For a stream that is in the committed lookup, objects are classified against its
 first_offset and epoch as above. For an object whose stream is NOT in the lookup
@@ -93,17 +95,30 @@ run() ->
 Run garbage collection. In `dry_run` mode, identifies and logs orphans without
 deleting. In `delete` mode, deletes identified orphans via the reaper.
 """.
--spec run(config()) -> {ok, [finding()]}.
+-spec run(config()) -> {ok, [finding()]} | {error, any()}.
 run(Config) when is_map(Config) ->
     Mode = maps:get(mode, Config, dry_run),
-    {ok, Streams} = rabbitmq_stream_s3_db:list(),
-    Lookup = build_lookup(Streams, Config),
-    Fun = make_handler(Mode),
-    Findings = list_and_classify(
-        <<"rabbitmq/stream/">>, start, Lookup, Fun, fun anchor_absent/1, []
-    ),
-    ?LOG_INFO("GC ~ts complete: ~b dangling object(s)", [Mode, length(Findings)]),
-    {ok, Findings}.
+    %% One strongly-consistent wildcard read snapshots every stream's committed
+    %% metadata up front, so the whole sweep pays a single quorum round trip rather
+    %% than one per stream. A quorum failure (for example on a minority partition)
+    %% fails the entire sweep closed rather than deleting on a stale local view.
+    case rabbitmq_stream_s3_db:list_consistent() of
+        {ok, Streams} ->
+            Lookup = build_lookup(Streams, Config),
+            Fun = make_handler(Mode),
+            Findings = list_and_classify(
+                <<"rabbitmq/stream/">>, start, Lookup, Fun, fun anchor_absent/1, []
+            ),
+            ?LOG_INFO("GC ~ts complete: ~b dangling object(s)", [Mode, length(Findings)]),
+            {ok, Findings};
+        {error, Reason} ->
+            ?LOG_WARNING(
+                "GC ~ts aborted: could not read committed stream metadata with "
+                "quorum (~p); sweeping nothing",
+                [Mode, Reason]
+            ),
+            {error, Reason}
+    end.
 
 -doc """
 Run garbage collection scoped to a single stream. Only lists objects under the
@@ -308,21 +323,21 @@ live_leading_group(StreamId, Key, Manifest) ->
 -doc """
 Cross-stream sweep lookup.
 
-Gates each stream on a strongly-consistent metadata read so a partitioned or
-deposed node that cannot reach a quorum fails closed and skips, rather than
-deleting on a stale local view. The committed epoch from that read is also
-more authoritative than the local db:list/0 snapshot. The per-stream decision
-is shared with the single-stream path via stream_lookup_decision/5; here it
-runs with no empty-manifest allowance (an empty manifest has nothing in the
-remote tier to sweep against).
+Consumes the committed metadata snapshot taken by the single wildcard quorum read
+in run/1 (db:list_consistent/0): every stream's entry is already the committed
+authority, so no per-stream quorum read is done here. For each stream it reads the
+local replica cache (a direct ETS read) and runs the shared per-stream decision
+(stream_lookup_decision/5) with no empty-manifest allowance (an empty manifest has
+nothing in the remote tier to sweep against), which gates the cached floor against
+the committed epoch and fails closed when the cache lags.
 """.
 build_lookup(Streams, Config) ->
     maps:fold(
-        fun(StreamId, _LocalEntry, Acc) ->
-            Consistent = rabbitmq_stream_s3_db:get_consistent(StreamId),
+        fun(StreamId, Entry, Acc) ->
+            Consistent = {ok, Entry},
             CacheResult = read_cache_after(Consistent, StreamId),
             case stream_lookup_decision(StreamId, Consistent, CacheResult, Config, false) of
-                {ok, Entry} -> Acc#{StreamId => Entry};
+                {ok, LookupEntry} -> Acc#{StreamId => LookupEntry};
                 skip -> Acc
             end
         end,
