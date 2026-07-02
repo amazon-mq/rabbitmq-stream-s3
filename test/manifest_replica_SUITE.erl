@@ -29,7 +29,9 @@ all() ->
         retention_evaluated_floors_first_offset_and_timestamp,
         member_down_releases_state,
         forget_releases_writer_row,
-        reregister_repoints_monitor
+        reregister_repoints_monitor,
+        sync_without_context_dropped,
+        register_after_dropped_sync_requests_resync
     ].
 
 init_per_suite(Config) ->
@@ -127,6 +129,63 @@ reregister_repoints_monitor(_Config) ->
     exit(New, kill),
     ok = await(fun() -> not Replica:is_context_registered(Stream) end).
 
+%% A sync for a stream with no registered reader context is dropped rather than
+%% caching a row that no member monitor would ever reclaim (the pre-registration
+%% / post-DOWN strand). get_manifest stays undefined: nothing was cached.
+sync_without_context_dropped(_Config) ->
+    Replica = rabbitmq_stream_s3_manifest_replica,
+    Stream = <<"no-context-stream">>,
+    {Manifest, _} = build_manifest([{fragment, #{offset => 0, size => 1000}}]),
+    ok = Replica:sync(Stream, 0, 1, Manifest),
+    ?assertEqual(undefined, Replica:get_manifest(Stream)).
+
+%% Registering a context for a stream whose sync was dropped requests a re-sync
+%% from the writer the dropped sync came from, so a sync that raced ahead of
+%% registration is recovered rather than leaving the cache empty.
+register_after_dropped_sync_requests_resync(_Config) ->
+    Replica = rabbitmq_stream_s3_manifest_replica,
+    Stream = <<"resync-on-register-stream">>,
+    {Manifest, _} = build_manifest([{fragment, #{offset => 0, size => 1000}}]),
+
+    %% A fake writer registered under {Stream, node()} receives the resync cast.
+    rabbitmq_stream_s3_registry:init(),
+    Self = self(),
+    WriterPid = spawn_link(fun() -> fake_writer(Self) end),
+    yes = rabbitmq_stream_s3_registry:register_name({Stream, node()}, WriterPid),
+
+    %% The sync arrives before any context: it is dropped and its writer node is
+    %% remembered.
+    ok = Replica:sync(Stream, 0, 1, Manifest),
+    ?assertEqual(undefined, Replica:get_manifest(Stream)),
+
+    %% Registering the context now requests a resync from that writer.
+    Member = register_context(Stream),
+    receive
+        {resync_received, Node} -> ?assertEqual(node(), Node)
+    after 1000 -> ct:fail("resync request not received after context registration")
+    end,
+
+    rabbitmq_stream_s3_registry:unregister_name({Stream, node()}),
+    unlink(WriterPid),
+    exit(WriterPid, kill),
+    exit(Member, kill).
+
+%% Register a live reader context so syncs for the stream are accepted (a sync
+%% for a stream with no context is dropped). Returns the member pid; it is left
+%% alive for the duration of the test.
+register_context(Stream) ->
+    Shared = atomics:new(1, []),
+    Counter = counters:new(5, []),
+    Member = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    ok = rabbitmq_stream_s3_manifest_replica:register_replica_context(
+        Stream, Member, <<"/tmp/s">>, Shared, Counter
+    ),
+    Member.
+
 await(Fun) ->
     await(Fun, 2000).
 
@@ -151,6 +210,7 @@ unknown_stream(_Config) ->
 cached_epoch_reflects_writer_epoch(_Config) ->
     Replica = rabbitmq_stream_s3_manifest_replica,
     StreamId = <<"epoch-stream">>,
+    _ = register_context(StreamId),
     {Manifest, _} = build_manifest([{fragment, #{offset => 0, size => 1000}}]),
 
     %% put_manifest/3 (the writer's local update) records its epoch.
@@ -258,6 +318,7 @@ range_updates_on_edit(_Config) ->
 
 sequenced_edits_applied_in_order(_Config) ->
     StreamId = <<"stream-seq">>,
+    _ = register_context(StreamId),
     {Manifest0, _} = build_manifest([
         {fragment, #{offset => 0, size => 1000}}
     ]),
@@ -299,6 +360,7 @@ sequenced_edits_applied_in_order(_Config) ->
 
 gap_triggers_resync(_Config) ->
     StreamId = <<"stream-gap">>,
+    _ = register_context(StreamId),
     {Manifest0, _} = build_manifest([
         {fragment, #{offset => 0, size => 1000}}
     ]),
@@ -341,6 +403,7 @@ gap_triggers_resync(_Config) ->
 
 rapid_edits_with_gap_then_resync(_Config) ->
     StreamId = <<"stream-rapid">>,
+    _ = register_context(StreamId),
     {Manifest0, _} = build_manifest([
         {fragment, #{offset => 0, size => 1000}}
     ]),
@@ -395,6 +458,7 @@ rapid_edits_with_gap_then_resync(_Config) ->
 
 stale_edit_after_resync_ignored(_Config) ->
     StreamId = <<"stream-stale">>,
+    _ = register_context(StreamId),
     {Manifest0, _} = build_manifest([
         {fragment, #{offset => 0, size => 1000}}
     ]),
@@ -438,6 +502,7 @@ stale_edit_after_resync_ignored(_Config) ->
 
 retention_and_append_in_same_broadcast(_Config) ->
     StreamId = <<"stream-mixed">>,
+    _ = register_context(StreamId),
     {Manifest0, _} = build_manifest([
         {fragment, #{offset => 0, size => 1000, uid => 1}},
         {fragment, #{offset => 50, size => 2000, uid => 2}},
@@ -526,6 +591,7 @@ sync_live_manifest_then_broadcast_double_applies(_Config) ->
     %% Correct (fixed) writer: sync the *persisted* manifest at seq 0, then the
     %% broadcast delivers Edit at seq 1. The replica converges on LiveManifest.
     Good = <<"stream-c1-good">>,
+    _ = register_context(Good),
     ok = rabbitmq_stream_s3_manifest_replica:sync(Good, 0, 1, Manifest0),
     ok = rabbitmq_stream_s3_manifest_replica:apply_edits(Good, [Edit], 1, 1),
     ?assertEqual(LiveManifest, rabbitmq_stream_s3_manifest_replica:get_manifest(Good)),
@@ -542,6 +608,7 @@ sync_live_manifest_then_broadcast_double_applies(_Config) ->
     Self = self(),
     WriterPid = spawn_link(fun() -> fake_writer(Self) end),
     Bad = <<"stream-c1-bad">>,
+    _ = register_context(Bad),
     yes = rabbitmq_stream_s3_registry:register_name({Bad, node()}, WriterPid),
     ok = rabbitmq_stream_s3_manifest_replica:sync(Bad, 0, 1, LiveManifest),
     ?assertEqual(
@@ -608,6 +675,7 @@ manifest_reset_requires_resync(_Config) ->
     Self = self(),
     WriterPid = spawn_link(fun() -> fake_writer(Self) end),
     Bad = <<"stream-reset-bad">>,
+    _ = register_context(Bad),
     yes = rabbitmq_stream_s3_registry:register_name({Bad, node()}, WriterPid),
     ok = rabbitmq_stream_s3_manifest_replica:sync(Bad, 0, 1, OldManifest),
     ?assertEqual(
@@ -627,6 +695,7 @@ manifest_reset_requires_resync(_Config) ->
     %% broadcast_seq) before the next edit. The replica drops OldManifest,
     %% adopts FreshManifest, then applies the edit onto it.
     Good = <<"stream-reset-good">>,
+    _ = register_context(Good),
     ok = rabbitmq_stream_s3_manifest_replica:sync(Good, 0, 1, OldManifest),
     ok = rabbitmq_stream_s3_manifest_replica:sync(Good, 0, 1, FreshManifest),
     ok = rabbitmq_stream_s3_manifest_replica:apply_edits(Good, [PostResetEdit], 1, 1),

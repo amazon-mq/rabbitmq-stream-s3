@@ -34,6 +34,12 @@ No heartbeat or reconnection mechanism is needed because:
   which re-registers with the writer, triggering a fresh sync.
 - An inactive stream (no writes) cannot grow disk regardless of
   whether the replica's manifest is stale.
+
+A sync is applied only for a stream that has a registered reader context, so a
+sync can never create a cached row that no member monitor would ever reclaim. A
+sync that races ahead of registration (or arrives after the context is released)
+is dropped; registering the context then requests a re-sync from that writer, so
+the drop is recovered rather than leaving the cache empty.
 """.
 
 -behaviour(gen_server).
@@ -46,11 +52,14 @@ No heartbeat or reconnection mechanism is needed because:
 
 -define(C_RESYNCS_REQUESTED, 1).
 -define(C_SYNCS_REJECTED, 2).
+-define(C_SYNCS_DROPPED_NO_CONTEXT, 3).
 -define(COUNTERS, [
     {resyncs_requested, ?C_RESYNCS_REQUESTED, counter,
         "Re-syncs a manifest replica requested after a broadcast gap or epoch mismatch"},
     {syncs_rejected, ?C_SYNCS_REJECTED, counter,
-        "Syncs a manifest replica dropped because they were older than the cached epoch or sequence"}
+        "Syncs a manifest replica dropped because they were older than the cached epoch or sequence"},
+    {syncs_dropped_no_context, ?C_SYNCS_DROPPED_NO_CONTEXT, counter,
+        "Syncs a manifest replica dropped because no live reader context owned the stream on this node"}
 ]).
 -define(COUNTER_KEY, {?MODULE, counter}).
 
@@ -97,7 +106,12 @@ No heartbeat or reconnection mechanism is needed because:
     seqs = #{} :: #{stream_id() => {non_neg_integer(), non_neg_integer(), node()}},
     %% Reverse index from a member monitor ref to its stream, so a DOWN can find
     %% which stream to release. Kept in lockstep with the mref in each context.
-    monitors = #{} :: #{reference() => stream_id()}
+    monitors = #{} :: #{reference() => stream_id()},
+    %% Streams whose sync was dropped for lack of a context, mapped to the writer
+    %% node the dropped sync came from. When a context later registers we request
+    %% a re-sync from that node, so a sync that raced ahead of registration is
+    %% recovered rather than leaving the cache empty. See maybe_apply_sync/8.
+    pending_resync = #{} :: #{stream_id() => node()}
 }).
 
 %% ------------------------------------------------------------------
@@ -242,10 +256,12 @@ handle_call({put_manifest, StreamId, Manifest, Epoch}, _From, State) ->
 handle_call(
     {sync, StreamId, Seq, Epoch, Manifest, WriterNode},
     _From,
-    #state{seqs = Seqs, contexts = Ctxs} = State
+    #state{seqs = Seqs, contexts = Ctxs, pending_resync = Pending} = State
 ) ->
-    Seqs1 = maybe_apply_sync(StreamId, Seq, Epoch, Manifest, WriterNode, Seqs, Ctxs),
-    {reply, ok, State#state{seqs = Seqs1}};
+    {Seqs1, Pending1} = maybe_apply_sync(
+        StreamId, Seq, Epoch, Manifest, WriterNode, Seqs, Ctxs, Pending
+    ),
+    {reply, ok, State#state{seqs = Seqs1, pending_resync = Pending1}};
 handle_call(
     {apply_edits, StreamId, Edits, Seq, Epoch, WriterNode}, _From, #state{seqs = Seqs} = State
 ) ->
@@ -290,7 +306,7 @@ handle_call({apply_edit, StreamId, Edit}, _From, State) ->
 handle_call(
     {register_replica_context, StreamId, MemberPid, Dir, Shared, Counter},
     _From,
-    #state{contexts = Ctxs, monitors = Mons0} = State
+    #state{contexts = Ctxs, monitors = Mons0, pending_resync = Pending0} = State
 ) ->
     %% Replace any previous registration's monitor first: a member restart
     %% re-registers, and the old incarnation's DOWN must not evict the new
@@ -305,9 +321,13 @@ handle_call(
         end,
     MRef = monitor(process, MemberPid),
     Ctx = #replica_ctx{dir = Dir, shared = Shared, counter = Counter, mref = MRef},
+    %% If a sync for this stream was dropped before this context existed, ask its
+    %% writer to re-send it now that a monitored context can own the cached row.
+    Pending1 = maybe_request_resync(StreamId, Pending0),
     {reply, ok, State#state{
         contexts = Ctxs#{StreamId => Ctx},
-        monitors = Mons1#{MRef => StreamId}
+        monitors = Mons1#{MRef => StreamId},
+        pending_resync = Pending1
     }};
 handle_call({is_context_registered, StreamId}, _From, #state{contexts = Ctxs} = State) ->
     {reply, maps:is_key(StreamId, Ctxs), State};
@@ -359,10 +379,12 @@ handle_cast({apply_edit, StreamId, Edit}, State) ->
     {noreply, State};
 handle_cast(
     {sync, StreamId, Seq, Epoch, Manifest, WriterNode},
-    #state{seqs = Seqs, contexts = Ctxs} = State
+    #state{seqs = Seqs, contexts = Ctxs, pending_resync = Pending} = State
 ) ->
-    Seqs1 = maybe_apply_sync(StreamId, Seq, Epoch, Manifest, WriterNode, Seqs, Ctxs),
-    {noreply, State#state{seqs = Seqs1}};
+    {Seqs1, Pending1} = maybe_apply_sync(
+        StreamId, Seq, Epoch, Manifest, WriterNode, Seqs, Ctxs, Pending
+    ),
+    {noreply, State#state{seqs = Seqs1, pending_resync = Pending1}};
 handle_cast({apply_edits, StreamId, Edits, Seq, Epoch, WriterNode}, #state{seqs = Seqs} = State) ->
     case maps:get(StreamId, Seqs, undefined) of
         {LastSeq, Epoch, _} when Seq =:= LastSeq + 1 ->
@@ -423,7 +445,10 @@ write_manifest(StreamId, Manifest, Epoch) ->
 %% Drop all per-node state for a stream: its context (and member monitor), its
 %% gap-detection sequence, and its cached manifest row. Used by both the member
 %% DOWN handler and the explicit forget/1 (writer reader teardown).
-release_stream(StreamId, #state{contexts = Ctxs, seqs = Seqs, monitors = Mons} = State) ->
+release_stream(
+    StreamId,
+    #state{contexts = Ctxs, seqs = Seqs, monitors = Mons, pending_resync = Pending} = State
+) ->
     Mons1 =
         case maps:get(StreamId, Ctxs, undefined) of
             #replica_ctx{mref = MRef} ->
@@ -436,7 +461,8 @@ release_stream(StreamId, #state{contexts = Ctxs, seqs = Seqs, monitors = Mons} =
     State#state{
         contexts = maps:remove(StreamId, Ctxs),
         seqs = maps:remove(StreamId, Seqs),
-        monitors = Mons1
+        monitors = Mons1,
+        pending_resync = maps:remove(StreamId, Pending)
     }.
 
 %% Apply a batch of edits, catching any failure from apply_edit/2. apply_edit/2
@@ -475,32 +501,54 @@ apply_edits_catching(StreamId, Edits, Manifest0) ->
 %% next gap triggers a re-sync. Drop any sync that is not at least as new as
 %% what is recorded, comparing epoch first and then sequence so a higher epoch
 %% always wins regardless of where its sequence restarted.
-maybe_apply_sync(StreamId, Seq, Epoch, Manifest, WriterNode, Seqs, Ctxs) ->
-    Recorded = maps:get(StreamId, Seqs, undefined),
-    case is_stale_sync(Epoch, Seq, Recorded) of
-        true ->
-            {Seq0, Epoch0, _} = Recorded,
-            inc(?C_SYNCS_REJECTED, 1),
+maybe_apply_sync(StreamId, Seq, Epoch, Manifest, WriterNode, Seqs, Ctxs, Pending) ->
+    case maps:is_key(StreamId, Ctxs) of
+        false ->
+            %% No live reader context owns this stream on this node: the member
+            %% has gone down (release_stream/2 already dropped its state) or has
+            %% not registered yet. Applying the sync would re-insert an ETS row
+            %% and sequence with no monitor to ever reclaim them. Drop it, and
+            %% remember the writer so registering a context can request a re-sync
+            %% (a sync that raced ahead of registration is then recovered rather
+            %% than leaving the cache empty).
+            inc(?C_SYNCS_DROPPED_NO_CONTEXT, 1),
             ?LOG_INFO(
-                "Manifest replica for stream ~ts dropped a stale sync "
-                "(epoch ~b seq ~b from node ~p) behind the cached epoch ~b seq ~b",
-                [StreamId, Epoch, Seq, WriterNode, Epoch0, Seq0],
+                "Manifest replica for stream ~ts dropped a sync "
+                "(epoch ~b seq ~b from node ~p) with no live reader context",
+                [StreamId, Epoch, Seq, WriterNode],
                 #{domain => ?RMQLOG_DOMAIN_STREAM_S3}
             ),
-            Seqs;
-        false ->
-            write_manifest(StreamId, Manifest, Epoch),
-            seed_first_offset_counter(StreamId, Manifest, Ctxs),
-            %% Evaluate local retention once against the freshly synced manifest.
-            %% On a replica, retention is otherwise only driven by edits that
-            %% advance next_offset; a replica that was offline (an upgrade, say),
-            %% receives a full sync on rejoin, and whose stream then stops
-            %% publishing would never reclaim the local segments already durable
-            %% in the remote tier. This one-shot pass reclaims them. It is a no-op
-            %% for an empty manifest or a stream with no registered context here
-            %% (issue #75).
-            maybe_evaluate_retention_on_sync(StreamId, Manifest, Ctxs),
-            Seqs#{StreamId => {Seq, Epoch, WriterNode}}
+            {Seqs, Pending#{StreamId => WriterNode}};
+        true ->
+            Recorded = maps:get(StreamId, Seqs, undefined),
+            case is_stale_sync(Epoch, Seq, Recorded) of
+                true ->
+                    {Seq0, Epoch0, _} = Recorded,
+                    inc(?C_SYNCS_REJECTED, 1),
+                    ?LOG_INFO(
+                        "Manifest replica for stream ~ts dropped a stale sync "
+                        "(epoch ~b seq ~b from node ~p) behind the cached epoch ~b seq ~b",
+                        [StreamId, Epoch, Seq, WriterNode, Epoch0, Seq0],
+                        #{domain => ?RMQLOG_DOMAIN_STREAM_S3}
+                    ),
+                    {Seqs, Pending};
+                false ->
+                    write_manifest(StreamId, Manifest, Epoch),
+                    seed_first_offset_counter(StreamId, Manifest, Ctxs),
+                    %% Evaluate local retention once against the freshly synced
+                    %% manifest. On a replica, retention is otherwise only driven
+                    %% by edits that advance next_offset; a replica that was
+                    %% offline (an upgrade, say), receives a full sync on rejoin,
+                    %% and whose stream then stops publishing would never reclaim
+                    %% the local segments already durable in the remote tier. This
+                    %% one-shot pass reclaims them. It is a no-op for an empty
+                    %% manifest or a stream with no registered context here
+                    %% (issue #75).
+                    maybe_evaluate_retention_on_sync(StreamId, Manifest, Ctxs),
+                    %% The sync landed, so any pending re-sync for this stream is
+                    %% satisfied.
+                    {Seqs#{StreamId => {Seq, Epoch, WriterNode}}, maps:remove(StreamId, Pending)}
+            end
     end.
 
 %% Run local retention against a just-synced manifest, guarding on the same
@@ -534,13 +582,36 @@ is_stale_sync(Epoch, Seq, {Seq0, Epoch0, _}) ->
     {Epoch, Seq} < {Epoch0, Seq0}.
 
 request_resync(StreamId, WriterNode) ->
-    inc(?C_RESYNCS_REQUESTED, 1),
     ?LOG_INFO(
         "Manifest replica for stream ~ts detected a broadcast gap or epoch "
         "mismatch; requesting a re-sync from writer node ~p",
         [StreamId, WriterNode],
         #{domain => ?RMQLOG_DOMAIN_STREAM_S3}
     ),
+    send_resync(StreamId, WriterNode).
+
+%% Request a re-sync from the writer whose sync was dropped for lack of a context
+%% (recorded in pending_resync), now that a context has registered to own the
+%% cached row. Without this, a sync that raced ahead of registration is dropped
+%% and never re-sent (the writer's register is idempotent), leaving the cache
+%% empty. See maybe_apply_sync/8.
+maybe_request_resync(StreamId, Pending) ->
+    case maps:take(StreamId, Pending) of
+        {WriterNode, Pending1} ->
+            ?LOG_INFO(
+                "Manifest replica for stream ~ts registered a context with a "
+                "sync pending; requesting a re-sync from writer node ~p",
+                [StreamId, WriterNode],
+                #{domain => ?RMQLOG_DOMAIN_STREAM_S3}
+            ),
+            send_resync(StreamId, WriterNode),
+            Pending1;
+        error ->
+            Pending
+    end.
+
+send_resync(StreamId, WriterNode) ->
+    inc(?C_RESYNCS_REQUESTED, 1),
     gen_server:cast(
         {via, rabbitmq_stream_s3_registry, {StreamId, WriterNode}},
         {resync, node()}

@@ -21,9 +21,10 @@ The models target five global invariants of the tiered-storage design:
 | --- | --- | --- |
 | INV#1 | no lost acked data | `gc-reset/` |
 | INV#2 | no dangling reference (GC never deletes a live object) | `gc-reset/`, `gc-leading-group/`, `gc-decision/` |
-| INV#3 | no unbounded orphan leak (liveness) | `orphan-leak/` |
+| INV#3 | no unbounded orphan leak (liveness) | `orphan-leak/`, `manifest-replica-lifecycle/` |
 | INV#4 | tier resolution total / gap-free | `read-resolution/`, `tier-routing/` |
 | INV#5 | monotonic frontier except a labeled reset | `gc-reset/`, `trimmed-segment/` |
+| (lifecycle) | per-node replica state is released when a reader exits | `manifest-replica-lifecycle/` |
 | (foundation) | epoch monotonicity / split-brain safety | `writer-fencing/` |
 
 The last row is the mechanism the others assume: `writer-fencing/` proves the
@@ -99,6 +100,29 @@ failures by leaving unconfirmed objects for orphan GC. Verifies that GC's
 re-sweep eventually reclaims a transiently-failed delete rather than leaking it
 forever. A *liveness* property (`hot`-state monitor). See
 [`orphan-leak/README.md`](orphan-leak/README.md).
+
+### `manifest-replica-lifecycle/`
+
+The per-node manifest replica's lifecycle: registration and cleanup when a reader
+(osiris member) exits, verifying the design behind commit `cc50092`. osiris has no
+terminate hook, so the replica monitors the registering member and releases its
+context, gap sequence, and cached row on `'DOWN'`. Proves three shipped guards
+load-bearing — the member-`DOWN` cleanup (no metadata leak), `is_stale_sync` (no
+stale floor served), and the re-registration monitor repoint (no eviction of a
+live reader) — plus a `hot`-state convergence property. Surfaces a gap the
+single-axis view misses: with every shipped guard on, a sync that arrives after
+the `DOWN` re-strands a cache row with no monitor to reclaim it, and models a
+proposed `syncRequiresContext` guard (A2) that closes it. Adds an attach-ordering
+axis that proves the guard is **unsafe in isolation**: with the shipped writer-first
+attach order a startup sync that beats the local context registration is dropped
+and never re-sent (the cache stays empty — a convergence violation). A1
+(register-context-before-writer) closes that for the acceptor-reply sync, but a
+second axis models the **writer-driven reconcile path** — a member-visible sync
+independent of `register_acceptor` that A1 cannot reach — and a proposed
+**A1′ resync-on-register** toggle. The gates show A1′ recovers *both* startup
+triggers (acceptor reply and reconcile) and **subsumes A1**, so the minimal sound
+fix is **A2 + A1′**, not A2 + A1 + A1′.
+See [`manifest-replica-lifecycle/README.md`](manifest-replica-lifecycle/README.md).
 
 ## Running
 
