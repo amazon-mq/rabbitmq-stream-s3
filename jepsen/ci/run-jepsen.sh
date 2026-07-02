@@ -8,31 +8,32 @@
 # deps/rabbitmq_stream_s3 but built within the umbrella). `up.sh` builds the
 # tarball from the umbrella root that contains this checkout.
 #
-# Tunables (all overridable via the environment):
+# Tunables (all overridable via the environment, consumed by run.sh):
 #   TIME_LIMIT, RATE, CONCURRENCY  - workload size
 #   FAULTS                         - comma-separated nemeses to inject
+#
+# This composes the same up.sh / run.sh / down.sh a developer uses locally; the
+# only CI-specific behaviour is tearing down unconditionally and propagating the
+# test's exit status as the build result.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 docker_dir="$here/../docker"
 
-TIME_LIMIT="${TIME_LIMIT:-120}"
-RATE="${RATE:-100}"
-CONCURRENCY="${CONCURRENCY:-20}"
-# Which faults to inject. Override per CI matrix entry to cover the storage-tier
-# and writer-fencing scenarios separately.
-FAULTS="${FAULTS:-partition,s3-outage,s3-latency,trim}"
+# Defaults for run.sh; export so the child script inherits them. Override per CI
+# matrix entry to cover the storage-tier and writer-fencing scenarios separately.
+export TIME_LIMIT="${TIME_LIMIT:-120}"
+export RATE="${RATE:-100}"
+export CONCURRENCY="${CONCURRENCY:-20}"
+export FAULTS="${FAULTS:-partition,s3-outage,s3-latency,trim}"
 
 "$docker_dir/up.sh"
 
 set +e
-docker compose -f "$docker_dir/docker-compose.yml" exec -T control \
-  lein run test --nodes-file /shared/nodes \
-    --username root --ssh-private-key /shared/ssh_key \
-    --time-limit "$TIME_LIMIT" --rate "$RATE" --concurrency "$CONCURRENCY" \
-    --faults "$FAULTS"
+"$docker_dir/run.sh"
 status=$?
 set -e
 
-docker compose -f "$docker_dir/docker-compose.yml" down -v
+# Always tear down; never let a teardown hiccup mask the test verdict.
+"$docker_dir/down.sh" || true
 exit $status
