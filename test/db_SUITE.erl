@@ -19,6 +19,7 @@ all() ->
         update_with_correct_revision,
         conflict_on_stale_revision,
         epoch_fencing,
+        list_and_list_consistent,
         keep_while_deletes_on_queue_removal,
         put_anchor_present_and_absent,
         anchor_removed_on_queue_removal
@@ -80,6 +81,31 @@ epoch_fencing(_Config) ->
     ?assertMatch(
         {ok, _, _},
         rabbitmq_stream_s3_db:put(StreamId, StreamId, 2, Rev1, Uid3)
+    ).
+
+%% list/0 (local) and list_consistent/0 (quorum) return the same committed entry
+%% for every stream. list_consistent/0 lets the cross-stream GC sweep read all
+%% streams in a single quorum round trip instead of one per stream.
+list_and_list_consistent(_Config) ->
+    Ids = [<<"db_suite_list_a">>, <<"db_suite_list_b">>, <<"db_suite_list_c">>],
+    Expected = maps:from_list([
+        begin
+            Uid = rabbitmq_stream_s3:uid(),
+            {ok, undefined, Rev} = rabbitmq_stream_s3_db:put(Id, Id, 3, 0, Uid),
+            {Id, #{uid => Uid, epoch => 3, revision => Rev}}
+        end
+     || Id <- Ids
+    ]),
+    {ok, Consistent} = rabbitmq_stream_s3_db:list_consistent(),
+    {ok, Local} = rabbitmq_stream_s3_db:list(),
+    %% The store is shared across the suite, so assert on our streams rather than
+    %% the whole map: each appears with its committed entry in both views.
+    lists:foreach(
+        fun(Id) ->
+            ?assertEqual(maps:get(Id, Expected), maps:get(Id, Consistent)),
+            ?assertEqual(maps:get(Id, Expected), maps:get(Id, Local))
+        end,
+        Ids
     ).
 
 keep_while_deletes_on_queue_removal(_Config) ->

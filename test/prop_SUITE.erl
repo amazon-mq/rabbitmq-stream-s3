@@ -9,6 +9,8 @@ Covers:
 - Manifest edits (append, truncate, replace) preserve structural invariants
 - Fragment assembly metadata correctness
 - Fragment iterator traversal completeness and ordering
+- Garbage collection never reaps a live object and always reclaims a genuine
+  orphan (INV#2), the Erlang-level companion to the P models in p/
 """.
 
 -compile([export_all, nowarn_export_all]).
@@ -56,7 +58,16 @@ all() ->
         broadcast_edits_with_retention,
         %% Remote reader core
         remote_reader_core_no_crash,
-        remote_reader_core_reply_size_bounded
+        remote_reader_core_reply_size_bounded,
+        %% Garbage collection reap decision
+        gc_classify_never_reaps_live,
+        gc_classify_reclaims_orphans,
+        gc_still_dangling_respects_live_manifest,
+        gc_stream_lookup_epoch_gate,
+        gc_fresh_enough_fails_closed,
+        gc_anchor_decision_fails_closed,
+        gc_cache_epoch_gate,
+        gc_epoch_permits_sweep
     ].
 
 init_per_suite(Config) -> Config.
@@ -1754,3 +1765,460 @@ run_rrc_events([{retry} | Rest], State0) ->
 run_rrc_events([Event | Rest], State0) ->
     {State1, _} = rabbitmq_stream_s3_remote_reader_core:step(State0, Event),
     run_rrc_events(Rest, State1).
+
+%% =========================================================================
+%% Garbage collection reap-decision properties
+%%
+%% The Erlang-level companion to the P models in p/. The P models prove the GC
+%% invariants (chiefly INV#2, "GC never deletes a live object") across
+%% concurrent interleavings; these properties fuzz the input space of the pure
+%% reap-decision functions -- floors, epochs, UIDs, and leading-group shapes --
+%% which the hand-written eunit examples in rabbitmq_stream_s3_gc do not reach.
+%% The two axes are complementary: P covers the ordering, these cover the
+%% classification breadth.
+%% =========================================================================
+
+%% INV#2 at classification time: for any manifest and floor, classify/2 never
+%% marks a live-referenced object deletable. Live means a fragment or group at or
+%% above the floor, the current-epoch manifest, or the referenced leading group
+%% straddling the floor (partial expiry). A conservative skip-groups manifest
+%% (leading kilo-/mega-group) additionally protects every group below the floor.
+gc_classify_never_reaps_live(_Config) ->
+    rabbit_ct_proper_helpers:run_proper(fun prop_gc_classify_never_reaps_live/0, [], 500).
+
+prop_gc_classify_never_reaps_live() ->
+    ?FORALL(
+        Scenario,
+        gen_gc_classify_scenario(),
+        begin
+            #{lookup := Lookup, live_keys := LiveKeys} = Scenario,
+            lists:all(
+                fun(Key) -> rabbitmq_stream_s3_gc:classify(Key, Lookup) =:= skip end,
+                LiveKeys
+            )
+        end
+    ).
+
+%% Anti-vacuity: a genuine orphan (fragment or non-leading group below the floor,
+%% or a stale-epoch manifest) is always classified deletable. Without this a
+%% classify/2 that skipped everything would pass the safety property vacuously.
+gc_classify_reclaims_orphans(_Config) ->
+    rabbit_ct_proper_helpers:run_proper(fun prop_gc_classify_reclaims_orphans/0, [], 500).
+
+prop_gc_classify_reclaims_orphans() ->
+    ?FORALL(
+        Scenario,
+        gen_gc_classify_scenario(),
+        begin
+            #{lookup := Lookup, dead_keys := DeadKeys} = Scenario,
+            lists:all(
+                fun(Key) ->
+                    case rabbitmq_stream_s3_gc:classify(Key, Lookup) of
+                        {ok, _} -> true;
+                        skip -> false
+                    end
+                end,
+                DeadKeys
+            )
+        end
+    ).
+
+%% Build a single-stream GC scenario: a manifest whose leading entry is a
+%% fragment, group, or kilo-/mega-group, a floor above that leading entry
+%% (partial-expiry, so a leading group straddles the floor), an epoch, and the
+%% lookup entry the sweep would compute. LiveKeys must all classify to skip;
+%% DeadKeys must all classify to a finding.
+gen_gc_classify_scenario() ->
+    ?LET(
+        {LeadingKind, LeadingUid, Floor, Epoch, AboveOffs, BelowOffs, DeadGroupOffs, StaleEpochs},
+        {
+            oneof([fragment, group, kilo_group, mega_group]),
+            gc_uid(),
+            integer(2, 100000),
+            integer(1, 1000),
+            non_empty(list(non_neg_integer())),
+            non_empty(list(non_neg_integer())),
+            list(pos_integer()),
+            list(non_neg_integer())
+        },
+        begin
+            StreamId = <<"gc-prop-stream">>,
+            LeadingOffset = 0,
+            Kind = gc_leading_kind(LeadingKind),
+            %% leading_group_info reads only the first entry, so a single leading
+            %% entry is a faithful manifest for building the lookup.
+            Manifest = #manifest{
+                first_offset = Floor,
+                next_offset = Floor + 1,
+                entries = ?ENTRY(LeadingOffset, 0, 0, Kind, 0, LeadingUid)
+            },
+            Lookup = #{
+                StreamId => rabbitmq_stream_s3_gc:lookup_entry(StreamId, Epoch, Floor, Manifest)
+            },
+            SkipGroups = LeadingKind =:= kilo_group orelse LeadingKind =:= mega_group,
+            %% Fragments and groups at or above the floor are live.
+            LiveAbove =
+                [
+                    rabbitmq_stream_s3:fragment_key(StreamId, Floor + (O rem 1000), gc_uid_of(O))
+                 || O <- AboveOffs
+                ] ++
+                    [
+                        gc_group_key(StreamId, Floor + (O rem 1000), gc_uid_of(O + 1))
+                     || O <- AboveOffs
+                    ],
+            %% The current-epoch manifest is live.
+            LiveManifest = [
+                rabbitmq_stream_s3:manifest_key(StreamId, #manifest_ref{epoch = Epoch, uid = 7})
+            ],
+            %% The referenced leading group (a group straddling the floor) is
+            %% live; in skip-groups mode every group below the floor is protected.
+            LiveGroups =
+                case LeadingKind of
+                    group ->
+                        [gc_group_key(StreamId, LeadingOffset, LeadingUid)];
+                    _ when SkipGroups ->
+                        [
+                            gc_group_key(StreamId, gc_below(O, Floor), gc_uid_of(O))
+                         || O <- DeadGroupOffs
+                        ];
+                    _ ->
+                        []
+                end,
+            LiveKeys = LiveAbove ++ LiveManifest ++ LiveGroups,
+            %% Fragments below the floor are always dead, regardless of leading
+            %% kind.
+            DeadFragments = [
+                rabbitmq_stream_s3:fragment_key(StreamId, gc_below(O, Floor), gc_uid_of(O))
+             || O <- BelowOffs
+            ],
+            %% A manifest strictly below the current epoch is stale.
+            DeadManifests = [
+                rabbitmq_stream_s3:manifest_key(
+                    StreamId, #manifest_ref{epoch = E rem Epoch, uid = 9}
+                )
+             || E <- StaleEpochs, Epoch > 0
+            ],
+            %% Non-leading groups below the floor are dead only when not in
+            %% conservative skip-groups mode. Offset >= 1 keeps them clear of the
+            %% leading group at offset 0.
+            DeadGroups =
+                case SkipGroups of
+                    true ->
+                        [];
+                    false ->
+                        [
+                            gc_group_key(StreamId, 1 + (O rem (Floor - 1)), gc_uid_of(O + 3))
+                         || O <- DeadGroupOffs
+                        ]
+                end,
+            DeadKeys = DeadFragments ++ DeadManifests ++ DeadGroups,
+            #{lookup => Lookup, live_keys => LiveKeys, dead_keys => DeadKeys}
+        end
+    ).
+
+gc_leading_kind(fragment) -> ?MANIFEST_KIND_FRAGMENT;
+gc_leading_kind(group) -> ?MANIFEST_KIND_GROUP;
+gc_leading_kind(kilo_group) -> ?MANIFEST_KIND_KILO_GROUP;
+gc_leading_kind(mega_group) -> ?MANIFEST_KIND_MEGA_GROUP.
+
+gc_group_key(StreamId, Offset, Uid) ->
+    rabbitmq_stream_s3:group_key(
+        StreamId, #group_ref{offset = Offset, kind = ?MANIFEST_KIND_GROUP, uid = Uid}
+    ).
+
+%% Map an arbitrary non-negative integer to an offset strictly below the floor.
+gc_below(O, Floor) -> O rem Floor.
+
+gc_uid() -> integer(1, 16#FFFFFFFF).
+
+%% A deterministic, always-in-range UID derived from a generated integer, so keys
+%% vary without adding another generator dimension.
+gc_uid_of(O) -> 1 + (O rem 16#FFFFFFFF).
+
+%% Execute-time re-validation (still_dangling/1), guards B and C: an offset-based
+%% finding is deletable iff it is still below the *live* floor and, for a group,
+%% is not the live referenced leading group. This is the reset re-read: a
+%% re-tiered fragment at or above the live floor is protected, a genuine orphan
+%% below it is reclaimed, and the live leading group straddling the floor is
+%% protected while a stale object at the same offset (different UID) is reaped.
+gc_still_dangling_respects_live_manifest(_Config) ->
+    {ok, Pid} = rabbitmq_stream_s3_manifest_replica:start_link(),
+    unlink(Pid),
+    try
+        rabbit_ct_proper_helpers:run_proper(
+            fun prop_gc_still_dangling_respects_live_manifest/0, [], 300
+        )
+    after
+        gen_server:stop(Pid)
+    end.
+
+prop_gc_still_dangling_respects_live_manifest() ->
+    ?FORALL(
+        {LiveFloor, LeadingUid, DataOffs, GroupOffs},
+        {
+            integer(2, 100000),
+            gc_uid(),
+            non_empty(list(non_neg_integer())),
+            list(non_neg_integer())
+        },
+        begin
+            StreamId = <<"gc-still-dangling-prop-stream">>,
+            LeadingOffset = 0,
+            %% A live manifest whose leading group straddles the floor.
+            ok = rabbitmq_stream_s3_manifest_replica:put_manifest(
+                StreamId,
+                #manifest{
+                    first_offset = LiveFloor,
+                    next_offset = LiveFloor + 1,
+                    entries = ?ENTRY(
+                        LeadingOffset, 0, 0, ?MANIFEST_KIND_GROUP, 0, LeadingUid
+                    )
+                }
+            ),
+            LeadingKey = gc_group_key(StreamId, LeadingOffset, LeadingUid),
+            %% The live leading group is below the floor but referenced: keep it.
+            LeadingChecks = [
+                not gc_still_dangling(StreamId, LeadingKey)
+            ],
+            %% A data fragment is deletable iff it is below the live floor.
+            DataChecks = [
+                begin
+                    Offset = O rem (LiveFloor * 2),
+                    Key = rabbitmq_stream_s3:fragment_key(StreamId, Offset, gc_uid_of(O)),
+                    gc_still_dangling(StreamId, Key) =:= (Offset < LiveFloor)
+                end
+             || O <- DataOffs
+            ],
+            %% A group at the leading offset with a *different* UID is a stale
+            %% orphan (below floor, not the live leading group): deletable. A
+            %% group at or above the floor is a re-tier: protected.
+            GroupChecks = [
+                begin
+                    StaleAtLeading = gc_group_key(
+                        StreamId, LeadingOffset, gc_other_uid(LeadingUid)
+                    ),
+                    Retier = gc_group_key(StreamId, LiveFloor + (O rem 1000), gc_uid_of(O)),
+                    gc_still_dangling(StreamId, StaleAtLeading) andalso
+                        not gc_still_dangling(StreamId, Retier)
+                end
+             || O <- GroupOffs
+            ],
+            %% Epoch-based findings are never re-checked (epoch is monotonic).
+            EpochChecks = [
+                gc_still_dangling_finding(#{
+                    stream_id => StreamId, key => <<"any">>, reason => stale_epoch
+                }),
+                gc_still_dangling_finding(#{
+                    stream_id => StreamId, key => <<"any">>, reason => no_anchor
+                })
+            ],
+            lists:all(
+                fun(B) -> B end,
+                LeadingChecks ++ DataChecks ++ GroupChecks ++ EpochChecks
+            )
+        end
+    ).
+
+gc_still_dangling(StreamId, Key) ->
+    gc_still_dangling_finding(#{
+        stream_id => StreamId, key => Key, reason => below_first_offset
+    }).
+
+gc_still_dangling_finding(Finding) ->
+    rabbitmq_stream_s3_gc:still_dangling(Finding).
+
+%% A UID distinct from the given one, staying in range.
+gc_other_uid(Uid) when Uid =:= 16#FFFFFFFF -> 1;
+gc_other_uid(Uid) -> Uid + 1.
+
+%% Guards A and D (cache-epoch gate): an offset-based delete is permitted only
+%% when the local manifest cache holds a manifest at exactly the committed epoch.
+%% A cache behind the committed epoch (the reset-after-snapshot window), a legacy
+%% entry with no epoch, or no manifest at all must all fail closed.
+gc_cache_epoch_gate(_Config) ->
+    rabbit_ct_proper_helpers:run_proper(fun prop_gc_cache_epoch_gate/0, [], 500).
+
+prop_gc_cache_epoch_gate() ->
+    ?FORALL(
+        {CacheResult, Committed},
+        {
+            oneof([
+                {#manifest{}, integer(0, 1000)},
+                {#manifest{}, undefined},
+                undefined
+            ]),
+            integer(0, 1000)
+        },
+        begin
+            Result = rabbitmq_stream_s3_gc:cache_at_committed_epoch(CacheResult, Committed),
+            Expected =
+                case CacheResult of
+                    {#manifest{}, Committed} -> true;
+                    _ -> false
+                end,
+            Result =:= Expected
+        end
+    ).
+
+%% The reset-path epoch fence: with a pinned writer epoch the sweep is permitted
+%% only when the committed epoch equals it (a deposed or not-yet-committed writer
+%% skips); with no writer epoch pinned (the operator CLI path) the consistent
+%% read is the only guard and the sweep is always permitted.
+gc_epoch_permits_sweep(_Config) ->
+    rabbit_ct_proper_helpers:run_proper(fun prop_gc_epoch_permits_sweep/0, [], 500).
+
+prop_gc_epoch_permits_sweep() ->
+    ?FORALL(
+        {Committed, MaybeWriter},
+        {integer(0, 1000), oneof([undefined, integer(0, 1000)])},
+        begin
+            Config =
+                case MaybeWriter of
+                    undefined -> #{mode => delete};
+                    W -> #{mode => delete, writer_epoch => W}
+                end,
+            Result = rabbitmq_stream_s3_gc:epoch_permits_sweep(Committed, Config),
+            Expected =
+                case MaybeWriter of
+                    undefined -> true;
+                    WriterEpoch -> Committed =:= WriterEpoch
+                end,
+            Result =:= Expected
+        end
+    ).
+
+%% Guard A (the cache-epoch gate) as a pure function of the two read results. The
+%% shared per-stream lookup decision yields an entry only when the quorum read
+%% succeeds, the writer-epoch fence permits the sweep, and the cache holds a
+%% manifest at exactly the committed epoch (with the cross-stream path also
+%% skipping an empty manifest). Every other combination fails closed. This is the
+%% functional core the read-performing shells (build_lookup/2, build_stream_lookup/2)
+%% delegate to, so it is exercised here without a live db or replica cache.
+gc_stream_lookup_epoch_gate(_Config) ->
+    rabbit_ct_proper_helpers:run_proper(fun prop_gc_stream_lookup_epoch_gate/0, [], 500).
+
+prop_gc_stream_lookup_epoch_gate() ->
+    ?FORALL(
+        {Consistent, Cache, MaybeWriter, AllowEmpty},
+        {gc_consistent(), gc_cache(), oneof([undefined, integer(0, 10)]), boolean()},
+        begin
+            StreamId = <<"gc-lookup-prop-stream">>,
+            Config =
+                case MaybeWriter of
+                    undefined -> #{mode => delete};
+                    W -> #{mode => delete, writer_epoch => W}
+                end,
+            Result = rabbitmq_stream_s3_gc:stream_lookup_decision(
+                StreamId, Consistent, Cache, Config, AllowEmpty
+            ),
+            Expected = gc_expected_lookup(Consistent, Cache, MaybeWriter, AllowEmpty),
+            case {Result, Expected} of
+                {skip, skip} ->
+                    true;
+                {{ok, Entry}, {ok, CommittedEpoch, FirstOffset}} ->
+                    maps:get(epoch, Entry) =:= CommittedEpoch andalso
+                        maps:get(first_offset, Entry) =:= FirstOffset;
+                _ ->
+                    false
+            end
+        end
+    ).
+
+%% Independent oracle for stream_lookup_decision/5: skip | {ok, Epoch, FirstOffset}.
+gc_expected_lookup({error, _}, _Cache, _Writer, _AllowEmpty) ->
+    skip;
+gc_expected_lookup({ok, #{epoch := CommittedEpoch}}, Cache, Writer, AllowEmpty) ->
+    case Writer =:= undefined orelse Writer =:= CommittedEpoch of
+        false -> skip;
+        true -> gc_expected_from_cache(CommittedEpoch, Cache, AllowEmpty)
+    end.
+
+gc_expected_from_cache(_CommittedEpoch, undefined, _AllowEmpty) ->
+    skip;
+gc_expected_from_cache(_CommittedEpoch, {#manifest{entries = <<>>}, _}, false) ->
+    %% Cross-stream sweep skips an empty manifest regardless of its epoch.
+    skip;
+gc_expected_from_cache(CommittedEpoch, {#manifest{first_offset = FO}, CommittedEpoch}, _AllowEmpty) ->
+    {ok, CommittedEpoch, FO};
+gc_expected_from_cache(_CommittedEpoch, {#manifest{}, _CacheEpoch}, _AllowEmpty) ->
+    skip.
+
+%% Guard D (the execute-time freshness re-check) as a pure function of the read
+%% results: an offset-based delete is permitted only when the quorum read succeeds
+%% and the cache is at the committed epoch. A quorum failure or a lagging cache
+%% both fail closed.
+gc_fresh_enough_fails_closed(_Config) ->
+    rabbit_ct_proper_helpers:run_proper(fun prop_gc_fresh_enough_fails_closed/0, [], 500).
+
+prop_gc_fresh_enough_fails_closed() ->
+    ?FORALL(
+        {Consistent, Cache},
+        {gc_consistent(), gc_cache()},
+        begin
+            StreamId = <<"gc-fresh-prop-stream">>,
+            Result = rabbitmq_stream_s3_gc:fresh_enough_decision(StreamId, Consistent, Cache),
+            Expected =
+                case Consistent of
+                    {error, _} ->
+                        false;
+                    {ok, #{epoch := CommittedEpoch}} ->
+                        case Cache of
+                            {#manifest{}, CommittedEpoch} -> true;
+                            _ -> false
+                        end
+                end,
+            Result =:= Expected
+        end
+    ).
+
+%% The no_anchor backstop as a pure function of the anchor read: reap only on a
+%% consistent read that positively reports the anchor gone; a present anchor or any
+%% read error fails closed.
+gc_anchor_decision_fails_closed(_Config) ->
+    rabbit_ct_proper_helpers:run_proper(fun prop_gc_anchor_decision_fails_closed/0, [], 500).
+
+prop_gc_anchor_decision_fails_closed() ->
+    ?FORALL(
+        Read,
+        oneof([{ok, boolean()}, {error, oneof([timeout, no_quorum, shutdown])}]),
+        begin
+            StreamId = <<"gc-anchor-prop-stream">>,
+            Result = rabbitmq_stream_s3_gc:anchor_decision(StreamId, Read),
+            Expected =
+                case Read of
+                    {ok, Exists} -> not Exists;
+                    {error, _} -> false
+                end,
+            Result =:= Expected
+        end
+    ).
+
+%% A committed-metadata quorum read result: an ok payload carrying the committed
+%% epoch, or a read error (partition, no quorum).
+gc_consistent() ->
+    oneof([
+        {ok, #{epoch => integer(0, 10)}},
+        {error, oneof([timeout, no_quorum, shutdown])}
+    ]).
+
+%% A local replica cache read result: a manifest tagged with its synced epoch
+%% (possibly a legacy undefined), or no cached manifest at all. The manifest is
+%% empty or carries a single leading fragment, at an arbitrary floor.
+gc_cache() ->
+    oneof([
+        undefined,
+        ?LET(
+            {Empty, Epoch, FirstOffset},
+            {boolean(), oneof([integer(0, 10), undefined]), integer(0, 100000)},
+            {gc_cache_manifest(Empty, FirstOffset), Epoch}
+        )
+    ]).
+
+gc_cache_manifest(true, FirstOffset) ->
+    #manifest{first_offset = FirstOffset, next_offset = FirstOffset};
+gc_cache_manifest(false, FirstOffset) ->
+    #manifest{
+        first_offset = FirstOffset,
+        next_offset = FirstOffset + 1,
+        entries = ?ENTRY(FirstOffset, 0, 0, ?MANIFEST_KIND_FRAGMENT, 0, 1)
+    }.
