@@ -45,7 +45,19 @@ The partition nemesis runs against a 5-node cluster with the kafka anomaly check
 
 The storage-tier nemeses make data really tier to S3 and exercise the read-from-S3 path under fault. Small segments and fragments plus padded payloads force segments to roll, upload and trim within a short run; MinIO needs a KMS key for the plugin's SSE uploads (see `docker/docker-compose.yml`). The `--faults` option selects `s3-outage` and `s3-latency` (via Toxiproxy), `trim` (periodic `evaluate_local_retention`, which trims uploaded segments locally so reads of older offsets fall to the S3 tier), and `leader-move` (each tick, transfer a random stream's leader to a replica, relocating that writer and bumping the stream epoch so a deposed writer's in-flight upload must be fenced).
 
-Two extra checkers run alongside the kafka anomaly checkers. The `:tiering` coverage checker scrapes the plugin's S3 counters before teardown and fails the run unless fragments were uploaded, and with `trim` that reads were served from S3, and with `leader-move` that the epoch advanced; this keeps a run from passing green while silently not using the remote tier or not moving leaders. The `s3-outage` fault is instead proven injected by the Toxiproxy status check in the nemesis (it fails on a non-2xx response), since the plugin tolerates an outage gracefully and need not surface an error counter. The `:durability` checker reads every stream end-to-end after the run and fails if any acknowledged write is lost or duplicated; it is authoritative under `leader-move`, where the kafka offset analyzers are downgraded to advisory (see "Why the Kafka workload").
+Three extra checkers run alongside the kafka anomaly checkers. The `:tiering` coverage checker scrapes the plugin's S3 counters before teardown and fails the run unless fragments were uploaded, and with `trim` that reads were served from S3, and with `leader-move` that the epoch advanced; this keeps a run from passing green while silently not using the remote tier or not moving leaders. The `s3-outage` fault is instead proven injected by the Toxiproxy status check in the nemesis (it fails on a non-2xx response), since the plugin tolerates an outage gracefully and need not surface an error counter. The `:durability` checker reads every stream end-to-end after the run and fails if any acknowledged write is lost or duplicated; it is authoritative under `leader-move`, where the kafka offset analyzers are downgraded to advisory (see "Why the Kafka workload").
+
+The `:replica` manifest-replica consistency checker snapshots each node's per-stream manifest cache (the table `rabbitmq_stream_s3_manifest_cache`) after the run quiesces and asserts three things: every stream's cached floor is identical across the nodes that cache it (convergence); the cross-node-agreed floor never sits beyond the stream's committed offset (a stale or corrupt floor would claim data the remote tier does not hold); and no cache row on a non-leader node lacks a registered replica context (a contextless replica row is one a sync re-created after the owning osiris member's `DOWN`, with no monitor to reclaim it). The cached epoch is reported alongside each floor for diagnosis but is deliberately left out of the convergence equality: a deposed leader's cache legitimately keeps the older epoch on an idle stream until the next edit, and the plugin's GC explicitly tolerates a cache that lags the committed epoch (`get_manifest_and_epoch/1`), so an epoch lag is not a convergence violation. The leader's own row is written by the writer path with no replica context, so the leader node is excluded from the last test to avoid a false positive. The convergence and stale-floor assertions are genuinely exercised by the `s3-outage`, `leader-move` and `partition` faults; the leaked-row assertion is a cheap always-on guard that only *fires* when a member departs a node permanently mid-sync, which graceful `leader-move` does not cause — reliably reproducing the leak needs a hard-kill / stream-churn nemesis (see `BACKLOG.md`).
+
+A run under `s3-outage,leader-move` drives manifest churn (uploads stall and resume while leaders relocate and epochs bump) and stays `:valid? true` with the caches converged:
+
+```sh
+docker compose exec control \
+  lein run test --nodes-file /shared/nodes \
+    --username root --ssh-private-key /shared/ssh_key \
+    --time-limit 150 --rate 50 --concurrency 10 \
+    --faults s3-outage,leader-move
+```
 
 A run under `partition,s3-outage,s3-latency,trim` stays `:valid? true` while serving thousands of reads from the remote tier:
 
@@ -67,7 +79,7 @@ docker compose exec control \
     --faults leader-move,trim
 ```
 
-GitHub Actions runs both of these scenarios with the `Jepsen` workflow (`.github/workflows/jepsen.yaml`), on a schedule and on demand. It clones the server, checks the plugin out into the umbrella, and invokes `ci/run-jepsen.sh`, which builds the tarball from the clean tree, brings the cluster up, runs one test, and fails the job if the checker reports anomalies.
+GitHub Actions runs these scenarios with the `Jepsen` workflow (`.github/workflows/jepsen.yaml`), on a schedule and on demand. It clones the server, checks the plugin out into the umbrella, and invokes `ci/run-jepsen.sh`, which builds the tarball from the clean tree, brings the cluster up, runs one test, and fails the job if the checker reports anomalies.
 
 ## Planned
 

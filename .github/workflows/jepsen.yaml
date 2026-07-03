@@ -50,10 +50,12 @@ jobs:
       fail-fast: false
       matrix:
         rmq-version: ['streams-tiered-storage']
-        # One job per scenario: storage-tier faults, and writer fencing.
+        # One job per scenario: storage-tier faults, writer fencing, and
+        # manifest-replica cache consistency under an S3 outage plus leader churn.
         faults:
           - 'partition,s3-outage,s3-latency,trim'
           - 'leader-move,trim'
+          - 's3-outage,leader-move'
         include:
           - rmq-version: 'streams-tiered-storage'
             otp-version: 27
