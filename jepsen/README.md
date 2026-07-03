@@ -28,16 +28,31 @@ The AWS backend is hardwired to TLS/443 with `verify_peer` and virtual-hosted ad
 
 ## Running
 
-Requires Docker and Compose and a working `make package-generic-unix` at the umbrella root.
+Requires Docker and Compose. Building the broker tarball needs a working `make package-generic-unix` at the umbrella root; if that is inconvenient (for example the umbrella is pre-compiled by another checkout, which trips an erlang.mk escript-zip duplicate), stage a prebuilt tarball with `TARBALL=` instead.
 
 ```sh
 cd docker
-./up.sh                       # builds tarball + certs, brings the cluster up
-docker compose exec control \
-  lein run test --nodes-file /shared/nodes \
-    --username root --ssh-private-key /shared/ssh_key \
-    --time-limit 300 --rate 200 --concurrency 20
+./up.sh                       # build the tarball + certs, bring the cluster up
+./run.sh                      # run one test (default faults), leaving it up
+./down.sh                     # tear the cluster down
 ```
+
+`up.sh` stages the broker tarball at `shared/rabbitmq.tar.xz`, picking, in order:
+
+```sh
+TARBALL=/path/to/rabbitmq-server-generic-unix-*.tar.xz ./up.sh   # use a prebuilt one, skip the build
+SKIP_BUILD=1 ./up.sh                                             # reuse an already-staged tarball
+./up.sh                                                          # build from the umbrella
+```
+
+`run.sh` runs one test against the already-up cluster and, unlike `ci/run-jepsen.sh`, leaves it running so you can iterate and inspect `store/`. It reads `FAULTS`, `TIME_LIMIT`, `RATE` and `CONCURRENCY` from the environment and passes any extra arguments through to `lein run test`:
+
+```sh
+FAULTS=s3-outage,leader-move ./run.sh
+FAULTS=leader-move,trim TIME_LIMIT=300 ./run.sh
+```
+
+`down.sh` kills any in-container test process first (on podman, killing the host-side `docker compose exec` shell does not stop the in-container JVM, so a hung run would otherwise contaminate the next one) and then brings the cluster down; `./down.sh --clean` also removes the generated `shared/`.
 
 ## Status
 
@@ -52,34 +67,22 @@ The `:replica` manifest-replica consistency checker snapshots each node's per-st
 A run under `s3-outage,leader-move` drives manifest churn (uploads stall and resume while leaders relocate and epochs bump) and stays `:valid? true` with the caches converged:
 
 ```sh
-docker compose exec control \
-  lein run test --nodes-file /shared/nodes \
-    --username root --ssh-private-key /shared/ssh_key \
-    --time-limit 150 --rate 50 --concurrency 10 \
-    --faults s3-outage,leader-move
+FAULTS=s3-outage,leader-move TIME_LIMIT=150 RATE=50 CONCURRENCY=10 ./run.sh
 ```
 
 A run under `partition,s3-outage,s3-latency,trim` stays `:valid? true` while serving thousands of reads from the remote tier:
 
 ```sh
-docker compose exec control \
-  lein run test --nodes-file /shared/nodes \
-    --username root --ssh-private-key /shared/ssh_key \
-    --time-limit 150 --rate 50 --concurrency 10 \
-    --faults partition,s3-outage,s3-latency,trim
+FAULTS=partition,s3-outage,s3-latency,trim TIME_LIMIT=150 RATE=50 CONCURRENCY=10 ./run.sh
 ```
 
 A run under `leader-move,trim` stays `:valid? true` with the durability checker confirming zero loss and zero duplication across epochs in the double digits:
 
 ```sh
-docker compose exec control \
-  lein run test --nodes-file /shared/nodes \
-    --username root --ssh-private-key /shared/ssh_key \
-    --time-limit 150 --rate 50 --concurrency 10 \
-    --faults leader-move,trim
+FAULTS=leader-move,trim TIME_LIMIT=150 RATE=50 CONCURRENCY=10 ./run.sh
 ```
 
-GitHub Actions runs these scenarios with the `Jepsen` workflow (`.github/workflows/jepsen.yaml`), on a schedule and on demand. It clones the server, checks the plugin out into the umbrella, and invokes `ci/run-jepsen.sh`, which builds the tarball from the clean tree, brings the cluster up, runs one test, and fails the job if the checker reports anomalies.
+GitHub Actions runs these scenarios with the `Jepsen` workflow (`.github/workflows/jepsen.yaml`), on a schedule and on demand. It clones the server, checks the plugin out into the umbrella, and invokes `ci/run-jepsen.sh`, which composes the same `up.sh`, `run.sh` and `down.sh`, building the tarball from the clean tree and failing the job if the checker reports anomalies.
 
 ## Planned
 
