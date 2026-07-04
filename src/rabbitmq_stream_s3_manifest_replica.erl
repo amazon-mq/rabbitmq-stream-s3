@@ -90,6 +90,12 @@ the drop is recovered rather than leaving the cache empty.
     terminate/2
 ]).
 
+-ifdef(TEST).
+%% Exercised as a pure predicate by prop_SUITE (the Erlang companion to the
+%% manifest-replica-lifecycle P model's epoch-monotonicity invariant).
+-export([is_stale_sync/3]).
+-endif.
+
 -record(replica_ctx, {
     dir :: file:filename_all(),
     shared :: atomics:atomics_ref(),

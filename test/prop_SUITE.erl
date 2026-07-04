@@ -11,6 +11,12 @@ Covers:
 - Fragment iterator traversal completeness and ordering
 - Garbage collection never reaps a live object and always reclaims a genuine
   orphan (INV#2), the Erlang-level companion to the P models in p/
+- Tier resolution routes remote-only offsets to the remote tier and never
+  collapses a transient group fetch to a silent local read (INV#4), mirroring
+  the tier-routing and read-resolution P models
+- A manifest-replica sync is dropped iff it is older than what is recorded,
+  comparing epoch before sequence (the manifest-replica-lifecycle model's
+  epoch-monotonicity invariant)
 """.
 
 -compile([export_all, nowarn_export_all]).
@@ -67,7 +73,13 @@ all() ->
         gc_fresh_enough_fails_closed,
         gc_anchor_decision_fails_closed,
         gc_cache_epoch_gate,
-        gc_epoch_permits_sweep
+        gc_epoch_permits_sweep,
+        %% Tier resolution (INV#4)
+        tier_routing_empty_local_never_routes_to_offset,
+        tier_routing_below_remote_first_routes_remote,
+        resolve_first_lookup_never_silent_local,
+        %% Manifest-replica sync staleness (epoch monotonicity)
+        is_stale_sync_is_total_order
     ].
 
 init_per_suite(Config) -> Config.
@@ -2222,3 +2234,220 @@ gc_cache_manifest(false, FirstOffset) ->
         next_offset = FirstOffset + 1,
         entries = ?ENTRY(FirstOffset, 0, 0, ?MANIFEST_KIND_FRAGMENT, 0, 1)
     }.
+
+%% =========================================================================
+%% Tier resolution properties (INV#4)
+%%
+%% The Erlang-level companion to the tier-routing and read-resolution P models.
+%% The models prove INV#4 (tier resolution total and gap-free) across concurrent
+%% interleavings; these properties fuzz the input space of the pure routing
+%% decision in rabbitmq_stream_s3_log_reader, which the hand-written eunit
+%% examples reach only at a handful of points.
+%% =========================================================================
+
+%% The `=/= -1` guard in resolve_remote_location/2 (the tier-routing model's
+%% load-bearing guard): when the local log is empty (first_chunk_id = -1) there
+%% is no local floor, so an offset at or beyond the remote tail must wait at the
+%% live tail ({local, next}) and never resolve to a local reader at that offset.
+%% Dropping the guard would treat the empty log's floor of -1 as a real floor and
+%% route every offset to {local, Offset}, silently skipping the remote tier.
+tier_routing_empty_local_never_routes_to_offset(_Config) ->
+    {ok, Pid} = rabbitmq_stream_s3_manifest_replica:start_link(),
+    unlink(Pid),
+    try
+        rabbit_ct_proper_helpers:run_proper(
+            fun prop_tier_routing_empty_local_never_routes_to_offset/0, [], 300
+        )
+    after
+        gen_server:stop(Pid)
+    end.
+
+prop_tier_routing_empty_local_never_routes_to_offset() ->
+    ?FORALL(
+        {RemoteFirst, Span, Extra},
+        {non_neg_integer(), pos_integer(), non_neg_integer()},
+        begin
+            StreamId = <<"tier-routing-empty-prop-stream">>,
+            RemoteNext = RemoteFirst + Span,
+            ok = tier_routing_put_manifest(StreamId, RemoteFirst, RemoteNext),
+            %% Fresh shared atomics: first_chunk_id = -1 (empty local log).
+            Shared = osiris_log_shared:new(),
+            Config = #{name => StreamId, shared => Shared},
+            %% An offset at or beyond the remote tail: with the local log empty
+            %% this must wait at the live tail, not read locally at the offset.
+            Offset = RemoteNext + Extra,
+            rabbitmq_stream_s3_log_reader:resolve_remote_location(Offset, Config) =:=
+                {local, next}
+        end
+    ).
+
+%% INV#4, both directions: an offset the local tier does not cover must route to
+%% the remote tier, while an offset the local tier covers may route locally.
+%% Modelled with a contiguous layout -- the remote tier holds
+%% [RemoteFirst, RemoteNext) and, when the local log is non-empty, the local
+%% floor sits at RemoteNext -- so an offset below RemoteFirst is below the local
+%% floor (or the local log is empty) and must attach at the remote start, while
+%% an offset at or above the local floor is served locally. This is the
+%% tier-routing model's remoteCovers/localCovers obligation, exercised through
+%% the I/O-free resolution branches.
+tier_routing_below_remote_first_routes_remote(_Config) ->
+    {ok, Pid} = rabbitmq_stream_s3_manifest_replica:start_link(),
+    unlink(Pid),
+    try
+        rabbit_ct_proper_helpers:run_proper(
+            fun prop_tier_routing_below_remote_first_routes_remote/0, [], 300
+        )
+    after
+        gen_server:stop(Pid)
+    end.
+
+prop_tier_routing_below_remote_first_routes_remote() ->
+    ?FORALL(
+        {RemoteFirst, Span, Below, LocalEmpty, Above},
+        {
+            %% RemoteFirst >= 1 leaves room for an offset strictly below it.
+            integer(1, 100000),
+            pos_integer(),
+            non_neg_integer(),
+            boolean(),
+            non_neg_integer()
+        },
+        begin
+            StreamId = <<"tier-routing-below-prop-stream">>,
+            RemoteNext = RemoteFirst + Span,
+            ok = tier_routing_put_manifest(StreamId, RemoteFirst, RemoteNext),
+            Shared = osiris_log_shared:new(),
+            case LocalEmpty of
+                true ->
+                    ok;
+                false ->
+                    %% Contiguous local tier: its floor is the remote tail.
+                    ok = osiris_log_shared:set_first_chunk_id(Shared, RemoteNext)
+            end,
+            Config = #{name => StreamId, shared => Shared},
+            %% An offset strictly below the remote first offset is not covered by
+            %% the local tier (which, if any, starts at RemoteNext), so it must
+            %% attach at the remote start rather than a local reader.
+            RemoteOnly = Below rem RemoteFirst,
+            RemoteRouted =
+                case rabbitmq_stream_s3_log_reader:resolve_remote_location(RemoteOnly, Config) of
+                    {ok, #remote_location{}} -> true;
+                    _ -> false
+                end,
+            %% With a non-empty local log, an offset at or above the local floor
+            %% is covered locally and routes to a local reader at that offset.
+            LocalRouted =
+                case LocalEmpty of
+                    true ->
+                        true;
+                    false ->
+                        LocalOffset = RemoteNext + Above,
+                        rabbitmq_stream_s3_log_reader:resolve_remote_location(
+                            LocalOffset, Config
+                        ) =:= {local, LocalOffset}
+                end,
+            RemoteRouted andalso LocalRouted
+        end
+    ).
+
+%% Cache a manifest with a single leading fragment covering [First, Next). A
+%% fragment (not a group) leading entry keeps the resolution I/O-free: descending
+%% to the first fragment does not fetch a group object.
+tier_routing_put_manifest(StreamId, First, Next) ->
+    rabbitmq_stream_s3_manifest_replica:put_manifest(
+        StreamId,
+        #manifest{
+            first_offset = First,
+            next_offset = Next,
+            entries = ?ENTRY(First, 0, 0, ?MANIFEST_KIND_FRAGMENT, 0, 1)
+        }
+    ).
+
+%% INV#4 (no silent remote skip): resolve_first_lookup/1 is total over the three
+%% outcomes of the fragment iterator and must never collapse a transient group
+%% fetch failure into a local read. An `ok` serves the read remotely, an
+%% `end_of_manifest` (the remote tier is genuinely empty) serves it locally, and
+%% a `group_fetch_failed` must surface as a retry. Mirrors the read-resolution
+%% model's NoSilentRemoteSkip monitor: only `end_of_manifest` may yield
+%% {local, first}.
+resolve_first_lookup_never_silent_local(_Config) ->
+    rabbit_ct_proper_helpers:run_proper(
+        fun prop_resolve_first_lookup_never_silent_local/0, [], 500
+    ).
+
+prop_resolve_first_lookup_never_silent_local() ->
+    ?FORALL(
+        Lookup,
+        gen_first_lookup(),
+        begin
+            Result = rabbitmq_stream_s3_log_reader:resolve_first_lookup(Lookup),
+            case Lookup of
+                {ok, #fragment_ref{offset = Offset}, _Iterator} ->
+                    case Result of
+                        {remote, #remote_location{chunk_id = Offset}} -> true;
+                        _ -> false
+                    end;
+                end_of_manifest ->
+                    Result =:= {local, first};
+                {error, {group_fetch_failed, _} = Reason} ->
+                    Result =:= {retry, Reason}
+            end
+        end
+    ).
+
+%% One of the three fragment-iterator outcomes resolve_first_lookup/1 interprets.
+%% The iterator term is opaque to the function (it is only stored), so a
+%% placeholder atom stands in.
+gen_first_lookup() ->
+    oneof([
+        ?LET(
+            Offset,
+            non_neg_integer(),
+            {ok, #fragment_ref{offset = Offset, uid = 1, size = 0}, iterator_placeholder}
+        ),
+        end_of_manifest,
+        {error, {group_fetch_failed, oneof([timeout, no_quorum, closed])}}
+    ]).
+
+%% =========================================================================
+%% Manifest-replica sync staleness (epoch monotonicity)
+%%
+%% The Erlang-level companion to the manifest-replica-lifecycle P model's
+%% NoStaleFloorServed invariant. is_stale_sync/3 decides whether a delayed,
+%% possibly reordered sync from a deposed writer is dropped.
+%% =========================================================================
+
+%% is_stale_sync/3 is exactly the lexicographic (epoch, sequence) order -- epoch
+%% dominates so a higher epoch always wins regardless of where its sequence
+%% restarted -- and a first sync (nothing recorded) is never stale. The
+%% consequence checked here is the epoch-monotonicity invariant: a sync that is
+%% applied (not stale) never lets the recorded (epoch, sequence) regress.
+is_stale_sync_is_total_order(_Config) ->
+    rabbit_ct_proper_helpers:run_proper(
+        fun prop_is_stale_sync_is_total_order/0, [], 500
+    ).
+
+prop_is_stale_sync_is_total_order() ->
+    ?FORALL(
+        {Epoch, Seq, Recorded},
+        {
+            non_neg_integer(),
+            non_neg_integer(),
+            oneof([undefined, {non_neg_integer(), non_neg_integer(), node()}])
+        },
+        begin
+            Stale = rabbitmq_stream_s3_manifest_replica:is_stale_sync(Epoch, Seq, Recorded),
+            Expected =
+                case Recorded of
+                    undefined -> false;
+                    {Seq0, Epoch0, _} -> {Epoch, Seq} < {Epoch0, Seq0}
+                end,
+            %% Applying a non-stale sync never regresses the recorded frontier.
+            Monotonic =
+                case Recorded of
+                    undefined -> true;
+                    {Seq0b, Epoch0b, _} -> Stale orelse {Epoch, Seq} >= {Epoch0b, Seq0b}
+                end,
+            Stale =:= Expected andalso Monotonic
+        end
+    ).
