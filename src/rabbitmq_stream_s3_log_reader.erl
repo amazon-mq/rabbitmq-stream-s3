@@ -119,7 +119,13 @@ tier.
 -export([mode/1, remote_pid/1]).
 
 -ifdef(TEST).
--export([find_fragment/3, find_index_position/2, resolve_remote_location/2, resolve_first_lookup/1]).
+-export([
+    find_fragment/3,
+    find_index_position/2,
+    resolve_remote_location/2,
+    resolve_first_lookup/1,
+    total_range/1
+]).
 -endif.
 
 %%%===================================================================

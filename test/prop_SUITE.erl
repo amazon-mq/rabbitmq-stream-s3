@@ -11,9 +11,10 @@ Covers:
 - Fragment iterator traversal completeness and ordering
 - Garbage collection never reaps a live object and always reclaims a genuine
   orphan (INV#2), the Erlang-level companion to the P models in p/
-- Tier resolution routes remote-only offsets to the remote tier and never
-  collapses a transient group fetch to a silent local read (INV#4), mirroring
-  the tier-routing and read-resolution P models
+- Tier resolution routes remote-only offsets to the remote tier, never
+  collapses a transient group fetch to a silent local read, and reports a read
+  range spanning both tiers (INV#4), mirroring the tier-routing and
+  read-resolution P models
 - A manifest-replica sync is dropped iff it is older than what is recorded,
   comparing epoch before sequence (the manifest-replica-lifecycle model's
   epoch-monotonicity invariant)
@@ -77,6 +78,8 @@ all() ->
         %% Tier resolution (INV#4)
         tier_routing_empty_local_never_routes_to_offset,
         tier_routing_below_remote_first_routes_remote,
+        total_range_spans_both_tiers,
+        abs_offset_out_of_total_range_is_rejected,
         resolve_first_lookup_never_silent_local,
         %% Manifest-replica sync staleness (epoch monotonicity)
         is_stale_sync_is_total_order
@@ -2362,6 +2365,138 @@ tier_routing_put_manifest(StreamId, First, Next) ->
             entries = ?ENTRY(First, 0, 0, ?MANIFEST_KIND_FRAGMENT, 0, 1)
         }
     ).
+
+%% INV#4 (tier resolution total): total_range/1 reports the union of the local
+%% and remote extents, and is empty only when both tiers are empty. The
+%% load-bearing case is an empty local log (first_chunk_id = -1) over a non-empty
+%% remote tier: returning `empty` there (the pre-fix regression) made {abs}
+%% reads of valid remote offsets fail as out_of_range. Mirrors the tier-routing
+%% model's totality obligation on the read domain.
+total_range_spans_both_tiers(_Config) ->
+    {ok, Pid} = rabbitmq_stream_s3_manifest_replica:start_link(),
+    unlink(Pid),
+    try
+        rabbit_ct_proper_helpers:run_proper(fun prop_total_range_spans_both_tiers/0, [], 500)
+    after
+        gen_server:stop(Pid)
+    end.
+
+prop_total_range_spans_both_tiers() ->
+    ?FORALL(
+        {Local, Remote},
+        {gen_local_extent(), gen_remote_extent()},
+        begin
+            StreamId = <<"total-range-prop-stream">>,
+            Config = tier_config(StreamId, Local, Remote),
+            Result = rabbitmq_stream_s3_log_reader:total_range(Config),
+            Expected =
+                case {Local, Remote} of
+                    {empty, empty} -> empty;
+                    {empty, {Rf, Rn}} -> {Rf, Rn - 1};
+                    {{Lf, Ll}, empty} -> {Lf, Ll};
+                    {{Lf, Ll}, {Rf, Rn}} -> {min(Lf, Rf), max(Ll, Rn - 1)}
+                end,
+            %% The reported range spans both tiers, and is empty only when both
+            %% tiers are empty (never empty while either tier holds data).
+            Result =:= Expected andalso
+                (Result =:= empty) =:= (Local =:= empty andalso Remote =:= empty)
+        end
+    ).
+
+%% INV#4 (resolution total over the read domain): the {abs, Offset} spec is
+%% defined exactly on total_range/1. An offset outside the total range must be
+%% rejected as offset_out_of_range carrying that range, never routed to a tier.
+%% The in-range direction (which reads a fragment index) is covered by the e2e
+%% suites; this pins the pure out-of-range boundary.
+abs_offset_out_of_total_range_is_rejected(_Config) ->
+    {ok, Pid} = rabbitmq_stream_s3_manifest_replica:start_link(),
+    unlink(Pid),
+    try
+        rabbit_ct_proper_helpers:run_proper(
+            fun prop_abs_offset_out_of_total_range_is_rejected/0, [], 500
+        )
+    after
+        gen_server:stop(Pid)
+    end.
+
+prop_abs_offset_out_of_total_range_is_rejected() ->
+    ?FORALL(
+        {Local, Remote, Below, Above},
+        {gen_local_extent(), gen_remote_extent(), pos_integer(), non_neg_integer()},
+        begin
+            StreamId = <<"abs-range-prop-stream">>,
+            Config = tier_config(StreamId, Local, Remote),
+            Range = rabbitmq_stream_s3_log_reader:total_range(Config),
+            OutOfRange =
+                case Range of
+                    empty ->
+                        %% With no data at all, every offset is out of range.
+                        [0, Above];
+                    {First, Last} ->
+                        %% Strictly below the first and strictly above the last.
+                        [First - Below, Last + 1 + Above]
+                end,
+            lists:all(
+                fun(Offset) ->
+                    rabbitmq_stream_s3_log_reader:resolve_remote_location(
+                        {abs, Offset}, Config
+                    ) =:=
+                        {error, {offset_out_of_range, Range}}
+                end,
+                OutOfRange
+            )
+        end
+    ).
+
+%% Configure a Config for total_range/1: an optional non-empty local log
+%% [LocalFirst, LocalLast] (or an empty local log, first_chunk_id = -1) and an
+%% optional non-empty remote extent [RemoteFirst, RemoteNext) cached in the
+%% replica. A manifest is always written (empty or single-fragment) so no stale
+%% row from a prior iteration leaks in.
+tier_config(StreamId, Local, Remote) ->
+    Shared = osiris_log_shared:new(),
+    case Local of
+        empty ->
+            ok;
+        {LocalFirst, LocalLast} ->
+            ok = osiris_log_shared:set_first_chunk_id(Shared, LocalFirst),
+            ok = osiris_log_shared:set_committed_offset(Shared, LocalLast)
+    end,
+    Manifest =
+        case Remote of
+            empty ->
+                #manifest{first_offset = 0, next_offset = 0};
+            {RemoteFirst, RemoteNext} ->
+                #manifest{
+                    first_offset = RemoteFirst,
+                    next_offset = RemoteNext,
+                    entries = ?ENTRY(RemoteFirst, 0, 0, ?MANIFEST_KIND_FRAGMENT, 0, 1)
+                }
+        end,
+    ok = rabbitmq_stream_s3_manifest_replica:put_manifest(StreamId, Manifest),
+    #{name => StreamId, shared => Shared}.
+
+%% An empty local log, or a non-empty one [First, Last] with First =< Last.
+gen_local_extent() ->
+    oneof([
+        empty,
+        ?LET(
+            {First, Span},
+            {non_neg_integer(), non_neg_integer()},
+            {First, First + Span}
+        )
+    ]).
+
+%% An empty remote tier, or a non-empty extent [First, Next) with Next > First.
+gen_remote_extent() ->
+    oneof([
+        empty,
+        ?LET(
+            {First, Span},
+            {non_neg_integer(), pos_integer()},
+            {First, First + Span}
+        )
+    ]).
 
 %% INV#4 (no silent remote skip): resolve_first_lookup/1 is total over the three
 %% outcomes of the fragment iterator and must never collapse a transient group
