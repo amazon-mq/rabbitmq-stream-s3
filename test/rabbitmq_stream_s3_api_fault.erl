@@ -187,20 +187,34 @@ maybe_delay(Op, Key) ->
     end.
 
 maybe_block(Op, Key) ->
-    case lookup({block, Op}) of
-        {ok, {KeyPat, TestPid, Ref}} ->
+    %% ets:take/2 atomically reads and removes the entry in one operation.
+    %% A separate lookup-then-delete (as this used to be) is a check-then-act
+    %% race: when a fragment cut produces several concurrent uploads for the
+    %% same stream (an unlimited-rate governor spawns one task per submission
+    %% immediately), more than one of their stream_put calls can read the
+    %% same still-present entry before either deletes it, so more than one
+    %% parks on the same one-shot block. Only one ever gets released (the
+    %% caller only awaits a single {fault_blocked, ...}), leaving the others
+    %% permanently stuck - an unmonitored governor task with nothing to ever
+    %% notice or unstick it. Found via replica_reader_statem_SUITE's repeated
+    %% (dozens-of-iterations) validation runs: a real, if narrow, race in this
+    %% shared fault backend, not in the code under test.
+    case ets:take(?TBL, {block, Op}) of
+        [{_, KeyPat, TestPid, Ref}] ->
             case matches(KeyPat, Key) of
                 true ->
-                    %% One-shot: remove before parking so only this call blocks.
-                    ets:delete(?TBL, {block, Op}),
                     TestPid ! {fault_blocked, Ref, self()},
                     receive
                         {fault_release, Ref} -> ok
                     end;
                 false ->
+                    %% Didn't match this key: this call just happened to win
+                    %% the take first. Put the block back so a later matching
+                    %% call can still find it.
+                    ets:insert(?TBL, {{block, Op}, KeyPat, TestPid, Ref}),
                     ok
             end;
-        none ->
+        [] ->
             ok
     end.
 
