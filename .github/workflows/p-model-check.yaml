@@ -396,7 +396,7 @@ jobs:
           cd p/manifest-replica-lifecycle
           for tc in tcCleanupGuarded tcStaleSyncGuarded tcReregisterGuarded \
                     tcConvergenceGuarded tcForgetReleasesWriterRow tcSyncAfterExitFixed \
-                    tcStartupRaceContextFirst tcReconcileRaceResync tcExplore; do
+                    tcEditAfterExitFixed tcStartupRaceContextFirst tcReconcileRaceResync tcExplore; do
             echo "::group::$tc (expect hold)"
             p check -tc "$tc" -i 5000
             echo "::endgroup::"
@@ -434,6 +434,9 @@ jobs:
           # The gap this model surfaces: a sync after a member DOWN re-strands the
           # row (the shipped-in-this-branch A2 guard closes it in tcSyncAfterExitFixed).
           check_gate tcSyncAfterExitStrands 'NOLEAK violated: replica holds per-node state for stream 0 with no live reader'
+          # The same gap on the other write path: apply_edits needed the identical
+          # A2 guard sync already had (tcEditAfterExitFixed closes it).
+          check_gate tcEditAfterExitStrands 'NOLEAK violated: replica holds per-node state for stream 0 with no live reader'
           # Liveness: syncs dropped forever (tcConvergenceStuck), and the two
           # startup triggers that starve the cache without recovery - the
           # WriterFirst acceptor race (A1 fixes it) and the writer-driven reconcile

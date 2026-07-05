@@ -15,7 +15,9 @@
    GAP (headline finding): with every SHIPPED guard on, a sync that arrives after
    a member DOWN re-creates a cache row for a stream the cleanup already released,
    stranding it forever (no monitor will ever fire again). tcSyncAfterExitStrands
-   demonstrates it; tcSyncAfterExitFixed shows a proposed guard closing it. */
+   demonstrates it; tcSyncAfterExitFixed shows a proposed guard closing it.
+   tcEditAfterExitStrands/Fixed prove the same guard closes the identical gap on
+   the other write path, apply_edits (eMREdit), not just sync. */
 
 fun Register(self: machine, replica: machine, stream: StreamId): int {
   var mref: int;
@@ -40,6 +42,15 @@ fun Commit(self: machine, writer: machine, stream: StreamId, floor: int, epoch: 
 fun EmitSync(self: machine, writer: machine, replica: machine,
              stream: StreamId, floor: int, epoch: int, sn: int) {
   send writer, eEmitSync,
+    (from = self, target = replica, stream = stream, floor = floor, epoch = epoch, sn = sn);
+  receive { case eEmitAck: { } }
+}
+
+/* Emit an edit cast (not yet applied); call Barrier to flush it. The eMREdit
+   counterpart to EmitSync, exercising apply_edits instead of sync. */
+fun EmitEdit(self: machine, writer: machine, replica: machine,
+             stream: StreamId, floor: int, epoch: int, sn: int) {
+  send writer, eEmitEdit,
     (from = self, target = replica, stream = stream, floor = floor, epoch = epoch, sn = sn);
   receive { case eEmitAck: { } }
 }
@@ -239,6 +250,35 @@ fun RunSyncAfterExit(self: machine, gapFix: bool) {
 
 machine DriverSyncAfterExitStrands { start state Init { entry { RunSyncAfterExit(this, false); } } }
 machine DriverSyncAfterExitFixed { start state Init { entry { RunSyncAfterExit(this, true); } } }
+
+/* ---- GAP: edit after exit (the same finding, for apply_edits) ---- */
+
+/* Same shape as RunSyncAfterExit, but the write-path event is eMREdit
+   (apply_edits) instead of eMRSync (sync). Proves the SAME syncRequiresContext
+   guard (A2) that closes the sync strand also closes the edit strand: the
+   apply_edits handlers gained the identical maps:is_key(StreamId, Ctxs) check
+   (drop_no_context/6) that maybe_apply_sync/8 already had. Every shipped guard
+   on; gapFix selects the proposed/now-shipped guard under test. */
+fun RunEditAfterExit(self: machine, gapFix: bool) {
+  var replica: machine;
+  var writer: machine;
+  var mref: int;
+  writer = new Writer();
+  replica = NewReplica(true, true, true, gapFix, false, writer);
+  Commit(self, writer, 0, 1000, 1, 1);
+  mref = Register(self, replica, 0);
+  EmitEdit(self, writer, replica, 0, 1000, 1, 1);
+  Barrier(self, writer, replica);
+  /* Synchronous: the cleanup has fully released the stream before we proceed. */
+  MemberDown(self, replica, 0, mref);
+  /* The straggler edit, now strictly after the release. */
+  EmitEdit(self, writer, replica, 0, 1000, 1, 1);
+  Barrier(self, writer, replica);
+  Quiesce(self, replica);
+}
+
+machine DriverEditAfterExitStrands { start state Init { entry { RunEditAfterExit(this, false); } } }
+machine DriverEditAfterExitFixed { start state Init { entry { RunEditAfterExit(this, true); } } }
 
 /* ---- STARTUP RACE: attach ordering vs the syncRequiresContext guard ---- */
 
@@ -473,6 +513,14 @@ test tcSyncAfterExitStrands [main = DriverSyncAfterExitStrands]:
 test tcSyncAfterExitFixed [main = DriverSyncAfterExitFixed]:
   assert ReplicaStateMatchesReaders in
   { DriverSyncAfterExitFixed, ManifestReplica, Writer };
+
+test tcEditAfterExitStrands [main = DriverEditAfterExitStrands]:
+  assert ReplicaStateMatchesReaders in
+  { DriverEditAfterExitStrands, ManifestReplica, Writer };
+
+test tcEditAfterExitFixed [main = DriverEditAfterExitFixed]:
+  assert ReplicaStateMatchesReaders in
+  { DriverEditAfterExitFixed, ManifestReplica, Writer };
 
 test tcExplore [main = DriverExplore]:
   assert ReplicaStateMatchesReaders, NoStaleFloorServed in

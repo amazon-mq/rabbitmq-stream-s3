@@ -51,6 +51,15 @@ machine Writer {
       send p.from, eEmitAck;
     }
 
+    /* The eMREdit counterpart to eEmitSync: emit a sequenced edit instead of a
+       full-manifest reset. */
+    on eEmitEdit do (p: (from: machine, target: machine, stream: StreamId,
+                         floor: int, epoch: int, sn: int)) {
+      send p.target, eMREdit,
+        (stream = p.stream, floor = p.floor, epoch = p.epoch, sn = p.sn, writerNode = 0);
+      send p.from, eEmitAck;
+    }
+
     /* Synchronous barrier: flush prior writer->target sync casts by riding the
        FIFO behind them, then confirm to the caller. */
     on eBarrier do (p: (from: machine, target: machine)) {
