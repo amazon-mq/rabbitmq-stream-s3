@@ -202,6 +202,48 @@
   [node]
   (util/meh (rabbitmqctl-eval node leader-move-eval)))
 
+;; One rabbitmqctl eval that permanently removes ONE randomly chosen replica from
+;; a randomly chosen jepsen-<k> stream, so that osiris member departs its node and
+;; does NOT return. This is the condition the manifest-replica sync-context guard
+;; protects against: a sync that races the member's teardown finds no reader
+;; context, and (without the guard) would re-create a cache row with no monitor to
+;; ever reclaim it. leader-move cannot exercise this because it restarts every
+;; member in place on the same node set, so each departed member re-registers a
+;; context that reclaims the row; only a member that leaves a node for good leaves
+;; an orphan visible at quiesce.
+;;
+;; Delete-only, and deliberately never re-added: add_replica would re-register a
+;; context on the node and reclaim (mask) any orphaned row before the replica
+;; checker's end-of-run snapshot, defeating the leaked-replica-row assertion. To
+;; keep every stream durable for the final read, a stream is a candidate only
+;; while it still has two or more replicas, so a delete always leaves the leader
+;; plus at least one replica. The coordinator is cluster-global, so this runs on a
+;; single node.
+(def ^:private member-churn-eval
+  (str "Names = [element(4, amqqueue:get_name(Q)) "
+       "|| Q <- rabbit_amqqueue:list(<<\"/\">>)], "
+       "Jeps = [N || N <- Names, byte_size(N) >= 7, binary:part(N, 0, 7) =:= <<\"jepsen-\">>], "
+       "Lookup = fun(N) -> element(2, rabbit_amqqueue:lookup(rabbit_misc:r(<<\"/\">>, queue, N))) end, "
+       "Reps = fun(N) -> maps:get(replica_nodes, amqqueue:get_type_state(Lookup(N)), []) end, "
+       "Cand = [N || N <- Jeps, length(Reps(N)) >= 2], "
+       "case Cand of "
+       "[] -> ok; "
+       "_ -> "
+       "N = lists:nth(rand:uniform(length(Cand)), Cand), "
+       "Rs = Reps(N), "
+       "R = lists:nth(rand:uniform(length(Rs)), Rs), "
+       "catch rabbit_stream_queue:delete_replica(<<\"/\">>, N, R) "
+       "end, ok."))
+
+(defn force-member-churn!
+  "Permanently removes one replica from a randomly chosen jepsen stream, so an
+  osiris member departs its node and does not return — the departing-member race
+  the manifest-replica sync-context guard protects against. Bounded to keep every
+  stream at leader + >=1 replica so durability holds for the final read. Run on a
+  single node (the coordinator is cluster-global). Runs in an SSH context."
+  [node]
+  (util/meh (rabbitmqctl-eval node member-churn-eval)))
+
 ;; The plugin's read/write paths are instrumented, not logged, so these
 ;; counters are how the test proves S3 was actually exercised (see the
 ;; coverage checker). The management/Prometheus listener is on 15692.
