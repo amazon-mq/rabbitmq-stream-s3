@@ -65,7 +65,13 @@ the reader pool avoids reader starvation.
     %% Native monotonic timestamp at which each connection was opened; used
     %% to report age when a connection goes down unexpectedly.
     created = #{} :: #{conn() => integer()},
-    counter :: counters:counters_ref()
+    counter :: counters:counters_ref(),
+    %% Injection points so this pool can be driven in tests without a real S3
+    %% endpoint or `gun` connection. Default to the real behavior; see
+    %% `config()`.
+    open_fun :: open_fun(),
+    usable_fun :: usable_fun(),
+    close_fun :: close_fun()
 }).
 
 %% Gun connection pid.
@@ -76,10 +82,19 @@ the reader pool avoids reader starvation.
 %% An attempt to check out a conn. (Internal.)
 -type checkout() :: reference().
 
+-type open_fun() :: fun(() -> {ok, conn()} | {error, any()}).
+-type usable_fun() :: fun((conn()) -> boolean()).
+-type close_fun() :: fun((conn()) -> any()).
+
 -type config() :: #{
     name := pool(),
     min_size := non_neg_integer(),
-    max_size := pos_integer()
+    max_size := pos_integer(),
+    %% Test-only injection points; default to the real `open/0`, `usable/1`
+    %% and `gun:close/1` when absent. See issue #178.
+    open_fun => open_fun(),
+    usable_fun => usable_fun(),
+    close_fun => close_fun()
 }.
 
 %% API
@@ -100,6 +115,13 @@ the reader pool avoids reader starvation.
     terminate/2,
     code_change/3
 ]).
+
+-ifdef(TEST).
+%% Full-fidelity state dump for api_aws_pool_statem_SUITE. `format_state/1`
+%% (used for logging/`sys:get_status`) only reports sizes/counts, which is not
+%% enough to assert the `checkouts`/`checkouts_rev` mirror-image invariant.
+-export([test_inspect/1]).
+-endif.
 
 %%---------------------------------------------------------------------------
 
@@ -138,7 +160,7 @@ with(Pool, Timeout, Fun) ->
 start_link(Name, Config) ->
     gen_server:start_link({local, Name}, ?MODULE, Config, []).
 
-init(#{min_size := MinSize, max_size := MaxSize, name := Name}) ->
+init(#{min_size := MinSize, max_size := MaxSize, name := Name} = Config) ->
     logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
     case rabbitmq_stream_s3_api:backend() of
         rabbitmq_stream_s3_api_aws ->
@@ -147,7 +169,14 @@ init(#{min_size := MinSize, max_size := MaxSize, name := Name}) ->
                 pool => Name
             }),
             self() ! grow,
-            {ok, #?MODULE{min_size = MinSize, max_size = MaxSize, counter = Cnt}};
+            {ok, #?MODULE{
+                min_size = MinSize,
+                max_size = MaxSize,
+                counter = Cnt,
+                open_fun = maps:get(open_fun, Config, fun open/0),
+                usable_fun = maps:get(usable_fun, Config, fun usable/1),
+                close_fun = maps:get(close_fun, Config, fun gun:close/1)
+            }};
         _ ->
             ignore
     end.
@@ -242,9 +271,9 @@ handle_gun_up(
         ]
     ),
     {noreply, make_available(Conn, State)};
-handle_gun_up(Conn, State) ->
+handle_gun_up(Conn, #?MODULE{close_fun = CloseFun} = State) ->
     %% Stale gun_up from a connection opened by a previous pool instance.
-    gun:close(Conn),
+    CloseFun(Conn),
     {noreply, State}.
 
 %% With retry=>0, gun stops the connection process immediately after sending
@@ -349,8 +378,8 @@ handle_info(Message, State) ->
 format_status(#{state := State0} = Status0) ->
     Status0#{state := format_state(State0)}.
 
-terminate(_Reason, #?MODULE{monitors = Monitors}) ->
-    _ = [gun:close(Conn) || Conn := _ <- Monitors],
+terminate(_Reason, #?MODULE{monitors = Monitors, close_fun = CloseFun}) ->
+    _ = [CloseFun(Conn) || Conn := _ <- Monitors],
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -377,8 +406,8 @@ grow(
 
 grow(0, State) ->
     State;
-grow(N, #?MODULE{monitors = Monitors0, created = Created0} = State0) ->
-    case open() of
+grow(N, #?MODULE{monitors = Monitors0, created = Created0, open_fun = OpenFun} = State0) ->
+    case OpenFun() of
         {ok, Conn} ->
             State = State0#?MODULE{
                 monitors = Monitors0#{Conn => erlang:monitor(process, Conn)},
@@ -452,12 +481,13 @@ take_available(
     #?MODULE{
         available = Available0,
         checkouts = Checkouts0,
-        checkouts_rev = CheckoutsRev0
+        checkouts_rev = CheckoutsRev0,
+        usable_fun = UsableFun
     } = State0
 ) ->
     case Available0 of
         [Conn | Available] ->
-            case usable(Conn) of
+            case UsableFun(Conn) of
                 true ->
                     MRef = erlang:monitor(process, Pid),
                     State = State0#?MODULE{
@@ -483,12 +513,13 @@ checkout(
         available = Available0,
         checkouts = Checkouts0,
         checkouts_rev = CheckoutsRev0,
-        counter = Cnt
+        counter = Cnt,
+        usable_fun = UsableFun
     } = State0
 ) ->
     case {queue:out(Pending0), Available0} of
         {{{value, #pending{from = From, mref = MRef}}, Pending}, [Conn | Available]} ->
-            case usable(Conn) of
+            case UsableFun(Conn) of
                 true ->
                     counters:add(Cnt, ?C_CHECKOUTS, 1),
                     gen_server:reply(From, Conn),
@@ -563,12 +594,14 @@ make_available(Conn, #?MODULE{available = Available, idle_timers = Timers} = Sta
 %% Close a connection and stop monitoring it. Used when the connection has
 %% been idle too long, or when its caller died holding it (and we cannot
 %% trust its on-wire state). A no-op if the connection is not in `monitors`.
-close_connection(Conn, #?MODULE{monitors = Monitors, created = Created} = State) when
+close_connection(
+    Conn, #?MODULE{monitors = Monitors, created = Created, close_fun = CloseFun} = State
+) when
     is_map_key(Conn, Monitors)
 ->
     ConnMRef = maps:get(Conn, Monitors),
     erlang:demonitor(ConnMRef, [flush]),
-    gun:close(Conn),
+    CloseFun(Conn),
     State#?MODULE{
         monitors = maps:remove(Conn, Monitors),
         created = maps:remove(Conn, Created)
@@ -601,3 +634,26 @@ format_state(#?MODULE{
         checkouts => map_size(Checkouts),
         pending => queue:len(Pending)
     }.
+
+-ifdef(TEST).
+test_inspect(Pool) ->
+    #?MODULE{
+        available = Available,
+        monitors = Monitors,
+        checkouts = Checkouts,
+        checkouts_rev = CheckoutsRev,
+        pending = Pending,
+        idle_timers = IdleTimers
+    } = sys:get_state(Pool),
+    #{
+        available => Available,
+        monitors => Monitors,
+        checkouts => Checkouts,
+        checkouts_rev => CheckoutsRev,
+        pending => [
+            From
+         || #pending{from = From} <- queue:to_list(Pending)
+        ],
+        idle_timers => IdleTimers
+    }.
+-endif.
