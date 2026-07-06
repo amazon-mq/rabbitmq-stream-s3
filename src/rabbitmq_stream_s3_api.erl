@@ -159,7 +159,6 @@ init() ->
     ok = rabbitmq_stream_s3_reaper:init_counters(),
     ok = rabbitmq_stream_s3_replica_reader:init_counters(),
     ok = rabbitmq_stream_s3_manifest_replica:init_counters(),
-    ok = rabbitmq_stream_s3_bucket_monitor:init_counters(),
     lists:foreach(
         fun(Kind) ->
             rabbitmq_stream_s3_histogram:new(

@@ -95,6 +95,10 @@ init([]) ->
     logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
     case rabbitmq_stream_s3_config:bucket_check_enabled() of
         true ->
+            %% Create the gauge only when the feature is enabled, so a node with
+            %% the check disabled does not expose a `bucket_accessible` metric at
+            %% all rather than a misleading value for a probe that never runs.
+            ok = init_counters(),
             {ok, #?MODULE{timer = schedule(?INITIAL_RETRY_MS)}};
         false ->
             ?LOG_INFO("Tiered storage bucket accessibility checks are disabled."),
@@ -284,6 +288,21 @@ state_machine_test_() ->
             end}
         ]
     end}.
+
+%% When the feature is disabled, init/1 must return `ignore` and must not create
+%% the gauge, so a disabled node exposes no `bucket_accessible` metric rather
+%% than a misleading value for a probe that never runs.
+disabled_does_not_create_gauge_test() ->
+    {ok, _} = application:ensure_all_started(seshat),
+    _ = seshat:new_group(rabbitmq_stream_s3),
+    persistent_term:erase(?COUNTER_KEY),
+    application:set_env(rabbitmq_stream_s3, bucket_check_enabled, false),
+    try
+        ?assertEqual(ignore, init([])),
+        ?assertEqual(undefined, persistent_term:get(?COUNTER_KEY, undefined))
+    after
+        application:unset_env(rabbitmq_stream_s3, bucket_check_enabled)
+    end.
 
 %% schedule_next/1 must retry quickly while still unknown and back off to the
 %% configured interval once a definitive result is known.
