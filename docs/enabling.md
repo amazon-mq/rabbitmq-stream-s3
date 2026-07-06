@@ -5,7 +5,10 @@ This document is for operators turning on `rabbitmq_stream_s3` for the first tim
 ## Prerequisites
 
 - A RabbitMQ cluster running a build that includes this plugin. The plugin currently requires specific development branches of `rabbitmq-server` and `osiris`; see the project [README](../README.md) for the current branch names.
-- An S3 bucket the cluster's IAM identity can read from, write to, list, and delete in.
+- An S3 bucket the cluster's IAM identity can access. The plugin requires four S3 actions, split across two resource scopes:
+  - object-level actions on `arn:aws:s3:::<bucket>/*`: `s3:PutObject` (upload fragments and manifests), `s3:GetObject` (read them back), and `s3:DeleteObject` (trim and retention)
+  - a bucket-level action on `arn:aws:s3:::<bucket>`: `s3:ListBucket`, used only by the bucket accessibility probe (a `HeadBucket` request); the upload and read paths do not need it, so a policy scoped to only the object actions works for tiering but makes the accessibility check report a false `access denied`
+  - See [operations.md](./operations.md#iam-permissions) for a minimal policy example
 - The Prometheus metrics endpoint is opened automatically because `rabbitmq_stream_s3` depends on `rabbitmq_prometheus`. Enabling the tiered-storage plugin **implicitly enables** `rabbitmq_prometheus`, which listens on port 15692.
 
 ## Configuration

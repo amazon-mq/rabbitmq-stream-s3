@@ -37,6 +37,39 @@ stream_s3.access_key_id = AKIAIOSFODNN7EXAMPLE
 stream_s3.secret_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 ```
 
+### IAM permissions
+
+The identity resolved above needs four S3 actions. Three are object-level and cover the data path; the fourth is bucket-level and is used only by the accessibility probe.
+
+| Action | Resource scope | Purpose |
+|---|---|---|
+| `s3:PutObject` | `arn:aws:s3:::<bucket>/*` | upload fragments and manifests |
+| `s3:GetObject` | `arn:aws:s3:::<bucket>/*` | read fragments and manifests |
+| `s3:DeleteObject` | `arn:aws:s3:::<bucket>/*` | trim and retention |
+| `s3:ListBucket` | `arn:aws:s3:::<bucket>` | bucket accessibility probe (`HeadBucket`) |
+
+`s3:ListBucket` authorizes the `HeadBucket` request the [bucket accessibility check](#bucket-accessibility-checks) issues; S3 has no separate `HeadBucket` action. The upload and read paths never call it, so a policy scoped to only the three object-level actions is sufficient for tiering itself, but the accessibility probe will then report a false `access denied` (see [troubleshooting.md](./troubleshooting.md#nothing-is-tiered-to-the-remote-tier)). Grant `s3:ListBucket` to avoid that false signal.
+
+A minimal illustrative policy (real deployments typically add KMS, transport, and VPC endpoint conditions):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::my-rabbitmq-streams-bucket/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::my-rabbitmq-streams-bucket"
+    }
+  ]
+}
+```
+
 ### Continuous Membership Reconciliation (CMR)
 
 Mirrors [Quorum Queue CMR](https://www.rabbitmq.com/docs/quorum-queues#member-reconciliation) for streams.
@@ -69,6 +102,8 @@ stream_s3.continuous_membership_reconciliation.trigger_interval = 10000
 ### Bucket accessibility checks
 
 The plugin periodically probes whether the configured bucket exists and is usable with the current credentials (a `HeadBucket` request). A wrong or unreachable bucket does not stop a stream working: it keeps running on local disk and uploads fail and retry indefinitely, so the misconfiguration is otherwise nearly silent. The probe surfaces the condition via an `ERROR` log on the transition, the `rabbitmq_stream_s3_bucket_accessible` metric, and the `stream_s3_status` CLI command. It never blocks publishers, so a tiering misconfiguration cannot become a publishing outage.
+
+The probe's `HeadBucket` request is authorized by `s3:ListBucket`, which the upload and read paths never use (see [IAM permissions](#iam-permissions)). A policy scoped to only the data path therefore makes this check report a false `access denied` even though tiering works; grant `s3:ListBucket` to avoid it.
 
 ```ini
 # Whether the configured bucket's accessibility is periodically probed.
