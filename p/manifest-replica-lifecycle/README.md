@@ -17,9 +17,13 @@ osiris has no terminate or delete hook, so a member `DOWN` (via `monitor/2`) is 
 
 The model abstracts a member to its monitor reference: the replica's only handle on a member is the monitor it holds. The driver starts and kills members; a kill is `eMemberDown` with that mref (the modeled `'DOWN'`).
 
+There are two write-path events into this state, both fire-and-forget casts from the writer: `eMRSync` (`sync/5`, a full-manifest reset checked against `is_stale_sync`) and `eMREdit` (`apply_edits/5`, a sequenced edit that requires `sn == last_seq + 1` against a recorded `seqs` entry, else a gap dropped without touching cache/seqs; a stream with no recorded entry yet accepts, the same "unrecorded is never rejected" convention `eMRSync` uses, since resolving a first-arrival gap is a data-prefix concern the TLA+ companion model owns, not this one). They are deliberately distinct events rather than one, because their acceptance checks differ, but the resource-lifecycle question this model asks - is the write gated on a live context, so it can never write a row no monitor will ever reclaim - is identical for both, and `syncRequiresContextEnabled` (A2) gates both with one check.
+
 ## The gap: a contextless sync strands the cache
 
 With every shipped guard on, cleanup is not airtight. A sync arriving after a member `DOWN`, when cleanup has already released the stream, falls through `maybe_apply_sync` with `Recorded == undefined`, so `is_stale_sync` returns `false` and `write_manifest` re-inserts the ETS row and `seqs` with no context and no monitor: nothing will ever `'DOWN'` to reclaim it. It lingers rather than being a narrow window because the writer keeps broadcasting to a departed node (decoupling 2 below). It re-introduces exactly the accretion `cc50092` killed. `tcSyncAfterExitStrands` reproduces it (NOLEAK).
+
+The same gap exists on the `apply_edits` path: before the fix below, only `maybe_apply_sync` checked for a live context, so a straggler edit delivered after the `DOWN` re-inserted the row exactly as a straggler sync did. `tcEditAfterExitStrands` reproduces the identical `NOLEAK` counterexample by driving `eMREdit` instead of `eMRSync` after the member exit; `tcEditAfterExitFixed` shows the same `syncRequiresContext` guard closes it.
 
 ## The fix: A2 + A1', and why the guard alone is unsafe
 
@@ -37,8 +41,8 @@ A1' (resync-on-register) covers both: on registering a context the replica reque
 
 ### Machines (`PSrc/`)
 
-- `ManifestReplica`, the system under test: the three maps and reverse index, with a toggle per guard so each gate can remove one (`cleanupEnabled`, `staleSyncGuardEnabled`, `repointEnabled`, `syncRequiresContextEnabled`, `resyncOnRegisterEnabled`)
-- `Writer`, the writer-side broadcaster (`rabbitmq_stream_s3_replica_reader`): the authoritative source of committed floors and the emitter of fire-and-forget syncs, answering two triggers from its persisted floor, `eReconcile` (member-visible-driven, independent of `register_acceptor`) and `eResync` (a replica's `request_resync`)
+- `ManifestReplica`, the system under test: the three maps and reverse index, with a toggle per guard so each gate can remove one (`cleanupEnabled`, `staleSyncGuardEnabled`, `repointEnabled`, `syncRequiresContextEnabled`, `resyncOnRegisterEnabled`), and two write-path events sharing those gates, `eMRSync` (`sync/5`) and `eMREdit` (`apply_edits/5`)
+- `Writer`, the writer-side broadcaster (`rabbitmq_stream_s3_replica_reader`): the authoritative source of committed floors and the emitter of fire-and-forget syncs and edits, answering two triggers from its persisted floor, `eReconcile` (member-visible-driven, independent of `register_acceptor`) and `eResync` (a replica's `request_resync`)
 - `AttachNode` and `ContextRegistrar`, which drive the attach order (the `contextFirst` axis) and the concurrent reconcile race, so a startup sync can be scheduled before or after context registration
 
 ### Monitors (`PSpec/`)
@@ -62,6 +66,8 @@ A1' (resync-on-register) covers both: on registering a context the replica reque
 | `tcForgetReleasesWriterRow` | holds: the writer-node `put_manifest` row is released by `forget/1` |
 | `tcSyncAfterExitStrands` | fails: all shipped guards on, and a sync after the `DOWN` re-strands the row: the same `NOLEAK` counterexample, the gap |
 | `tcSyncAfterExitFixed` | holds: the `syncRequiresContext` guard (A2) ignores the post-exit sync |
+| `tcEditAfterExitStrands` | fails: the same setup, but the write-path event is `eMREdit` (`apply_edits`) instead of `eMRSync`; the identical `NOLEAK` counterexample, proving `apply_edits` needed the same gate |
+| `tcEditAfterExitFixed` | holds: the same `syncRequiresContext` guard (A2) ignores the post-exit edit |
 | `tcStartupRaceWriterFirst` | fails: A2 on plus the shipped writer-first attach; a startup sync beats context registration, is dropped, and is never re-sent: `ReplicaConverges detected liveness bug in hot state 'Lagging' at the end of program execution` (the cache stays empty and NOLEAK stays green, so the guard alone is unsafe) |
 | `tcStartupRaceContextFirst` | holds: A1 attach-ordering (context before writer) plus A2; the startup sync always lands and the post-`DOWN` straggler is dropped (convergence and NOLEAK) |
 | `tcReconcileRaceNoResync` | fails: A1-consistent registration plus A2 with A1' off; the writer-driven reconcile sync races ahead of the context, is dropped, and is never re-sent: `ReplicaConverges detected liveness bug in hot state 'Lagging' at the end of program execution` (A1 cannot cover the writer-side trigger) |
@@ -78,6 +84,7 @@ p check -tc tcReregisterGuarded     -i 2000   # 0 bugs
 p check -tc tcConvergenceGuarded    -i 2000   # 0 bugs
 p check -tc tcForgetReleasesWriterRow -i 2000 # 0 bugs
 p check -tc tcSyncAfterExitFixed    -i 2000   # 0 bugs (A2 closes the strand)
+p check -tc tcEditAfterExitFixed    -i 2000   # 0 bugs (A2 closes the edit strand too)
 p check -tc tcStartupRaceContextFirst -i 2000 # 0 bugs (A1 + A2)
 p check -tc tcReconcileRaceResync   -i 2000   # 0 bugs (A2 + A1' covers reconcile)
 p check -tc tcExplore               -i 5000   # 0 bugs
@@ -86,6 +93,7 @@ p check -tc tcCleanupUnguarded      -i 2000   # 1 bug: NOLEAK
 p check -tc tcStaleSyncUnguarded    -i 2000   # 1 bug: STALEFLOOR
 p check -tc tcReregisterUnguarded   -i 2000   # 1 bug: RETAIN
 p check -tc tcSyncAfterExitStrands  -i 2000   # 1 bug: NOLEAK (the gap)
+p check -tc tcEditAfterExitStrands  -i 2000   # 1 bug: NOLEAK (the same gap, via apply_edits)
 p check -tc tcConvergenceStuck      -i 2000   # 1 bug: liveness (hot Lagging)
 p check -tc tcStartupRaceWriterFirst -i 2000  # 1 bug: liveness (guard alone unsafe)
 p check -tc tcReconcileRaceNoResync -i 2000   # 1 bug: liveness (A1 misses reconcile)
@@ -94,3 +102,5 @@ p check -tc tcReconcileRaceNoResync -i 2000   # 1 bug: liveness (A1 misses recon
 ## Corresponding code fix
 
 A2 and A1' are implemented in `rabbitmq_stream_s3_manifest_replica`. `maybe_apply_sync/8` drops a sync for a stream with no registered context (counted as `syncs_dropped_no_context`) and records the writer node the sync carried in a new `pending_resync` map; `register_replica_context` consumes that entry to `request_resync/2` from the writer once a monitored context can own the row. Sourcing the writer node from the dropped sync, which carries it, covers both the acceptor-reply and reconcile-path syncs without threading a leader lookup into registration. A1 (attach reorder) and A3 are not implemented: A1' is trigger-agnostic (it fires on registration regardless of which premature sync was dropped), so it recovers the acceptor-reply drop that A1 would reorder around as well as the reconcile drop A1 cannot reach, and A3 is unnecessary once the receiver refuses the orphan row. The suite's tests that drove `sync/4` without a context now register one first; `make ct-manifest_replica`, `make xref`, and `make dialyze` are green.
+
+The same A2 gate has since landed on `apply_edits`'s two `handle_call`/`handle_cast` clauses, which previously applied a sequenced edit regardless of whether a context was registered. Both now check `maps:is_key(StreamId, Ctxs)` first and, if absent, drop through a shared `drop_no_context/6` helper (counted as `edits_dropped_no_context`) that records the writer node in the same `pending_resync` map `maybe_apply_sync/8` uses, so `apply_edits` and `sync` recover identically once a context registers.

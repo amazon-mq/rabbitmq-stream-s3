@@ -16,7 +16,7 @@ include ../../erlang.mk
 # CT suites share a node name (erlang.mk limitation), so they cannot run in parallel.
 .NOTPARALLEL:
 
-CT_QUICK_SUITES = api_fs db replica_reader_core remote_reader_core replica_reader log_reader fragment_iterator fragment_assembly prop manifest_replica
+CT_QUICK_SUITES = api_fs db replica_reader_core remote_reader_core replica_reader log_reader fragment_iterator fragment_assembly prop manifest_replica manifest_replica_statem
 
 ERLFMT ?= erlfmt
 ERLFMT_FILES = src/*.erl test/*.erl

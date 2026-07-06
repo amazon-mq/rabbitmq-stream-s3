@@ -35,11 +35,13 @@ No heartbeat or reconnection mechanism is needed because:
 - An inactive stream (no writes) cannot grow disk regardless of
   whether the replica's manifest is stale.
 
-A sync is applied only for a stream that has a registered reader context, so a
-sync can never create a cached row that no member monitor would ever reclaim. A
-sync that races ahead of registration (or arrives after the context is released)
-is dropped; registering the context then requests a re-sync from that writer, so
-the drop is recovered rather than leaving the cache empty.
+A sync or edit is applied only for a stream that has a registered reader
+context, so neither can create or advance cached state that no member monitor
+would ever reclaim. A sync or edit that races ahead of registration (or arrives
+after the context is released) is dropped; registering the context then
+requests a re-sync from that writer, so the drop is recovered rather than
+leaving the cache empty or `seqs` pinned to a sequence with no corresponding
+manifest row.
 """.
 
 -behaviour(gen_server).
@@ -53,13 +55,16 @@ the drop is recovered rather than leaving the cache empty.
 -define(C_RESYNCS_REQUESTED, 1).
 -define(C_SYNCS_REJECTED, 2).
 -define(C_SYNCS_DROPPED_NO_CONTEXT, 3).
+-define(C_EDITS_DROPPED_NO_CONTEXT, 4).
 -define(COUNTERS, [
     {resyncs_requested, ?C_RESYNCS_REQUESTED, counter,
         "Re-syncs a manifest replica requested after a broadcast gap or epoch mismatch"},
     {syncs_rejected, ?C_SYNCS_REJECTED, counter,
         "Syncs a manifest replica dropped because they were older than the cached epoch or sequence"},
     {syncs_dropped_no_context, ?C_SYNCS_DROPPED_NO_CONTEXT, counter,
-        "Syncs a manifest replica dropped because no live reader context owned the stream on this node"}
+        "Syncs a manifest replica dropped because no live reader context owned the stream on this node"},
+    {edits_dropped_no_context, ?C_EDITS_DROPPED_NO_CONTEXT, counter,
+        "Edits a manifest replica dropped because no live reader context owned the stream on this node"}
 ]).
 -define(COUNTER_KEY, {?MODULE, counter}).
 
@@ -193,7 +198,7 @@ apply_edits(StreamId, Edits, Seq, Epoch, Node) ->
 
 -doc "Apply sequenced edits locally (synchronous).".
 -spec apply_edits(stream_id(), [#edit{}], non_neg_integer(), non_neg_integer()) ->
-    ok | {error, gap}.
+    ok | {error, gap} | {error, apply_failed} | {error, no_context}.
 apply_edits(StreamId, Edits, Seq, Epoch) ->
     gen_server:call(?MODULE, {apply_edits, StreamId, Edits, Seq, Epoch, node()}).
 
@@ -269,29 +274,43 @@ handle_call(
     ),
     {reply, ok, State#state{seqs = Seqs1, pending_resync = Pending1}};
 handle_call(
-    {apply_edits, StreamId, Edits, Seq, Epoch, WriterNode}, _From, #state{seqs = Seqs} = State
+    {apply_edits, StreamId, Edits, Seq, Epoch, WriterNode},
+    _From,
+    #state{seqs = Seqs, contexts = Ctxs, pending_resync = Pending} = State
 ) ->
-    case maps:get(StreamId, Seqs, undefined) of
-        {LastSeq, Epoch, _} when Seq =:= LastSeq + 1 ->
-            case ets:lookup(?TABLE, StreamId) of
-                [{_, Manifest0, _}] ->
-                    case apply_edits_catching(StreamId, Edits, Manifest0) of
-                        {ok, Manifest} ->
-                            write_manifest(StreamId, Manifest, Epoch),
-                            maybe_evaluate_retention(StreamId, Manifest0, Manifest, State),
-                            {reply, ok, State#state{
-                                seqs = Seqs#{StreamId => {Seq, Epoch, WriterNode}}
-                            }};
-                        {error, _} ->
+    case maps:is_key(StreamId, Ctxs) of
+        false ->
+            Pending1 = drop_no_context(edits, StreamId, Epoch, Seq, WriterNode, Pending),
+            {reply, {error, no_context}, State#state{pending_resync = Pending1}};
+        true ->
+            case maps:get(StreamId, Seqs, undefined) of
+                {LastSeq, Epoch, _} when Seq =:= LastSeq + 1 ->
+                    case ets:lookup(?TABLE, StreamId) of
+                        [{_, Manifest0, _}] ->
+                            case apply_edits_catching(StreamId, Edits, Manifest0) of
+                                {ok, Manifest} ->
+                                    write_manifest(StreamId, Manifest, Epoch),
+                                    maybe_evaluate_retention(StreamId, Manifest0, Manifest, State),
+                                    {reply, ok, State#state{
+                                        seqs = Seqs#{StreamId => {Seq, Epoch, WriterNode}}
+                                    }};
+                                {error, _} ->
+                                    request_resync(StreamId, WriterNode),
+                                    {reply, {error, apply_failed}, State}
+                            end;
+                        [] ->
+                            %% A live context always has seqs and the cached row
+                            %% advanced together (write_manifest runs alongside
+                            %% every seqs update below), so this should be
+                            %% unreachable. Recover via resync rather than trust
+                            %% an inconsistent cache.
                             request_resync(StreamId, WriterNode),
-                            {reply, {error, apply_failed}, State}
+                            {reply, {error, gap}, State}
                     end;
-                [] ->
-                    {reply, ok, State#state{seqs = Seqs#{StreamId => {Seq, Epoch, WriterNode}}}}
-            end;
-        _ ->
-            request_resync(StreamId, WriterNode),
-            {reply, {error, gap}, State}
+                _ ->
+                    request_resync(StreamId, WriterNode),
+                    {reply, {error, gap}, State}
+            end
     end;
 handle_call({apply_edit, StreamId, Edit}, _From, State) ->
     Reply =
@@ -391,36 +410,51 @@ handle_cast(
         StreamId, Seq, Epoch, Manifest, WriterNode, Seqs, Ctxs, Pending
     ),
     {noreply, State#state{seqs = Seqs1, pending_resync = Pending1}};
-handle_cast({apply_edits, StreamId, Edits, Seq, Epoch, WriterNode}, #state{seqs = Seqs} = State) ->
-    case maps:get(StreamId, Seqs, undefined) of
-        {LastSeq, Epoch, _} when Seq =:= LastSeq + 1 ->
-            %% In sequence: apply edits.
-            case ets:lookup(?TABLE, StreamId) of
-                [{_, Manifest0, _}] ->
-                    case apply_edits_catching(StreamId, Edits, Manifest0) of
-                        {ok, Manifest} ->
-                            write_manifest(StreamId, Manifest, Epoch),
-                            maybe_evaluate_retention(StreamId, Manifest0, Manifest, State),
-                            {noreply, State#state{
-                                seqs = Seqs#{StreamId => {Seq, Epoch, WriterNode}}
-                            }};
-                        {error, _} ->
-                            %% The edit is structurally inconsistent with this
-                            %% replica's manifest: it has diverged (or the edit
-                            %% is malformed). Don't apply a corrupt edit or crash
-                            %% the per-node cache shared by every stream - keep
-                            %% the last good manifest, leave the sequence
-                            %% unadvanced, and force a full resync.
+handle_cast(
+    {apply_edits, StreamId, Edits, Seq, Epoch, WriterNode},
+    #state{seqs = Seqs, contexts = Ctxs, pending_resync = Pending} = State
+) ->
+    case maps:is_key(StreamId, Ctxs) of
+        false ->
+            Pending1 = drop_no_context(edits, StreamId, Epoch, Seq, WriterNode, Pending),
+            {noreply, State#state{pending_resync = Pending1}};
+        true ->
+            case maps:get(StreamId, Seqs, undefined) of
+                {LastSeq, Epoch, _} when Seq =:= LastSeq + 1 ->
+                    %% In sequence: apply edits.
+                    case ets:lookup(?TABLE, StreamId) of
+                        [{_, Manifest0, _}] ->
+                            case apply_edits_catching(StreamId, Edits, Manifest0) of
+                                {ok, Manifest} ->
+                                    write_manifest(StreamId, Manifest, Epoch),
+                                    maybe_evaluate_retention(StreamId, Manifest0, Manifest, State),
+                                    {noreply, State#state{
+                                        seqs = Seqs#{StreamId => {Seq, Epoch, WriterNode}}
+                                    }};
+                                {error, _} ->
+                                    %% The edit is structurally inconsistent with
+                                    %% this replica's manifest: it has diverged
+                                    %% (or the edit is malformed). Don't apply a
+                                    %% corrupt edit or crash the per-node cache
+                                    %% shared by every stream - keep the last
+                                    %% good manifest, leave the sequence
+                                    %% unadvanced, and force a full resync.
+                                    request_resync(StreamId, WriterNode),
+                                    {noreply, State}
+                            end;
+                        [] ->
+                            %% A live context always has seqs and the cached row
+                            %% advanced together, so this should be unreachable.
+                            %% Recover via resync rather than trust an
+                            %% inconsistent cache.
                             request_resync(StreamId, WriterNode),
                             {noreply, State}
                     end;
-                [] ->
-                    {noreply, State#state{seqs = Seqs#{StreamId => {Seq, Epoch, WriterNode}}}}
-            end;
-        _ ->
-            %% Gap or epoch mismatch: request re-sync from writer.
-            request_resync(StreamId, WriterNode),
-            {noreply, State}
+                _ ->
+                    %% Gap or epoch mismatch: request re-sync from writer.
+                    request_resync(StreamId, WriterNode),
+                    {noreply, State}
+            end
     end;
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -517,14 +551,7 @@ maybe_apply_sync(StreamId, Seq, Epoch, Manifest, WriterNode, Seqs, Ctxs, Pending
             %% remember the writer so registering a context can request a re-sync
             %% (a sync that raced ahead of registration is then recovered rather
             %% than leaving the cache empty).
-            inc(?C_SYNCS_DROPPED_NO_CONTEXT, 1),
-            ?LOG_INFO(
-                "Manifest replica for stream ~ts dropped a sync "
-                "(epoch ~b seq ~b from node ~p) with no live reader context",
-                [StreamId, Epoch, Seq, WriterNode],
-                #{domain => ?RMQLOG_DOMAIN_STREAM_S3}
-            ),
-            {Seqs, Pending#{StreamId => WriterNode}};
+            {Seqs, drop_no_context(sync, StreamId, Epoch, Seq, WriterNode, Pending)};
         true ->
             Recorded = maps:get(StreamId, Seqs, undefined),
             case is_stale_sync(Epoch, Seq, Recorded) of
@@ -586,6 +613,28 @@ is_stale_sync(_Epoch, _Seq, undefined) ->
     false;
 is_stale_sync(Epoch, Seq, {Seq0, Epoch0, _}) ->
     {Epoch, Seq} < {Epoch0, Seq0}.
+
+%% Drop a sync or edit for a stream with no live reader context on this node
+%% (see maybe_apply_sync/8 and the {apply_edits, ...} handlers). Remember the
+%% writer node in pending_resync so registering a context later requests a
+%% re-sync via maybe_request_resync/2, recovering the message that raced ahead
+%% of registration instead of leaving the cache empty or the sequence pinned
+%% with no corresponding manifest row.
+drop_no_context(Kind, StreamId, Epoch, Seq, WriterNode, Pending) ->
+    inc(
+        case Kind of
+            sync -> ?C_SYNCS_DROPPED_NO_CONTEXT;
+            edits -> ?C_EDITS_DROPPED_NO_CONTEXT
+        end,
+        1
+    ),
+    ?LOG_INFO(
+        "Manifest replica for stream ~ts dropped ~ts "
+        "(epoch ~b seq ~b from node ~p) with no live reader context",
+        [StreamId, Kind, Epoch, Seq, WriterNode],
+        #{domain => ?RMQLOG_DOMAIN_STREAM_S3}
+    ),
+    Pending#{StreamId => WriterNode}.
 
 request_resync(StreamId, WriterNode) ->
     ?LOG_INFO(

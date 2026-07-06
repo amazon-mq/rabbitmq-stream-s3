@@ -28,7 +28,14 @@
    Syncs from the writer are fire-and-forget casts (eMRSync) that the scheduler
    may drop, delay, or reorder relative to a member exit - the same multi-node
    stale-cache substrate as ../gc-reset-multinode. is_stale_sync gates them:
-   epoch dominates sequence, so a delayed lower-epoch sync is rejected. */
+   epoch dominates sequence, so a delayed lower-epoch sync is rejected.
+
+   Sequenced edits from the writer (apply_edits/5) are a second fire-and-forget
+   write path, eMREdit, modeled distinctly from eMRSync because it requires
+   exact seq contiguity (last_seq + 1) against seqs rather than eMRSync's
+   monotonic-epoch reset check. A recent fix gated eMREdit on a live context
+   exactly like eMRSync already was, reusing the same syncRequiresContextEnabled
+   toggle: see tcEditAfterExitStrands/Fixed in PTst/TestDrivers.p. */
 
 /* A stream id (small ints). */
 type StreamId = int;
@@ -50,6 +57,12 @@ event eDownAck;
 /* sync/5: a full-manifest sync from the writer, fire-and-forget (cast). Carries
    the writer's epoch and sequence; applied only if not is_stale_sync. */
 event eMRSync: (stream: StreamId, floor: int, epoch: int, sn: int, writerNode: int);
+
+/* apply_edits/5: sequenced edits applied to the cached manifest, fire-and-forget
+   (cast). Applied only if sn == last_seq + 1 for the stream's recorded seq (a
+   gap or epoch mismatch is otherwise dropped without touching cache/seqs); same
+   shape as eMRSync so the two write paths can share a driver/writer plumbing. */
+event eMREdit: (stream: StreamId, floor: int, epoch: int, sn: int, writerNode: int);
 
 /* put_manifest/3: the WRITER node writes its own cache row directly (no osiris
    member to monitor); released explicitly by forget/1. Synchronous. */
@@ -82,6 +95,11 @@ event eCommitAck;
 event eEmitSync: (from: machine, target: machine, stream: StreamId,
                   floor: int, epoch: int, sn: int);
 event eEmitAck;
+
+/* Emit an edit (cast) to a replica for a chosen (floor, epoch, sn), the eMREdit
+   counterpart to eEmitSync. Shares eEmitAck. */
+event eEmitEdit: (from: machine, target: machine, stream: StreamId,
+                  floor: int, epoch: int, sn: int);
 
 /* Synchronous barrier through the writer: flushes prior writer->replica casts. */
 event eBarrier: (from: machine, target: machine);

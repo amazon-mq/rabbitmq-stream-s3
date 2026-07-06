@@ -31,7 +31,9 @@ all() ->
         forget_releases_writer_row,
         reregister_repoints_monitor,
         sync_without_context_dropped,
-        register_after_dropped_sync_requests_resync
+        register_after_dropped_sync_requests_resync,
+        apply_edits_without_context_dropped,
+        register_after_dropped_edits_requests_resync
     ].
 
 init_per_suite(Config) ->
@@ -156,6 +158,66 @@ register_after_dropped_sync_requests_resync(_Config) ->
     %% The sync arrives before any context: it is dropped and its writer node is
     %% remembered.
     ok = Replica:sync(Stream, 0, 1, Manifest),
+    ?assertEqual(undefined, Replica:get_manifest(Stream)),
+
+    %% Registering the context now requests a resync from that writer.
+    Member = register_context(Stream),
+    receive
+        {resync_received, Node} -> ?assertEqual(node(), Node)
+    after 1000 -> ct:fail("resync request not received after context registration")
+    end,
+
+    rabbitmq_stream_s3_registry:unregister_name({Stream, node()}),
+    unlink(WriterPid),
+    exit(WriterPid, kill),
+    exit(Member, kill).
+
+%% Edits for a stream with no registered reader context are dropped the same
+%% way a sync is: applying them would advance seqs with no cached row for any
+%% member monitor to ever reclaim. get_manifest stays undefined: nothing was
+%% cached, and the sequence was not advanced.
+apply_edits_without_context_dropped(_Config) ->
+    Replica = rabbitmq_stream_s3_manifest_replica,
+    Stream = <<"no-context-edits-stream">>,
+    Edit = #edit{
+        first_offset = 0,
+        first_timestamp = 1000,
+        first_last_timestamp = 1100,
+        next_offset = 1,
+        size = 1000,
+        entries = ?ENTRY(0, 1000, 1100, ?MANIFEST_KIND_FRAGMENT, 1000, 1),
+        pos = 0,
+        len = 0
+    },
+    ?assertEqual({error, no_context}, Replica:apply_edits(Stream, [Edit], 1, 1)),
+    ?assertEqual(undefined, Replica:get_manifest(Stream)).
+
+%% Registering a context for a stream whose edits were dropped requests a
+%% re-sync from the writer the dropped edits came from, the same recovery path
+%% used for a dropped sync (register_after_dropped_sync_requests_resync).
+register_after_dropped_edits_requests_resync(_Config) ->
+    Replica = rabbitmq_stream_s3_manifest_replica,
+    Stream = <<"resync-on-register-edits-stream">>,
+    Edit = #edit{
+        first_offset = 0,
+        first_timestamp = 1000,
+        first_last_timestamp = 1100,
+        next_offset = 1,
+        size = 1000,
+        entries = ?ENTRY(0, 1000, 1100, ?MANIFEST_KIND_FRAGMENT, 1000, 1),
+        pos = 0,
+        len = 0
+    },
+
+    %% A fake writer registered under {Stream, node()} receives the resync cast.
+    rabbitmq_stream_s3_registry:init(),
+    Self = self(),
+    WriterPid = spawn_link(fun() -> fake_writer(Self) end),
+    yes = rabbitmq_stream_s3_registry:register_name({Stream, node()}, WriterPid),
+
+    %% The edit arrives before any context: it is dropped and its writer node
+    %% is remembered.
+    ?assertEqual({error, no_context}, Replica:apply_edits(Stream, [Edit], 1, 1)),
     ?assertEqual(undefined, Replica:get_manifest(Stream)),
 
     %% Registering the context now requests a resync from that writer.
