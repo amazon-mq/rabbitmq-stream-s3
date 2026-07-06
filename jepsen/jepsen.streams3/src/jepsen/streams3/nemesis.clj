@@ -13,6 +13,14 @@
                   writer (and uploader) moves and the stream epoch bumps, fencing
                   the deposed writer (its straggler uploads must be rejected on an
                   epoch conflict, never overwrite the new leader's data)
+    member-churn- permanently remove a replica from a random stream each tick, so
+                  an osiris member departs its node for good mid-sync: a sync that
+                  races the teardown has no re-registration to reclaim it, the
+                  condition the manifest-replica sync-context guard protects
+                  against (a contextless cache row). Unlike leader-move, which
+                  restarts members in place on the same node set, this leaves a
+                  member gone so an orphan is visible at the replica checker's
+                  end-of-run snapshot
 
   Still stubbed (see bottom): force-trim (needs the bounded-durability
   checker)."
@@ -137,6 +145,26 @@
       (assoc op :value :leaders-moved))
     (teardown! [this _test] this)))
 
+(defn member-churn-nemesis
+  "Not a network fault: permanently removes a replica from a random jepsen stream
+  each tick, so an osiris member departs its node and does not return. A manifest
+  sync that races the member's teardown then has no re-registration on that node
+  to reclaim it — the condition the manifest-replica sync-context guard protects
+  against (a contextless cache row). The member is deliberately never re-added:
+  re-adding would re-register a context that reclaims (masks) an orphan before the
+  replica checker's end-of-run snapshot. Deletes are bounded (a stream is churned
+  only while it still has two or more replicas) so every stream keeps leader +
+  >=1 replica and stays durable for the final read. Run on one node only (the
+  coordinator is cluster-global)."
+  []
+  (reify nemesis/Nemesis
+    (setup! [this _test] this)
+    (invoke! [_ test op]
+      (c/on-nodes test [(first (:nodes test))]
+                  (fn [_test node] (db/force-member-churn! node)))
+      (assoc op :value :member-churned))
+    (teardown! [this _test] this)))
+
 (defn full-nemesis
   "Composes all nemeses; the generator decides which faults actually fire."
   []
@@ -146,7 +174,8 @@
      #{:start-s3-outage :stop-s3-outage
        :start-s3-latency :stop-s3-latency} (s3-nemesis)
      #{:trim-local}                  (trim-nemesis)
-     #{:move-leaders}                (leader-move-nemesis)}))
+     #{:move-leaders}                (leader-move-nemesis)
+     #{:churn-member}                (member-churn-nemesis)}))
 
 ;; ---------------------------------------------------------------------------
 ;; Generator
@@ -162,8 +191,9 @@
 ;; across the inter-fault gaps and, on its own, when no start/stop fault is
 ;; enabled.
 (def ^:private fault->bg-op
-  {"trim"        {:type :info :f :trim-local}
-   "leader-move" {:type :info :f :move-leaders}})
+  {"trim"         {:type :info :f :trim-local}
+   "leader-move"  {:type :info :f :move-leaders}
+   "member-churn" {:type :info :f :churn-member}})
 
 (def known-faults
   "Every token --faults accepts (start/stop faults plus background ops)."

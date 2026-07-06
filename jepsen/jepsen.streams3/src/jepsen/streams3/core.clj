@@ -58,12 +58,18 @@
                     {:perf     (checker/perf)
                      :timeline (timeline/html)
                      ;; The kafka workload checker is authoritative on its own,
-                     ;; except under leader-move: there our send offsets drift
-                     ;; (see client.clj), so its offset-consistency analyzers go
-                     ;; red on artifacts. We downgrade it to advisory in that case
-                     ;; and let the durability checker carry the safety verdict.
+                     ;; except when a fault restarts the stream's writer: producer
+                     ;; recovery then drifts our send offsets (see client.clj), so
+                     ;; its offset-consistency analyzers go red on artifacts. Both
+                     ;; leader-move and member-churn do this — the latter because
+                     ;; the coordinator's delete_replica stops and restarts every
+                     ;; member, not just the removed one. We downgrade the checker
+                     ;; to advisory in those cases and let the durability checker
+                     ;; carry the safety verdict.
                      :workload (s3-checker/downgrade-when
-                                 (fn [t] (contains? (nem/faults t) "leader-move"))
+                                 (fn [t] (let [fs (nem/faults t)]
+                                           (or (contains? fs "leader-move")
+                                               (contains? fs "member-churn"))))
                                  (:checker wl))
                      ;; Authoritative no-loss / no-duplicate via an end-to-end
                      ;; read, sound even when send offsets are unreliable.
