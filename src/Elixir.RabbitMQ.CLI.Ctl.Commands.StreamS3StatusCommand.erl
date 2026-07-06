@@ -47,39 +47,17 @@ usage_additional() ->
         [<<"--vhost <vhost>">>, <<"The virtual host of the stream.">>]
     ].
 
+%% `status/2` runs on the target node and folds in the node-level bucket
+%% accessibility itself, so a single round-trip carries both the per-stream
+%% status and the `bucket` entry the sections below render.
 run([Name], #{node := NodeName, vhost := VHost, timeout := Timeout}) ->
-    case
-        rabbit_misc:rpc_call(
-            NodeName,
-            rabbitmq_stream_s3_replica_reader,
-            status,
-            [VHost, Name],
-            Timeout
-        )
-    of
-        {ok, Info} ->
-            {ok, Info#{bucket => bucket_status(NodeName, Timeout)}};
-        Other ->
-            Other
-    end.
-
-%% The bucket accessibility check is node-level, so query the monitor on the
-%% same target node and fold its result into the per-stream status. A node
-%% without the monitor (older node, monitor disabled or restarting) yields
-%% `undefined`, rendered as "unknown".
-bucket_status(NodeName, Timeout) ->
-    case
-        rabbit_misc:rpc_call(
-            NodeName,
-            rabbitmq_stream_s3_bucket_monitor,
-            status,
-            [],
-            Timeout
-        )
-    of
-        #{status := _} = Status -> Status;
-        _ -> undefined
-    end.
+    rabbit_misc:rpc_call(
+        NodeName,
+        rabbitmq_stream_s3_replica_reader,
+        status,
+        [VHost, Name],
+        Timeout
+    ).
 
 banner([Name], #{vhost := VHost}) ->
     erlang:iolist_to_binary(

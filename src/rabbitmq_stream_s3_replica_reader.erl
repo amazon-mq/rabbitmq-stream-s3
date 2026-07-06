@@ -289,7 +289,7 @@ start_link(#{stream := StreamId} = Args) ->
 status(StreamId) ->
     case call(StreamId, status) of
         {error, _} = Err -> Err;
-        Result -> {ok, Result}
+        Result -> {ok, with_bucket_status(Result)}
     end.
 
 -doc "Return the formatted status by vhost and queue name.".
@@ -297,8 +297,21 @@ status(StreamId) ->
 status(VHost, QueueName) ->
     case call(VHost, QueueName, status) of
         {error, _} = Err -> Err;
-        Result -> {ok, Result}
+        Result -> {ok, with_bucket_status(Result)}
     end.
+
+%% Fold the node-level bucket accessibility into the per-stream status. This is
+%% a local call on the node already serving the status request, so the CLI
+%% avoids a second round-trip. A missing monitor (disabled or restarting) yields
+%% `undefined`, which the CLI renders as "unknown".
+with_bucket_status(Result) ->
+    Bucket =
+        try
+            rabbitmq_stream_s3_bucket_monitor:status()
+        catch
+            _:_ -> undefined
+        end,
+    Result#{bucket => Bucket}.
 
 -doc "Trigger local retention evaluation for a stream on the current node.".
 -spec evaluate_local_retention(stream_id()) -> ok | {error, term()}.
