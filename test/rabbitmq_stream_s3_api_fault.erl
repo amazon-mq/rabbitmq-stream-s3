@@ -43,6 +43,7 @@ passthrough to the FS backend.
     stream_abort/1,
     delete/2,
     list/3,
+    check_bucket/1,
     match_async/3,
     handle_async/3,
     cancel_async/2
@@ -157,6 +158,7 @@ stream_finish(State, Crc) -> ?FS:stream_finish(State, Crc).
 stream_abort(State) -> ?FS:stream_abort(State).
 delete(Keys, Opts) -> ?FS:delete(Keys, Opts).
 list(Prefix, Continuation, Opts) -> ?FS:list(Prefix, Continuation, Opts).
+check_bucket(Opts) -> ?FS:check_bucket(Opts).
 match_async(Msg, Reqs, Cancelled) -> ?FS:match_async(Msg, Reqs, Cancelled).
 handle_async(Msg, Req, State) -> ?FS:handle_async(Msg, Req, State).
 cancel_async(Req, State) -> ?FS:cancel_async(Req, State).
