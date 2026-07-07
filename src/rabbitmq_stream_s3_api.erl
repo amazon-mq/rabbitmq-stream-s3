@@ -31,6 +31,8 @@ file-system operations. Use that in non-unit tests.
     delete/2,
     list/1,
     list/2,
+    check_bucket/0,
+    check_bucket/1,
     match_async/3,
     handle_async/3,
     cancel_async/2,
@@ -92,6 +94,17 @@ examples.
 -callback delete(key() | [key()], request_opts()) -> ok | {error, any()}.
 -callback list(key(), list_continuation(), request_opts()) ->
     {ok, [key()], list_continuation()} | {error, any()}.
+-doc """
+Probe whether the configured bucket exists and is accessible with the current
+credentials.
+
+`no_such_bucket` and `access_denied` are definitive: the bucket is misconfigured
+or unreadable and a monitor should surface that loudly. Any other `{error, _}`
+(credentials not yet available, a transient network error, a throttling
+response) is non-definitive and a caller must not treat it as inaccessible.
+""".
+-callback check_bucket(request_opts()) ->
+    ok | {error, no_such_bucket | access_denied | term()}.
 -callback match_async(
     Msg :: term(),
     Reqs :: #{async_req() := async_state()},
@@ -273,6 +286,17 @@ list(Prefix) ->
 list(Prefix, Continuation) when is_binary(Prefix) ->
     counters:add(counter(), ?C_LIST, 1),
     (backend()):list(Prefix, Continuation, #{}).
+
+-doc #{equiv => check_bucket(#{})}.
+-spec check_bucket() -> ok | {error, no_such_bucket | access_denied | term()}.
+check_bucket() ->
+    check_bucket(#{}).
+
+-doc "Probe whether the configured bucket exists and is accessible.".
+-spec check_bucket(request_opts()) ->
+    ok | {error, no_such_bucket | access_denied | term()}.
+check_bucket(Opts) when is_map(Opts) ->
+    (backend()):check_bucket(Opts).
 
 -spec match_async(
     Msg :: term(),

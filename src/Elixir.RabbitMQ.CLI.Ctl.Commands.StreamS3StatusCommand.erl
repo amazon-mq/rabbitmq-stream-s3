@@ -47,6 +47,9 @@ usage_additional() ->
         [<<"--vhost <vhost>">>, <<"The virtual host of the stream.">>]
     ].
 
+%% `status/2` runs on the target node and folds in the node-level bucket
+%% accessibility itself, so a single round-trip carries both the per-stream
+%% status and the `bucket` entry the sections below render.
 run([Name], #{node := NodeName, vhost := VHost, timeout := Timeout}) ->
     rabbit_misc:rpc_call(
         NodeName,
@@ -68,6 +71,7 @@ output({ok, Info}, #{formatter := <<"json">>}) ->
     {ok, flatten(Info)};
 output({ok, Info}, _Opts) ->
     Sections = [
+        bucket_section(Info),
         stream_section(Info),
         remote_tier_section(Info),
         upload_pipeline_section(Info),
@@ -89,6 +93,27 @@ formatter() ->
 %% ------------------------------------------------------------------
 %% Human-readable sections
 %% ------------------------------------------------------------------
+
+bucket_section(Info) ->
+    Bucket = maps:get(bucket, Info, undefined),
+    [
+        header(<<"Remote tier bucket">>),
+        <<>>,
+        kv(<<"Accessible">>, bucket_accessible(Bucket))
+    ].
+
+%% Render the node-level bucket accessibility into a single line: "yes",
+%% "no (<reason>)", or "unknown" when it has not been determined yet.
+bucket_accessible(#{status := accessible}) ->
+    <<"yes">>;
+bucket_accessible(#{status := inaccessible, reason := Reason}) ->
+    erlang:iolist_to_binary([<<"no (">>, bucket_reason(Reason), <<")">>]);
+bucket_accessible(_) ->
+    <<"unknown">>.
+
+bucket_reason(no_such_bucket) -> <<"does not exist">>;
+bucket_reason(access_denied) -> <<"access denied">>;
+bucket_reason(Other) -> erlang:iolist_to_binary(io_lib:format("~tp", [Other])).
 
 stream_section(#{stream := StreamId, node := Node, log_next_offset := LogNext}) ->
     [
@@ -252,7 +277,17 @@ flatten(
         {transfer_deadlines_armed, maps:get(transfer_deadlines_armed, Info)},
         {log_next_offset, LogNext}
     ],
-    Base ++ flatten_core(Core) ++ flatten_assembly(Assembly).
+    Base ++ flatten_bucket(maps:get(bucket, Info, undefined)) ++
+        flatten_core(Core) ++ flatten_assembly(Assembly).
+
+flatten_bucket(#{status := Status} = Bucket) ->
+    [
+        {bucket_accessible, Status =:= accessible},
+        {bucket_status, Status},
+        {bucket_reason, maps:get(reason, Bucket, undefined)}
+    ];
+flatten_bucket(_) ->
+    [{bucket_status, unknown}].
 
 flatten_core(undefined) ->
     [{core, <<"not initialized">>}];

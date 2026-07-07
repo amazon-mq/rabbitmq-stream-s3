@@ -51,6 +51,11 @@ init([]) ->
         type => worker,
         start => {rabbitmq_stream_s3_api_aws, start_link, []}
     },
+    BucketMonitor = #{
+        id => rabbitmq_stream_s3_bucket_monitor,
+        type => worker,
+        start => {rabbitmq_stream_s3_bucket_monitor, start_link, []}
+    },
     UploadPool = pool_child(rabbitmq_stream_s3_upload_pool, #{
         name => rabbitmq_stream_s3_upload_pool,
         min_size => rabbitmq_stream_s3_config:upload_pool_min_size(),
@@ -98,6 +103,7 @@ init([]) ->
     },
     Procs = [
         CredentialServer,
+        BucketMonitor,
         ManifestCache,
         Reaper,
         MembershipReconciliation,

@@ -18,7 +18,8 @@ all() ->
         get_range_variants,
         delete_missing_key_is_idempotent,
         list_keys,
-        stream_put
+        stream_put,
+        check_bucket
     ].
 
 init_per_suite(Config) ->
@@ -97,3 +98,8 @@ stream_put(_Config) ->
     Crc = erlang:crc32(<<"hello world">>),
     ok = rabbitmq_stream_s3_api_fs:stream_finish(Stream2, Crc),
     ?assertEqual({ok, <<"hello world">>}, rabbitmq_stream_s3_api_fs:get(Key, #{})).
+
+check_bucket(_Config) ->
+    %% The FS "bucket" is its data directory: accessible when it exists or can
+    %% be created.
+    ?assertEqual(ok, rabbitmq_stream_s3_api_fs:check_bucket(#{})).

@@ -36,6 +36,8 @@ lives here. Callers use these functions instead of calling
     membership_reconciliation_auto_remove/0,
     reconciliation_enabled/0,
     reconciliation_interval/0,
+    bucket_check_enabled/0,
+    bucket_check_interval/0,
     task_retry_delay_max_ms/0,
     task_retry_delay_constant/0,
     task_retry_delay_exponent/0,
@@ -174,6 +176,19 @@ reconciliation_enabled() ->
 reconciliation_interval() ->
     application:get_env(?APP, reconciliation_interval, 60_000).
 
+%% Periodic probe of the configured bucket's accessibility (it exists and the
+%% credentials may use it). A misconfigured or unreachable bucket does not stop
+%% the stream working on local disk, so this only surfaces the condition via
+%% logs, the `bucket_accessible` metric, and the status CLI; it never blocks
+%% publishers.
+-spec bucket_check_enabled() -> boolean().
+bucket_check_enabled() ->
+    application:get_env(?APP, bucket_check_enabled, true).
+
+-spec bucket_check_interval() -> non_neg_integer().
+bucket_check_interval() ->
+    application:get_env(?APP, bucket_check_interval, 300_000).
+
 -spec task_retry_delay_max_ms() -> non_neg_integer().
 task_retry_delay_max_ms() ->
     application:get_env(?APP, task_retry_delay_max_ms, 5_000).
@@ -284,6 +299,8 @@ defaults_test_() ->
         ?_assertEqual(false, membership_reconciliation_auto_remove()),
         ?_assertEqual(true, reconciliation_enabled()),
         ?_assertEqual(60_000, reconciliation_interval()),
+        ?_assertEqual(true, bucket_check_enabled()),
+        ?_assertEqual(300_000, bucket_check_interval()),
         ?_assertEqual(5_000, task_retry_delay_max_ms()),
         ?_assertEqual(10, task_retry_delay_constant()),
         ?_assertEqual(2, task_retry_delay_exponent()),
