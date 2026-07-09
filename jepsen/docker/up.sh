@@ -77,7 +77,8 @@ cat <<'EOF'
 Cluster is up. Run a test with:
 
   ./run.sh                                # default faults
-  FAULTS=leader-move,trim ./run.sh        # pick faults
+  FAULTS=leader-move ./run.sh             # pick faults
+  FINAL_READ_TIER=local ./run.sh          # final reads from the local tier
 
 Tear down with:
 

@@ -119,10 +119,14 @@
       this)))
 
 (defn trim-nemesis
-  "Not a fault: forces local-retention evaluation on every node so segments
-  already uploaded to S3 are trimmed locally and reads of older offsets fall
-  back to the S3 tier. Without this the workload's data stays local and the
-  read-from-S3 path is never exercised."
+  "Not a fault, and not a recurring op: the delivery mechanism for a single
+  final-read coverage step. The plugin already trims uploaded segments eagerly
+  on its own — every manifest advance runs the same local_retention_fun — so
+  this forces no trimming that would not otherwise happen. Its only job is to run
+  one cluster-wide evaluate_local_retention after faults heal, so the final
+  verification reads deterministically drain from the S3 tier instead of a local
+  copy a quiet stream might still be holding. Driven by --final-read-tier s3 (see
+  core.clj); never selectable via --faults."
   []
   (reify nemesis/Nemesis
     (setup! [this _test] this)
@@ -186,13 +190,13 @@
    "s3-outage"  [:start-s3-outage :stop-s3-outage]
    "s3-latency" [:start-s3-latency :stop-s3-latency]})
 
-;; Background single-shot ops (not start/stop faults): a retention trim and a
-;; leader move. Each, when selected, runs steadily throughout the test — spread
-;; across the inter-fault gaps and, on its own, when no start/stop fault is
-;; enabled.
+;; Background single-shot control ops (not start/stop faults): a leader move and
+;; a member churn. Each, when selected, runs steadily throughout the test —
+;; spread across the inter-fault gaps and, on its own, when no start/stop fault
+;; is enabled. (The final-read trim is not here: it is a one-shot coverage step
+;; driven by --final-read-tier, not a recurring op — see trim-nemesis.)
 (def ^:private fault->bg-op
-  {"trim"         {:type :info :f :trim-local}
-   "leader-move"  {:type :info :f :move-leaders}
+  {"leader-move"  {:type :info :f :move-leaders}
    "member-churn" {:type :info :f :churn-member}})
 
 (def known-faults
@@ -212,12 +216,12 @@
 (defn nemesis-generator
   "Rotates through the enabled start/stop faults one at a time, each led by a
   quiet baseline period (so the workload establishes itself before the first
-  fault, and recovers between faults). Background single-shot ops selected via
-  --faults (`trim`, `leader-move`) run steadily throughout — between fault
-  transitions and, on their own, when no start/stop fault is enabled — so the
-  S3 read path and the writer-fencing path stay exercised. With nothing
-  selected, an empty generator — never a long sleep, which would deadlock a
-  phase barrier on the nemesis."
+  fault, and recovers between faults). Background single-shot control ops
+  selected via --faults (`leader-move`, `member-churn`) run steadily throughout —
+  between fault transitions and, on their own, when no start/stop fault is
+  enabled — so the writer-fencing and member-departure paths stay exercised. With
+  nothing selected, an empty generator — never a long sleep, which would deadlock
+  a phase barrier on the nemesis."
   [opts]
   (let [fs           (faults opts)
         interval     (or (:nemesis-interval opts) 15)

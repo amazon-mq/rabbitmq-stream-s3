@@ -52,10 +52,16 @@ jobs:
         rmq-version: ['streams-tiered-storage']
         # One job per scenario: storage-tier faults, writer fencing, and
         # manifest-replica cache consistency under an S3 outage plus leader churn.
-        faults:
-          - 'partition,s3-outage,s3-latency,trim'
-          - 'leader-move,trim'
-          - 's3-outage,leader-move'
+        # final-read-tier is a coverage knob, not a fault: 's3' forces the final
+        # reads off the local tier (so the tiering checker asserts reads were
+        # served from S3), 'local' leaves them local.
+        scenario:
+          - faults: 'partition,s3-outage,s3-latency'
+            final-read-tier: 's3'
+          - faults: 'leader-move'
+            final-read-tier: 's3'
+          - faults: 's3-outage,leader-move'
+            final-read-tier: 'local'
         include:
           - rmq-version: 'streams-tiered-storage'
             otp-version: 27
@@ -98,7 +104,8 @@ jobs:
         working-directory: rabbitmq-server/deps/rabbitmq_stream_s3
         run: jepsen/ci/run-jepsen.sh
         env:
-          FAULTS: ${{ matrix.faults }}
+          FAULTS: ${{ matrix.scenario.faults }}
+          FINAL_READ_TIER: ${{ matrix.scenario.final-read-tier }}
           TIME_LIMIT: ${{ github.event.inputs.time-limit || '120' }}
           RATE: ${{ github.event.inputs.rate || '100' }}
           CONCURRENCY: ${{ github.event.inputs.concurrency || '20' }}

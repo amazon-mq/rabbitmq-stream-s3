@@ -11,6 +11,7 @@
 # Tunables (all overridable via the environment, consumed by run.sh):
 #   TIME_LIMIT, RATE, CONCURRENCY  - workload size
 #   FAULTS                         - comma-separated nemeses to inject
+#   FINAL_READ_TIER                - tier the final reads exercise (local or s3)
 #
 # This composes the same up.sh / run.sh / down.sh a developer uses locally; the
 # only CI-specific behaviour is tearing down unconditionally and propagating the
@@ -25,7 +26,8 @@ docker_dir="$here/../docker"
 export TIME_LIMIT="${TIME_LIMIT:-120}"
 export RATE="${RATE:-100}"
 export CONCURRENCY="${CONCURRENCY:-20}"
-export FAULTS="${FAULTS:-partition,s3-outage,s3-latency,trim}"
+export FAULTS="${FAULTS:-partition,s3-outage,s3-latency}"
+export FINAL_READ_TIER="${FINAL_READ_TIER:-s3}"
 
 "$docker_dir/up.sh"
 

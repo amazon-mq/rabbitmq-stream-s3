@@ -15,9 +15,10 @@
 
 (defn tiering-checker
   "Fails the test unless S3 was genuinely used: fragments must have uploaded,
-  when `trim` is enabled (which forces reads off the local tier) reads must have
-  been served from S3, and when `leader-move` is enabled the stream epoch must
-  have advanced past its initial 1 (proving a writer was actually fenced)."
+  when --final-read-tier is s3 (which forces the final reads off the local tier)
+  reads must have been served from S3, and when `leader-move` is enabled the
+  stream epoch must have advanced past its initial 1 (proving a writer was
+  actually fenced)."
   []
   (reify checker/Checker
     (check [_ test _history _opts]
@@ -26,7 +27,7 @@
             reads        (get stats "rabbitmq_stream_s3_get_range" 0)
             max-epoch    (get stats "max_epoch" 0)
             fs           (nem/faults test)
-            trim?        (contains? fs "trim")
+            s3-reads?    (= "s3" (:final-read-tier test))
             leader-move? (contains? fs "leader-move")
             problems (cond-> []
                        (empty? stats)
@@ -35,7 +36,7 @@
                        (not (pos? uploads))
                        (conj :no-fragments-uploaded-to-s3)
 
-                       (and trim? (not (pos? reads)))
+                       (and s3-reads? (not (pos? reads)))
                        (conj :no-reads-served-from-s3)
 
                        ;; The epoch starts at 1 and bumps on every leader move;

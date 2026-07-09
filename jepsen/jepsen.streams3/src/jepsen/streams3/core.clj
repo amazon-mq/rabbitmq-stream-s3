@@ -34,8 +34,14 @@
     "Cap on the durability checker's end-to-end read (per committed-offset target)"
     :default 180 :parse-fn parse-long]
    [nil "--faults FAULTS"
-    "Comma-separated: partition, s3-outage, s3-latency, trim, leader-move"
-    :default "partition"]])
+    "Comma-separated: partition, s3-outage, s3-latency, leader-move, member-churn"
+    :default "partition"]
+   [nil "--final-read-tier TIER"
+    (str "Which tier the final verification reads exercise: 'local' (leave data "
+         "where it lies) or 's3' (force one local-retention trim after healing so "
+         "the reads drain from the remote tier). A coverage knob, not a fault.")
+    :default "local"
+    :validate [#{"local" "s3"} "Must be one of: local, s3"]]])
 
 (defn streams3-test
   [opts]
@@ -94,10 +100,12 @@
                                   {:type :info :f :stop-s3-outage}
                                   {:type :info :f :stop-s3-latency}])
                     (gen/sleep (:final-settle-sec opts))
-                    ;; With trimming enabled, trim once more after healing so the
-                    ;; final reads drain from the now-trimmed (S3-only) tier and
-                    ;; actually exercise the read-from-S3 path.
-                    (gen/nemesis (when (contains? (nem/faults opts) "trim")
+                    ;; With --final-read-tier s3, force one trim after healing so
+                    ;; the final reads drain from the now-trimmed (S3-only) tier
+                    ;; and actually exercise the read-from-S3 path. The plugin
+                    ;; trims eagerly on its own; this only makes the tier the
+                    ;; final reads hit deterministic rather than timing-dependent.
+                    (gen/nemesis (when (= "s3" (:final-read-tier opts))
                                    {:type :info :f :trim-local}))
                     ;; Final reads: the kafka workload drains everything written.
                     ;; The kafka final-polls generator is unbounded by design —

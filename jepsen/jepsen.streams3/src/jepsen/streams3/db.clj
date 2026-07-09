@@ -156,10 +156,11 @@
        "|| N <- Names, byte_size(N) >= 7, binary:part(N, 0, 7) =:= <<\"jepsen-\">>], ok."))
 
 (defn force-local-trim!
-  "Triggers local-retention evaluation for the jepsen streams on `node`, so
-  segments already uploaded to S3 are trimmed locally and reads of older
-  offsets fall back to the S3 tier. Runs in an SSH context (caller wraps with
-  c/on-nodes)."
+  "Triggers local-retention evaluation for the jepsen streams on `node` — the
+  same evaluation the plugin runs itself on every manifest advance, invoked
+  on demand so that after faults heal any already-uploaded segments are trimmed
+  deterministically and the final reads drain from the S3 tier. Runs in an SSH
+  context (caller wraps with c/on-nodes)."
   [node]
   (util/meh (rabbitmqctl-eval node trim-eval)))
 
