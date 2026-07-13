@@ -101,6 +101,13 @@ init([]) ->
         type => worker,
         start => {rabbitmq_stream_s3_reconciler, start_link, []}
     },
+    %% Triggers periodic cross-stream GC when enabled; a non-blocking
+    %% cluster-wide lock keeps concurrent sweeps to one node at a time.
+    GcScheduler = #{
+        id => rabbitmq_stream_s3_gc_scheduler,
+        type => worker,
+        start => {rabbitmq_stream_s3_gc_scheduler, start_link, []}
+    },
     Procs = [
         CredentialServer,
         BucketMonitor,
@@ -111,7 +118,8 @@ init([]) ->
         GeneralPool,
         Governor,
         ReplicaReaderSup,
-        Reconciler
+        Reconciler,
+        GcScheduler
     ],
     {ok, {SupFlags, Procs}}.
 

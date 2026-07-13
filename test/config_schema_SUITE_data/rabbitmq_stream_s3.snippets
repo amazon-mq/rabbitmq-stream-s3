@@ -81,4 +81,12 @@
  {stream_s3_kms_key_id,
   "stream_s3.kms_key_id = arn:aws:kms:us-east-1:123456789012:key/example-key-id",
   [{rabbitmq_stream_s3, [{kms_key_id, <<"arn:aws:kms:us-east-1:123456789012:key/example-key-id">>}]}],
+  []},
+ {stream_s3_gc_enabled,
+  "stream_s3.gc.enabled = true",
+  [{rabbitmq_stream_s3, [{gc_enabled, true}]}],
+  []},
+ {stream_s3_gc_interval,
+  "stream_s3.gc.interval = 86400000",
+  [{rabbitmq_stream_s3, [{gc_interval, 86400000}]}],
   []}].

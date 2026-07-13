@@ -36,6 +36,8 @@ lives here. Callers use these functions instead of calling
     membership_reconciliation_auto_remove/0,
     reconciliation_enabled/0,
     reconciliation_interval/0,
+    gc_enabled/0,
+    gc_interval/0,
     bucket_check_enabled/0,
     bucket_check_interval/0,
     task_retry_delay_max_ms/0,
@@ -189,6 +191,20 @@ bucket_check_enabled() ->
 bucket_check_interval() ->
     application:get_env(?APP, bucket_check_interval, 300_000).
 
+%% Whether a delete-mode GC sweep runs automatically on an interval. A sweep is
+%% a bucket-wide LIST plus one strongly-consistent metadata read per stream, so
+%% it is off by default; orphan GC via the CLI remains available on demand.
+-spec gc_enabled() -> boolean().
+gc_enabled() ->
+    application:get_env(?APP, gc_enabled, false).
+
+%% Interval between automatic GC sweeps, in milliseconds. Defaults to 24 hours:
+%% stragglers and tombstones are not urgent, and each sweep is comparatively
+%% heavy.
+-spec gc_interval() -> non_neg_integer().
+gc_interval() ->
+    application:get_env(?APP, gc_interval, 86_400_000).
+
 -spec task_retry_delay_max_ms() -> non_neg_integer().
 task_retry_delay_max_ms() ->
     application:get_env(?APP, task_retry_delay_max_ms, 5_000).
@@ -299,6 +315,8 @@ defaults_test_() ->
         ?_assertEqual(false, membership_reconciliation_auto_remove()),
         ?_assertEqual(true, reconciliation_enabled()),
         ?_assertEqual(60_000, reconciliation_interval()),
+        ?_assertEqual(false, gc_enabled()),
+        ?_assertEqual(86_400_000, gc_interval()),
         ?_assertEqual(true, bucket_check_enabled()),
         ?_assertEqual(300_000, bucket_check_interval()),
         ?_assertEqual(5_000, task_retry_delay_max_ms()),
