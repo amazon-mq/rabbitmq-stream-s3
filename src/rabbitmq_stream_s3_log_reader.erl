@@ -878,7 +878,16 @@ init_remote_reader(
         stream => StreamId,
         location => Location
     },
-    case gen_server:start(rabbitmq_stream_s3_remote_reader, Conf, []) of
+    %% The remote reader is a data pipe for large refc binaries with a small
+    %% heap of its own, the same profile as the pool's gun processes. Full
+    %% sweeps are nearly free, and making every GC a full sweep releases
+    %% dropped buffer blocks immediately instead of leaving tenured dead
+    %% references pinned until a rare major GC (an idle reader could otherwise
+    %% hold a full prefetch window indefinitely). The off-heap message queue
+    %% keeps those full sweeps from scanning a backed-up mailbox of gun data
+    %% frames. See docs/investigations/remote-reader-memory.md.
+    SpawnOpts = [{spawn_opt, [{fullsweep_after, 0}, {message_queue_data, off_heap}]}],
+    case gen_server:start(rabbitmq_stream_s3_remote_reader, Conf, SpawnOpts) of
         {ok, Pid} ->
             counters:add(counter(), ?C_REMOTE_INIT, 1),
             Reader = #?MODULE{
