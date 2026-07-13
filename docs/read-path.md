@@ -54,6 +54,18 @@ The remote reader is split into a functional core and a gen_server shell, follow
 
 Effects that require local data (manifest range lookups, iterator refreshes) are resolved synchronously in the shell's effect-execution loop and fed back to the core immediately. This avoids extra async round-trips for what are fast ETS lookups.
 
+### Buffer
+
+The core buffers fragment data in a `rabbitmq_stream_s3_read_buffer`: a queue of the delivered binaries ("blocks", batched to ~1 MiB by the S3 API layer) held as-is in offset order, addressed by absolute byte positions within the fragment object. One buffer holds the current fragment's window; a second accumulates the prefetched next fragment and is moved into place whole at the transition.
+
+This design complements the Erlang VM binary implementation. A naive approach, growing a binary by appending each delivery, interacts badly with an owned binary structure that lends out references. Serving a read as a sub-binary seals it, preventing the runtime from optimizing appends.
+
+- Blocks are contiguous and immutable: `end_pos - start_pos` equals the sum of block sizes, and a delivery is never copied into place (append is O(1)).
+- Consumed data is freed block-by-block: reads are non-decreasing, so when a read is served every block entirely below its start offset is dropped. `start_pos` advances block-granularly, never past the last read's start.
+- A read pins at most the blocks it overlaps: reads ≤ 512 bytes (chunk-header over-reads are 303 bytes) are copied and pin nothing; larger single-block reads share a sub-binary of one block; reads spanning blocks are assembled into a fresh binary.
+
+Reads spanning blocks concatenate only the requested bytes (chunk-sized, not window-sized), which is rare and cheap once the AIMD window is large relative to chunks.
+
 ### Prefetch
 
 The starting byte position within a fragment is determined once, at offset-spec resolution time, by the log reader (see [Index lookup within a fragment](#index-lookup-within-a-fragment)), not by the remote reader. Once reading begins, the remote reader issues forward range requests only for the chunk-data region `[8 + start, 8 + Size)` (it never re-fetches the index), reading ahead of the consumer's position and walking chunk headers sequentially within the buffered data.

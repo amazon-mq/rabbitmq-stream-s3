@@ -39,6 +39,11 @@ fragment state to determine if a pending read can be served. When it cannot,
 the core returns effects to fetch more data. When data arrives, the shell
 feeds it back and the core re-evaluates.
 
+Buffered data is held in a `rabbitmq_stream_s3_read_buffer`: a queue of the
+delivered binaries as-is rather than one flat binary, so a delivery is never
+copied into place and consumed data is freed block-by-block (see that
+module's docs for why flat-binary appends degrade here).
+
 The AIMD algorithm adjusts `read_size` (prefetch window):
 - Buffer hit: after N consecutive hits, additive increase by 1 MiB
 - Buffer miss: multiplicative decrease (halve)
@@ -84,13 +89,10 @@ and transitions immediately if available, or signals that more data is needed.
     %% Current fragment
     fragment_ref :: #fragment_ref{},
     key :: rabbitmq_stream_s3:key(),
-    buffer = <<>> :: binary(),
-    start_pos :: byte_offset(),
-    current_pos :: byte_offset(),
-    end_pos :: byte_offset(),
+    buffer :: rabbitmq_stream_s3_read_buffer:buffer(),
 
     %% Next fragment (pre-fetched)
-    next :: {#fragment_ref{}, binary()} | undefined | not_found,
+    next :: {#fragment_ref{}, rabbitmq_stream_s3_read_buffer:buffer()} | undefined | not_found,
 
     %% Fragment iterator
     iterator :: rabbitmq_stream_s3_fragment_iterator:iterator(),
@@ -176,10 +178,7 @@ init(StreamId, FragRef, Position, Iterator, Opts) ->
         retry_delay = Cfg#cfg.min_retry_delay_ms,
         fragment_ref = FragRef,
         key = Key,
-        buffer = <<>>,
-        start_pos = Position,
-        current_pos = Position,
-        end_pos = Position,
+        buffer = rabbitmq_stream_s3_read_buffer:new(Position),
         iterator = Iterator,
         next = undefined
     },
@@ -278,14 +277,12 @@ step(State0, retry) ->
     {State2, Effects ++ Effects2};
 step(#state{cfg = #cfg{min_retry_delay_ms = MinDelay}} = State0, deadline_expired) ->
     %% The shell's pending-read deadline fired. Reply with an error and reset
-    %% buffer state so the next read at any position passes Offset >= StartPos.
+    %% buffer state so the next read at any position is within the buffer's
+    %% bounds once data arrives.
     %% See: https://github.com/amazon-mq/rabbitmq-stream-s3/issues/157
     %% See: https://github.com/amazon-mq/rabbitmq-stream-s3/issues/161
     State = State0#state{
-        buffer = <<>>,
-        start_pos = 0,
-        current_pos = 0,
-        end_pos = 0,
+        buffer = rabbitmq_stream_s3_read_buffer:new(0),
         pending = undefined,
         requests_in_flight = #{},
         retry_delay = MinDelay
@@ -311,10 +308,7 @@ step(State0, {iterator_refreshed, Iterator}) ->
                 retry_delay = Cfg#cfg.min_retry_delay_ms,
                 fragment_ref = FragRef,
                 key = Key,
-                buffer = <<>>,
-                start_pos = ?SEGMENT_HEADER_B,
-                current_pos = ?SEGMENT_HEADER_B,
-                end_pos = ?SEGMENT_HEADER_B,
+                buffer = rabbitmq_stream_s3_read_buffer:new(?SEGMENT_HEADER_B),
                 iterator = Iterator1,
                 next = undefined
             },
@@ -388,18 +382,21 @@ try_read(#state{fragment_ref = #fragment_ref{size = FragSize}} = State, Offset, 
 ->
     %% Past end of current fragment. Transition.
     try_fragment_transition(State);
-try_read(#state{end_pos = EndPos} = State, Offset, Bytes) when
-    Offset + Bytes > EndPos
-->
-    %% Not enough data buffered.
-    IdxStartPos = ?SEGMENT_HEADER_B + (State#state.fragment_ref)#fragment_ref.size,
-    case EndPos >= IdxStartPos of
-        true ->
-            %% All chunk data is buffered (the index region, which follows the
-            %% chunk data, has started), so nothing more is coming for a read
-            %% within the chunk-data range: this is the consumer over-reading a
-            %% chunk header at the fragment tail. Cap the read at the index
-            %% boundary and serve the remaining chunk data.
+try_read(
+    #state{fragment_ref = #fragment_ref{size = FragSize}, buffer = Buffer} = State,
+    Offset,
+    Bytes
+) ->
+    EndPos = rabbitmq_stream_s3_read_buffer:end_pos(Buffer),
+    IdxStartPos = ?SEGMENT_HEADER_B + FragSize,
+    case Offset + Bytes > EndPos of
+        true when EndPos >= IdxStartPos ->
+            %% Not enough data buffered, but all chunk data is buffered (the
+            %% index region, which follows the chunk data, has started), so
+            %% nothing more is coming for a read within the chunk-data range:
+            %% this is the consumer over-reading a chunk header at the fragment
+            %% tail. Cap the read at the index boundary and serve the remaining
+            %% chunk data.
             %%
             %% The only read that overshoots EndPos is the header over-read,
             %% which read_header1/1 always issues at a chunk boundary, so
@@ -411,7 +408,7 @@ try_read(#state{end_pos = EndPos} = State, Offset, Bytes) when
             %% the consumer hung. (The 64 was also arbitrary: the over-read is
             %% CHUNK_HEADER_B + MAX_FILTER_SIZE bytes, not 64.)
             try_read(State, Offset, EndPos - Offset);
-        false ->
+        true ->
             %% Chunk data is still streaming in (EndPos has not reached the
             %% index boundary). Wait for more, unless the fragment 404'd.
             case State of
@@ -419,23 +416,15 @@ try_read(#state{end_pos = EndPos} = State, Offset, Bytes) when
                     {not_found_check_range, State};
                 _ ->
                     {await, State}
-            end
-    end;
-try_read(
-    #state{
-        fragment_ref = #fragment_ref{size = FragSize},
-        start_pos = StartPos,
-        current_pos = _CurrentPos,
-        buffer = Buffer
-    } = State,
-    Offset,
-    Bytes0
-) ->
-    IdxStartPos = ?SEGMENT_HEADER_B + FragSize,
-    Bytes = min(Bytes0, IdxStartPos - Offset),
-    ?assert(Offset >= StartPos),
-    Data = binary:part(Buffer, Offset - StartPos, Bytes),
-    {ok, Data, State#state{current_pos = Offset}}.
+            end;
+        false ->
+            ReadBytes = min(Bytes, IdxStartPos - Offset),
+            Data = rabbitmq_stream_s3_read_buffer:read(Offset, ReadBytes, Buffer),
+            %% Reads are non-decreasing, so blocks entirely below this read's
+            %% start are consumed; drop them so they are freed incrementally.
+            Buffer1 = rabbitmq_stream_s3_read_buffer:drop_before(Offset, Buffer),
+            {ok, Data, State#state{buffer = Buffer1}}
+    end.
 
 try_fragment_transition(
     #state{next = {#fragment_ref{offset = NextOffset}, _}} = State0
@@ -547,9 +536,6 @@ goto_next_fragment(
             ?assert(NextOffset > CurrentOffset),
             Key = rabbitmq_stream_s3:fragment_key(StreamId, NextOffset, NextUid),
             State#state{
-                start_pos = ?SEGMENT_HEADER_B,
-                current_pos = ?SEGMENT_HEADER_B,
-                end_pos = ?SEGMENT_HEADER_B + byte_size(Buffer),
                 buffer = Buffer,
                 fragment_ref = NextFragRef,
                 key = Key,
@@ -559,10 +545,7 @@ goto_next_fragment(
             };
         _ ->
             State#state{
-                start_pos = ?SEGMENT_HEADER_B,
-                current_pos = ?SEGMENT_HEADER_B,
-                end_pos = ?SEGMENT_HEADER_B,
-                buffer = <<>>,
+                buffer = rabbitmq_stream_s3_read_buffer:new(?SEGMENT_HEADER_B),
                 iterator = Iterator,
                 next = undefined,
                 current_not_found = false
@@ -584,43 +567,24 @@ add_data(Fragment, Data, #state{fragment_ref = #fragment_ref{offset = Fragment}}
 add_data(Fragment, Data, State) ->
     add_data_next(Fragment, Data, State).
 
-add_data_current(
-    Data,
-    #state{
-        start_pos = StartPos0,
-        current_pos = CurrentPos,
-        end_pos = EndPos0,
-        buffer = Buffer0
-    } = State
-) ->
-    Buffer =
-        case CurrentPos =:= StartPos0 of
-            true ->
-                <<Buffer0/binary, Data/binary>>;
-            false ->
-                <<
-                    (binary:part(Buffer0, CurrentPos - StartPos0, EndPos0 - CurrentPos))/binary,
-                    Data/binary
-                >>
-        end,
-    State#state{
-        start_pos = CurrentPos,
-        end_pos = EndPos0 + byte_size(Data),
-        buffer = Buffer
-    }.
+add_data_current(Data, #state{buffer = Buffer} = State) ->
+    State#state{buffer = rabbitmq_stream_s3_read_buffer:append(Data, Buffer)}.
 
 add_data_next(NextOffset, Data, #state{next = Next0, iterator = Iterator} = State) ->
     Next =
         case Next0 of
             undefined ->
+                Buffer = rabbitmq_stream_s3_read_buffer:append(
+                    Data, rabbitmq_stream_s3_read_buffer:new(?SEGMENT_HEADER_B)
+                ),
                 case rabbitmq_stream_s3_fragment_iterator:next(Iterator) of
                     {ok, #fragment_ref{offset = NextOffset} = FragRef, _} ->
-                        {FragRef, Data};
+                        {FragRef, Buffer};
                     _ ->
-                        {#fragment_ref{offset = NextOffset, uid = 0, size = 0}, Data}
+                        {#fragment_ref{offset = NextOffset, uid = 0, size = 0}, Buffer}
                 end;
             {#fragment_ref{offset = NextOffset} = FragRef, Buffer0} ->
-                {FragRef, <<Buffer0/binary, Data/binary>>}
+                {FragRef, rabbitmq_stream_s3_read_buffer:append(Data, Buffer0)}
         end,
     State#state{next = Next}.
 
@@ -645,11 +609,12 @@ maybe_start_current_request(
     #state{
         read_size = ReadSize,
         fragment_ref = #fragment_ref{offset = Fragment, size = FragSize},
-        end_pos = EndPos,
+        buffer = Buffer,
         key = Key,
         requests_in_flight = Reqs
     } = State
 ) ->
+    EndPos = rabbitmq_stream_s3_read_buffer:end_pos(Buffer),
     IdxStartPos = ?SEGMENT_HEADER_B + FragSize,
     case EndPos < IdxStartPos andalso not maps:is_key(Fragment, Reqs) of
         true ->
@@ -666,13 +631,15 @@ maybe_start_next_request(
         stream = StreamId,
         read_size = ReadSize,
         fragment_ref = #fragment_ref{size = FragSize},
-        end_pos = EndPos,
+        buffer = Buffer,
         next = undefined,
         iterator = Iterator,
         requests_in_flight = Reqs
     } = State
-) when EndPos >= ?SEGMENT_HEADER_B + FragSize ->
-    case rabbitmq_stream_s3_fragment_iterator:next(Iterator) of
+) ->
+    CurrentFullyFetched =
+        rabbitmq_stream_s3_read_buffer:end_pos(Buffer) >= ?SEGMENT_HEADER_B + FragSize,
+    case CurrentFullyFetched andalso rabbitmq_stream_s3_fragment_iterator:next(Iterator) of
         {ok, #fragment_ref{offset = NextOffset, uid = NextUid}, _} ->
             case maps:is_key(NextOffset, Reqs) of
                 true ->

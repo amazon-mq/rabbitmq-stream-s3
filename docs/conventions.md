@@ -40,6 +40,12 @@ The manifest stores entries as a flat binary (34 bytes per entry) rather than a 
 
 Use binary arrays for any fixed-size record collection that needs binary search or sequential access. Do not convert to lists of records for processing.
 
+## Never grow a binary that reads are served from
+
+Do not accumulate a long-lived buffer with `<<Buffer/binary, Data/binary>>` if sub-binaries of it are handed to other processes (replies, messages). Copying a sub-binary into a message seals the writable binary, so the next append copies the whole buffer; the sub-binary also pins the entire buffer in the receiver's heap until it collects garbage.
+
+Keep the delivered binaries whole in a queue instead and assemble reads from the pieces. `rabbitmq_stream_s3_read_buffer` implements this for the remote read path (see its moduledoc and [read-path.md](./read-path.md#buffer)); reuse it rather than growing a flat binary.
+
 ## List accumulation
 
 Do not use `List ++ [Element]` to build lists incrementally. Tail-append copies the entire list on every call, making N appends O(N²).
