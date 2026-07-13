@@ -142,7 +142,7 @@ handle_queue_deletion(#{path := ?PATH(StreamId)}) ->
     %% Khepri leader node. This may not be the same node as the stream's writer
     %% process. And in larger clusters (5, 7, 9 nodes, etc..) this might not
     %% be a node of a replica either.
-    ok = rabbitmq_stream_s3_reaper:delete_stream(StreamId).
+    ok = rabbitmq_stream_s3_lister:delete_stream(StreamId).
 
 -doc "Gets the latest-known manifest root UID and revision with a low-latency local read.".
 -spec get(stream_id()) -> {ok, entry()} | {error, not_found | any()}.

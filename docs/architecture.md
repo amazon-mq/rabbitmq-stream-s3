@@ -23,9 +23,15 @@ rabbitmq_stream_s3_sup (one_for_one, intensity 3 / period 5)
 │     Receives sequenced edits from writer-node replica readers. Detects
 │     gaps and requests re-sync. Triggers retention on replica nodes.
 ├── rabbitmq_stream_s3_reaper (worker, permanent)
-│     Batched S3 object deletion. Collects keys from retention and stream
-│     deletion, issues DeleteObjects in batches of 1000. Stream deletion
-│     spawns a short-lived task that pages through LIST and feeds keys back.
+│     Batched S3 object deletion. Collects keys from retention and the
+│     deletion lister, issues DeleteObjects in batches of 1000. Serves keys
+│     both fire-and-forget (retention) and synchronously (the lister, so
+│     listing is paced against deletion).
+├── rabbitmq_stream_s3_lister (worker, permanent)
+│     Drives whole-stream remote tier deletion under backpressure. Pages
+│     through LIST one page at a time, handing each page to the reaper
+│     synchronously so listing never outruns deletion. Processes streams
+│     first-in-first-out.
 ├── rabbitmq_stream_s3_membership_reconciliation (worker, permanent)
 │     Continuous Membership Reconciliation for streams. Evaluates whether
 │     streams have the correct replica set and triggers corrections.
@@ -177,12 +183,12 @@ When the rate is configured as `unlimited` (the default), the governor imposes n
 When a stream queue is deleted:
 1. RabbitMQ removes the queue from `rabbit_db_queue` in Khepri.
 2. The plugin's keep-while condition on the per-stream container node fires, removing the container and the subtree below it (the manifest pointer and the anchor).
-3. The stored procedure `handle_queue_deletion` runs, calling `rabbitmq_stream_s3_reaper:delete_stream(StreamId)`.
-4. The reaper spawns a short-lived task that pages through `rabbitmq_stream_s3_api:list/2` on the stream's prefix.
-5. Each page of keys is sent back to the reaper as a delete cast.
+3. The stored procedure `handle_queue_deletion` runs, calling `rabbitmq_stream_s3_lister:delete_stream(StreamId)`.
+4. The lister enqueues the stream and pages through `rabbitmq_stream_s3_api:list/2` on the stream's prefix, one page at a time.
+5. Each page of keys is handed to the reaper with a synchronous call that returns only once the page has been deleted, so the lister fetches the next page only after the previous one has drained (backpressure).
 6. The reaper batches keys (up to 1000) and calls `rabbitmq_stream_s3_api:delete/1`.
 
-If the task crashes or S3 is unavailable, the objects are left behind, but the anchor is already gone (step 2 removed the whole subtree), so a later GC run reaps the prefix via the no-anchor path. See [operations.md](./operations.md#garbage-collection).
+If the lister or reaper crashes or S3 is unavailable, the objects are left behind, but the anchor is already gone (step 2 removed the whole subtree), so a later GC run reaps the prefix via the no-anchor path. See [operations.md](./operations.md#garbage-collection).
 
 ## Read path (consumer side)
 

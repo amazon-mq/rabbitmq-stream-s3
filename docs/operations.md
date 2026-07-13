@@ -294,7 +294,14 @@ Owned by `rabbitmq_stream_s3_reaper`.
 |-------------------------------------|---------|-------------------------------------------------------------------|
 | `rabbitmq_stream_s3_objects_deleted`                   | counter | S3 objects confirmed deleted via the reaper (retention or stream deletion) |
 | `rabbitmq_stream_s3_objects_delete_failed`             | counter | Objects the reaper could not confirm deleted (a DeleteObjects partial or whole-request failure); left for orphan GC |
-| `rabbitmq_stream_s3_streams_deleted`                   | counter | Streams whose deletion task ran to completion                     |
+
+### Lister (per-node)
+
+Owned by `rabbitmq_stream_s3_lister`.
+
+| Metric                              | Type    | Description                                                       |
+|-------------------------------------|---------|-------------------------------------------------------------------|
+| `rabbitmq_stream_s3_streams_deleted`                   | counter | Streams whose deletion ran to completion                          |
 
 ### Manifest replica (per-node)
 

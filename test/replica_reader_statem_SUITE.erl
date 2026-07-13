@@ -247,7 +247,7 @@ start_fresh_writer(StreamId) ->
 cleanup(StreamId, Writer) ->
     Cfg = writer_cfg(StreamId),
     catch osiris_writer:stop(Cfg),
-    _ = rabbitmq_stream_s3_reaper:delete_stream(StreamId),
+    _ = rabbitmq_stream_s3_lister:delete_stream(StreamId),
     catch osiris_log:delete_directory(Cfg),
     catch rabbitmq_stream_s3_manifest_replica:forget(StreamId),
     catch rabbitmq_stream_s3_api_fault:reset(),

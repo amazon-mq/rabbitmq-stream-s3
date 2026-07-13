@@ -71,6 +71,11 @@ init([]) ->
         type => worker,
         start => {rabbitmq_stream_s3_reaper, start_link, []}
     },
+    Lister = #{
+        id => rabbitmq_stream_s3_lister,
+        type => worker,
+        start => {rabbitmq_stream_s3_lister, start_link, []}
+    },
     ManifestCache = #{
         id => rabbitmq_stream_s3_manifest_replica,
         type => worker,
@@ -106,6 +111,7 @@ init([]) ->
         BucketMonitor,
         ManifestCache,
         Reaper,
+        Lister,
         MembershipReconciliation,
         UploadPool,
         GeneralPool,
