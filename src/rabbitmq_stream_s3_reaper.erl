@@ -68,12 +68,19 @@ Returns `ok` once this batch has been processed, regardless of whether every
 individual object was confirmed deleted (unconfirmed ones are left for orphan
 GC). This is the backpressure primitive the lister relies on: the reply does
 not arrive until the reaper has drained the batch.
+
+The call waits `infinity`. Each S3 request the reaper makes is individually
+bounded by `?DELETE_TIMEOUT_MS`, so `handle_batch` always completes in bounded
+time; a finite call timeout here would instead measure the caller's wait
+against the whole batch (which folds in unrelated fire-and-forget casts and
+splits into up to `?MAX_BATCH`-key sub-batches run sequentially) and could
+crash the lister while deletion is still making progress.
 """.
 -spec delete_objects_sync(stream_id(), [rabbitmq_stream_s3:key()]) -> ok.
 delete_objects_sync(_StreamId, []) ->
     ok;
 delete_objects_sync(_StreamId, Keys) ->
-    gen_batch_server:call(?MODULE, {delete, Keys}, ?DELETE_TIMEOUT_MS).
+    gen_batch_server:call(?MODULE, {delete, Keys}, infinity).
 
 init([]) ->
     logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),

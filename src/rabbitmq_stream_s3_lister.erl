@@ -67,8 +67,8 @@ init([]) ->
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
-handle_cast({delete_stream, StreamId}, #state{queue = Q} = State) ->
-    {noreply, maybe_start(State#state{queue = queue:in(StreamId, Q)})};
+handle_cast({delete_stream, StreamId}, State) ->
+    {noreply, enqueue(StreamId, State)};
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
@@ -89,6 +89,20 @@ code_change(_OldVsn, State, _Extra) ->
 %% ------------------------------------------------------------------
 %% Internal
 %% ------------------------------------------------------------------
+
+%% Enqueue a stream for deletion, skipping it when the same stream is already
+%% in flight or already queued. The Khepri deletion trigger can fire more than
+%% once for a stream (redelivery, leader change), and a duplicate would list an
+%% already-empty prefix and double-count `streams_deleted`.
+enqueue(StreamId, #state{current = {StreamId, _, _}} = State) ->
+    State;
+enqueue(StreamId, #state{queue = Q} = State) ->
+    case queue:member(StreamId, Q) of
+        true ->
+            State;
+        false ->
+            maybe_start(State#state{queue = queue:in(StreamId, Q)})
+    end.
 
 %% Start the next queued stream if idle. When a job is already in flight the new
 %% stream stays queued and is picked up when the current one finishes.
@@ -112,12 +126,18 @@ page(StreamId, Prefix, Continuation, State) ->
         {ok, [], done} ->
             finish(StreamId, State);
         {ok, Keys, done} ->
-            ok = rabbitmq_stream_s3_reaper:delete_objects_sync(StreamId, Keys),
-            finish(StreamId, State);
+            case delete_page(StreamId, Keys) of
+                ok -> finish(StreamId, State);
+                {error, _} -> next(State)
+            end;
         {ok, Keys, NextContinuation} ->
-            ok = rabbitmq_stream_s3_reaper:delete_objects_sync(StreamId, Keys),
-            self() ! ?PAGE,
-            State#state{current = {StreamId, Prefix, NextContinuation}};
+            case delete_page(StreamId, Keys) of
+                ok ->
+                    self() ! ?PAGE,
+                    State#state{current = {StreamId, Prefix, NextContinuation}};
+                {error, _} ->
+                    next(State)
+            end;
         {error, Reason} ->
             ?LOG_WARNING(
                 "Failed to list objects for prefix ~ts: ~p; leaving remaining "
@@ -127,6 +147,24 @@ page(StreamId, Prefix, Continuation, State) ->
             %% Best effort: abandon this stream (orphan GC catches the rest) and
             %% move on so one unlistable stream cannot wedge the queue.
             next(State)
+    end.
+
+%% Hand a page to the reaper for synchronous deletion. The reaper is an
+%% independently supervised worker; if it crashes or is restarting, the
+%% synchronous call exits. Treat that like any other transient failure (log and
+%% leave the objects for orphan GC) rather than letting it cascade into a lister
+%% crash that would discard the entire queue of pending stream deletions.
+delete_page(StreamId, Keys) ->
+    try rabbitmq_stream_s3_reaper:delete_objects_sync(StreamId, Keys) of
+        ok -> ok
+    catch
+        Class:Reason ->
+            ?LOG_WARNING(
+                "Reaper unavailable while deleting a page for stream ~ts: "
+                "~ts:~p; abandoning it for orphan GC",
+                [StreamId, Class, Reason]
+            ),
+            {error, Reason}
     end.
 
 finish(StreamId, State) ->
@@ -153,3 +191,34 @@ inc(Idx, N) ->
         undefined -> ok;
         Cnt -> counters:add(Cnt, Idx, N)
     end.
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+%% A stream in flight (current set) so enqueue/2 only appends to the queue and
+%% maybe_start/1 leaves it untouched, making the queue contents observable.
+busy_state() ->
+    #state{current = {<<"in_flight">>, <<"prefix/">>, start}}.
+
+enqueue_dedup_test_() ->
+    [
+        {"a fresh stream is queued", fun() ->
+            S = enqueue(<<"s1">>, busy_state()),
+            ?assertEqual([<<"s1">>], queue:to_list(S#state.queue))
+        end},
+        {"distinct streams are all queued in order", fun() ->
+            S = enqueue(<<"s2">>, enqueue(<<"s1">>, busy_state())),
+            ?assertEqual([<<"s1">>, <<"s2">>], queue:to_list(S#state.queue))
+        end},
+        {"a stream already queued is not queued again", fun() ->
+            S0 = enqueue(<<"s1">>, busy_state()),
+            S1 = enqueue(<<"s1">>, S0),
+            ?assertEqual([<<"s1">>], queue:to_list(S1#state.queue))
+        end},
+        {"the in-flight stream is not re-queued", fun() ->
+            S = enqueue(<<"in_flight">>, busy_state()),
+            ?assertEqual([], queue:to_list(S#state.queue))
+        end}
+    ].
+
+-endif.
