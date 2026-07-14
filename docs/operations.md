@@ -115,6 +115,27 @@ stream_s3.bucket_check.enabled = true
 stream_s3.bucket_check.interval = 300000
 ```
 
+### Automatic garbage collection
+
+Garbage collection reclaims dangling S3 objects (see [Garbage collection](#garbage-collection)). It can run automatically on an interval in addition to the on-demand `stream_s3_gc` CLI command. Automatic GC is off by default: a full sweep is a bucket-wide `LIST` plus one strongly-consistent metadata read per stream, and the objects it reclaims (a straggler left by the deletion race and its tombstone) are not urgent.
+
+Each node runs its own timer, but a non-blocking cluster-wide lock ensures only one node sweeps per round, so a larger cluster does not multiply the sweep cost. There is no fixed leader; the sweep survives the loss of any node.
+
+```ini
+# Whether a GC sweep runs automatically on an interval.
+# Type: boolean. Default: false.
+stream_s3.gc.enabled = true
+
+# Interval between automatic GC sweeps, in milliseconds.
+# Type: positive integer. Default: 86400000 (24 hours).
+stream_s3.gc.interval = 86400000
+
+# Mode the automatic sweep runs in. `dry_run` only identifies and logs
+# dangling objects, without reclaiming them.
+# Type: dry_run | delete. Default: delete.
+stream_s3.gc.mode = delete
+```
+
 ### Tuning the upload path
 
 ```ini
@@ -696,7 +717,7 @@ curl http://node:15692/metrics/per-object | grep 'queue="my-stream"'
 
 Objects in S3 can become orphaned (not referenced by any manifest) in several scenarios: a deposed writer uploads a fragment but loses the Khepri race, a manifest persist fails or the process crashes before completion, retention deletes entries from the manifest but the corresponding object deletion does not complete, or a stream is deleted (or its Khepri metadata is wiped) and its objects outlive the metadata that referenced them.
 
-The GC mechanism identifies these orphans by listing S3 objects and comparing their keys against current authoritative state. It is invoked on demand via the CLI.
+The GC mechanism identifies these orphans by listing S3 objects and comparing their keys against current authoritative state. It is invoked on demand via the CLI, and can also run automatically on an interval (see [Automatic garbage collection](#automatic-garbage-collection)).
 
 ### Safety guarantee: monotonicity
 

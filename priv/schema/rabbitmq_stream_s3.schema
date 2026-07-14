@@ -162,6 +162,30 @@ end}.
 ]}.
 
 %%
+%% Automatic garbage collection
+%%
+
+%% Whether a delete-mode GC sweep runs automatically on an interval. A sweep is
+%% a bucket-wide LIST plus one strongly-consistent metadata read per stream, so
+%% it is off by default; orphan GC via the stream_s3_gc CLI command remains
+%% available on demand.
+
+{mapping, "stream_s3.gc.enabled", "rabbitmq_stream_s3.gc_enabled", [
+    {datatype, {enum, [true, false]}}
+]}.
+
+{mapping, "stream_s3.gc.interval", "rabbitmq_stream_s3.gc_interval", [
+    {datatype, integer}, {validators, ["non_zero_positive_integer"]}
+]}.
+
+%% Mode the automatic sweep runs in. `delete` (the default) reclaims dangling
+%% objects; `dry_run` only identifies and logs them.
+
+{mapping, "stream_s3.gc.mode", "rabbitmq_stream_s3.gc_mode", [
+    {datatype, {enum, [dry_run, delete]}}
+]}.
+
+%%
 %% Bucket accessibility checks
 %%
 
