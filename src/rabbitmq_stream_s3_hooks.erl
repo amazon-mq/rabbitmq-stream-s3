@@ -89,6 +89,10 @@ on_init(acceptor, Pid, #{name := Name, leader_pid := LeaderPid, counter := Count
     ),
     Shared = maps:get(shared, Config),
     Dir = maps:get(dir, Config),
+    %% register_replica_context marks the cache row pending before the member
+    %% finishes init, so a consumer attaching on this node fails closed (and
+    %% retries) until the writer's sync lands, rather than resolving the
+    %% remote tier as absent.
     rabbitmq_stream_s3_manifest_replica:register_replica_context(
         StreamId, Pid, Dir, Shared, Counter
     ),
@@ -97,6 +101,10 @@ on_init(acceptor, Pid, #{name := Name, counter := Counter} = Config) ->
     StreamId = rabbitmq_stream_s3:ensure_stream_id(Name),
     Shared = maps:get(shared, Config),
     Dir = maps:get(dir, Config),
+    %% No leader is known yet, so no sync can be requested here; the writer's
+    %% periodic replica reconciliation will register this node and sync it.
+    %% Until then readers fail closed on the pending row that
+    %% register_replica_context marks.
     rabbitmq_stream_s3_manifest_replica:register_replica_context(
         StreamId, Pid, Dir, Shared, Counter
     ),
@@ -150,6 +158,9 @@ on_retention_evaluated(Cnt, #{name := Name}) ->
             counters:put(Cnt, ?C_OSIRIS_LOG_FIRST_OFFSET, min(LocalFirst, RemoteFirst)),
             LocalFirstTs = counters:get(Cnt, ?C_OSIRIS_LOG_FIRST_TIMESTAMP),
             counters:put(Cnt, ?C_OSIRIS_LOG_FIRST_TIMESTAMP, min(LocalFirstTs, RemoteFirstTs));
+        pending ->
+            %% Not yet resolved: nothing known to override the counters with.
+            ok;
         undefined ->
             ok
     end.
@@ -353,6 +364,9 @@ attach_replica(Pid) ->
     StreamId = rabbitmq_stream_s3:ensure_stream_id(Name),
     %% Seshat registers replica counters under {osiris_replica, Reference}.
     Counter = osiris_counters:fetch({osiris_replica, Reference}),
+    %% Same pending marker as on_init(acceptor, ...), applied by
+    %% register_replica_context: readers fail closed until the writer's sync
+    %% lands. Re-discovery of an already synced replica changes nothing.
     rabbitmq_stream_s3_manifest_replica:register_replica_context(
         StreamId, Pid, Dir, Shared, Counter
     ),

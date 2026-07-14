@@ -74,6 +74,7 @@ manifest row.
     get_manifest/1,
     get_manifest_and_epoch/1,
     get_range/1,
+    mark_pending/1,
     put_manifest/2,
     put_manifest/3,
     apply_edit/2,
@@ -133,8 +134,18 @@ manifest row.
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
--doc "Get the cached manifest for a stream. Direct ETS read.".
--spec get_manifest(stream_id()) -> #manifest{} | undefined.
+-doc """
+Get the cached manifest for a stream. Direct ETS read.
+
+Returns three distinct states, and callers must not conflate them:
+`#manifest{}` is the resolved manifest (possibly empty); `pending` means the
+plugin is attached to this stream on this node but the manifest has not been
+resolved or synced yet, so the remote tier's extent is unknown (readers must
+fail closed, not fall back to the local tier); `undefined` means no plugin
+state exists for the stream on this node (an un-tiered stream), so the local
+log is the whole stream.
+""".
+-spec get_manifest(stream_id()) -> #manifest{} | pending | undefined.
 get_manifest(StreamId) ->
     case ets:lookup(?TABLE, StreamId) of
         [{_, Manifest, _Epoch}] -> Manifest;
@@ -144,24 +155,48 @@ get_manifest(StreamId) ->
 -doc """
 Get the cached manifest together with the writer epoch it was stored at. Direct
 ETS read. The epoch is `undefined` when the manifest was stored without one. GC
-uses this to skip a stream whose cache lags the committed epoch.
+uses this to skip a stream whose cache lags the committed epoch. A `pending`
+row (attached but not yet resolved) is reported as `undefined` so GC fails
+closed on it exactly as it does on a missing row.
 """.
 -spec get_manifest_and_epoch(stream_id()) ->
     {#manifest{}, non_neg_integer() | undefined} | undefined.
 get_manifest_and_epoch(StreamId) ->
     case ets:lookup(?TABLE, StreamId) of
-        [{_, Manifest, Epoch}] -> {Manifest, Epoch};
+        [{_, #manifest{} = Manifest, Epoch}] -> {Manifest, Epoch};
+        [{_, pending, _}] -> undefined;
         [] -> undefined
     end.
 
--doc "Get the remote tier range for a stream. Direct ETS read.".
+-doc """
+Get the remote tier range for a stream. Direct ETS read. A `pending` row is
+reported as `empty`: the callers of this function (local retention, UI range)
+must act as if nothing is known to be in the remote tier, which for both means
+doing nothing destructive.
+""".
 -spec get_range(stream_id()) -> rabbitmq_stream_s3:range().
 get_range(StreamId) ->
     case ets:lookup(?TABLE, StreamId) of
         [{_, #manifest{entries = <<>>}, _}] -> empty;
         [{_, #manifest{first_offset = First, next_offset = Next}, _}] -> {First, Next};
+        [{_, pending, _}] -> empty;
         [] -> empty
     end.
+
+-doc """
+Mark a stream's cache row as `pending` (synchronous): the plugin is attached on
+this node but the manifest is not yet resolved or synced, so readers must fail
+closed rather than treat the remote tier as absent. `register_replica_context/5`
+marks pending automatically for every replica context registration; call this
+directly only for the writer node, which has no replica context to register
+before its remote replica reader resolves the manifest. Insert-if-absent: a row
+surviving from a previous incarnation (a transient reader restart deliberately
+leaves the cache intact, see the replica reader's terminate/2) is never
+downgraded.
+""".
+-spec mark_pending(stream_id()) -> ok.
+mark_pending(StreamId) ->
+    gen_server:call(?MODULE, {mark_pending, StreamId}).
 
 -doc """
 Store a manifest locally (synchronous), recording the writer epoch that produced
@@ -286,6 +321,11 @@ init([]) ->
 handle_call({put_manifest, StreamId, Manifest, Epoch}, _From, State) ->
     write_manifest(StreamId, Manifest, Epoch),
     {reply, ok, State};
+handle_call({mark_pending, StreamId}, _From, State) ->
+    %% Insert-if-absent: never downgrade a resolved manifest (or an existing
+    %% pending marker) that survived a reader restart.
+    _ = ets:insert_new(?TABLE, {StreamId, pending, undefined}),
+    {reply, ok, State};
 handle_call(
     {sync, StreamId, Seq, Epoch, Manifest, WriterNode},
     _From,
@@ -308,7 +348,7 @@ handle_call(
             case maps:get(StreamId, Seqs, undefined) of
                 {LastSeq, Epoch, _} when Seq =:= LastSeq + 1 ->
                     case ets:lookup(?TABLE, StreamId) of
-                        [{_, Manifest0, _}] ->
+                        [{_, #manifest{} = Manifest0, _}] ->
                             case apply_edits_catching(StreamId, Edits, Manifest0) of
                                 {ok, Manifest} ->
                                     write_manifest(StreamId, Manifest, Epoch),
@@ -320,10 +360,11 @@ handle_call(
                                     request_resync(StreamId, WriterNode),
                                     {reply, {error, apply_failed}, State}
                             end;
-                        [] ->
-                            %% A live context always has seqs and the cached row
-                            %% advanced together (write_manifest runs alongside
-                            %% every seqs update below), so this should be
+                        _ ->
+                            %% Missing row or a pending marker. A live context
+                            %% always has seqs and a resolved row advanced
+                            %% together (write_manifest runs alongside every
+                            %% seqs update below), so this should be
                             %% unreachable. Recover via resync rather than trust
                             %% an inconsistent cache.
                             request_resync(StreamId, WriterNode),
@@ -337,7 +378,7 @@ handle_call(
 handle_call({apply_edit, StreamId, Edit}, _From, State) ->
     Reply =
         case ets:lookup(?TABLE, StreamId) of
-            [{_, Manifest0, Epoch0}] ->
+            [{_, #manifest{} = Manifest0, Epoch0}] ->
                 case apply_edits_catching(StreamId, [Edit], Manifest0) of
                     {ok, Manifest} ->
                         write_manifest(StreamId, Manifest, Epoch0),
@@ -346,6 +387,10 @@ handle_call({apply_edit, StreamId, Edit}, _From, State) ->
                     {error, _} = Err ->
                         Err
                 end;
+            %% A pending row has no manifest to edit; the sync that resolves it
+            %% carries the current state, so the edit is not lost, just moot.
+            [{_, pending, _}] ->
+                {error, not_found};
             [] ->
                 {error, not_found}
         end,
@@ -368,6 +413,12 @@ handle_call(
         end,
     MRef = monitor(process, MemberPid),
     Ctx = #replica_ctx{dir = Dir, shared = Shared, counter = Counter, mref = MRef},
+    %% Mark the row pending here rather than at each caller: every context
+    %% registration (member init, or reconciliation re-registering after this
+    %% process itself restarts and drops its contexts) is a point past which a
+    %% reader could attach before the row is resolved. Insert-if-absent: a
+    %% resolved row or an existing pending marker is never downgraded.
+    _ = ets:insert_new(?TABLE, {StreamId, pending, undefined}),
     %% If a sync for this stream was dropped before this context existed, ask its
     %% writer to re-send it now that a monitored context can own the cached row.
     Pending1 = maybe_request_resync(StreamId, Pending0),
@@ -392,6 +443,8 @@ handle_call({evaluate_local_retention, StreamId}, _From, #state{contexts = Ctxs}
                     #manifest{} = Manifest ->
                         run_local_retention(StreamId, Manifest, Ctx),
                         ok;
+                    pending ->
+                        {error, manifest_not_resolved};
                     undefined ->
                         {error, manifest_not_resolved}
                 end;
@@ -409,7 +462,7 @@ handle_cast({put_manifest, StreamId, Manifest, Epoch}, State) ->
     {noreply, State};
 handle_cast({apply_edit, StreamId, Edit}, State) ->
     case ets:lookup(?TABLE, StreamId) of
-        [{_, Manifest0, Epoch0}] ->
+        [{_, #manifest{} = Manifest0, Epoch0}] ->
             case apply_edits_catching(StreamId, [Edit], Manifest0) of
                 {ok, Manifest} ->
                     write_manifest(StreamId, Manifest, Epoch0),
@@ -420,7 +473,8 @@ handle_cast({apply_edit, StreamId, Edit}, State) ->
                     %% gap or sync.
                     ok
             end;
-        [] ->
+        _ ->
+            %% Missing row or a pending marker: nothing to edit.
             ok
     end,
     {noreply, State};
@@ -445,7 +499,7 @@ handle_cast(
                 {LastSeq, Epoch, _} when Seq =:= LastSeq + 1 ->
                     %% In sequence: apply edits.
                     case ets:lookup(?TABLE, StreamId) of
-                        [{_, Manifest0, _}] ->
+                        [{_, #manifest{} = Manifest0, _}] ->
                             case apply_edits_catching(StreamId, Edits, Manifest0) of
                                 {ok, Manifest} ->
                                     write_manifest(StreamId, Manifest, Epoch),
@@ -464,11 +518,12 @@ handle_cast(
                                     request_resync(StreamId, WriterNode),
                                     {noreply, State}
                             end;
-                        [] ->
-                            %% A live context always has seqs and the cached row
-                            %% advanced together, so this should be unreachable.
-                            %% Recover via resync rather than trust an
-                            %% inconsistent cache.
+                        _ ->
+                            %% Missing row or a pending marker. A live context
+                            %% always has seqs and a resolved row advanced
+                            %% together, so this should be unreachable. Recover
+                            %% via resync rather than trust an inconsistent
+                            %% cache.
                             request_resync(StreamId, WriterNode),
                             {noreply, State}
                     end;

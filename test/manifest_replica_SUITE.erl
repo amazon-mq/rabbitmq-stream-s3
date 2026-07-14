@@ -33,7 +33,9 @@ all() ->
         sync_without_context_dropped,
         register_after_dropped_sync_requests_resync,
         apply_edits_without_context_dropped,
-        register_after_dropped_edits_requests_resync
+        register_after_dropped_edits_requests_resync,
+        register_replica_context_marks_pending,
+        mark_pending_does_not_downgrade_resolved
     ].
 
 init_per_suite(Config) ->
@@ -130,6 +132,51 @@ reregister_repoints_monitor(_Config) ->
     %% The new member dies: now the context is released.
     exit(New, kill),
     ok = await(fun() -> not Replica:is_context_registered(Stream) end).
+
+%% register_replica_context marks the row pending before the member finishes
+%% starting: a reader attaching in the window before a sync or resolution lands
+%% must fail closed rather than see the row as absent.
+register_replica_context_marks_pending(_Config) ->
+    Replica = rabbitmq_stream_s3_manifest_replica,
+    Stream = <<"pending-on-register-stream">>,
+    Shared = atomics:new(1, []),
+    Counter = counters:new(5, []),
+    Member = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+
+    ?assertEqual(undefined, Replica:get_manifest(Stream)),
+    ok = Replica:register_replica_context(Stream, Member, <<"/tmp/s">>, Shared, Counter),
+    ?assertEqual(pending, Replica:get_manifest(Stream)).
+
+%% The pending marker is insert-if-absent: it must never downgrade a row that
+%% has already resolved, whether the caller racing behind the resolution is a
+%% repeated register_replica_context (reconciliation re-registering a replica
+%% after manifest_replica itself restarts) or a direct mark_pending call (the
+%% writer path).
+mark_pending_does_not_downgrade_resolved(_Config) ->
+    Replica = rabbitmq_stream_s3_manifest_replica,
+    Stream = <<"resolved-then-pending-stream">>,
+    Shared = atomics:new(1, []),
+    Counter = counters:new(5, []),
+    Member = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    {Manifest, _} = build_manifest([{fragment, #{offset => 0, size => 1000}}]),
+
+    ok = Replica:register_replica_context(Stream, Member, <<"/tmp/s">>, Shared, Counter),
+    ok = Replica:sync(Stream, 0, 1, Manifest),
+    ?assertEqual(Manifest, Replica:get_manifest(Stream)),
+
+    ok = Replica:register_replica_context(Stream, Member, <<"/tmp/s">>, Shared, Counter),
+    ?assertEqual(Manifest, Replica:get_manifest(Stream)),
+
+    ok = Replica:mark_pending(Stream),
+    ?assertEqual(Manifest, Replica:get_manifest(Stream)).
 
 %% A sync for a stream with no registered reader context is dropped rather than
 %% caching a row that no member monitor would ever reclaim (the pre-registration

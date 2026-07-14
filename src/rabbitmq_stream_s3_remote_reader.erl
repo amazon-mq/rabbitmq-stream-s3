@@ -508,11 +508,15 @@ refresh_iterator(StreamId, NotFoundOffset) ->
                 {iterator, _} -> Iterator;
                 end_of_manifest -> end_of_manifest
             end;
-        _ ->
+        Missing when Missing =:= undefined; Missing =:= pending ->
+            %% A resolved row is never downgraded, so mid-read this means the
+            %% row was released: the member is going down and this reader is
+            %% about to die with it. end_of_manifest hands off to the local
+            %% tier, whose own teardown handles the rest.
             ?LOG_DEBUG(
                 "refresh_iterator for stream '~ts': not_found_offset=~b"
-                " manifest=undefined result=end_of_manifest",
-                [StreamId, NotFoundOffset]
+                " manifest=~p result=end_of_manifest",
+                [StreamId, NotFoundOffset, Missing]
             ),
             end_of_manifest
     end.

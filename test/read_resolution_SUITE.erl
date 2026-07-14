@@ -42,7 +42,9 @@ all() ->
         property_catches_collapsed_transient_error,
         collapsed_transient_error_is_deterministically_caught,
         routing_offset_in_local_tier_resolves_local,
-        routing_cold_cache_below_floor_resolves_first,
+        routing_unattached_below_floor_resolves_first,
+        routing_pending_below_floor_fails_closed,
+        routing_pending_spec_first_fails_closed,
         routing_empty_local_log_routes_remote
     ].
 
@@ -139,14 +141,16 @@ prop_offset_in_local_tier_local() ->
         end
     ).
 
-%% An offset below the local floor with no cached manifest (a cold or
-%% not-yet-synced cache) attaches at the local first offset, never the tail.
-routing_cold_cache_below_floor_resolves_first(_Config) ->
+%% An offset below the local floor on a stream with no cache row at all (the
+%% plugin never attached: an un-tiered stream) attaches at the local first
+%% offset, never the tail. The local log is the whole stream here, so local
+%% emulation is correct, not a silent skip.
+routing_unattached_below_floor_resolves_first(_Config) ->
     rabbit_ct_proper_helpers:run_proper(
-        fun() -> prop_cold_cache_below_floor_first() end, [], 1000
+        fun() -> prop_unattached_below_floor_first() end, [], 1000
     ).
 
-prop_cold_cache_below_floor_first() ->
+prop_unattached_below_floor_first() ->
     ?FORALL(
         {Floor, BelowDelta},
         {range(1, 1_000_000), range(1, 1_000_000)},
@@ -154,9 +158,58 @@ prop_cold_cache_below_floor_first() ->
             Offset = max(0, Floor - BelowDelta),
             Shared = osiris_log_shared:new(),
             ok = osiris_log_shared:set_first_chunk_id(Shared, Floor),
-            %% A stream id with no manifest ever put: get_manifest -> undefined.
-            Config = #{name => <<"routing-cold-cache-never-put">>, shared => Shared},
+            %% A stream id with no row ever written: get_manifest -> undefined.
+            Config = #{name => <<"routing-unattached-never-put">>, shared => Shared},
             ?LR:resolve_remote_location(Offset, Config) =:= {local, first}
+        end
+    ).
+
+%% An offset below the local floor while the cache row is pending (the plugin is
+%% attached but the manifest is not yet resolved or synced) must fail closed
+%% with a retryable error. The remote tier's extent is unknown at that moment;
+%% falling back to the local tier would silently skip the remote range below
+%% the local floor.
+routing_pending_below_floor_fails_closed(_Config) ->
+    rabbit_ct_proper_helpers:run_proper(
+        fun() -> prop_pending_below_floor_fails_closed() end, [], 1000
+    ).
+
+prop_pending_below_floor_fails_closed() ->
+    ?FORALL(
+        {Floor, BelowDelta},
+        {range(1, 1_000_000), range(1, 1_000_000)},
+        begin
+            Offset = max(0, Floor - BelowDelta),
+            StreamId = <<"routing-pending-below-floor">>,
+            ok = rabbitmq_stream_s3_manifest_replica:mark_pending(StreamId),
+            Shared = osiris_log_shared:new(),
+            ok = osiris_log_shared:set_first_chunk_id(Shared, Floor),
+            Config = #{name => StreamId, shared => Shared},
+            ?LR:resolve_remote_location(Offset, Config) =:=
+                {error, {manifest_not_resolved, StreamId}}
+        end
+    ).
+
+%% The 'first' spec while the cache row is pending must fail closed for any
+%% local floor, populated or empty: 'first' means the beginning of the stream,
+%% and where the stream begins is unknown until the manifest resolves.
+routing_pending_spec_first_fails_closed(_Config) ->
+    rabbit_ct_proper_helpers:run_proper(
+        fun() -> prop_pending_spec_first_fails_closed() end, [], 1000
+    ).
+
+prop_pending_spec_first_fails_closed() ->
+    ?FORALL(
+        Floor,
+        oneof([-1, range(0, 1_000_000)]),
+        begin
+            StreamId = <<"routing-pending-spec-first">>,
+            ok = rabbitmq_stream_s3_manifest_replica:mark_pending(StreamId),
+            Shared = osiris_log_shared:new(),
+            ok = osiris_log_shared:set_first_chunk_id(Shared, Floor),
+            Config = #{name => StreamId, shared => Shared},
+            ?LR:resolve_remote_location(first, Config) =:=
+                {error, {manifest_not_resolved, StreamId}}
         end
     ).
 

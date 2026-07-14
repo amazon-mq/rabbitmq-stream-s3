@@ -297,9 +297,11 @@ still_dangling(#{reason := below_first_offset, stream_id := StreamId, key := Key
                 _ ->
                     false
             end;
-        undefined ->
-            %% No live manifest to compare against: do not delete (a later sweep
-            %% reclaims a genuine orphan once a floor is known again).
+        Unresolved when Unresolved =:= undefined; Unresolved =:= pending ->
+            %% No live manifest to compare against (missing row, or a pending
+            %% marker whose manifest has not resolved yet): do not delete (a
+            %% later sweep reclaims a genuine orphan once a floor is known
+            %% again).
             false
     end.
 
