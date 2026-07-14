@@ -5,13 +5,19 @@
 -moduledoc """
 Batched S3 object deletion.
 
-Collects keys from replica readers, retention evaluation, and stream
-deletion tasks, then issues batched DeleteObjects calls (up to 1000 keys
+Collects keys from replica readers, retention evaluation, and the stream
+deletion lister, then issues batched DeleteObjects calls (up to 1000 keys
 per request).
 
-For stream deletion, a short-lived task pages through LIST on the
-stream's S3 prefix and sends discovered keys back to this process
-for batched deletion. The task exits when the listing is exhausted.
+Keys arrive two ways:
+
+- `delete_objects/2` casts keys fire-and-forget. The set of keys from
+  retention and replica readers is bounded, so a cast cannot grow the
+  mailbox without bound.
+- `delete_objects_sync/2` submits keys and replies only once they have been
+  deleted. `rabbitmq_stream_s3_lister` uses this to page through a stream's
+  prefix under backpressure: it lists one page, hands it over synchronously,
+  and only lists the next page once this reaper has drained the previous one.
 """.
 
 -behaviour(gen_batch_server).
@@ -21,7 +27,7 @@ for batched deletion. The task exits when the listing is exhausted.
 -include_lib("kernel/include/logger.hrl").
 
 -export([start_link/0]).
--export([delete_objects/2, delete_stream/1]).
+-export([delete_objects/2, delete_objects_sync/2]).
 -export([init/1, handle_batch/2, terminate/2]).
 -export([init_counters/0]).
 
@@ -33,12 +39,10 @@ for batched deletion. The task exits when the listing is exhausted.
 -define(DELETE_TIMEOUT_MS, 60_000).
 
 -define(C_OBJECTS_DELETED, 1).
--define(C_STREAMS_DELETED, 2).
--define(C_OBJECTS_DELETE_FAILED, 3).
+-define(C_OBJECTS_DELETE_FAILED, 2).
 -define(COUNTERS, [
     {objects_deleted, ?C_OBJECTS_DELETED, counter,
         "Individual objects confirmed deleted via the reaper (retention or stream deletion)"},
-    {streams_deleted, ?C_STREAMS_DELETED, counter, "Streams whose deletion task ran to completion"},
     {objects_delete_failed, ?C_OBJECTS_DELETE_FAILED, counter,
         "Individual objects the reaper could not confirm deleted, left for orphan GC"}
 ]).
@@ -57,14 +61,26 @@ delete_objects(_StreamId, []) ->
 delete_objects(_StreamId, Keys) ->
     gen_batch_server:cast(?MODULE, {delete, Keys}).
 
--doc "Delete all remote tier objects for a stream (async).".
--spec delete_stream(stream_id()) -> ok.
-delete_stream(StreamId) ->
-    spawn(fun() ->
-        logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
-        list_and_delete(StreamId)
-    end),
-    ok.
+-doc """
+Send object keys for batched deletion and block until they are deleted.
+
+Returns `ok` once this batch has been processed, regardless of whether every
+individual object was confirmed deleted (unconfirmed ones are left for orphan
+GC). This is the backpressure primitive the lister relies on: the reply does
+not arrive until the reaper has drained the batch.
+
+The call waits `infinity`. Each S3 request the reaper makes is individually
+bounded by `?DELETE_TIMEOUT_MS`, so `handle_batch` always completes in bounded
+time; a finite call timeout here would instead measure the caller's wait
+against the whole batch (which folds in unrelated fire-and-forget casts and
+splits into up to `?MAX_BATCH`-key sub-batches run sequentially) and could
+crash the lister while deletion is still making progress.
+""".
+-spec delete_objects_sync(stream_id(), [rabbitmq_stream_s3:key()]) -> ok.
+delete_objects_sync(_StreamId, []) ->
+    ok;
+delete_objects_sync(_StreamId, Keys) ->
+    gen_batch_server:call(?MODULE, {delete, Keys}, infinity).
 
 init([]) ->
     logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
@@ -73,7 +89,7 @@ init([]) ->
 handle_batch(Ops, State) ->
     Keys = collect(Ops),
     _ = delete_batched(Keys),
-    {ok, State}.
+    {ok, replies(Ops), State}.
 
 terminate(_Reason, _State) ->
     ok.
@@ -82,8 +98,17 @@ terminate(_Reason, _State) ->
 %% Internal
 %% ------------------------------------------------------------------
 
+%% Keys arrive from both fire-and-forget casts and synchronous calls.
 collect(Ops) ->
-    lists:append([K || {cast, {delete, K}} <- Ops]).
+    lists:append([keys(Op) || Op <- Ops]).
+
+keys({cast, {delete, K}}) -> K;
+keys({call, _From, {delete, K}}) -> K;
+keys(_) -> [].
+
+%% Reply to every synchronous caller once its batch has been deleted above.
+replies(Ops) ->
+    [{reply, From, ok} || {call, From, {delete, _}} <- Ops].
 
 delete_batched([]) ->
     ok;
@@ -121,29 +146,6 @@ delete_batch(Batch) ->
                 "Reaper delete request for ~b objects failed: ~p; leaving them for GC",
                 [N, Reason]
             )
-    end.
-
-list_and_delete(StreamId) ->
-    Prefix = rabbitmq_stream_s3:stream_prefix(StreamId),
-    Result = list_and_delete_loop(Prefix, start),
-    case Result of
-        ok -> inc(?C_STREAMS_DELETED, 1);
-        _ -> ok
-    end.
-
-list_and_delete_loop(_Prefix, done) ->
-    ok;
-list_and_delete_loop(Prefix, Continuation) ->
-    case rabbitmq_stream_s3_api:list(Prefix, Continuation) of
-        {ok, [], done} ->
-            ok;
-        {ok, Keys, NextContinuation} ->
-            gen_batch_server:cast(?MODULE, {delete, Keys}),
-            list_and_delete_loop(Prefix, NextContinuation);
-        {error, Reason} ->
-            ?LOG_WARNING("Failed to list objects for prefix ~ts: ~p", [Prefix, Reason]),
-            %% Best effort - orphan GC will catch anything we miss.
-            error
     end.
 
 %% ------------------------------------------------------------------

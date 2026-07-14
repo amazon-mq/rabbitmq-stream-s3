@@ -900,7 +900,7 @@ stream_deletion_cleans_remote_tier(Config) ->
     osiris_writer:stop(WriterCfg),
 
     %% Delete remote tier objects.
-    ok = rabbitmq_stream_s3_reaper:delete_stream(StreamId),
+    ok = rabbitmq_stream_s3_lister:delete_stream(StreamId),
     ?awaitMatch([], list_fragment_offsets(Config), 1000),
 
     %% Delete local tier.
