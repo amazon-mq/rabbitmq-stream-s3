@@ -79,9 +79,19 @@ GC reaps an S3 object only when it can prove the object is not live. For an obje
 | Anchor removal | The anchor is kept alive by a `keep_while` on the stream queue, so it is removed in the same transaction that deletes the queue. The "stream deleted" signal is permanent and cannot be lost to a crash. | [operations.md](./operations.md#safety-guarantee-the-anchor) |
 | Anchor read | An object whose stream is absent from the lookup is reaped only when a strongly-consistent read reports its anchor absent; a present anchor or a non-quorum read fails closed. A stale local read could report a live stream's anchor absent, so the consistent read is load-bearing. Modeled in [PR #311](https://github.com/amazon-mq/rabbitmq-stream-s3/pull/311). | [operations.md](./operations.md#safety-guarantee-the-anchor) |
 
+## Cached state
+
+The invariants above are stated over the manifest `M`, but no reader consults `M` directly: every consumer reads a node-local cache of it (`rabbitmq_stream_s3_manifest_replica`'s ETS table). The cache is volatile state with its own lifecycle, and the read-path invariants only follow from the durable-state invariants if the cache's relationship to `M` is itself pinned down. `Cache(node, S)` denotes the cache row for stream `S` on a node, with three states: a resolved manifest (possibly empty), `pending` (attached but not yet resolved or synced), and absent (no row).
+
+| Invariant | Statement | Where |
+|---|---|---|
+| Cache availability | On any node hosting a member of `S`, `Cache(node, S)` exists (pending or resolved) from before the member finishes init, and therefore from before any reader can attach. The member-init hooks write the pending marker synchronously; resolution or the writer's sync replaces it. An absent row is therefore a positive statement: the plugin never attached to `S` on this node (an un-tiered stream), whose local log is the whole stream. | [read-path.md](./read-path.md) (Offset spec resolution) |
+| Cache coherence | A resolved row is the writer's manifest at some point in time, and only moves forward: a replica's row is a prefix of the writer's edit history (Replica prefix), the writer's own row is written only by its resolution, persist, and reset paths, and `mark_pending` is insert-if-absent so a resolved row is never downgraded to pending. | [manifest.md](./manifest.md) (Manifest edit replication) |
+| Miss semantics | `pending` means the remote tier's extent is unknown, and every consumer must fail in the direction that cannot lose data: the read path fails closed (a retryable error, never a local fallback that would skip `[f, f_local)`), local retention deletes nothing, GC treats the stream as unsweepable, counters are left uncorrected, and the writer's own resolution ignores the row and reads the store. Absent means un-tiered: the read path serves locally, which is exact, not a fallback. No consumer may branch on a catch-all over cache states. | [read-path.md](./read-path.md) (Offset spec resolution) |
+
 ## Read path
 
 | Invariant | Statement | Where |
 |---|---|---|
-| Exactly-once | A read started at spec `s` delivers each offset of `[max(s, f), T)` exactly once, in strictly increasing order, across both tiers. A seek into a group resolves to the unique fragment containing the target (Ordering), not the group's first child. | [read-path.md](./read-path.md) |
+| Exactly-once | A read started at spec `s` delivers each offset of `[max(s, f), T)` exactly once, in strictly increasing order, across both tiers. A seek into a group resolves to the unique fragment containing the target (Ordering), not the group's first child. A fail-closed attach (Miss semantics) is not a violation: it delivers nothing and the consumer retries; only a delivery that skips an offset of `[max(s, f), T)` violates this invariant. | [read-path.md](./read-path.md) |
 | Tier overlap | The local segments cover `[n, T)` while the remote tier covers `[f, n)`; the ranges overlap and the reader hands off at a shared offset, so no offset is skipped or repeated at the seam. | [read-path.md](./read-path.md) |
