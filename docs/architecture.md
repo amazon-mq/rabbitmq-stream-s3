@@ -2,6 +2,16 @@
 
 This document describes how the plugin's processes fit together: what starts them, what they own, and how data flows between them.
 
+## Design stance: durability versus availability
+
+The plugin resolves the durability-versus-availability trade differently on its two paths, and every mechanism below follows from this asymmetry.
+
+On the write path, availability wins and durability is a bounded, explicitly scoped promise. Producers never wait on S3: publishing, replication, and local consumption are unaffected by an object-store outage of any length. Durability in S3 is promised only for the uploaded range `[f, n)`, and the user's retention bound is authoritative over upload progress, so an outage longer than the local retention window can buffer costs the un-uploaded tail. The window is an operator-sized knob, not a guarantee (see [Durability versus the local retention bound](#durability-versus-the-local-retention-bound)).
+
+On the read path, correctness wins and availability degrades only in two sanctioned, visible ways. A read whose answer is momentarily unknowable (a transient fetch failure, an unresolved manifest cache) fails closed and the consumer retries. A read whose data is permanently gone (retention, a gap from an outage) is repositioned at the oldest available offset, the same observable semantics as vanilla stream retention. What is never sanctioned is silently serving an incomplete answer: a stalled read is recoverable, a wrong one is not (see the Cached state and Read path sections of [invariants.md](./invariants.md)).
+
+In one sentence: the write path never lets an S3 outage become a local availability problem, at the cost of a bounded, un-uploaded tail; the read path never lets an unknown answer look like a correct one, at the cost of availability.
+
 ## Plugin lifecycle
 
 The plugin is enabled via `rabbitmq-plugins enable rabbitmq_stream_s3`. RabbitMQ starts it after the broker is fully up (after `core_started`). On start, the plugin's supervisor initializes all infrastructure and sets the osiris hooks. Streams that already exist at this point are discovered and attached to (see [Stream discovery](#stream-discovery)). Streams created after plugin start are handled by the hooks.
