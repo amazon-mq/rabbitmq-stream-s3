@@ -123,8 +123,6 @@ maybe_start(#state{} = State) ->
 %% backpressure: the next list happens only after the previous page drained.
 page(StreamId, Prefix, Continuation, State) ->
     case rabbitmq_stream_s3_api:list(Prefix, Continuation) of
-        {ok, [], done} ->
-            finish(StreamId, State);
         {ok, Keys, done} ->
             case delete_page(StreamId, Keys) of
                 ok -> finish(StreamId, State);
