@@ -53,7 +53,7 @@ The read and tier-resolution seam: resolving the `first` offset spec when the le
 
 ### `tier-routing`
 
-The offset-to-tier routing branch of `resolve_remote_location`: when the local log is empty (`first_chunk_id == -1`), every offset must fall through to the remote tier. Verifies that dropping the `=/= -1` guard routes a remote-only offset to the local tail (a silent remote skip). A second INV#4 guard, distinct from the group-fetch catch-all. See [`tier-routing/README.md`](tier-routing/README.md).
+The offset-to-tier routing branch of `resolve_remote_location`, including the manifest cache's lifecycle (`Cold -> Pending -> Serving`). Verifies two INV#4 guards: the `=/= -1` empty-local floor guard, and the fail-closed handling of an unresolved cache (the boot-window bug: a node restart used to make the remote tier invisible to readers until a persist or the reconciler re-seeded the cache, so `first` attached at the local floor and silently skipped the remote range). The spec's oracle is the ground-truth extent announced by the driver, independent of the cache the reader consults, and the gates include a weakened-environment run (no pending marker) alongside the weakened-code runs. See [`tier-routing/README.md`](tier-routing/README.md).
 
 ### `trimmed-segment`
 

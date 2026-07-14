@@ -36,3 +36,7 @@ p check -tc tcReadResolveGuarded -i 5000   # 0 bugs
 p check -tc tcReadResolveBuggy   -i 2000   # 1 bug: INV#4 silent remote skip
 p check -tc tcReadResolveExplore -i 5000   # 0 bugs
 ```
+
+## Scope note
+
+This model covers the group-fetch classification inside `resolve_first` (a transient fetch failure must retry, never fall back local). The manifest cache's availability axis - `pending` versus resolved versus absent rows, and the boot window they create - lives in the sibling [`tier-routing`](../tier-routing/README.md) model; the `pending` clause in `resolve_first` itself is exercised directly by `read_resolution_SUITE`, which drives the real module.
