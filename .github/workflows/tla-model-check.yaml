@@ -32,7 +32,15 @@ jobs:
           else
             BASE=${{ github.event.before }}
           fi
-          CHANGED=$(git diff --name-only "$BASE" HEAD)
+          # github.event.before can be the zero SHA (first push to a branch) or
+          # a commit unreachable from history (e.g. a squash/rebase merge
+          # rewrote main), which makes `git diff` fail. Fall back to treating
+          # every path as changed so the affected jobs run instead of erroring out.
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            CHANGED=$(git ls-tree -r --name-only HEAD)
+          else
+            CHANGED=$(git diff --name-only "$BASE" HEAD)
+          fi
           echo "osiris=false" >> "$GITHUB_OUTPUT"
           echo "manifest=false" >> "$GITHUB_OUTPUT"
           echo "$CHANGED" | grep -q '^tla/osiris-replication/' && echo "osiris=true" >> "$GITHUB_OUTPUT" || true
