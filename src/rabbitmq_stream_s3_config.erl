@@ -38,6 +38,7 @@ lives here. Callers use these functions instead of calling
     reconciliation_interval/0,
     gc_enabled/0,
     gc_interval/0,
+    gc_mode/0,
     bucket_check_enabled/0,
     bucket_check_interval/0,
     task_retry_delay_max_ms/0,
@@ -205,6 +206,12 @@ gc_enabled() ->
 gc_interval() ->
     application:get_env(?APP, gc_interval, 86_400_000).
 
+%% Mode an automatic GC sweep runs in. `delete` reclaims dangling objects;
+%% `dry_run` only identifies and logs them. Defaults to `delete`.
+-spec gc_mode() -> rabbitmq_stream_s3_gc:mode().
+gc_mode() ->
+    application:get_env(?APP, gc_mode, delete).
+
 -spec task_retry_delay_max_ms() -> non_neg_integer().
 task_retry_delay_max_ms() ->
     application:get_env(?APP, task_retry_delay_max_ms, 5_000).
@@ -317,6 +324,7 @@ defaults_test_() ->
         ?_assertEqual(60_000, reconciliation_interval()),
         ?_assertEqual(false, gc_enabled()),
         ?_assertEqual(86_400_000, gc_interval()),
+        ?_assertEqual(delete, gc_mode()),
         ?_assertEqual(true, bucket_check_enabled()),
         ?_assertEqual(300_000, bucket_check_interval()),
         ?_assertEqual(5_000, task_retry_delay_max_ms()),

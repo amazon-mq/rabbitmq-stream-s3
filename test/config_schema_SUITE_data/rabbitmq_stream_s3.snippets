@@ -89,4 +89,12 @@
  {stream_s3_gc_interval,
   "stream_s3.gc.interval = 86400000",
   [{rabbitmq_stream_s3, [{gc_interval, 86400000}]}],
+  []},
+ {stream_s3_gc_mode_dry_run,
+  "stream_s3.gc.mode = dry_run",
+  [{rabbitmq_stream_s3, [{gc_mode, dry_run}]}],
+  []},
+ {stream_s3_gc_mode_delete,
+  "stream_s3.gc.mode = delete",
+  [{rabbitmq_stream_s3, [{gc_mode, delete}]}],
   []}].

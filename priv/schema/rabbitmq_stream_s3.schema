@@ -178,6 +178,13 @@ end}.
     {datatype, integer}, {validators, ["non_zero_positive_integer"]}
 ]}.
 
+%% Mode the automatic sweep runs in. `delete` (the default) reclaims dangling
+%% objects; `dry_run` only identifies and logs them.
+
+{mapping, "stream_s3.gc.mode", "rabbitmq_stream_s3.gc_mode", [
+    {datatype, {enum, [dry_run, delete]}}
+]}.
+
 %%
 %% Bucket accessibility checks
 %%

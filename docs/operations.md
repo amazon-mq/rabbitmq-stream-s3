@@ -122,13 +122,18 @@ Garbage collection reclaims dangling S3 objects (see [Garbage collection](#garba
 Each node runs its own timer, but a non-blocking cluster-wide lock ensures only one node sweeps per round, so a larger cluster does not multiply the sweep cost. There is no fixed leader; the sweep survives the loss of any node.
 
 ```ini
-# Whether a delete-mode GC sweep runs automatically on an interval.
+# Whether a GC sweep runs automatically on an interval.
 # Type: boolean. Default: false.
 stream_s3.gc.enabled = true
 
 # Interval between automatic GC sweeps, in milliseconds.
 # Type: positive integer. Default: 86400000 (24 hours).
 stream_s3.gc.interval = 86400000
+
+# Mode the automatic sweep runs in. `dry_run` only identifies and logs
+# dangling objects, without reclaiming them.
+# Type: dry_run | delete. Default: delete.
+stream_s3.gc.mode = delete
 ```
 
 ### Tuning the upload path

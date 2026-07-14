@@ -12,10 +12,14 @@ a straggler object left by the deletion race (an upload that completes after the
 one-shot deletion sweep) and its tombstone persist until an operator runs GC by
 hand.
 
-This server runs a delete-mode sweep on a timer to make straggler reclamation and
-tombstone cleanup self-healing. A full sweep is a bucket-wide LIST plus one
+This server runs a sweep on a timer to make straggler reclamation and tombstone
+cleanup self-healing. A full sweep is a bucket-wide LIST plus one
 strongly-consistent metadata read per stream, so it is off by default and runs on
 a conservative interval when enabled.
+
+The sweep runs in `delete` mode by default. It can instead be configured to run
+in `dry_run` mode, which only identifies and logs dangling objects without
+reclaiming them.
 
 Reclamation is eventual, not immediate. Objects orphaned by a deleted stream are
 identified from Khepri via a strongly-consistent anchor read, so any sweeping node
@@ -72,8 +76,8 @@ init([]) ->
     case rabbitmq_stream_s3_config:gc_enabled() of
         true ->
             ?LOG_INFO(
-                "Automatic tiered storage GC is enabled; scheduling a sweep every ~b ms.",
-                [rabbitmq_stream_s3_config:gc_interval()]
+                "Automatic tiered storage GC is enabled; scheduling a ~p sweep every ~b ms.",
+                [rabbitmq_stream_s3_config:gc_mode(), rabbitmq_stream_s3_config:gc_interval()]
             ),
             {ok, #?MODULE{timer = schedule()}};
         false ->
@@ -146,12 +150,13 @@ with_sweep_lock(Nodes, Fun) ->
     end.
 
 sweep() ->
-    ?LOG_INFO("Starting automatic tiered storage GC sweep."),
-    case rabbitmq_stream_s3_gc:run(#{mode => delete}) of
+    Mode = rabbitmq_stream_s3_config:gc_mode(),
+    ?LOG_INFO("Starting automatic tiered storage GC sweep (mode: ~p).", [Mode]),
+    case rabbitmq_stream_s3_gc:run(#{mode => Mode}) of
         {ok, Findings} ->
             ?LOG_INFO(
-                "Automatic tiered storage GC sweep complete: ~b dangling object(s).",
-                [length(Findings)]
+                "Automatic tiered storage GC sweep complete: ~b dangling object(s) ~ts.",
+                [length(Findings), verb(Mode)]
             );
         {error, Reason} ->
             ?LOG_WARNING(
@@ -159,6 +164,9 @@ sweep() ->
                 [Reason]
             )
     end.
+
+verb(delete) -> "deleted";
+verb(dry_run) -> "found".
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
