@@ -775,23 +775,25 @@ maybe_reseed_local_cache(#state{core = Core, cfg = #cfg{stream = StreamId, epoch
             %% No remote tier yet; nothing to cache.
             ok;
         #manifest{} = Manifest ->
-            case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
-                Missing when Missing =:= undefined; Missing =:= pending ->
-                    %% undefined: the manifest_replica restarted and lost the
-                    %% row. pending: a marker leaked from an incarnation that
-                    %% died between init and resolution. Both leave readers
-                    %% unable to resolve the remote tier, so re-seed.
-                    ?LOG_INFO(
-                        "Reconciliation: re-seeding the local manifest cache for "
-                        "stream ~ts after a manifest_replica restart",
-                        [StreamId]
-                    ),
-                    ok = rabbitmq_stream_s3_manifest_replica:put_manifest(
-                        StreamId, Manifest, Epoch
-                    );
-                #manifest{} ->
-                    ok
-            end
+            %% An absent row means the manifest_replica restarted and lost it;
+            %% a pending row is a marker leaked from an incarnation that died
+            %% between init and resolution. Both leave readers unable to
+            %% resolve the remote tier, so re-seed.
+            Reseed = fun() ->
+                ?LOG_INFO(
+                    "Reconciliation: re-seeding the local manifest cache for "
+                    "stream ~ts after a manifest_replica restart",
+                    [StreamId]
+                ),
+                ok = rabbitmq_stream_s3_manifest_replica:put_manifest(
+                    StreamId, Manifest, Epoch
+                )
+            end,
+            rabbitmq_stream_s3_manifest_replica:with_manifest(StreamId, #{
+                resolved => fun(_) -> ok end,
+                pending => Reseed,
+                absent => Reseed
+            })
     end.
 
 %% Proactively register replica nodes for manifest broadcast.
@@ -1297,19 +1299,20 @@ maybe_spawn_group_retention(_Manifest, _Retention, _Now, _StreamId, State) ->
 
 -spec resolve_manifest(stream_id()) -> {ok, #manifest{}} | {retry, term()}.
 resolve_manifest(StreamId) ->
-    case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
-        #manifest{} = M ->
+    %% A pending row is this incarnation's own init marker (or a
+    %% predecessor's): there is no cached manifest to trust, so resolve
+    %% authoritatively, exactly as for an absent row.
+    FromStore = fun() -> resolve_manifest_from_store(StreamId) end,
+    rabbitmq_stream_s3_manifest_replica:with_manifest(StreamId, #{
+        resolved => fun(M) ->
             case classify_cache_result(M, catch rabbitmq_stream_s3_db:get(StreamId)) of
                 {ok, _} = Ok -> Ok;
                 resolve_from_store -> resolve_manifest_from_store(StreamId)
-            end;
-        %% pending is this incarnation's own init marker (or a predecessor's):
-        %% there is no cached manifest to trust, so resolve authoritatively.
-        pending ->
-            resolve_manifest_from_store(StreamId);
-        undefined ->
-            resolve_manifest_from_store(StreamId)
-    end.
+            end
+        end,
+        pending => FromStore,
+        absent => FromStore
+    }).
 
 %% Decide whether the locally cached manifest may be trusted on resolution
 %% (startup, promotion, reinitialize, recovery). Split out like

@@ -286,8 +286,8 @@ still_dangling(#{reason := no_anchor}) ->
     %% the absence is permanent, so there is nothing to re-validate.
     true;
 still_dangling(#{reason := below_first_offset, stream_id := StreamId, key := Key}) ->
-    case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
-        #manifest{first_offset = FirstOffset} = Manifest ->
+    rabbitmq_stream_s3_manifest_replica:with_manifest(StreamId, #{
+        resolved => fun(#manifest{first_offset = FirstOffset} = Manifest) ->
             case parse_key(Key) of
                 {data, _StreamId, Offset} ->
                     Offset < FirstOffset;
@@ -296,14 +296,14 @@ still_dangling(#{reason := below_first_offset, stream_id := StreamId, key := Key
                         not live_leading_group(StreamId, Key, Manifest);
                 _ ->
                     false
-            end;
-        Unresolved when Unresolved =:= undefined; Unresolved =:= pending ->
-            %% No live manifest to compare against (missing row, or a pending
-            %% marker whose manifest has not resolved yet): do not delete (a
-            %% later sweep reclaims a genuine orphan once a floor is known
-            %% again).
-            false
-    end.
+            end
+        end,
+        %% No live manifest to compare against (a pending marker whose manifest
+        %% has not resolved yet, or a missing row): do not delete (a later
+        %% sweep reclaims a genuine orphan once a floor is known again).
+        pending => fun() -> false end,
+        absent => fun() -> false end
+    }).
 
 %% Whether the group object Key is protected by the LIVE manifest's leading-group
 %% carve-out: it is the live referenced leading group, or the live manifest is in

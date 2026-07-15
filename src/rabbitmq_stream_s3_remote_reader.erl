@@ -481,44 +481,51 @@ execute_effect(stop, State) ->
 %% Rebuild the fragment iterator from the manifest cache, advancing past
 %% the given offset (the fragment known to be 404).
 refresh_iterator(StreamId, NotFoundOffset) ->
-    case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
-        #manifest{first_offset = First, next_offset = Next} = Manifest ->
-            GetGroupFun = rabbitmq_stream_s3_manifest:get_group_fun(StreamId),
-            Iterator0 = rabbitmq_stream_s3_fragment_iterator:init(
-                Manifest, NotFoundOffset, GetGroupFun
-            ),
-            %% Advance past the 404'd fragment.
-            Iterator =
-                case rabbitmq_stream_s3_fragment_iterator:next(Iterator0) of
-                    {ok, #fragment_ref{offset = O}, It} when O =< NotFoundOffset -> It;
-                    _ -> Iterator0
-                end,
-            %% Check if there's anything after.
-            Result =
-                case rabbitmq_stream_s3_fragment_iterator:next(Iterator) of
-                    {ok, #fragment_ref{offset = NextOff}, _} -> {iterator, NextOff};
-                    _ -> end_of_manifest
-                end,
-            ?LOG_DEBUG(
-                "refresh_iterator for stream '~ts': not_found_offset=~b"
-                " manifest_first=~b manifest_next=~b result=~p",
-                [StreamId, NotFoundOffset, First, Next, Result]
-            ),
-            case Result of
-                {iterator, _} -> Iterator;
-                end_of_manifest -> end_of_manifest
-            end;
-        Missing when Missing =:= undefined; Missing =:= pending ->
-            %% A resolved row is never downgraded, so mid-read this means the
-            %% row was released: the member is going down and this reader is
-            %% about to die with it. end_of_manifest hands off to the local
-            %% tier, whose own teardown handles the rest.
-            ?LOG_DEBUG(
-                "refresh_iterator for stream '~ts': not_found_offset=~b"
-                " manifest=~p result=end_of_manifest",
-                [StreamId, NotFoundOffset, Missing]
-            ),
-            end_of_manifest
+    %% A resolved row is never downgraded, so a pending or absent row mid-read
+    %% means the row was released: the member is going down and this reader is
+    %% about to die with it. end_of_manifest hands off to the local tier, whose
+    %% own teardown handles the rest.
+    Released = fun() ->
+        ?LOG_DEBUG(
+            "refresh_iterator for stream '~ts': not_found_offset=~b"
+            " manifest unavailable, result=end_of_manifest",
+            [StreamId, NotFoundOffset]
+        ),
+        end_of_manifest
+    end,
+    rabbitmq_stream_s3_manifest_replica:with_manifest(StreamId, #{
+        resolved => fun(Manifest) -> refresh_iterator1(StreamId, NotFoundOffset, Manifest) end,
+        pending => Released,
+        absent => Released
+    }).
+
+refresh_iterator1(
+    StreamId, NotFoundOffset, #manifest{first_offset = First, next_offset = Next} = Manifest
+) ->
+    GetGroupFun = rabbitmq_stream_s3_manifest:get_group_fun(StreamId),
+    Iterator0 = rabbitmq_stream_s3_fragment_iterator:init(
+        Manifest, NotFoundOffset, GetGroupFun
+    ),
+    %% Advance past the 404'd fragment.
+    Iterator =
+        case rabbitmq_stream_s3_fragment_iterator:next(Iterator0) of
+            {ok, #fragment_ref{offset = O}, It} when O =< NotFoundOffset -> It;
+            _ -> Iterator0
+        end,
+    %% Check if there's anything after.
+    Result =
+        case rabbitmq_stream_s3_fragment_iterator:next(Iterator) of
+            {ok, #fragment_ref{offset = NextOff}, _} -> {iterator, NextOff};
+            _ -> end_of_manifest
+        end,
+    ?LOG_DEBUG(
+        "refresh_iterator for stream '~ts': not_found_offset=~b"
+        " manifest_first=~b manifest_next=~b result=~p",
+        [StreamId, NotFoundOffset, First, Next, Result]
+    ),
+    case Result of
+        {iterator, _} -> Iterator;
+        end_of_manifest -> end_of_manifest
     end.
 
 maybe_stop(#state{stopping = true} = State) ->

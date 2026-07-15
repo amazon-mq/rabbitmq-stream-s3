@@ -150,20 +150,22 @@ on_retention_evaluated(Cnt, #{name := Name}) ->
     %% of -1, which must never reach the counter. get_range/1 returns `empty`
     %% in that case, so the override only runs when the remote tier actually
     %% holds data and its first_timestamp is a real timestamp.
-    case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
-        #manifest{entries = <<>>} ->
-            ok;
-        #manifest{first_offset = RemoteFirst, first_timestamp = RemoteFirstTs} ->
-            LocalFirst = counters:get(Cnt, ?C_OSIRIS_LOG_FIRST_OFFSET),
-            counters:put(Cnt, ?C_OSIRIS_LOG_FIRST_OFFSET, min(LocalFirst, RemoteFirst)),
-            LocalFirstTs = counters:get(Cnt, ?C_OSIRIS_LOG_FIRST_TIMESTAMP),
-            counters:put(Cnt, ?C_OSIRIS_LOG_FIRST_TIMESTAMP, min(LocalFirstTs, RemoteFirstTs));
-        pending ->
-            %% Not yet resolved: nothing known to override the counters with.
-            ok;
-        undefined ->
-            ok
-    end.
+    rabbitmq_stream_s3_manifest_replica:with_manifest(StreamId, #{
+        resolved => fun
+            (#manifest{entries = <<>>}) ->
+                ok;
+            (#manifest{first_offset = RemoteFirst, first_timestamp = RemoteFirstTs}) ->
+                LocalFirst = counters:get(Cnt, ?C_OSIRIS_LOG_FIRST_OFFSET),
+                counters:put(Cnt, ?C_OSIRIS_LOG_FIRST_OFFSET, min(LocalFirst, RemoteFirst)),
+                LocalFirstTs = counters:get(Cnt, ?C_OSIRIS_LOG_FIRST_TIMESTAMP),
+                counters:put(
+                    Cnt, ?C_OSIRIS_LOG_FIRST_TIMESTAMP, min(LocalFirstTs, RemoteFirstTs)
+                )
+        end,
+        %% Not yet resolved: nothing known to override the counters with.
+        pending => fun() -> ok end,
+        absent => fun() -> ok end
+    }).
 
 -doc """
 Discover existing osiris writers and replicas on this node and attach

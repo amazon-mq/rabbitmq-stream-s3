@@ -74,6 +74,7 @@ manifest row.
     get_manifest/1,
     get_manifest_and_epoch/1,
     get_range/1,
+    with_manifest/2,
     mark_pending/1,
     put_manifest/2,
     put_manifest/3,
@@ -144,12 +145,42 @@ resolved or synced yet, so the remote tier's extent is unknown (readers must
 fail closed, not fall back to the local tier); `undefined` means no plugin
 state exists for the stream on this node (an un-tiered stream), so the local
 log is the whole stream.
+
+Code that branches on the state must use `with_manifest/2` instead, which
+makes handling all three states a structural property of the call site. This
+accessor exists for non-branching uses (diagnostics, tests) and for callers
+that immediately re-dispatch through their own total interface.
 """.
 -spec get_manifest(stream_id()) -> #manifest{} | pending | undefined.
 get_manifest(StreamId) ->
     case ets:lookup(?TABLE, StreamId) of
         [{_, Manifest, _Epoch}] -> Manifest;
         [] -> undefined
+    end.
+
+-doc """
+Fold over the cache row's state. The three handlers are mandatory map keys, so
+a caller that fails to consider a state does not compile a quiet fallback into
+place; it fails to match at the call site. This is the enforcement mechanism
+for the Miss semantics invariant (see the Cached state section of
+docs/invariants.md). When a new state is ever added, every `with_manifest/2`
+caller crashes loudly rather than inheriting a neighbor's behavior.
+
+`resolved` receives the manifest (possibly empty); `pending` means attached but
+not yet resolved or synced (readers fail closed, mutators do nothing
+destructive); `absent` means the plugin never attached on this node (an
+un-tiered stream, the local log is the whole stream).
+""".
+-spec with_manifest(stream_id(), #{
+    resolved := fun((#manifest{}) -> Result),
+    pending := fun(() -> Result),
+    absent := fun(() -> Result)
+}) -> Result.
+with_manifest(StreamId, #{resolved := Resolved, pending := Pending, absent := Absent}) ->
+    case get_manifest(StreamId) of
+        #manifest{} = Manifest -> Resolved(Manifest);
+        pending -> Pending();
+        undefined -> Absent()
     end.
 
 -doc """
@@ -433,21 +464,22 @@ handle_call({evaluate_local_retention, StreamId}, _From, #state{contexts = Ctxs}
     Reply =
         case maps:get(StreamId, Ctxs, undefined) of
             #replica_ctx{} = Ctx ->
-                case get_manifest(StreamId) of
-                    #manifest{entries = <<>>} ->
-                        %% No remote tier yet: nothing has been uploaded, so no
-                        %% local segment is safe to delete. Returning early also
-                        %% avoids feeding the empty manifest's -1 first_timestamp
-                        %% sentinel into the counter (see run_local_retention).
-                        ok;
-                    #manifest{} = Manifest ->
-                        run_local_retention(StreamId, Manifest, Ctx),
-                        ok;
-                    pending ->
-                        {error, manifest_not_resolved};
-                    undefined ->
-                        {error, manifest_not_resolved}
-                end;
+                with_manifest(StreamId, #{
+                    resolved => fun
+                        (#manifest{entries = <<>>}) ->
+                            %% No remote tier yet: nothing has been uploaded,
+                            %% so no local segment is safe to delete. Returning
+                            %% early also avoids feeding the empty manifest's
+                            %% -1 first_timestamp sentinel into the counter
+                            %% (see run_local_retention).
+                            ok;
+                        (#manifest{} = Manifest) ->
+                            run_local_retention(StreamId, Manifest, Ctx),
+                            ok
+                    end,
+                    pending => fun() -> {error, manifest_not_resolved} end,
+                    absent => fun() -> {error, manifest_not_resolved} end
+                });
             undefined ->
                 {error, {not_found, StreamId}}
         end,
