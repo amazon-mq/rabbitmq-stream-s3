@@ -32,3 +32,14 @@ fmt-check:
 ct-quick: test-build
 	$(verbose) mkdir -p $(CT_LOGS_DIR)
 	$(gen_verbose) $(CT_RUN) -sname ct_$(PROJECT) -suite $(addsuffix _SUITE,$(CT_QUICK_SUITES)) $(CT_EXTRA) $(CT_OPTS)
+
+# Benchmarks (test/*_bench.erl). Not CI-gated; for before/after comparisons
+# on a quiet machine. `make bench` runs all, `make bench-<module>` runs one.
+# The harness itself matches the *_bench.erl glob; it is not a benchmark.
+BENCH_MODULES = $(filter-out rabbitmq_stream_s3_bench,$(patsubst test/%.erl,%,$(wildcard test/*_bench.erl)))
+
+.PHONY: bench
+bench: $(addprefix bench-,$(BENCH_MODULES))
+
+bench-%: test-build
+	$(gen_verbose) erl -noshell -pa ebin -pa test -eval '$*:run(), halt(0).'

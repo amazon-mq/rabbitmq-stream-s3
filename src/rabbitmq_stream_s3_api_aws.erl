@@ -57,6 +57,11 @@ A wrapper around the AWS S3 HTTP API.
 -define(READ_CHECKOUT_TIMEOUT_MS, 100).
 %% Amount of data to buffer in async state before giving it to the remote
 %% reader process. See the async_state() type.
+%%
+%% This also sets the remote reader's buffer granularity: each batch becomes
+%% one immutable block in its rabbitmq_stream_s3_read_buffer, so this constant
+%% caps how much memory a shared sub-binary read can pin (one block) and keeps
+%% the block count per prefetch window low.
 %% 1024^2 (1 MiB).
 -define(BUFFER_PENDING_DATA_BYTES, 1_048_576).
 

@@ -18,6 +18,9 @@ Covers:
 - A manifest-replica sync is dropped iff it is older than what is recorded,
   comparing epoch before sequence (the manifest-replica-lifecycle model's
   epoch-monotonicity invariant)
+- The read buffer (block queue) serves byte-exact reads against a flat-binary
+  model under arbitrary append/read/drop interleavings, and the remote reader
+  core built on it replies with byte-exact data at every read offset
 """.
 
 -compile([export_all, nowarn_export_all]).
@@ -66,6 +69,9 @@ all() ->
         %% Remote reader core
         remote_reader_core_no_crash,
         remote_reader_core_reply_size_bounded,
+        remote_reader_core_reply_bytes_exact,
+        %% Read buffer (block queue)
+        read_buffer_matches_model,
         %% Garbage collection reap decision
         gc_classify_never_reaps_live,
         gc_classify_reclaims_orphans,
@@ -1780,6 +1786,150 @@ run_rrc_events([{retry} | Rest], State0) ->
 run_rrc_events([Event | Rest], State0) ->
     {State1, _} = rabbitmq_stream_s3_remote_reader_core:step(State0, Event),
     run_rrc_events(Rest, State1).
+
+%% Every reply carries exactly the bytes of the stream at the read offset.
+%% Data content is a function of absolute position, so any bookkeeping error in
+%% the buffer (a block dropped too eagerly, an off-by-one in block slicing, a
+%% stale block surviving a drop) surfaces as a content mismatch, not just a
+%% size mismatch. Steps interleave a delivery with a forward (non-decreasing)
+%% read, the log reader's access pattern.
+remote_reader_core_reply_bytes_exact(_Config) ->
+    rabbit_ct_proper_helpers:run_proper(fun prop_remote_reader_core_reply_bytes_exact/0, [], 500).
+
+prop_remote_reader_core_reply_bytes_exact() ->
+    ?FORALL(
+        Steps,
+        list({range(1, 5000), range(0, 99), range(1, 4000)}),
+        begin
+            FragSize = 100_000_000,
+            FragRef = #fragment_ref{offset = 0, uid = 1, size = FragSize},
+            Manifest = #manifest{
+                first_offset = 0,
+                next_offset = 200,
+                entries = ?ENTRY(0, 0, 0, ?MANIFEST_KIND_FRAGMENT, FragSize, 1)
+            },
+            GetGroupFun = fun(_) -> {error, not_found} end,
+            Iterator0 = rabbitmq_stream_s3_fragment_iterator:init(Manifest, 0, GetGroupFun),
+            Iterator =
+                case rabbitmq_stream_s3_fragment_iterator:next(Iterator0) of
+                    {ok, _, It} -> It;
+                    _ -> Iterator0
+                end,
+            {S0, _} = rabbitmq_stream_s3_remote_reader_core:init(
+                <<"prop-stream">>, FragRef, 8, Iterator, #{}
+            ),
+            run_rrc_exact_steps(Steps, S0, 8, 8)
+        end
+    ).
+
+run_rrc_exact_steps([], _State, _DataEnd, _ReadFloor) ->
+    true;
+run_rrc_exact_steps([{DataLen, PosFrac, LenWant} | Steps], S0, DataEnd0, ReadFloor) ->
+    %% Deliver DataLen bytes of position-patterned data.
+    Data = rb_pattern(DataEnd0, DataLen),
+    {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(
+        S0, {data, make_ref(), 0, Data, done}
+    ),
+    DataEnd = DataEnd0 + DataLen,
+    %% Read at a position at or past the previous read (reads are
+    %% non-decreasing) and within delivered data, so a reply is guaranteed.
+    ReadPos = ReadFloor + ((DataEnd - 1 - ReadFloor) * PosFrac) div 100,
+    ReadLen = min(LenWant, DataEnd - ReadPos),
+    {S2, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
+        S1, {read, ReadPos, ReadLen, chunk_boundary}
+    ),
+    case [D || {reply, {ok, D}} <- Effects] of
+        [Reply] ->
+            Reply =:= rb_pattern(ReadPos, ReadLen) andalso
+                run_rrc_exact_steps(Steps, S2, DataEnd, ReadPos);
+        _ ->
+            false
+    end.
+
+%% =========================================================================
+%% Read buffer (block queue) properties
+%%
+%% The model is the flat binary of everything ever appended, based at the
+%% buffer's initial position. Whatever interleaving of appends, reads, and
+%% block-granular drops occurs, the retained window and every in-range read
+%% must be byte-identical to the corresponding slice of that history.
+%% =========================================================================
+
+read_buffer_matches_model(_Config) ->
+    rabbit_ct_proper_helpers:run_proper(fun prop_read_buffer_matches_model/0, [], 500).
+
+prop_read_buffer_matches_model() ->
+    ?FORALL(
+        {StartPos, Ops},
+        {range(0, 100), list(gen_rb_op())},
+        begin
+            Buf = rabbitmq_stream_s3_read_buffer:new(StartPos),
+            check_rb_ops(Ops, Buf, StartPos, <<>>)
+        end
+    ).
+
+gen_rb_op() ->
+    frequency([
+        %% Zero-length appends exercise the empty-block no-op.
+        {4, {append, range(0, 2000)}},
+        {3, {read, range(0, 99), range(0, 2000)}},
+        %% Fractions above 100 drop past end_pos.
+        {2, {drop, range(0, 120)}}
+    ]).
+
+check_rb_ops([], _Buf, _Base, _History) ->
+    true;
+check_rb_ops([{append, Len} | Ops], Buf0, Base, History0) ->
+    Data = rb_pattern(rabbitmq_stream_s3_read_buffer:end_pos(Buf0), Len),
+    Buf = rabbitmq_stream_s3_read_buffer:append(Data, Buf0),
+    History = <<History0/binary, Data/binary>>,
+    check_rb_window(Buf, Base, History) andalso check_rb_ops(Ops, Buf, Base, History);
+check_rb_ops([{read, PosFrac, LenWant} | Ops], Buf, Base, History) ->
+    Start = rabbitmq_stream_s3_read_buffer:start_pos(Buf),
+    End = rabbitmq_stream_s3_read_buffer:end_pos(Buf),
+    case End - Start of
+        0 ->
+            check_rb_ops(Ops, Buf, Base, History);
+        Size ->
+            Pos = Start + (Size * PosFrac) div 100,
+            Len = min(LenWant, End - Pos),
+            Expected = binary:part(History, Pos - Base, Len),
+            Flat = rabbitmq_stream_s3_read_buffer:read(Pos, Len, Buf),
+            IoData = rabbitmq_stream_s3_read_buffer:read_iodata(Pos, Len, Buf),
+            Flat =:= Expected andalso
+                iolist_to_binary(IoData) =:= Expected andalso
+                check_rb_ops(Ops, Buf, Base, History)
+    end;
+check_rb_ops([{drop, PosFrac} | Ops], Buf0, Base, History) ->
+    Start0 = rabbitmq_stream_s3_read_buffer:start_pos(Buf0),
+    End = rabbitmq_stream_s3_read_buffer:end_pos(Buf0),
+    Pos = Start0 + ((End - Start0) * PosFrac) div 100,
+    Buf = rabbitmq_stream_s3_read_buffer:drop_before(Pos, Buf0),
+    Start = rabbitmq_stream_s3_read_buffer:start_pos(Buf),
+    %% Blocks are dropped whole: the new start never passes Pos (nor end_pos),
+    %% never regresses, and the end is untouched.
+    Start >= Start0 andalso
+        Start =< max(Start0, min(Pos, End)) andalso
+        rabbitmq_stream_s3_read_buffer:end_pos(Buf) =:= End andalso
+        check_rb_window(Buf, Base, History) andalso
+        check_rb_ops(Ops, Buf, Base, History).
+
+%% The retained window [start_pos, end_pos) is byte-identical to the history
+%% slice at those offsets, and the size accounting agrees.
+check_rb_window(Buf, Base, History) ->
+    Start = rabbitmq_stream_s3_read_buffer:start_pos(Buf),
+    End = rabbitmq_stream_s3_read_buffer:end_pos(Buf),
+    Size = rabbitmq_stream_s3_read_buffer:size(Buf),
+    Size =:= End - Start andalso
+        rabbitmq_stream_s3_read_buffer:read(Start, Size, Buf) =:=
+            binary:part(History, Start - Base, Size).
+
+%% Bytes whose value is a function of their absolute offset, so a read's
+%% content proves which offsets it came from.
+rb_pattern(_Pos, 0) ->
+    <<>>;
+rb_pattern(Pos, Len) ->
+    <<<<(P rem 251)>> || P <- lists:seq(Pos, Pos + Len - 1)>>.
 
 %% =========================================================================
 %% Garbage collection reap-decision properties
