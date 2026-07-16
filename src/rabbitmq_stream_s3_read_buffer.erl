@@ -161,6 +161,12 @@ read_iodata(Pos, Len, #buffer{start_pos = StartPos, end_pos = EndPos}) ->
 %% into it, so a read near start_pos never pays for the whole block list.
 take(_Skip, 0, _Front, _Rear) ->
     [];
+take(_Skip, _Len, [], []) ->
+    %% No blocks remain but Len > 0 (the clause above consumed Len == 0). This
+    %% is unreachable while read_iodata/3's range check guards every call, but
+    %% crashing here turns a broken invariant into a loud error rather than an
+    %% infinite loop: the clause below would otherwise spin on lists:reverse([]).
+    error(buffer_underrun);
 take(Skip, Len, [], Rear) ->
     take(Skip, Len, lists:reverse(Rear), []);
 take(Skip, Len, [Block | Blocks], Rear) when Skip >= byte_size(Block) ->

@@ -36,6 +36,9 @@ all() ->
         large_read_shares_block,
         whole_block_read_shares_block_term,
         read_iodata_copies_nothing_at_edges,
+        copy_share_boundary,
+        small_spanning_read_is_copied,
+        read_spans_front_and_rear,
         interleaved_append_read_drop
     ].
 
@@ -196,6 +199,46 @@ read_iodata_copies_nothing_at_edges(_Config) ->
     ?assertEqual(1000, byte_size(Middle)),
     ?assertEqual(500, byte_size(Last)),
     ?assertEqual(pattern(500, 2000), iolist_to_binary(IoData)).
+
+copy_share_boundary(_Config) ->
+    %% Pins down the copy-vs-share cutoff (?COPY_MAX_B = 512). A read at the
+    %% threshold is copied and pins nothing; one byte over it is shared as a
+    %% sub-binary of the whole block. A flip of `=<` to `<` in read/3 would
+    %% regress the threshold read into pinning the block.
+    Buf = build(8, [100_000]),
+    AtLimit = ?BUF:read(50, 512, Buf),
+    ?assertEqual(512, byte_size(AtLimit)),
+    ?assertEqual(512, binary:referenced_byte_size(AtLimit)),
+    OverLimit = ?BUF:read(50, 513, Buf),
+    ?assertEqual(513, byte_size(OverLimit)),
+    ?assertEqual(100_000, binary:referenced_byte_size(OverLimit)).
+
+small_spanning_read_is_copied(_Config) ->
+    %% A small read that straddles two blocks cannot be a sub-binary of any one
+    %% block, so read/3 assembles it into a fresh binary that pins nothing.
+    Buf = build(0, [1000, 1000]),
+    Data = ?BUF:read(950, 100, Buf),
+    ?assertEqual(pattern(950, 100), Data),
+    ?assertEqual(100, binary:referenced_byte_size(Data)).
+
+read_spans_front_and_rear(_Config) ->
+    %% Exercises take/4's front/rear split: a drop migrates blocks into `front`,
+    %% later appends land in `rear`, and a read then crosses the boundary,
+    %% forcing take to drain `front` and reverse `rear`. The deterministic
+    %% build/2 helper only appends (everything lands in `rear`), so without this
+    %% the split state is left to the stochastic property test.
+    Buf0 = build(8, [10, 10, 10]),
+    %% Dropping migrates rear into front and advances start_pos into the second
+    %% block, leaving front = [b2, b3], rear = [].
+    Buf1 = ?BUF:drop_before(20, Buf0),
+    ?assertEqual(18, ?BUF:start_pos(Buf1)),
+    %% Fresh appends land in rear, so the buffer now straddles both lists.
+    %% end_pos is 38 after the drop, so append at 38 first, then at 48.
+    Buf2 = ?BUF:append(pattern(48, 10), ?BUF:append(pattern(38, 10), Buf1)),
+    ?assertEqual(4, ?BUF:block_count(Buf2)),
+    %% A read from a front block into a rear block must be byte-exact.
+    ?assertEqual(pattern(30, 25), ?BUF:read(30, 25, Buf2)),
+    ?assertEqual(pattern(18, 40), ?BUF:read(18, 40, Buf2)).
 
 %% ------------------------------------------------------------------
 %% Interleaving
