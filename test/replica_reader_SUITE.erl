@@ -708,9 +708,22 @@ local_ahead_discards_manifest(Config) ->
     %% Phase 3: restart replica reader. It should discard old manifest and upload new data.
     _ = start_replica_reader(Writer, Config, #{fragment_target_size => 500}),
 
-    %% Wait for the new replica reader to upload.
-    [FirstLocal | _] = list_segment_offsets(Config),
-    await_offset(Config, FirstLocal + 10),
+    %% Wait for the reader to durably upload fresh data.
+    %%
+    %% An await_offset barrier cannot be used here: the reset installs an empty
+    %% manifest whose next_offset equals the local log's first *readable* chunk
+    %% id, which the test cannot compute a priori (it can exceed the segment-file
+    %% offset reported by list_segment_offsets). Any offset the test could name is
+    %% therefore satisfied vacuously by the empty reset manifest, before a single
+    %% fresh fragment uploads, racing the assertions below against the in-flight
+    %% uploads. Instead wait directly for the observable outcome: at least one
+    %% fragment that is not one of the pre-restart fragments appears in the remote
+    %% tier.
+    ?awaitMatch(
+        [_ | _],
+        [F || F <- list_fragment_offsets(Config), not lists:member(F, OldFragments)],
+        5000
+    ),
 
     %% Old fragments should be gone (deleted asynchronously by the replica reader).
     ?awaitMatch(
@@ -718,10 +731,15 @@ local_ahead_discards_manifest(Config) ->
         [F || F <- OldFragments, lists:member(F, list_fragment_offsets(Config))],
         1000
     ),
-    %% New fragments exist starting at or after the local first offset.
+    %% New fragments exist and start above the discarded phase-1 range: the reset
+    %% re-tiered from the local floor, not from offset 0. The exact floor is not
+    %% asserted because it is the local log's first readable chunk id at reset
+    %% time, which the test cannot compute and which local retention keeps
+    %% advancing; asserting it is above the highest pre-restart fragment offset
+    %% captures the intent without racing retention.
     NewFragments = list_fragment_offsets(Config),
     ?assert(length(NewFragments) > 0),
-    ?assert(hd(NewFragments) >= FirstLocal).
+    ?assert(hd(NewFragments) > lists:max(OldFragments)).
 
 upload_path_recovers_from_trimmed_segment(Config) ->
     %% Issue #225, mid-stream path: while a fragment upload is in flight, user
