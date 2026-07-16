@@ -1373,10 +1373,15 @@ resolve_and_start(#state{cfg = #cfg{stream = StreamId}} = State0) ->
     case resolve_manifest(StreamId) of
         {ok, Manifest} ->
             State1 = on_manifest_resolved(Manifest, State0),
-            {Core, _Effects} = rabbitmq_stream_s3_replica_reader_core:init(
+            {Core0, _Effects} = rabbitmq_stream_s3_replica_reader_core:init(
                 Manifest, State1#state.config
             ),
-            start_reading(State1#state{core = Core});
+            %% Carry any await_offset waiters from the discarded core so a caller
+            %% blocked across the rebuild is not dropped without a reply.
+            {Core, WaiterEffects} = rabbitmq_stream_s3_replica_reader_core:carry_waiters(
+                State1#state.core, Core0
+            ),
+            start_reading(execute_effects(WaiterEffects, State1#state{core = Core}));
         {retry, Reason} ->
             %% Logged at WARNING (not ERROR) like the sibling init_data_reader
             %% retry in start_reading: this retries once a second, so a
@@ -1531,7 +1536,11 @@ restart_at_local_floor(
     #state{cfg = #cfg{stream = StreamId, epoch = Epoch}} = State
 ) ->
     FreshManifest = reset_manifest(LocalFirst, Revision),
-    {Core1, _} = rabbitmq_stream_s3_replica_reader_core:init(FreshManifest, State#state.config),
+    {Core0, _} = rabbitmq_stream_s3_replica_reader_core:init(FreshManifest, State#state.config),
+    %% Carry any await_offset waiters from the discarded core (see resolve_and_start/1).
+    {Core1, WaiterEffects} = rabbitmq_stream_s3_replica_reader_core:carry_waiters(
+        State#state.core, Core0
+    ),
     ok = rabbitmq_stream_s3_manifest_replica:put_manifest(StreamId, FreshManifest, Epoch),
     %% Propagate the reset to replicas. The fresh manifest carries the discarded
     %% manifest's revision (the broadcast sequence number), so the sync is not
@@ -1542,7 +1551,7 @@ restart_at_local_floor(
     %% an unsynced register).
     ok = sync_all_replicas(FreshManifest, State),
     gc_stream_async(StreamId, Epoch),
-    start_reading(State#state{core = Core1}).
+    start_reading(execute_effects(WaiterEffects, State#state{core = Core1})).
 
 %% Whether the live local log has been trimmed past the manifest's next_offset.
 %% When true, the segment backing the stalled head fragment is permanently gone
