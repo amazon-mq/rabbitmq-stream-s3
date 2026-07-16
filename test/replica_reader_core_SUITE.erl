@@ -43,6 +43,9 @@ all() ->
         await_offset_satisfied_immediately,
         await_offset_blocks_until_applied,
         multiple_waiters_notified,
+        carry_waiters_replies_when_new_manifest_satisfies,
+        carry_waiters_preserves_unsatisfied_waiter,
+        carry_waiters_from_empty_old_core_is_noop,
         first_fragment_sets_manifest_metadata,
         interleaved_cut_complete_cut,
         timer_restarts_after_persist_and_new_cut,
@@ -452,6 +455,46 @@ multiple_waiters_notified(_Config) ->
     {_S8, Effects2b} = rabbitmq_stream_s3_replica_reader_core:persist_complete(2, S7),
     Replies2 = lists:flatten([Rs || {reply_waiters, Rs} <- Effects2 ++ Effects2b]),
     ?assertMatch([{from2, ok}], Replies2).
+
+carry_waiters_replies_when_new_manifest_satisfies(_Config) ->
+    %% A waiter blocks on the old core, then the core is rebuilt (reinitialize
+    %% or local-ahead reset) with a manifest already past the waiter's offset.
+    %% carry_waiters must reply immediately rather than drop the waiter.
+    {Old0, _} = init_core(#{persist_threshold => 1}),
+    {Old1, []} = rabbitmq_stream_s3_replica_reader_core:await_offset(100, fake_from, Old0),
+    {New0, _} = init_core_with_manifest(#manifest{next_offset = 500}),
+    {New1, Effects} = rabbitmq_stream_s3_replica_reader_core:carry_waiters(Old1, New0),
+    ?assertMatch([{reply_waiters, [{fake_from, ok}]}], Effects),
+    %% The waiter has been discharged, so it does not linger: a later reply
+    %% names only the new caller, never fake_from again.
+    {_New2, Later} = rabbitmq_stream_s3_replica_reader_core:await_offset(1, another_from, New1),
+    ?assertMatch([{reply_waiters, [{another_from, ok}]}], Later).
+
+carry_waiters_preserves_unsatisfied_waiter(_Config) ->
+    %% If the rebuilt manifest is still behind the waiter's offset, the waiter is
+    %% preserved (not dropped, not replied to early) and fires once the new core
+    %% advances past it.
+    {Old0, _} = init_core(#{persist_threshold => 1}),
+    {Old1, []} = rabbitmq_stream_s3_replica_reader_core:await_offset(150, fake_from, Old0),
+    {New0, _} = init_core(#{persist_threshold => 1}),
+    {New1, []} = rabbitmq_stream_s3_replica_reader_core:carry_waiters(Old1, New0),
+    %% Advance the new core past 150 and confirm the carried waiter is notified.
+    {New2, Ref, _} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(0, 200), New1),
+    {New3, _} = rabbitmq_stream_s3_replica_reader_core:transfer_complete(Ref, 1001, New2),
+    {_New4, Effects} = rabbitmq_stream_s3_replica_reader_core:persist_complete(1, New3),
+    Replies = lists:flatten([Rs || {reply_waiters, Rs} <- Effects]),
+    ?assertMatch([{fake_from, ok}], Replies).
+
+carry_waiters_from_empty_old_core_is_noop(_Config) ->
+    %% The common case: the old core had no waiters, so the rebuild carries
+    %% nothing and emits no replies.
+    {Old0, _} = init_core(),
+    {New0, _} = init_core(),
+    ?assertEqual({New0, []}, rabbitmq_stream_s3_replica_reader_core:carry_waiters(Old0, New0)),
+    %% A first init (no prior core) is likewise a no-op.
+    ?assertEqual(
+        {New0, []}, rabbitmq_stream_s3_replica_reader_core:carry_waiters(undefined, New0)
+    ).
 
 tick_no_op_before_interval(_Config) ->
     {S0, _} = init_core(#{persist_threshold => 100, persist_interval_ms => 5000}),

@@ -29,6 +29,7 @@ testable without mocks or timing.
     persist_failed/2,
     tick/2,
     await_offset/3,
+    carry_waiters/2,
     retention_started/1,
     retention_complete/2,
     retention_failed/2
@@ -456,6 +457,26 @@ await_offset(Offset, From, #state{last_persisted_manifest = Committed} = State) 
         false ->
             {State#state{waiters = [{Offset, From} | State#state.waiters]}, []}
     end.
+
+-doc """
+Carry `await_offset` waiters from a discarded core into a freshly built one.
+
+Every path that rebuilds the core (manifest reinitialize after a commit
+conflict, local-log-ahead / remote-ahead reset) replaces the whole state with
+`init/2`, which starts with no waiters. A caller already blocked in
+`await_offset` would otherwise be dropped without a reply and hang until its
+own timeout, even though the reader is healthy and advancing. Move the
+waiters onto the new core and re-run `notify_waiters` so any the resolved
+manifest already satisfies reply immediately.
+""".
+-spec carry_waiters(Old :: state() | undefined, New :: state()) -> {state(), [core_effect()]}.
+carry_waiters(undefined, NewState) ->
+    %% First init (no prior core), so there is nothing to carry.
+    {NewState, []};
+carry_waiters(#state{waiters = []}, NewState) ->
+    {NewState, []};
+carry_waiters(#state{waiters = Waiters}, NewState) ->
+    notify_waiters(NewState#state{waiters = Waiters ++ NewState#state.waiters}).
 
 -doc """
 A group upload completed. Apply the rebalance edit to the in-memory manifest,

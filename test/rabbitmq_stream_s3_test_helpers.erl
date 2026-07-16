@@ -12,6 +12,15 @@ Shared test helpers for rabbitmq_stream_s3 CT suites.
 
 -compile([export_all, nowarn_export_all]).
 
+%% Default deadline for the await_offset/1,2 barriers. The reader only has to
+%% persist a manifest past the target, which is fast in isolation, but under
+%% full-suite CPU contention it occasionally exceeds a tight deadline and the
+%% gen_server:call exits with {timeout, _}. This is generous enough to absorb
+%% that contention without masking a genuine stall (a real freeze never
+%% clears, however long the wait). Callers that need a different deadline use
+%% await_offset/3.
+-define(AWAIT_OFFSET_TIMEOUT_MS, 5000).
+
 %% ------------------------------------------------------------------
 %% Log seeding DSL
 %% ------------------------------------------------------------------
@@ -305,11 +314,11 @@ argument. The Config form provides better diagnostics on timeout.
 """.
 -spec await_offset(binary() | list(), osiris:offset()) -> ok.
 await_offset(StreamId, Offset) when is_binary(StreamId) ->
-    await_offset(StreamId, Offset, 1000);
+    await_offset(StreamId, Offset, ?AWAIT_OFFSET_TIMEOUT_MS);
 await_offset(Config, Offset) when is_list(Config) ->
     StreamId = ?config(stream_id, Config),
     try
-        await_offset(StreamId, Offset, 1000)
+        await_offset(StreamId, Offset, ?AWAIT_OFFSET_TIMEOUT_MS)
     catch
         exit:{timeout, _} ->
             Name = {via, rabbitmq_stream_s3_registry, {StreamId, node()}},
