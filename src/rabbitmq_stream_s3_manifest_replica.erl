@@ -198,9 +198,19 @@ apply_edits(StreamId, Edits, Seq, Epoch, Node) ->
 
 -doc "Apply sequenced edits locally (synchronous).".
 -spec apply_edits(stream_id(), [#edit{}], non_neg_integer(), non_neg_integer()) ->
-    ok | {error, gap} | {error, apply_failed} | {error, no_context}.
+    ok | {error, gap} | {error, apply_failed} | {error, no_context} | {error, term()}.
 apply_edits(StreamId, Edits, Seq, Epoch) ->
-    gen_server:call(?MODULE, {apply_edits, StreamId, Edits, Seq, Epoch, node()}).
+    %% Specced with an {error, _} contract; convert a singleton call exit
+    %% (noproc mid-restart, timeout) into a named error so it cannot escape as a
+    %% raw OTP exit to a caller matching the tagged failures above.
+    try
+        gen_server:call(?MODULE, {apply_edits, StreamId, Edits, Seq, Epoch, node()})
+    catch
+        exit:{timeout, _} ->
+            {error, timeout};
+        exit:Reason ->
+            {error, {manifest_replica_down, Reason}}
+    end.
 
 -doc "Send a sync (full manifest reset) to a remote node. Fire-and-forget.".
 -spec sync(stream_id(), non_neg_integer(), non_neg_integer(), #manifest{}, node()) -> ok.
@@ -238,7 +248,19 @@ is_context_registered(StreamId) ->
 -doc "Evaluate local-tier retention for a stream on this node.".
 -spec evaluate_local_retention(stream_id()) -> ok | {error, term()}.
 evaluate_local_retention(StreamId) ->
-    gen_server:call(?MODULE, {evaluate_local_retention, StreamId}).
+    %% This is specced ok | {error, term()} and reached over
+    %% rabbit_misc:rpc_call from the CLI. gen_server:call/2 exits the caller if
+    %% the per-node singleton is mid-restart (noproc) or overloaded (timeout);
+    %% convert the exit into a named error so it stays within the contract
+    %% rather than escaping as a raw OTP exit.
+    try
+        gen_server:call(?MODULE, {evaluate_local_retention, StreamId})
+    catch
+        exit:{timeout, _} ->
+            {error, timeout};
+        exit:Reason ->
+            {error, {manifest_replica_down, Reason}}
+    end.
 
 -doc """
 Release all per-node state for a stream: its retention context (and member
@@ -766,6 +788,16 @@ seed_first_offset_counter(
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
+
+%% When the singleton is not running (noproc), the synchronous entry points must
+%% convert the gen_server:call exit into a named error rather than letting the
+%% raw OTP exit escape their {error, _} contracts. The server is not registered
+%% during a plain eunit run, so a call to ?MODULE exits with noproc.
+evaluate_local_retention_converts_call_exit_test() ->
+    ?assertMatch({error, {manifest_replica_down, _}}, evaluate_local_retention(<<"s">>)).
+
+apply_edits_converts_call_exit_test() ->
+    ?assertMatch({error, {manifest_replica_down, _}}, apply_edits(<<"s">>, [], 0, 0)).
 
 is_stale_sync_test() ->
     Node = node(),

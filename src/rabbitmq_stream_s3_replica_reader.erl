@@ -318,7 +318,7 @@ with_bucket_status(Result) ->
 evaluate_local_retention(StreamId) ->
     case rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}) of
         Pid when is_pid(Pid) ->
-            gen_server:call(Pid, evaluate_local_retention);
+            safe_call(Pid, evaluate_local_retention);
         undefined ->
             rabbitmq_stream_s3_manifest_replica:evaluate_local_retention(StreamId)
     end.
@@ -695,8 +695,28 @@ format_state(#state{
 
 call(StreamId, Msg) ->
     case find_reader(StreamId) of
-        {ok, Pid} -> gen_server:call(Pid, Msg);
+        {ok, Pid} -> safe_call(Pid, Msg);
         undefined -> {error, {not_found, StreamId}}
+    end.
+
+%% gen_server:call exits the caller on timeout and if the reader is already
+%% gone (noproc) or on a remote node that is unreachable (the pid can be on any
+%% node, see find_reader/1). These admin/retention entry points are specced
+%% ok | {error, term()} and reached over rabbit_misc:rpc_call from the CLI, so a
+%% raw exit would escape the contract (surfacing as {badrpc, {'EXIT', _}} that
+%% the command output/1 clauses do not match). Convert the exit into a named
+%% error so it stays within the contract. Mirrors remote_reader:read/5.
+safe_call(Pid, Msg) ->
+    safe_call(Pid, Msg, 5000).
+
+safe_call(Pid, Msg, Timeout) ->
+    try
+        gen_server:call(Pid, Msg, Timeout)
+    catch
+        exit:{timeout, _} ->
+            {error, timeout};
+        exit:Reason ->
+            {error, {reader_down, Reason}}
     end.
 
 call(VHost, QueueName, Msg) ->
@@ -2498,6 +2518,34 @@ evaluate_retention_on_unresolved_manifest_replies_error_test() ->
         {reply, {error, manifest_not_resolved}, State},
         handle_call(evaluate_remote_retention, From, State)
     ).
+
+%% A call to a dead reader (noproc) must be converted to a named error, not let
+%% the raw OTP exit escape the ok | {error, term()} contract of the admin and
+%% retention entry points (which are reached over rabbit_misc:rpc_call from the
+%% CLI).
+safe_call_dead_reader_returns_reader_down_test() ->
+    Dead = spawn(fun() -> ok end),
+    %% Ensure the process has exited so the call sees noproc.
+    Ref = monitor(process, Dead),
+    receive
+        {'DOWN', Ref, process, Dead, _} -> ok
+    after 1000 -> error(process_did_not_exit)
+    end,
+    ?assertMatch({error, {reader_down, _}}, safe_call(Dead, status)).
+
+%% A call that outlives its timeout must be converted to {error, timeout}. The
+%% stub server never replies, so the short call timeout below fires.
+safe_call_timeout_returns_timeout_test() ->
+    Server = spawn(fun() ->
+        receive
+            never -> ok
+        end
+    end),
+    try
+        ?assertEqual({error, timeout}, safe_call(Server, status, 50))
+    after
+        exit(Server, kill)
+    end.
 
 %% A retry_transfer that fires after a reset cleared the in-flight transfer
 %% tracking must be dropped, not re-submitted as a phantom upload (would
