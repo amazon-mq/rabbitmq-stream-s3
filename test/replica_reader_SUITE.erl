@@ -880,7 +880,7 @@ reconcile_reseeds_writer_cache_after_restart(Config) ->
     %% Await the full offset so the persist pipeline is quiesced: an in-flight
     %% persist would otherwise re-seed the cache right after we clear it and the
     %% stream would not be genuinely idle.
-    ok = await_offset(StreamId, 50),
+    ok = await_offset(Config, 50),
     %% The writer node's local cache holds the stream's manifest.
     ?awaitMatch(M when M =/= undefined, Cache:get_manifest(StreamId), 2000),
 
