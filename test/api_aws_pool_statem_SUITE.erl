@@ -45,6 +45,7 @@ over the invariants above.
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("proper/include/proper.hrl").
+-include_lib("eunit/include/eunit.hrl").
 
 -define(POOL, statem_aws_pool).
 -define(MIN_SIZE, 1).
@@ -57,7 +58,7 @@ over the invariants above.
 -define(AWAIT_MS, 1500).
 
 all() ->
-    [no_leak_or_inconsistency].
+    [no_leak_or_inconsistency, checkout_timeout_returns_pool_busy].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(seshat),
@@ -75,6 +76,26 @@ end_per_suite(Config) ->
 
 no_leak_or_inconsistency(_Config) ->
     rabbit_ct_proper_helpers:run_proper(fun prop_no_leak_or_inconsistency/0, [], 150).
+
+%% A saturated pool must surface as {error, pool_busy}, not a raw
+%% gen_server:call exit escaping the pool boundary (issue #332).
+checkout_timeout_returns_pool_busy(_Config) ->
+    _ = seshat:new_group(rabbitmq_stream_s3),
+    Config = (pool_config())#{name => busy_pool, min_size => 1, max_size => 1},
+    {ok, Pid} = rabbitmq_stream_s3_api_aws_pool:start_link(busy_pool, Config),
+    try
+        %% Take the pool's only connection and hold it, so the next checkout
+        %% cannot be served and must time out.
+        {ok, Conn} = rabbitmq_stream_s3_api_aws_pool:checkout(busy_pool, 1000),
+        ?assertEqual(
+            {error, pool_busy},
+            rabbitmq_stream_s3_api_aws_pool:checkout(busy_pool, 100)
+        ),
+        %% The connection held above is still valid and checks back in cleanly.
+        ok = rabbitmq_stream_s3_api_aws_pool:checkin(busy_pool, Conn)
+    after
+        gen_server:stop(Pid)
+    end.
 
 prop_no_leak_or_inconsistency() ->
     ?FORALL(
@@ -229,9 +250,12 @@ postcondition(_S, {call, _, do_kill_conn, []}, Conn) when is_pid(Conn) ->
 do_checkout(CallerId) ->
     TestPid = self(),
     spawn(fun() ->
+        %% checkout/2 returns {ok, Conn} on success and {error, pool_busy} on a
+        %% saturated-pool timeout; the catch only guards against an unexpected
+        %% exit (e.g. a dead pool), which this model never induces.
         Result =
-            try rabbitmq_stream_s3_api_aws_pool:checkout(?POOL, ?CHECKOUT_TIMEOUT_MS) of
-                Conn -> {ok, Conn}
+            try
+                rabbitmq_stream_s3_api_aws_pool:checkout(?POOL, ?CHECKOUT_TIMEOUT_MS)
             catch
                 C:E -> {error, {C, E}}
             end,

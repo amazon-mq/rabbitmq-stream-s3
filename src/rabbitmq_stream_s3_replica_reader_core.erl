@@ -899,5 +899,14 @@ is_retriable(#{status := Status}) ->
     %% 408 request timeout, 429 throttling, and any 5xx are server-side
     %% transients; everything else (e.g. 403, 404) is fatal.
     Status =:= 408 orelse Status =:= 429 orelse (Status >= 500 andalso Status =< 599);
+%% A saturated upload pool. rabbitmq_stream_s3_api_aws_pool:checkout/2 converts
+%% the checkout timeout into this named atom at the pool boundary, so the real
+%% cause (capacity, not a fatal 403/404) is classified transient and takes the
+%% fast retry path.
+is_retriable(pool_busy) ->
+    true;
+%% Any other reason (including a governor-wrapped {Class, Reason} from an
+%% unexpected upload-task crash) is fatal: the delayed-retry path keeps the
+%% fragment and retries it with a backoff, never dropping it.
 is_retriable(_) ->
     false.

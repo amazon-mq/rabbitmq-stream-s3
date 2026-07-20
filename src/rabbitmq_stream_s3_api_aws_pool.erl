@@ -125,17 +125,27 @@ the reader pool avoids reader starvation.
 
 %%---------------------------------------------------------------------------
 
--spec checkout(pool(), timeout()) -> conn().
+-spec checkout(pool(), timeout()) -> {ok, conn()} | {error, pool_busy}.
 checkout(Pool, Timeout) ->
     %% NOTE: the server monitors the caller, but we also send a cancellation
     %% message. The cancellation message ensures the checkout attempt is
-    %% dropped if the caller is catching the error re-raised in the catch block
-    %% below. The monitor catches cases where the cancellation message can't
-    %% be sent (disconnects, brutal kills, etc.).
+    %% dropped when the checkout times out (the caller is no longer waiting for
+    %% a connection). The monitor catches cases where the cancellation message
+    %% can't be sent (disconnects, brutal kills, etc.).
     Checkout = erlang:make_ref(),
     try
-        gen_server:call(Pool, {checkout, Checkout}, Timeout)
+        {ok, gen_server:call(Pool, {checkout, Checkout}, Timeout)}
     catch
+        %% A saturated pool times the checkout out with a gen_server:call exit.
+        %% Convert it to a named term here, where the knowledge that the
+        %% checkout is a timed gen_server:call lives, so the raw OTP exit never
+        %% escapes the pool boundary and callers classify pool_busy by name.
+        exit:{timeout, _} ->
+            gen_server:cast(Pool, {cancel_checkout, Checkout}),
+            {error, pool_busy};
+        %% Any other exit (e.g. the pool is down) is not a saturation signal.
+        %% Send the cancellation and re-raise, preserving the caller's view of
+        %% a genuinely broken pool.
         C:E:Stack ->
             gen_server:cast(Pool, {cancel_checkout, Checkout}),
             erlang:raise(C, E, Stack)
@@ -145,13 +155,17 @@ checkout(Pool, Timeout) ->
 checkin(Pool, Conn) ->
     gen_server:cast(Pool, {checkin, Conn}).
 
--spec with(pool(), timeout(), fun((conn()) -> term())) -> term().
+-spec with(pool(), timeout(), fun((conn()) -> term())) -> term() | {error, pool_busy}.
 with(Pool, Timeout, Fun) ->
-    Conn = checkout(Pool, Timeout),
-    try
-        Fun(Conn)
-    after
-        ok = checkin(Pool, Conn)
+    case checkout(Pool, Timeout) of
+        {ok, Conn} ->
+            try
+                Fun(Conn)
+            after
+                ok = checkin(Pool, Conn)
+            end;
+        {error, pool_busy} = Err ->
+            Err
     end.
 
 %%---------------------------------------------------------------------------
