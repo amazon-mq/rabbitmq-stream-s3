@@ -93,7 +93,7 @@ jobs:
             https://github.com/amazon-mq/upstream-to-rabbitmq-server.git
           git -C "${{ github.workspace }}/rabbitmq-server" fetch -q --depth 1 origin "$RMQ_SERVER_SHA"
           git -C "${{ github.workspace }}/rabbitmq-server" checkout -q "$RMQ_SERVER_SHA"
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: rabbitmq-server/deps/rabbitmq_stream_s3
           # The job then runs a full server build plus a lein dependency
