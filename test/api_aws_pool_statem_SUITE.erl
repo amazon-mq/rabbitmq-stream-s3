@@ -229,9 +229,12 @@ postcondition(_S, {call, _, do_kill_conn, []}, Conn) when is_pid(Conn) ->
 do_checkout(CallerId) ->
     TestPid = self(),
     spawn(fun() ->
+        %% checkout/2 returns {ok, Conn} on success and {error, pool_busy} on a
+        %% saturated-pool timeout; the catch only guards against an unexpected
+        %% exit (e.g. a dead pool), which this model never induces.
         Result =
-            try rabbitmq_stream_s3_api_aws_pool:checkout(?POOL, ?CHECKOUT_TIMEOUT_MS) of
-                Conn -> {ok, Conn}
+            try
+                rabbitmq_stream_s3_api_aws_pool:checkout(?POOL, ?CHECKOUT_TIMEOUT_MS)
             catch
                 C:E -> {error, {C, E}}
             end,

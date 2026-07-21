@@ -125,17 +125,27 @@ the reader pool avoids reader starvation.
 
 %%---------------------------------------------------------------------------
 
--spec checkout(pool(), timeout()) -> conn().
+-spec checkout(pool(), timeout()) -> {ok, conn()} | {error, pool_busy}.
 checkout(Pool, Timeout) ->
     %% NOTE: the server monitors the caller, but we also send a cancellation
     %% message. The cancellation message ensures the checkout attempt is
-    %% dropped if the caller is catching the error re-raised in the catch block
-    %% below. The monitor catches cases where the cancellation message can't
-    %% be sent (disconnects, brutal kills, etc.).
+    %% dropped when the checkout times out (the caller is no longer waiting for
+    %% a connection). The monitor catches cases where the cancellation message
+    %% can't be sent (disconnects, brutal kills, etc.).
     Checkout = erlang:make_ref(),
     try
-        gen_server:call(Pool, {checkout, Checkout}, Timeout)
+        {ok, gen_server:call(Pool, {checkout, Checkout}, Timeout)}
     catch
+        %% A saturated pool times the checkout out with a gen_server:call exit.
+        %% Convert it to a named term here, where the knowledge that the
+        %% checkout is a timed gen_server:call lives, so the raw OTP exit never
+        %% escapes the pool boundary and callers classify pool_busy by name.
+        exit:{timeout, _} ->
+            gen_server:cast(Pool, {cancel_checkout, Checkout}),
+            {error, pool_busy};
+        %% Any other exit (e.g. the pool is down) is not a saturation signal.
+        %% Send the cancellation and re-raise, preserving the caller's view of
+        %% a genuinely broken pool.
         C:E:Stack ->
             gen_server:cast(Pool, {cancel_checkout, Checkout}),
             erlang:raise(C, E, Stack)
@@ -145,13 +155,17 @@ checkout(Pool, Timeout) ->
 checkin(Pool, Conn) ->
     gen_server:cast(Pool, {checkin, Conn}).
 
--spec with(pool(), timeout(), fun((conn()) -> term())) -> term().
+-spec with(pool(), timeout(), fun((conn()) -> term())) -> term() | {error, pool_busy}.
 with(Pool, Timeout, Fun) ->
-    Conn = checkout(Pool, Timeout),
-    try
-        Fun(Conn)
-    after
-        ok = checkin(Pool, Conn)
+    case checkout(Pool, Timeout) of
+        {ok, Conn} ->
+            try
+                Fun(Conn)
+            after
+                ok = checkin(Pool, Conn)
+            end;
+        {error, pool_busy} = Err ->
+            Err
     end.
 
 %%---------------------------------------------------------------------------
@@ -636,6 +650,8 @@ format_state(#?MODULE{
     }.
 
 -ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
 test_inspect(Pool) ->
     #?MODULE{
         available = Available,
@@ -656,4 +672,47 @@ test_inspect(Pool) ->
         ],
         idle_timers => IdleTimers
     }.
+
+%% A saturated pool must surface as {error, pool_busy}, not a raw
+%% gen_server:call exit escaping the pool boundary (issue #332).
+checkout_timeout_returns_pool_busy_test() ->
+    {ok, _} = application:ensure_all_started(seshat),
+    ok = application:set_env(
+        rabbitmq_stream_s3, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_aws
+    ),
+    _ = seshat:new_group(rabbitmq_stream_s3),
+    Config = #{
+        name => busy_pool,
+        min_size => 1,
+        max_size => 1,
+        open_fun => fun test_open/0,
+        usable_fun => fun erlang:is_process_alive/1,
+        close_fun => fun test_close/1
+    },
+    {ok, Pid} = start_link(busy_pool, Config),
+    try
+        %% Take the pool's only connection and hold it, so the next checkout
+        %% cannot be served and must time out.
+        {ok, Conn} = checkout(busy_pool, 1000),
+        ?assertEqual({error, pool_busy}, checkout(busy_pool, 100)),
+        %% The connection held above is still valid and checks back in cleanly.
+        ok = checkin(busy_pool, Conn)
+    after
+        gen_server:stop(Pid)
+    end.
+
+%% A fake connection is a plain process that only understands `stop`; the pool
+%% sends itself `gun_up` synchronously, mirroring the real `open/0` path.
+test_open() ->
+    Pid = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    self() ! {gun_up, Pid, http},
+    {ok, Pid}.
+
+test_close(Conn) ->
+    catch exit(Conn, kill),
+    ok.
 -endif.

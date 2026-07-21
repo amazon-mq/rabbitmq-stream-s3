@@ -392,26 +392,31 @@ stream_put(Key, ContentLength, Opts0) when is_binary(Key) andalso is_map(Opts0) 
                 {ok, Headers} ->
                     Pool = ?UPLOAD_POOL,
                     %% Acquire the connection before touching the request
-                    %% gauges. checkout/2 re-raises on a timeout or pool-down,
-                    %% and C_ACTIVE_REQUESTS is only decremented by finish_async,
-                    %% which runs once we hold a connection and have built State.
-                    %% Incrementing before the checkout leaked the gauge on every
-                    %% failed checkout (a sustained partial outage that drains the
-                    %% pool drove active_requests up with no way back down).
-                    Conn = rabbitmq_stream_s3_api_aws_pool:checkout(Pool, 10_000),
-                    Cnt = counter(),
-                    counters:add(Cnt, ?C_ACTIVE_REQUESTS, 1),
-                    counters:add(Cnt, ?C_TOTAL_REQUESTS, 1),
-                    StreamRef = gun:headers(Conn, Method, Path, Headers),
-                    State = #{
-                        pool => Pool,
-                        conn => Conn,
-                        stream_ref => StreamRef,
-                        data => [],
-                        pending_bytes => 0,
-                        timeout => maps:get(timeout, Opts0, 60_000)
-                    },
-                    {ok, State};
+                    %% gauges. checkout/2 returns {error, pool_busy} on a
+                    %% saturated pool, and C_ACTIVE_REQUESTS is only decremented
+                    %% by finish_async, which runs once we hold a connection and
+                    %% have built State. Incrementing before the checkout leaked
+                    %% the gauge on every failed checkout (a sustained partial
+                    %% outage that drains the pool drove active_requests up with
+                    %% no way back down).
+                    case rabbitmq_stream_s3_api_aws_pool:checkout(Pool, 10_000) of
+                        {ok, Conn} ->
+                            Cnt = counter(),
+                            counters:add(Cnt, ?C_ACTIVE_REQUESTS, 1),
+                            counters:add(Cnt, ?C_TOTAL_REQUESTS, 1),
+                            StreamRef = gun:headers(Conn, Method, Path, Headers),
+                            State = #{
+                                pool => Pool,
+                                conn => Conn,
+                                stream_ref => StreamRef,
+                                data => [],
+                                pending_bytes => 0,
+                                timeout => maps:get(timeout, Opts0, 60_000)
+                            },
+                            {ok, State};
+                        {error, pool_busy} = Err ->
+                            Err
+                    end;
                 {error, _} = Err ->
                     Err
             end;
@@ -1180,8 +1185,8 @@ request_async(Method, Path, Headers0, Body, Opts) ->
     end.
 
 start_async_request(Pool, Method, Path, Headers, Body, Opts) ->
-    try rabbitmq_stream_s3_api_aws_pool:checkout(Pool, ?READ_CHECKOUT_TIMEOUT_MS) of
-        Conn ->
+    case rabbitmq_stream_s3_api_aws_pool:checkout(Pool, ?READ_CHECKOUT_TIMEOUT_MS) of
+        {ok, Conn} ->
             Cnt = counter(),
             counters:add(Cnt, ?C_ACTIVE_REQUESTS, 1),
             counters:add(Cnt, ?C_TOTAL_REQUESTS, 1),
@@ -1198,10 +1203,9 @@ start_async_request(Pool, Method, Path, Headers, Body, Opts) ->
                 first_data_at => undefined,
                 bytes_received => 0
             },
-            {ok, StreamRef, maybe_set_timer(Opts, StreamRef, State)}
-    catch
-        exit:{timeout, _} ->
-            {error, pool_busy}
+            {ok, StreamRef, maybe_set_timer(Opts, StreamRef, State)};
+        {error, pool_busy} = Err ->
+            Err
     end.
 
 maybe_set_timer(#{timeout := Timeout}, StreamRef, State) ->
