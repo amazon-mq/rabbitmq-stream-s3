@@ -650,6 +650,8 @@ format_state(#?MODULE{
     }.
 
 -ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
 test_inspect(Pool) ->
     #?MODULE{
         available = Available,
@@ -670,4 +672,47 @@ test_inspect(Pool) ->
         ],
         idle_timers => IdleTimers
     }.
+
+%% A saturated pool must surface as {error, pool_busy}, not a raw
+%% gen_server:call exit escaping the pool boundary (issue #332).
+checkout_timeout_returns_pool_busy_test() ->
+    {ok, _} = application:ensure_all_started(seshat),
+    ok = application:set_env(
+        rabbitmq_stream_s3, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_aws
+    ),
+    _ = seshat:new_group(rabbitmq_stream_s3),
+    Config = #{
+        name => busy_pool,
+        min_size => 1,
+        max_size => 1,
+        open_fun => fun test_open/0,
+        usable_fun => fun erlang:is_process_alive/1,
+        close_fun => fun test_close/1
+    },
+    {ok, Pid} = start_link(busy_pool, Config),
+    try
+        %% Take the pool's only connection and hold it, so the next checkout
+        %% cannot be served and must time out.
+        {ok, Conn} = checkout(busy_pool, 1000),
+        ?assertEqual({error, pool_busy}, checkout(busy_pool, 100)),
+        %% The connection held above is still valid and checks back in cleanly.
+        ok = checkin(busy_pool, Conn)
+    after
+        gen_server:stop(Pid)
+    end.
+
+%% A fake connection is a plain process that only understands `stop`; the pool
+%% sends itself `gun_up` synchronously, mirroring the real `open/0` path.
+test_open() ->
+    Pid = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    self() ! {gun_up, Pid, http},
+    {ok, Pid}.
+
+test_close(Conn) ->
+    catch exit(Conn, kill),
+    ok.
 -endif.
