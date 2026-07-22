@@ -236,7 +236,7 @@ postcondition(S, {call, _, do_sync, [StreamId, Seq, Epoch]}, Res) ->
                 case ?REPLICA:is_stale_sync(Epoch, Seq, Recorded) of
                     true ->
                         %% Stale: dropped, cache unchanged.
-                        ?REPLICA:get_manifest(StreamId) =:= maps:get(manifest, SM) andalso
+                        ?REPLICA:get_manifest(StreamId) =:= expected_manifest(SM) andalso
                             ?REPLICA:get_manifest_and_epoch(StreamId) =:=
                                 expected_manifest_and_epoch(SM);
                     false ->
@@ -269,11 +269,23 @@ postcondition(S, {call, _, do_apply_edits, [StreamId, Edit, Seq, Epoch]}, Res) -
                 _ ->
                     %% Property 3: gap/epoch mismatch never corrupts the cache.
                     Res =:= {error, gap} andalso
-                        ?REPLICA:get_manifest(StreamId) =:= maps:get(manifest, SM) andalso
+                        ?REPLICA:get_manifest(StreamId) =:= expected_manifest(SM) andalso
                         ?REPLICA:get_manifest_and_epoch(StreamId) =:=
                             expected_manifest_and_epoch(SM)
             end
     end.
+
+%% get_manifest/1's return for a stream in this model state. A registered
+%% stream's row always exists: register_replica_context/5 marks it pending, so
+%% a stream that has never synced or applied an edit reports pending, not
+%% undefined. get_manifest_and_epoch/1 and get_range/1 do not make this
+%% distinction (see expected_manifest_and_epoch/1); only get_manifest/1 does.
+expected_manifest(#{registered := false}) ->
+    undefined;
+expected_manifest(#{manifest := undefined}) ->
+    pending;
+expected_manifest(#{manifest := M}) ->
+    M.
 
 manifest_or_default(SM) ->
     case maps:get(manifest, SM) of

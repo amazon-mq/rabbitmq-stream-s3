@@ -12,7 +12,7 @@
 -include_lib("rabbitmq_ct_helpers/include/rabbit_assert.hrl").
 
 all() ->
-    [{group, cluster_size_3}].
+    [{group, cluster_size_3}, {group, cluster_size_1}].
 
 groups() ->
     [
@@ -24,6 +24,14 @@ groups() ->
             plugin_disable_reenable,
             prometheus_metrics,
             bucket_monitor_reports_accessible
+        ]},
+        %% Single node on purpose: with replicas, an acceptor's cache is seeded
+        %% by the writer's sync within milliseconds of the member starting, so
+        %% the cold-cache boot window is only reachable on the writer's own
+        %% node with no peer to sync from. A 3-node version of the restart case
+        %% passes with and without the seeding fix (a hollow green).
+        {cluster_size_1, [], [
+            restarted_node_serves_first_from_remote_tier
         ]}
     ].
 
@@ -39,11 +47,16 @@ init_per_suite(Config) ->
 end_per_suite(Config) ->
     Config.
 
-init_per_group(cluster_size_3, Config) ->
+init_per_group(Group, Config) ->
+    Count =
+        case Group of
+            cluster_size_3 -> 3;
+            cluster_size_1 -> 1
+        end,
     DataDir = filename:join([?config(priv_dir, Config), "remote_tier"]),
     Config1 = rabbit_ct_helpers:set_config(Config, [
-        {rmq_nodes_count, 3},
-        {rmq_nodename_suffix, ?MODULE}
+        {rmq_nodes_count, Count},
+        {rmq_nodename_suffix, Group}
     ]),
     Config2 = rabbit_ct_helpers:merge_app_env(Config1, [
         {rabbitmq_stream_s3, [
@@ -143,6 +156,46 @@ consumer_reads_across_tiers(Config) ->
     [?assertEqual(Payload, M) || M <- Messages],
 
     amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
+    ok.
+
+%% A node restart empties the node's manifest cache (ETS), and with no publish
+%% afterwards nothing re-seeds it through a persist. A consumer subscribing at
+%% 'first' on the restarted node, after local retention has trimmed the
+%% earliest segments, must still read from the beginning of the stream in the
+%% remote tier - never silently attach at the local floor. Attach may
+%% transiently fail closed while the manifest resolves; the subscribe helper
+%% retries like a real reconnecting client.
+restarted_node_serves_first_from_remote_tier(Config) ->
+    QName = <<"restart_first_remote">>,
+    Ch = rabbit_ct_client_helpers:open_channel(Config),
+    stream_declare(Ch, QName, [{<<"x-stream-max-segment-size-bytes">>, long, 5000}]),
+    #'confirm.select_ok'{} = amqp_channel:call(Ch, #'confirm.select'{}),
+
+    Payload = binary:copy(<<0>>, 600),
+    N = 20,
+    [publish(Ch, QName, Payload) || _ <- lists:seq(1, N)],
+    true = amqp_channel:wait_for_confirms(Ch, 30),
+    %% The channel lives on node 0, which may be the node restarted below.
+    rabbit_ct_client_helpers:close_channel(Ch),
+
+    #{stream_id := StreamId, writer_node := WriterNode} = get_stream_info(Config, QName),
+    ok = await_offset(Config, WriterNode, StreamId, N),
+    %% Wait for local retention to trim the earliest segment on the writer
+    %% node, so 'first' exists only in the remote tier there.
+    ?awaitMatch([S | _] when S > 0, list_segments(Config, WriterNode, StreamId), 5000),
+
+    WriterIdx = node_index(Config, WriterNode),
+    ok = rabbit_ct_broker_helpers:restart_node(Config, WriterIdx),
+
+    %% Subscribe at 'first' on the restarted node without publishing anything.
+    {S, C1, SubId} = connect_subscribe_first_retry(Config, WriterIdx, QName, 60),
+    Messages = receive_messages(S, C1, SubId, N),
+    gen_tcp:close(S),
+    ?assertEqual(N, length(Messages)),
+    [?assertEqual(Payload, M) || M <- Messages],
+
+    Ch2 = rabbit_ct_client_helpers:open_channel(Config),
+    amqp_channel:call(Ch2, #'queue.delete'{queue = QName}),
     ok.
 
 leadership_transfer_continues_upload(Config) ->
@@ -509,6 +562,34 @@ list_segments(Config, Node, StreamId) ->
         list_segment_offsets_local,
         [StreamId]
     ).
+
+node_index(Config, Node) ->
+    Names = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+    length(lists:takewhile(fun(N) -> N =/= Node end, Names)).
+
+%% Connect to the given node and subscribe at 'first', retrying on any
+%% failure: right after a node restart the member may not be running yet, and
+%% a fail-closed attach (manifest not yet resolved) closes the connection.
+%% Real clients reconnect and retry; so does this helper.
+connect_subscribe_first_retry(_Config, _Idx, QName, 0) ->
+    ct:fail({subscribe_first_never_succeeded, QName});
+connect_subscribe_first_retry(Config, Idx, QName, Attempts) ->
+    SubId = 1,
+    try
+        {ok, S, C0} = stream_test_utils:connect(Config, Idx),
+        try stream_test_utils:subscribe(S, C0, QName, SubId, 10000, #{}, first) of
+            {ok, C1} ->
+                {S, C1, SubId}
+        catch
+            _:_ ->
+                catch gen_tcp:close(S),
+                error(subscribe_failed)
+        end
+    catch
+        _:_ ->
+            timer:sleep(250),
+            connect_subscribe_first_retry(Config, Idx, QName, Attempts - 1)
+    end.
 
 receive_messages(S, C0, SubId, N) ->
     receive_messages(S, C0, SubId, N, []).

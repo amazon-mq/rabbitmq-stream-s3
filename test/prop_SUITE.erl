@@ -76,6 +76,7 @@ all() ->
         gc_classify_never_reaps_live,
         gc_classify_reclaims_orphans,
         gc_still_dangling_respects_live_manifest,
+        gc_still_dangling_pending_row_never_deletes,
         gc_stream_lookup_epoch_gate,
         gc_fresh_enough_fails_closed,
         gc_anchor_decision_fails_closed,
@@ -2181,6 +2182,34 @@ prop_gc_still_dangling_respects_live_manifest() ->
                 fun(B) -> B end,
                 LeadingChecks ++ DataChecks ++ GroupChecks ++ EpochChecks
             )
+        end
+    ).
+
+%% A pending row (attached but not yet resolved) is not a live manifest to
+%% compare against: still_dangling must never treat any offset or group as
+%% deletable while a stream's row is in that state.
+gc_still_dangling_pending_row_never_deletes(_Config) ->
+    {ok, Pid} = rabbitmq_stream_s3_manifest_replica:start_link(),
+    unlink(Pid),
+    try
+        rabbit_ct_proper_helpers:run_proper(
+            fun prop_gc_still_dangling_pending_row_never_deletes/0, [], 300
+        )
+    after
+        gen_server:stop(Pid)
+    end.
+
+prop_gc_still_dangling_pending_row_never_deletes() ->
+    ?FORALL(
+        {Offset, Uid},
+        {non_neg_integer(), gc_uid()},
+        begin
+            StreamId = <<"gc-still-dangling-pending-prop-stream">>,
+            ok = rabbitmq_stream_s3_manifest_replica:mark_pending(StreamId),
+            DataKey = rabbitmq_stream_s3:fragment_key(StreamId, Offset, Uid),
+            GroupKey = gc_group_key(StreamId, Offset, Uid),
+            not gc_still_dangling(StreamId, DataKey) andalso
+                not gc_still_dangling(StreamId, GroupKey)
         end
     ).
 

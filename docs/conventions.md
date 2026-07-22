@@ -24,6 +24,20 @@ The `log_hooks` key follows this pattern. Passing `log_hooks => undefined` in th
 
 The chunk header is not a fixed 48 bytes. It includes a bloom filter whose size depends on `filter_size` configuration. Do not hardcode chunk header sizes. Use `data_size` and `position`/`next_position` from the header map to reason about byte offsets.
 
+## Derived state has no catch-alls
+
+Any state derived from the manifest (the per-node manifest cache, the osiris first-offset counters, iterator snapshots) can be missing or not yet established, and "missing" is never the same value as "empty". When branching on such state, write one clause per state and no catch-all: a `_ ->` arm over cache states is how a cache miss gets silently collapsed into "no remote tier", which is the boot-window read bug (see the Cached state section of [invariants.md](./invariants.md)). If a new state is added, every consumer should fail to compile or crash loudly, not inherit an arbitrary neighbor's behavior.
+
+For the manifest cache this is enforced structurally, not by convention: branching goes through `rabbitmq_stream_s3_manifest_replica:with_manifest/2`, whose handler map has mandatory keys for all three states (`resolved`, `pending`, `absent`). A call site that fails to consider a state does not compile a quiet fallback into place; it fails to match. `get_manifest/1` remains only for non-branching uses (diagnostics, tests). New derived-state APIs should follow the same shape: expose a total fold, not a bare accessor that invites per-caller `case` expressions.
+
+The direction of each explicit miss clause matters: consumers must fail in the direction that cannot lose data. Readers fail closed (error, the consumer retries), retention deletes nothing, GC skips, resolution goes to the authoritative store. A fallback that degrades silently reads as robustness in review and is exactly where correctness leaks out.
+
+## Cold-state test dimension
+
+Every stateful fixture a test warms up implicitly is a state the suite must also construct cold. An end-to-end test that publishes and then reads has, as a side effect, seeded the manifest cache, attached the hooks, and resolved the manifest: the act of arranging the fixture destroys the cold-start state, so the warm path is the only path such suites can ever exercise.
+
+When a subsystem keeps per-node volatile state, its suite needs at least one case that restarts the owning process or node and exercises the consumer before anything re-warms the state (for streams: subscribe before any publish). Note the topology: with replicas present, the writer's sync re-seeds an acceptor's cache within milliseconds, so cold-cache cases need the single-node shape where no peer can heal the state (see `broker_SUITE:restarted_node_serves_first_from_remote_tier/1`).
+
 ## Pure functional cores
 
 Complex state machines use a functional-core / imperative-shell split inspired by Ra's `ra_server` / `ra_server_proc` separation.

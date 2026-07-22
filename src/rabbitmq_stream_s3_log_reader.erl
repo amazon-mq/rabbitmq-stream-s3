@@ -44,6 +44,7 @@ tier.
 -define(C_RESOLVE_DURATION_MS, 11).
 -define(C_RESOLVE, 12).
 -define(C_REMOTE_READER_RESTART, 13).
+-define(C_RESOLVE_FAILED_CLOSED, 14).
 -define(COUNTERS, [
     {remote_init, ?C_REMOTE_INIT, counter, "Readers initialized in remote mode"},
     {local_init, ?C_LOCAL_INIT, counter, "Readers initialized in local mode"},
@@ -68,7 +69,9 @@ tier.
         "Total milliseconds spent resolving offset specs"},
     {resolve, ?C_RESOLVE, counter, "Number of offset spec resolutions"},
     {remote_reader_restart, ?C_REMOTE_READER_RESTART, counter,
-        "Remote tier readers restarted after an unexpected exit"}
+        "Remote tier readers restarted after an unexpected exit"},
+    {resolve_failed_closed, ?C_RESOLVE_FAILED_CLOSED, counter,
+        "Offset spec resolutions failed closed on a pending (unresolved) manifest"}
 ]).
 -define(COUNTER_KEY, {?MODULE, counter}).
 
@@ -141,6 +144,12 @@ init_counters() ->
 counter() ->
     persistent_term:get(?COUNTER_KEY).
 
+record_resolve_failed_closed(T0) ->
+    Cnt = counter(),
+    counters:add(Cnt, ?C_RESOLVE_DURATION_MS, rabbitmq_stream_s3_util:elapsed_ms(T0)),
+    counters:add(Cnt, ?C_RESOLVE, 1),
+    counters:add(Cnt, ?C_RESOLVE_FAILED_CLOSED, 1).
+
 record_resolve(T0, Tier, OffsetSpec) ->
     Cnt = counter(),
     Duration = rabbitmq_stream_s3_util:elapsed_ms(T0),
@@ -167,11 +176,19 @@ record_resolve(T0, Tier, OffsetSpec) ->
 %%%===================================================================
 
 resolve_offset_spec(OffsetSpec, Config) ->
+    T0 = erlang:monotonic_time(),
     case resolve_remote_location(OffsetSpec, Config) of
         {ok, #remote_location{chunk_id = ChunkId}} ->
             {ok, ChunkId};
         {local, LocalSpec} ->
             osiris_log:resolve_offset_spec(LocalSpec, Config);
+        {error, {manifest_not_resolved, _}} = Err ->
+            %% Same fail-closed accounting as init_offset_reader/2: without
+            %% this, a caller that resolves through this callback instead of
+            %% init_offset_reader/2 has its fail-closed attaches invisible to
+            %% the alertable counter.
+            record_resolve_failed_closed(T0),
+            Err;
         {error, _} = Err ->
             Err
     end.
@@ -185,6 +202,24 @@ init_offset_reader(OffsetSpec, Config) ->
         {local, LocalSpec} ->
             record_resolve(T0, local, OffsetSpec),
             init_local_reader(LocalSpec, Config);
+        {error, {manifest_not_resolved, StreamId}} = Err ->
+            %% Fail closed: the manifest cache row is still pending, so the
+            %% remote tier's extent is unknown for a spec that may live in it.
+            %% The consumer's retry lands after resolution (normally
+            %% milliseconds after member start). INFO, not WARNING: expected
+            %% during the attach window; sustained repeats mean manifest
+            %% resolution is stuck and the resolve_failed_closed counter (and
+            %% the replica reader's manifest_resolution_failures) is the
+            %% alertable signal.
+            ?LOG_INFO(
+                "Failing reader setup closed for stream '~ts': offset spec ~w "
+                "may be in the remote tier but the manifest is not yet "
+                "resolved on this node",
+                [StreamId, OffsetSpec],
+                ?DOMAIN
+            ),
+            record_resolve_failed_closed(T0),
+            Err;
         {error, _} = Err ->
             Err
     end.
@@ -193,23 +228,36 @@ resolve_remote_location(Spec, _Config) when Spec =:= last orelse Spec =:= next -
     {local, Spec};
 resolve_remote_location(first, #{name := StreamId, shared := Shared}) ->
     LocalFirstOffset = osiris_log_shared:first_chunk_id(Shared),
-    case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
-        #manifest{first_offset = RemoteFirstOffset} when
-            LocalFirstOffset =:= -1; RemoteFirstOffset < LocalFirstOffset
-        ->
-            %% The remote tier starts before the local log (or the local log is
-            %% empty, first_chunk_id = -1, fully trimmed), so 'first' is in the
-            %% remote tier. Without the -1 case an empty local log would resolve
-            %% to the local tail and skip the entire remote tier.
-            ?LOG_DEBUG(
-                "Attaching remote reader at first offset ~b for spec 'first'",
-                [RemoteFirstOffset],
-                ?DOMAIN
-            ),
-            resolve_first(StreamId, RemoteFirstOffset);
-        _ ->
-            {local, first}
-    end;
+    rabbitmq_stream_s3_manifest_replica:with_manifest(StreamId, #{
+        resolved => fun
+            (#manifest{first_offset = RemoteFirstOffset}) when
+                LocalFirstOffset =:= -1; RemoteFirstOffset < LocalFirstOffset
+            ->
+                %% The remote tier starts before the local log (or the local
+                %% log is empty, first_chunk_id = -1, fully trimmed), so
+                %% 'first' is in the remote tier. Without the -1 case an empty
+                %% local log would resolve to the local tail and skip the
+                %% entire remote tier.
+                ?LOG_DEBUG(
+                    "Attaching remote reader at first offset ~b for spec 'first'",
+                    [RemoteFirstOffset],
+                    ?DOMAIN
+                ),
+                resolve_first(StreamId, RemoteFirstOffset);
+            (#manifest{}) ->
+                %% The remote tier does not start before the local log: the
+                %% local first offset is the stream's beginning.
+                {local, first}
+        end,
+        %% Attached but the manifest is not yet resolved or synced, so where
+        %% the stream begins is unknown. Fail closed: a local fallback here
+        %% would silently skip the remote range below the local floor. The
+        %% consumer retries.
+        pending => fun() -> {error, {manifest_not_resolved, StreamId}} end,
+        %% No plugin state for this stream on this node (un-tiered): the local
+        %% log is the whole stream.
+        absent => fun() -> {local, first} end
+    });
 resolve_remote_location(Offset, #{name := StreamId, shared := Shared}) when
     is_integer(Offset)
 ->
@@ -238,38 +286,48 @@ resolve_remote_location(Offset, #{name := StreamId, shared := Shared}) when
                 ],
                 ?DOMAIN
             ),
-            case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
-                undefined ->
-                    %% No remote manifest is cached: a cold or not-yet-synced
-                    %% cache, or genuinely no remote tier. The requested offset
-                    %% is below the local floor, so emulate osiris_log and attach
-                    %% at the local first offset. Returning {local, next} here
-                    %% would attach at the tail and silently skip all local (and
-                    %% any remote) data the consumer asked for.
-                    {local, first};
-                #manifest{next_offset = RemoteNext} when
-                    FirstChunkId =:= -1, Offset >= RemoteNext
-                ->
-                    %% The local log is empty and the offset is at or beyond the
-                    %% remote tier's tail, i.e. beyond the committed stream.
-                    %% Attach at the live tail and wait for new writes, as a
-                    %% local reader at or past the tail would.
-                    {local, next};
-                #manifest{first_offset = FirstOffset} when Offset < FirstOffset ->
-                    %% Emulate osiris_log's behavior: attach at the beginning
-                    %% of the stream.
-                    resolve_first(StreamId, FirstOffset);
-                #manifest{entries = Entries} = Manifest when byte_size(Entries) >= ?ENTRY_B ->
-                    find_position({offset, Offset}, Manifest, StreamId);
-                #manifest{} ->
-                    %% The remote manifest has no fragment entries (the remote
-                    %% tier is behind the local floor, or retention emptied it).
-                    %% The offset is below the local floor and no remote fragment
-                    %% can serve it, so emulate osiris_log and attach at the local
-                    %% first offset rather than crashing in find_fragment on an
-                    %% empty entry array.
-                    {local, first}
-            end
+            rabbitmq_stream_s3_manifest_replica:with_manifest(StreamId, #{
+                resolved => fun
+                    (#manifest{next_offset = RemoteNext}) when
+                        FirstChunkId =:= -1, Offset >= RemoteNext
+                    ->
+                        %% The local log is empty and the offset is at or
+                        %% beyond the remote tier's tail, i.e. beyond the
+                        %% committed stream. Attach at the live tail and wait
+                        %% for new writes, as a local reader at or past the
+                        %% tail would.
+                        {local, next};
+                    (#manifest{first_offset = FirstOffset}) when Offset < FirstOffset ->
+                        %% Emulate osiris_log's behavior: attach at the
+                        %% beginning of the stream.
+                        resolve_first(StreamId, FirstOffset);
+                    (#manifest{entries = Entries} = Manifest) when
+                        byte_size(Entries) >= ?ENTRY_B
+                    ->
+                        find_position({offset, Offset}, Manifest, StreamId);
+                    (#manifest{}) ->
+                        %% The remote manifest has no fragment entries (the
+                        %% remote tier is behind the local floor, or retention
+                        %% emptied it). The offset is below the local floor and
+                        %% no remote fragment can serve it, so emulate
+                        %% osiris_log and attach at the local first offset
+                        %% rather than crashing in find_fragment on an empty
+                        %% entry array.
+                        {local, first}
+                end,
+                %% Attached but not yet resolved or synced: the remote tier's
+                %% extent is unknown and the offset is below the local floor,
+                %% so it cannot be served without it. Fail closed rather than
+                %% silently skip; the consumer retries.
+                pending => fun() -> {error, {manifest_not_resolved, StreamId}} end,
+                %% No plugin state for this stream on this node (un-tiered):
+                %% the local log is the whole stream. The requested offset is
+                %% below the local floor, so emulate osiris_log and attach at
+                %% the local first offset. Returning {local, next} here would
+                %% attach at the tail and silently skip all local data the
+                %% consumer asked for.
+                absent => fun() -> {local, first} end
+            })
     end;
 resolve_remote_location({timestamp, Ts} = Spec, #{name := StreamId}) ->
     ?LOG_DEBUG(
@@ -279,26 +337,43 @@ resolve_remote_location({timestamp, Ts} = Spec, #{name := StreamId}) ->
     ),
     %% We can't cheaply query the first timestamp from `osiris_log_shared`.
     %% Instead try the remote tier first.
-    case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
-        #manifest{first_offset = FirstOffset, first_timestamp = FirstTs} when Ts < FirstTs ->
-            resolve_first(StreamId, FirstOffset);
-        #manifest{entries = Entries} = Manifest ->
-            case rabbitmq_stream_s3_array:last(?ENTRY_B, Entries) of
-                ?ENTRY(_O, _FTs, LTs, _, _, _) when LTs >= Ts ->
-                    find_position({timestamp, Ts}, Manifest, StreamId);
-                _ ->
-                    {local, Spec}
-            end;
-        undefined ->
-            {local, Spec}
-    end;
-resolve_remote_location({abs, Offset}, Config) ->
-    case total_range(Config) of
-        {First, Last} when First =< Offset andalso Offset =< Last ->
-            resolve_remote_location(Offset, Config);
-        Range ->
-            {error, {offset_out_of_range, Range}}
-    end.
+    rabbitmq_stream_s3_manifest_replica:with_manifest(StreamId, #{
+        resolved => fun
+            (#manifest{first_offset = FirstOffset, first_timestamp = FirstTs}) when
+                Ts < FirstTs
+            ->
+                resolve_first(StreamId, FirstOffset);
+            (#manifest{entries = Entries} = Manifest) ->
+                case rabbitmq_stream_s3_array:last(?ENTRY_B, Entries) of
+                    ?ENTRY(_O, _FTs, LTs, _, _, _) when LTs >= Ts ->
+                        find_position({timestamp, Ts}, Manifest, StreamId);
+                    _ ->
+                        {local, Spec}
+                end
+        end,
+        %% Attached but not yet resolved or synced: the timestamp may live in
+        %% the remote tier. Fail closed rather than silently skip.
+        pending => fun() -> {error, {manifest_not_resolved, StreamId}} end,
+        absent => fun() -> {local, Spec} end
+    });
+resolve_remote_location({abs, Offset}, #{name := StreamId} = Config) ->
+    CheckRange = fun() ->
+        case total_range(Config) of
+            {First, Last} when First =< Offset andalso Offset =< Last ->
+                resolve_remote_location(Offset, Config);
+            Range ->
+                {error, {offset_out_of_range, Range}}
+        end
+    end,
+    rabbitmq_stream_s3_manifest_replica:with_manifest(StreamId, #{
+        resolved => fun(_) -> CheckRange() end,
+        %% {abs, Offset} validates the offset against the stream's total range,
+        %% which is unknown until the manifest resolves. Fail closed with a
+        %% retryable error; an out_of_range here would be a lie the client
+        %% treats as permanent.
+        pending => fun() -> {error, {manifest_not_resolved, StreamId}} end,
+        absent => fun() -> CheckRange() end
+    }).
 
 -doc "Finds the range of offsets in both local and remote tiers".
 -spec total_range(osiris_log:config()) -> rabbitmq_stream_s3:range().
@@ -1132,29 +1207,42 @@ advance_past_current(Iterator) ->
     end.
 
 resolve_first(StreamId, FirstOffset) ->
-    case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
-        #manifest{entries = Entries} = Manifest when byte_size(Entries) >= ?ENTRY_B ->
-            GetGroupFun = rabbitmq_stream_s3_manifest:get_group_fun(StreamId),
-            Iterator = rabbitmq_stream_s3_fragment_iterator:init(
-                Manifest, FirstOffset, GetGroupFun
-            ),
-            Lookup = rabbitmq_stream_s3_fragment_iterator:next(Iterator),
-            case resolve_first_lookup(Lookup) of
-                {remote, Location} ->
-                    {ok, Location};
-                {local, first} ->
-                    {local, first};
-                {retry, Reason} ->
-                    %% A transient group fetch failed while descending to the
-                    %% first fragment. Failing the read setup (rather than
-                    %% falling back to the local tier) makes the consumer retry
-                    %% instead of silently skipping the remote range below the
-                    %% local floor.
-                    {error, Reason}
-            end;
-        _ ->
-            {local, first}
-    end.
+    rabbitmq_stream_s3_manifest_replica:with_manifest(StreamId, #{
+        resolved => fun
+            (#manifest{entries = Entries} = Manifest) when byte_size(Entries) >= ?ENTRY_B ->
+                GetGroupFun = rabbitmq_stream_s3_manifest:get_group_fun(StreamId),
+                Iterator = rabbitmq_stream_s3_fragment_iterator:init(
+                    Manifest, FirstOffset, GetGroupFun
+                ),
+                Lookup = rabbitmq_stream_s3_fragment_iterator:next(Iterator),
+                case resolve_first_lookup(Lookup) of
+                    {remote, Location} ->
+                        {ok, Location};
+                    {local, first} ->
+                        {local, first};
+                    {retry, Reason} ->
+                        %% A transient group fetch failed while descending to
+                        %% the first fragment. Failing the read setup (rather
+                        %% than falling back to the local tier) makes the
+                        %% consumer retry instead of silently skipping the
+                        %% remote range below the local floor.
+                        {error, Reason}
+                end;
+            (#manifest{}) ->
+                %% No fragment entries: the remote tier is empty here (behind
+                %% the local floor, or retention emptied it), so the local
+                %% first offset is the oldest data that exists.
+                {local, first}
+        end,
+        %% Unreachable from the resolution clauses (they only call in after
+        %% observing a resolved manifest, and a row is never downgraded), but
+        %% stated: a pending row must never be collapsed into the local
+        %% fallback.
+        pending => fun() -> {error, {manifest_not_resolved, StreamId}} end,
+        %% The row was released concurrently (the member is going down); the
+        %% local fallback is moot, the reader is about to die with it.
+        absent => fun() -> {local, first} end
+    }).
 
 %% Interpret the first-fragment lookup returned by the fragment iterator. Total
 %% over the three outcomes of `fragment_iterator:next/1`, with no catch-all so a
@@ -1239,11 +1327,11 @@ read(RemoteReader, Offset, Bytes, Hint, Attempt) ->
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
-%% A subscription by offset below the local floor, when no remote manifest is
-%% cached (a cold/not-yet-synced cache), must fall back to the local first
-%% offset, not the tail. Attaching at the tail ({local, next}) silently skips
-%% every record the consumer asked for.
-resolve_below_floor_cold_cache_falls_back_to_first_test_() ->
+%% A stream with no cache row at all is un-tiered on this node (the plugin
+%% never attached to it), so the local log is the whole stream: emulate
+%% osiris_log and attach at the local first offset, not the tail. Attaching at
+%% the tail ({local, next}) silently skips every record the consumer asked for.
+resolve_below_floor_unattached_falls_back_to_first_test_() ->
     {setup,
         fun() ->
             {ok, Pid} = rabbitmq_stream_s3_manifest_replica:start_link(),
@@ -1253,13 +1341,47 @@ resolve_below_floor_cold_cache_falls_back_to_first_test_() ->
         fun(Pid) -> gen_server:stop(Pid) end, fun(_) ->
             Shared = osiris_log_shared:new(),
             ok = osiris_log_shared:set_first_chunk_id(Shared, 100),
-            Config = #{name => <<"cold-stream">>, shared => Shared},
+            Config = #{name => <<"untiered-stream">>, shared => Shared},
             [
-                %% Below the local floor, cold cache: fall back to local first.
+                %% Below the local floor, no plugin state: fall back to local
+                %% first.
                 ?_assertEqual({local, first}, resolve_remote_location(5, Config)),
+                ?_assertEqual({local, first}, resolve_remote_location(first, Config)),
                 %% At/above the local floor: local reader at the offset (no
-                %% cache needed), unaffected by this change.
+                %% cache needed).
                 ?_assertEqual({local, 150}, resolve_remote_location(150, Config))
+            ]
+        end}.
+
+%% A pending cache row means the plugin is attached but the manifest is not yet
+%% resolved: the remote tier's extent is unknown, so any spec that may live in
+%% it must fail closed (a retryable error) rather than fall back to the local
+%% tier and silently skip the remote range below the local floor. Specs the
+%% local tier answers by itself are unaffected.
+resolve_pending_fails_closed_test_() ->
+    {setup,
+        fun() ->
+            {ok, Pid} = rabbitmq_stream_s3_manifest_replica:start_link(),
+            unlink(Pid),
+            Pid
+        end,
+        fun(Pid) -> gen_server:stop(Pid) end, fun(_) ->
+            StreamId = <<"pending-stream">>,
+            ok = rabbitmq_stream_s3_manifest_replica:mark_pending(StreamId),
+            Shared = osiris_log_shared:new(),
+            ok = osiris_log_shared:set_first_chunk_id(Shared, 100),
+            Config = #{name => StreamId, shared => Shared},
+            Err = {error, {manifest_not_resolved, StreamId}},
+            [
+                ?_assertEqual(Err, resolve_remote_location(first, Config)),
+                ?_assertEqual(Err, resolve_remote_location(5, Config)),
+                ?_assertEqual(Err, resolve_remote_location({timestamp, 123}, Config)),
+                ?_assertEqual(Err, resolve_remote_location({abs, 5}, Config)),
+                %% At/above the local floor the local tier alone answers, so
+                %% pending does not block the read.
+                ?_assertEqual({local, 150}, resolve_remote_location(150, Config)),
+                ?_assertEqual({local, last}, resolve_remote_location(last, Config)),
+                ?_assertEqual({local, next}, resolve_remote_location(next, Config))
             ]
         end}.
 

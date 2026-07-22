@@ -23,13 +23,18 @@ A consumer subscribes to a stream with an offset spec (`first`, `last`, `next`, 
 
 Resolution determines which tier holds the requested offset and where within that tier to start reading.
 
-The log reader checks the manifest cache (`rabbitmq_stream_s3_manifest_replica:get_range/1`) to get the remote tier's `{first_offset, next_offset}`. It also checks the local log's first chunk ID via shared atomics.
+The log reader checks the manifest cache (`rabbitmq_stream_s3_manifest_replica:get_manifest/1`) for the remote tier's extent. It also checks the local log's first chunk ID via shared atomics. The cache row is in one of three states, and the decision depends on the state, not just the extent (see the Cached state section of [invariants.md](./invariants.md)):
 
-Decision logic:
+Decision logic with a resolved manifest:
 
+- If the offset is at or above the local first chunk ID: resolve to local (delegate to `osiris_log`). The cache is not consulted; `last` and `next` also short-circuit to local.
 - If the offset is below the local first chunk ID and within the manifest's range: resolve to remote.
-- If the offset is at or above the local first chunk ID: resolve to local (delegate to `osiris_log`).
-- If the offset is below both the local range and the manifest range: the data has been retained away. Return `{error, {offset_out_of_range, ...}}`.
+- If the offset is below both the local range and the manifest range: the data has been retained away. Attach at the oldest available data, matching vanilla stream retention behavior.
+
+Decision logic without one:
+
+- If the row is `pending` (the plugin is attached on this node but the manifest has not been resolved or synced yet, for example in the first moments after a member starts): fail closed with `{error, {manifest_not_resolved, StreamId}}` for any spec the remote tier may hold (`first`, a below-floor offset, a timestamp, `{abs, _}`). The subscription fails and the client retries; falling back to the local tier here would silently skip the remote range below the local floor. The `resolve_failed_closed` counter records these.
+- If there is no row at all: the plugin never attached to this stream on this node (an un-tiered stream), so the local log is the whole stream and local resolution is exact.
 
 For timestamp-based specs, the log reader binary-searches the manifest's entries (each entry has `first_timestamp` and `last_timestamp`) to find the fragment containing the target timestamp.
 

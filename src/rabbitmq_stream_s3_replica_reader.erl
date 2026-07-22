@@ -382,6 +382,13 @@ init(
         epoch = Epoch
     },
     Retention = maps:get(retention, Args, []),
+    %% Mark this node's manifest cache row pending before returning: init runs
+    %% inside the on_init(writer) hook, synchronously within osiris_log:init,
+    %% so the row exists before the member finishes starting and therefore
+    %% before any consumer can attach a reader. Readers fail closed on pending
+    %% until resolve_manifest seeds the resolved manifest. Insert-if-absent: a
+    %% row surviving a transient reader restart is never downgraded.
+    ok = rabbitmq_stream_s3_manifest_replica:mark_pending(StreamId),
     {ok,
         #state{
             cfg = Cfg,
@@ -768,19 +775,25 @@ maybe_reseed_local_cache(#state{core = Core, cfg = #cfg{stream = StreamId, epoch
             %% No remote tier yet; nothing to cache.
             ok;
         #manifest{} = Manifest ->
-            case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
-                undefined ->
-                    ?LOG_INFO(
-                        "Reconciliation: re-seeding the local manifest cache for "
-                        "stream ~ts after a manifest_replica restart",
-                        [StreamId]
-                    ),
-                    ok = rabbitmq_stream_s3_manifest_replica:put_manifest(
-                        StreamId, Manifest, Epoch
-                    );
-                _ ->
-                    ok
-            end
+            %% An absent row means the manifest_replica restarted and lost it;
+            %% a pending row is a marker leaked from an incarnation that died
+            %% between init and resolution. Both leave readers unable to
+            %% resolve the remote tier, so re-seed.
+            Reseed = fun() ->
+                ?LOG_INFO(
+                    "Reconciliation: re-seeding the local manifest cache for "
+                    "stream ~ts after a manifest_replica restart",
+                    [StreamId]
+                ),
+                ok = rabbitmq_stream_s3_manifest_replica:put_manifest(
+                    StreamId, Manifest, Epoch
+                )
+            end,
+            rabbitmq_stream_s3_manifest_replica:with_manifest(StreamId, #{
+                resolved => fun(_) -> ok end,
+                pending => Reseed,
+                absent => Reseed
+            })
     end.
 
 %% Proactively register replica nodes for manifest broadcast.
@@ -1286,15 +1299,20 @@ maybe_spawn_group_retention(_Manifest, _Retention, _Now, _StreamId, State) ->
 
 -spec resolve_manifest(stream_id()) -> {ok, #manifest{}} | {retry, term()}.
 resolve_manifest(StreamId) ->
-    case rabbitmq_stream_s3_manifest_replica:get_manifest(StreamId) of
-        #manifest{} = M ->
+    %% A pending row is this incarnation's own init marker (or a
+    %% predecessor's): there is no cached manifest to trust, so resolve
+    %% authoritatively, exactly as for an absent row.
+    FromStore = fun() -> resolve_manifest_from_store(StreamId) end,
+    rabbitmq_stream_s3_manifest_replica:with_manifest(StreamId, #{
+        resolved => fun(M) ->
             case classify_cache_result(M, catch rabbitmq_stream_s3_db:get(StreamId)) of
                 {ok, _} = Ok -> Ok;
                 resolve_from_store -> resolve_manifest_from_store(StreamId)
-            end;
-        undefined ->
-            resolve_manifest_from_store(StreamId)
-    end.
+            end
+        end,
+        pending => FromStore,
+        absent => FromStore
+    }).
 
 %% Decide whether the locally cached manifest may be trusted on resolution
 %% (startup, promotion, reinitialize, recovery). Split out like
@@ -2413,16 +2431,31 @@ apply_task_crash(retention, Reason, #state{tasks = Tasks0, cfg = #cfg{stream = S
     ),
     apply_retention_decisions(Decisions, State0#state{tasks = Tasks}).
 
-on_manifest_resolved(#manifest{next_offset = 0}, State) ->
+on_manifest_resolved(
+    #manifest{next_offset = 0} = Manifest,
+    #state{cfg = #cfg{stream = StreamId, epoch = Epoch}} = State
+) ->
     inc(State, ?C_MANIFESTS_RESOLVED_EMPTY, 1),
     update_manifest_gauges(#manifest{}, State),
+    %% Seed the cache row even when the resolved manifest is empty: the row
+    %% replaces the pending marker written at init, telling readers the remote
+    %% tier is resolved (and empty) so they stop failing closed and serve
+    %% locally. Without this a brand-new stream would fail closed until its
+    %% first persist.
+    ok = rabbitmq_stream_s3_manifest_replica:put_manifest(StreamId, Manifest, Epoch),
     State;
 on_manifest_resolved(
     #manifest{first_offset = ManifestFirst, first_timestamp = ManifestFirstTs} = Manifest,
-    #state{cfg = #cfg{counter = Cnt}} = State
+    #state{cfg = #cfg{stream = StreamId, epoch = Epoch, counter = Cnt}} = State
 ) ->
     inc(State, ?C_MANIFESTS_RESOLVED, 1),
     update_manifest_gauges(Manifest, State),
+    %% Seed this node's manifest cache row from the just-resolved manifest,
+    %% replacing the pending marker written at init, so consumers attaching at
+    %% 'first' (or any offset below the local floor) can see the remote tier
+    %% without waiting for a publish-driven persist or the reconciler's
+    %% periodic reseed.
+    ok = rabbitmq_stream_s3_manifest_replica:put_manifest(StreamId, Manifest, Epoch),
     %% Seed the osiris first-offset and first-timestamp counters immediately so
     %% the management UI reflects the remote tier's range without waiting for the
     %% first retention evaluation or manifest edit. Without this, an idle stream

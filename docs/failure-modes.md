@@ -85,6 +85,24 @@ Discarding remote manifest and restarting from the local log.
 
 ---
 
+## Node restart with an idle stream (cold manifest cache)
+
+**Trigger.** A node restarts, emptying its in-memory manifest cache, and no publish follows. This is the most ordinary event in the catalog: an upgrade, a reboot, a crash-and-recover, followed by consumers reconnecting before producers do.
+
+**Impact assessment.** None. The member-init hooks mark the stream's cache row `pending` before the member finishes starting, and the replica reader's manifest resolution (writer node) or the writer's sync (replica nodes) replaces the marker moments later. A consumer that attaches inside that window has its subscription fail closed with `{error, {manifest_not_resolved, _}}` and retries; it cannot be silently attached at the local floor.
+
+**Detection.**
+
+- `rabbitmq_stream_s3_log_reader` counter `resolve_failed_closed` counts attaches that failed closed during the window; a burst right after a restart is expected, a sustained rate is not.
+- `rabbitmq_stream_s3_replica_reader` counter `manifest_resolution_failures` increments when resolution itself cannot complete (S3 or metadata store unavailable), which is what keeps rows pending.
+- Logs: `Failing reader setup closed for stream <stream_id>` (INFO, expected during the window); `Reconciliation: re-seeding the local manifest cache` (the reconciler healing a row that resolution could not seed, for example after a manifest_replica crash).
+
+**Mitigation.** None needed in the normal case; the window is milliseconds. If consumers fail closed for longer, manifest resolution is stuck: check S3 reachability and the metadata store, exactly as for an S3 outage.
+
+**Resolution.** Automatic. Resolution or sync replaces the pending marker; the reconciler heals leaked markers within one period.
+
+---
+
 ## Segment deleted before upload
 
 **Trigger.** Local retention deletes a segment the replica reader has not yet uploaded. Most likely during an S3 outage or when local retention is aggressive relative to throughput.
