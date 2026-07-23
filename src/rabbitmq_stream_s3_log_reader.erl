@@ -182,13 +182,15 @@ resolve_offset_spec(OffsetSpec, Config) ->
             {ok, ChunkId};
         {local, LocalSpec} ->
             osiris_log:resolve_offset_spec(LocalSpec, Config);
-        {error, {manifest_not_resolved, _}} = Err ->
+        {error, {manifest_not_resolved, _}} ->
             %% Same fail-closed accounting as init_offset_reader/2: without
             %% this, a caller that resolves through this callback instead of
             %% init_offset_reader/2 has its fail-closed attaches invisible to
-            %% the alertable counter.
+            %% the alertable counter. osiris_log_reader's transient_error/0
+            %% contract is the external shape; the specific reason stays
+            %% internal to this module.
             record_resolve_failed_closed(T0),
-            Err;
+            {error, unavailable};
         {error, _} = Err ->
             Err
     end.
@@ -202,7 +204,7 @@ init_offset_reader(OffsetSpec, Config) ->
         {local, LocalSpec} ->
             record_resolve(T0, local, OffsetSpec),
             init_local_reader(LocalSpec, Config);
-        {error, {manifest_not_resolved, StreamId}} = Err ->
+        {error, {manifest_not_resolved, StreamId}} ->
             %% Fail closed: the manifest cache row is still pending, so the
             %% remote tier's extent is unknown for a spec that may live in it.
             %% The consumer's retry lands after resolution (normally
@@ -210,7 +212,9 @@ init_offset_reader(OffsetSpec, Config) ->
             %% during the attach window; sustained repeats mean manifest
             %% resolution is stuck and the resolve_failed_closed counter (and
             %% the replica reader's manifest_resolution_failures) is the
-            %% alertable signal.
+            %% alertable signal. osiris_log_reader's transient_error/0 contract
+            %% ({error, unavailable}) is the external shape a caller sees; the
+            %% specific reason logged here stays internal to this module.
             ?LOG_INFO(
                 "Failing reader setup closed for stream '~ts': offset spec ~w "
                 "may be in the remote tier but the manifest is not yet "
@@ -219,7 +223,7 @@ init_offset_reader(OffsetSpec, Config) ->
                 ?DOMAIN
             ),
             record_resolve_failed_closed(T0),
-            Err;
+            {error, unavailable};
         {error, _} = Err ->
             Err
     end.
