@@ -45,15 +45,19 @@ all() ->
         routing_unattached_below_floor_resolves_first,
         routing_pending_below_floor_fails_closed,
         routing_pending_spec_first_fails_closed,
-        routing_empty_local_log_routes_remote
+        routing_empty_local_log_routes_remote,
+        pending_row_reports_unavailable_at_callback_boundary
     ].
 
 %% The routing properties drive the real `log_reader:resolve_remote_location/2`,
 %% which reads the cached manifest through `manifest_replica`. The pure-core cases
 %% above do not need it, but a singleton is cheap to keep for the whole suite.
 init_per_suite(Config) ->
+    {ok, _} = application:ensure_all_started(osiris),
+    _ = seshat:new_group(rabbitmq_stream_s3),
     {ok, Pid} = rabbitmq_stream_s3_manifest_replica:start_link(),
     unlink(Pid),
+    ok = rabbitmq_stream_s3_log_reader:init_counters(),
     [{manifest_replica, Pid} | Config].
 
 end_per_suite(Config) ->
@@ -212,6 +216,21 @@ prop_pending_spec_first_fails_closed() ->
                 {error, {manifest_not_resolved, StreamId}}
         end
     ).
+
+%% resolve_remote_location/2 (exercised above) reports a pending row with the
+%% plugin's own internal reason, but init_offset_reader/2 and
+%% resolve_offset_spec/2 are the two functions that actually implement the
+%% osiris_log_reader callback contract: at that boundary the internal reason
+%% must be translated to osiris_log_reader's transient_error/0 contract
+%% ({error, unavailable}), not leaked out as a plugin-specific term.
+pending_row_reports_unavailable_at_callback_boundary(_Config) ->
+    StreamId = <<"pending-callback-boundary">>,
+    ok = rabbitmq_stream_s3_manifest_replica:mark_pending(StreamId),
+    Shared = osiris_log_shared:new(),
+    ok = osiris_log_shared:set_first_chunk_id(Shared, 100),
+    Cfg = #{name => StreamId, shared => Shared},
+    ?assertEqual({error, unavailable}, ?LR:init_offset_reader(first, Cfg)),
+    ?assertEqual({error, unavailable}, ?LR:resolve_offset_spec(first, Cfg)).
 
 %% With the local log empty (first_chunk_id = -1) and a populated remote tier,
 %% the beginning and any offset below the remote first resolve to the remote

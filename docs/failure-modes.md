@@ -89,7 +89,7 @@ Discarding remote manifest and restarting from the local log.
 
 **Trigger.** A node restarts, emptying its in-memory manifest cache, and no publish follows. This is the most ordinary event in the catalog: an upgrade, a reboot, a crash-and-recover, followed by consumers reconnecting before producers do.
 
-**Impact assessment.** None. The member-init hooks mark the stream's cache row `pending` before the member finishes starting, and the replica reader's manifest resolution (writer node) or the writer's sync (replica nodes) replaces the marker moments later. A consumer that attaches inside that window has its subscription fail closed with `{error, {manifest_not_resolved, _}}` and retries; it cannot be silently attached at the local floor.
+**Impact assessment.** None. The member-init hooks mark the stream's cache row `pending` before the member finishes starting, and the replica reader's manifest resolution (writer node) or the writer's sync (replica nodes) replaces the marker moments later. A consumer that attaches inside that window has its subscription fail closed with `osiris_log_reader`'s `{error, unavailable}` and retries; it cannot be silently attached at the local floor.
 
 **Detection.**
 
