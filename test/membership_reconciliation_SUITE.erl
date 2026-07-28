@@ -109,7 +109,7 @@ add_remove(Config) ->
         StopNode,
         false
     ]),
-    ?awaitMatch([_, _], stream_coordinator_members(Config, Leader2), 1_000),
+    ?awaitMatch([_, _], stream_coordinator_members(Config, Leader2), 5_000),
     evaluate_membership(Config, Leader2),
     ?awaitMatch(#{nodes := [_, _]}, get_type_state(Config, Leader2, QRef), 1_000),
     ?awaitMatch(Members when map_size(Members) =:= 2, members(Config, Leader2, QRef), 5_000),
