@@ -1150,10 +1150,14 @@ execute_effect(cancel_persist_timer, #state{persist_timer = Ref} = State) ->
 execute_effect(reinitialize, #state{cfg = #cfg{stream = StreamId}} = State0) ->
     ?LOG_INFO("~ts reinitializing after commit conflict", [StreamId]),
     resolve_and_start(reset_for_recovery(State0));
-execute_effect(stop, State) ->
-    %% The stream's metadata node was deleted (the queue was removed). Mark the
+execute_effect(stop, #state{tasks = Tasks} = State) ->
+    %% The stream's metadata node was deleted (the queue was removed). Cancel
+    %% every outstanding fragment upload in one batch so it stops occupying
+    %% upload-pool capacity for a stream that no longer exists, then mark the
     %% reader for shutdown; the handler that ran this effect returns
     %% {stop, normal} via maybe_stop/1.
+    Refs = maps:keys(rabbitmq_stream_s3_replica_reader_tasks:transfers(Tasks)),
+    rabbitmq_stream_s3_governor:cancel(Refs),
     State#state{stopping = true}.
 
 cancel_timer(undefined) -> ok;

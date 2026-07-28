@@ -11,11 +11,18 @@ The transfer function is opaque to the governor.
 
 When the configured rate is `unlimited`, submissions execute immediately
 with no pacing.
+
+A caller can cancel a batch of submissions by their `Ref`s via `cancel/1`: an
+admitted task is killed, a still-queued item is dropped before ever being
+spawned, and the pending queue is scanned once for the whole batch.
+Spawned tasks are monitored, not linked, so a governor restart does not
+kill tasks already running - they keep delivering their results directly to
+`ReplyTo` regardless of the governor's own lifecycle.
 """.
 
 -behaviour(gen_server).
 
--export([start_link/1, submit/4]).
+-export([start_link/1, submit/4, cancel/1]).
 -export([
     init/1,
     handle_call/3,
@@ -35,6 +42,7 @@ with no pacing.
 -define(C_TASKS_IN_FLIGHT, 2).
 -define(C_PENDING_SUBMISSIONS, 3).
 -define(C_OVERSIZED_ADMISSIONS, 4).
+-define(C_DROPPED_DEAD_REPLYTO, 5).
 -define(COUNTERS, [
     {governor_submissions_received, ?C_SUBMISSIONS_RECEIVED, counter,
         "Total transfer submissions received by the governor"},
@@ -45,7 +53,11 @@ with no pacing.
     {governor_oversized_admissions, ?C_OVERSIZED_ADMISSIONS, counter,
         "Transfers admitted whose size exceeded the token-bucket burst (admitted "
         "on credit, driving the bucket into debt). A persistently climbing value "
-        "means the configured burst is smaller than typical fragments"}
+        "means the configured burst is smaller than typical fragments"},
+    {governor_dropped_dead_replyto, ?C_DROPPED_DEAD_REPLYTO, counter,
+        "Submissions dropped because their requester was already dead: either "
+        "at intake, or while queued behind the token bucket. Protects against "
+        "any requester death (crash, restart), not just graceful deletion"}
 ]).
 -define(COUNTER_KEY, {?MODULE, counter}).
 
@@ -53,7 +65,13 @@ with no pacing.
     bucket :: rabbitmq_stream_s3_token_bucket:t() | unlimited,
     %% Pending submissions waiting for tokens.
     pending :: queue:queue(pending_item()),
-    timer_ref :: reference() | undefined
+    timer_ref :: reference() | undefined,
+    %% Ref => {Pid, MonRef} for every task currently executing, so cancel/1
+    %% can reach an admitted task by its caller-minted Ref.
+    tasks = #{} :: #{reference() => {pid(), reference()}},
+    %% MonRef => Ref, the reverse index the 'DOWN' handler uses to find which
+    %% submission a completed, crashed or killed monitor belonged to.
+    tasks_rev = #{} :: #{reference() => reference()}
 }).
 
 -type pending_item() :: {
@@ -83,6 +101,15 @@ where Result is the return value of `Fun`.
 submit(Fun, Size, ReplyTo, Ref) ->
     gen_server:cast(?MODULE, {submit, Fun, Size, ReplyTo, Ref}).
 
+-doc """
+Cancel a batch of previously submitted transfers.
+""".
+-spec cancel([reference()]) -> ok.
+cancel([]) ->
+    ok;
+cancel(Refs) ->
+    gen_server:cast(?MODULE, {cancel, Refs}).
+
 %% ------------------------------------------------------------------
 %% gen_server callbacks
 %% ------------------------------------------------------------------
@@ -109,7 +136,34 @@ handle_call(_Request, _From, State) ->
 
 handle_cast({submit, Fun, Size, ReplyTo, Ref}, State) ->
     inc(?C_SUBMISSIONS_RECEIVED, 1),
-    {noreply, dispatch({Fun, Size, ReplyTo, Ref}, State)};
+    case is_process_alive(ReplyTo) of
+        true ->
+            {noreply, dispatch({Fun, Size, ReplyTo, Ref}, State)};
+        false ->
+            %% The requester died between calling submit/4 and this cast
+            %% landing (e.g. a stream deletion or a crash). Drop it now
+            %% rather than pacing, spawning, and uploading for nobody: its
+            %% result would just be dropped into a dead mailbox anyway.
+            inc(?C_DROPPED_DEAD_REPLYTO, 1),
+            {noreply, State}
+    end;
+handle_cast({cancel, Refs0}, #state{tasks = Tasks} = State) ->
+    %% tasks/tasks_rev removal and the TASKS_IN_FLIGHT decrement happen in
+    %% the 'DOWN' handler below, the single cleanup path shared by normal
+    %% completion, a crash and a kill alike.
+    Refs = lists:filter(
+        fun(Ref) ->
+            case Tasks of
+                #{Ref := {Pid, _MonRef}} ->
+                    exit(Pid, kill),
+                    false;
+                #{} ->
+                    true
+            end
+        end,
+        Refs0
+    ),
+    {noreply, cancel_pending(Refs, State)};
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
@@ -123,6 +177,27 @@ handle_info(refill, #state{bucket = Bucket0} = State0) ->
             false -> schedule_refill()
         end,
     {noreply, State2#state{timer_ref = TimerRef}};
+handle_info(
+    {'DOWN', MonRef, process, _Pid, _Reason},
+    #state{tasks = Tasks, tasks_rev = TasksRev} = State
+) ->
+    case maps:take(MonRef, TasksRev) of
+        {Ref, TasksRev1} ->
+            dec(?C_TASKS_IN_FLIGHT, 1),
+            %% A resubmit (same-Ref retry) may have already overwritten this
+            %% Ref's entry with a newer, still-running task by the time this
+            %% DOWN (from the earlier attempt) is processed. Only remove the
+            %% entry if it still belongs to this MonRef, so a stale DOWN can't
+            %% erase a live task and leave it unreachable by cancel/1.
+            Tasks1 =
+                case Tasks of
+                    #{Ref := {_, MonRef}} -> maps:remove(Ref, Tasks);
+                    #{} -> Tasks
+                end,
+            {noreply, State#state{tasks = Tasks1, tasks_rev = TasksRev1}};
+        error ->
+            {noreply, State}
+    end;
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -144,8 +219,7 @@ format_state(#state{bucket = Bucket, pending = Pending}) ->
 %% ------------------------------------------------------------------
 
 dispatch(Item, #state{bucket = unlimited} = State) ->
-    spawn_task(Item),
-    State;
+    spawn_task(Item, State);
 dispatch(Item, #state{pending = Pending} = State) ->
     case queue:is_empty(Pending) of
         false ->
@@ -163,10 +237,30 @@ try_admit({_Fun, Size, _ReplyTo, _Ref} = Item, #state{bucket = Bucket0} = State)
     case rabbitmq_stream_s3_token_bucket:request(Size, Bucket0) of
         {ok, Bucket} ->
             count_oversized(Size, Bucket0),
-            spawn_task(Item),
-            State#state{bucket = Bucket};
+            spawn_task(Item, State#state{bucket = Bucket});
         {insufficient, _, _} ->
             enqueue(Item, State)
+    end.
+
+%% Remove every Ref in `Refs` from `pending` in a single pass; a no-op for
+%% any Ref whose task was already admitted and cleaned up, or that never had
+%% a live submission.
+cancel_pending([], State) ->
+    State;
+cancel_pending(Refs, #state{pending = Pending0} = State) ->
+    RefSet = sets:from_list(Refs, [{version, 2}]),
+    Pending = queue:filter(
+        fun({_Fun, _Size, _ReplyTo, ItemRef}) -> not sets:is_element(ItemRef, RefSet) end,
+        Pending0
+    ),
+    Len0 = queue:len(Pending0),
+    Len = queue:len(Pending),
+    case Len of
+        Len0 ->
+            State;
+        _ ->
+            set(?C_PENDING_SUBMISSIONS, Len),
+            State#state{pending = Pending}
     end.
 
 %% Append a submission to the pending queue and ensure the refill timer is
@@ -184,25 +278,42 @@ drain_pending(#state{pending = Pending0, bucket = Bucket0} = State) ->
     case queue:peek(Pending0) of
         empty ->
             State;
-        {value, {_Fun, Size, _ReplyTo, _Ref} = Item} ->
-            case rabbitmq_stream_s3_token_bucket:request(Size, Bucket0) of
-                {ok, Bucket} ->
-                    count_oversized(Size, Bucket0),
-                    spawn_task(Item),
+        {value, {_Fun, _Size, ReplyTo, _Ref} = Item} ->
+            case is_process_alive(ReplyTo) of
+                false ->
+                    %% The requester died while this item waited behind the
+                    %% token bucket. Drop it for free (no tokens spent) and
+                    %% keep draining: the head is being discarded outright,
+                    %% not skipped-and-retried, so this doesn't let a later
+                    %% item unfairly jump the FIFO order (see enqueue/2).
+                    inc(?C_DROPPED_DEAD_REPLYTO, 1),
                     Pending = queue:drop(Pending0),
                     set(?C_PENDING_SUBMISSIONS, queue:len(Pending)),
-                    drain_pending(State#state{
-                        pending = Pending,
-                        bucket = Bucket
-                    });
-                {insufficient, _, _} ->
-                    State
+                    drain_pending(State#state{pending = Pending});
+                true ->
+                    drain_pending_admit(Item, Pending0, Bucket0, State)
             end
     end.
 
-spawn_task({Fun, _Size, ReplyTo, Ref}) ->
+drain_pending_admit({_Fun, Size, _ReplyTo, _Ref} = Item, Pending0, Bucket0, State) ->
+    case rabbitmq_stream_s3_token_bucket:request(Size, Bucket0) of
+        {ok, Bucket} ->
+            count_oversized(Size, Bucket0),
+            Pending = queue:drop(Pending0),
+            set(?C_PENDING_SUBMISSIONS, queue:len(Pending)),
+            drain_pending(
+                spawn_task(Item, State#state{
+                    pending = Pending,
+                    bucket = Bucket
+                })
+            );
+        {insufficient, _, _} ->
+            State
+    end.
+
+spawn_task({Fun, _Size, ReplyTo, Ref}, #state{tasks = Tasks, tasks_rev = TasksRev} = State) ->
     inc(?C_TASKS_IN_FLIGHT, 1),
-    spawn(fun() ->
+    {Pid, MonRef} = spawn_monitor(fun() ->
         logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
         Result =
             try
@@ -210,9 +321,12 @@ spawn_task({Fun, _Size, ReplyTo, Ref}) ->
             catch
                 Class:Reason -> {error, {Class, Reason}}
             end,
-        dec(?C_TASKS_IN_FLIGHT, 1),
         ReplyTo ! {transfer_result, Ref, Result}
-    end).
+    end),
+    State#state{
+        tasks = Tasks#{Ref => {Pid, MonRef}},
+        tasks_rev = TasksRev#{MonRef => Ref}
+    }.
 
 schedule_refill() ->
     erlang:send_after(?REFILL_INTERVAL_MS, self(), refill).
@@ -284,6 +398,189 @@ completion_routes_back_test() ->
     Results = collect_results([Ref1, Ref2], 1000),
     ?assertEqual({ok, first}, maps:get(Ref1, Results)),
     ?assertEqual({error, boom}, maps:get(Ref2, Results)),
+    gen_server:stop(Pid).
+
+%% cancel/1 on an admitted, running task kills it: no result is ever
+%% delivered, and the task is dropped from the governor's bookkeeping.
+cancel_kills_running_task_test() ->
+    {ok, Pid} = start_link(#{rate => unlimited}),
+    Self = self(),
+    Ref = make_ref(),
+    submit(
+        fun() ->
+            receive
+                never -> ok
+            end
+        end,
+        100,
+        Self,
+        Ref
+    ),
+    %% submit/1 and cancel/1 are both casts from this process to the same
+    %% registered name, so send order is preserved: by the time cancel is
+    %% handled, the task is already admitted and in `tasks`.
+    cancel([Ref]),
+    receive
+        {transfer_result, Ref, _} -> error(unexpected_result)
+    after 300 ->
+        %% Also gives the kill and the resulting 'DOWN' time to land.
+        ok
+    end,
+    ?assertEqual(#{}, (sys:get_state(Pid))#state.tasks),
+    gen_server:stop(Pid).
+
+%% cancel/1 on a still-queued item removes it before it is ever admitted.
+cancel_removes_pending_item_test() ->
+    {ok, Pid} = start_link(#{rate => 1000, burst => 1000}),
+    Self = self(),
+    RefA = make_ref(),
+    RefQueued = make_ref(),
+    submit(fun() -> {ok, a} end, 1000, Self, RefA),
+    receive
+        {transfer_result, RefA, _} -> ok
+    after 1000 -> error(a_timeout)
+    end,
+    %% Bucket is now exhausted; this one queues (see try_admit/enqueue).
+    submit(fun() -> error(should_not_run) end, 500, Self, RefQueued),
+    cancel([RefQueued]),
+    receive
+        {transfer_result, RefQueued, _} -> error(unexpected_result)
+    after 500 -> ok
+    end,
+    ?assertEqual(0, queue:len((sys:get_state(Pid))#state.pending)),
+    gen_server:stop(Pid).
+
+%% cancel/1 accepts a batch: a single call can kill an admitted, running task
+%% and remove a still-queued item together, in one pass over the pending
+%% queue.
+cancel_batch_test() ->
+    {ok, Pid} = start_link(#{rate => 1000, burst => 1000}),
+    Self = self(),
+    RefRunning = make_ref(),
+    RefQueued = make_ref(),
+    %% Bucket starts full: admitted immediately, then blocks forever,
+    %% leaving the bucket exhausted.
+    submit(
+        fun() ->
+            receive
+                never -> ok
+            end
+        end,
+        1000,
+        Self,
+        RefRunning
+    ),
+    %% Bucket is now exhausted; this one queues (see try_admit/enqueue).
+    submit(fun() -> error(should_not_run) end, 500, Self, RefQueued),
+    cancel([RefRunning, RefQueued]),
+    receive
+        {transfer_result, RefRunning, _} -> error(unexpected_result)
+    after 300 ->
+        %% Also gives the kill and the resulting 'DOWN' time to land.
+        ok
+    end,
+    receive
+        {transfer_result, RefQueued, _} -> error(unexpected_result)
+    after 0 -> ok
+    end,
+    ?assertEqual(#{}, (sys:get_state(Pid))#state.tasks),
+    ?assertEqual(0, queue:len((sys:get_state(Pid))#state.pending)),
+    gen_server:stop(Pid).
+
+%% Regression test for a Ref-reuse race: a resubmit (a transient-retry
+%% resubmission reuses the same Ref) can install a new, live task under a Ref
+%% before the earlier attempt's own 'DOWN' (sent by the runtime when that
+%% attempt's process exits) is processed by the governor. Before the identity
+%% check in the 'DOWN' handler, that stale DOWN would erase the live task's
+%% entry, leaving it unreachable - and therefore unkillable - by cancel/1.
+resubmit_survives_stale_down_test() ->
+    {ok, Pid} = start_link(#{rate => unlimited}),
+    Self = self(),
+    Ref = make_ref(),
+    Fun = fun() ->
+        receive
+            never -> ok
+        end
+    end,
+    submit(Fun, 100, Self, Ref),
+    #state{tasks = Tasks0} = sys:get_state(Pid),
+    {OldTaskPid, OldMonRef} = maps:get(Ref, Tasks0),
+    %% Resubmit with the same Ref, as a transient-retry resubmission does:
+    %% installs a new, still-running task under the same key.
+    submit(Fun, 100, Self, Ref),
+    #state{tasks = Tasks1} = sys:get_state(Pid),
+    {NewTaskPid, NewMonRef} = maps:get(Ref, Tasks1),
+    ?assertNotEqual({OldTaskPid, OldMonRef}, {NewTaskPid, NewMonRef}),
+    %% Simulate the earlier attempt's own 'DOWN' arriving late, after the
+    %% resubmit already overwrote the entry.
+    Pid ! {'DOWN', OldMonRef, process, OldTaskPid, normal},
+    %% Sync: sys:get_status round-trips through the gen_server, guaranteeing
+    %% the DOWN above has already been processed.
+    _ = sys:get_status(Pid),
+    ?assertEqual({NewTaskPid, NewMonRef}, maps:get(Ref, (sys:get_state(Pid))#state.tasks)),
+    %% cancel/1 must still be able to reach (and kill) the live task.
+    cancel([Ref]),
+    receive
+        {transfer_result, Ref, _} -> error(unexpected_result)
+    after 300 -> ok
+    end,
+    ?assertEqual(#{}, (sys:get_state(Pid))#state.tasks),
+    gen_server:stop(Pid).
+
+%% A submission whose ReplyTo is already dead is dropped at intake, before
+%% ever touching the bucket or spawning anything.
+dispatch_drops_dead_replyto_test() ->
+    {ok, Pid} = start_link(#{rate => unlimited}),
+    DeadPid = spawn(fun() -> ok end),
+    Mon = monitor(process, DeadPid),
+    receive
+        {'DOWN', Mon, process, DeadPid, _} -> ok
+    after 1000 -> error(setup_failed)
+    end,
+    submit(fun() -> error(should_not_run) end, 100, DeadPid, make_ref()),
+    %% Sync: a second, live submission proves the first cast was processed.
+    Self = self(),
+    SyncRef = make_ref(),
+    submit(fun() -> {ok, sync} end, 1, Self, SyncRef),
+    receive
+        {transfer_result, SyncRef, _} -> ok
+    after 1000 -> error(sync_timeout)
+    end,
+    ?assertEqual(#{}, (sys:get_state(Pid))#state.tasks),
+    gen_server:stop(Pid).
+
+%% A queued item whose ReplyTo dies before its turn to drain is dropped for
+%% free, without ever being admitted.
+drain_drops_dead_replyto_test() ->
+    {ok, Pid} = start_link(#{rate => 1000, burst => 1000}),
+    Self = self(),
+    DeadPid = spawn(fun() -> ok end),
+    Mon = monitor(process, DeadPid),
+    receive
+        {'DOWN', Mon, process, DeadPid, _} -> ok
+    after 1000 -> error(setup_failed)
+    end,
+    RefA = make_ref(),
+    submit(fun() -> {ok, a} end, 1000, Self, RefA),
+    receive
+        {transfer_result, RefA, _} -> ok
+    after 1000 -> error(a_timeout)
+    end,
+    %% Bucket is now exhausted; this queues behind it with a dead ReplyTo.
+    %% The periodic refill timer (armed by enqueue/2) may drop it on its own
+    %% before the explicit refill below, so this doesn't assert on the
+    %% queue's length in between - only that the item never runs and the
+    %% queue eventually settles at 0.
+    submit(fun() -> error(should_not_run) end, 500, DeadPid, make_ref()),
+    %% Force a drain synchronously rather than relying solely on the timer.
+    Pid ! refill,
+    RefSync = make_ref(),
+    submit(fun() -> {ok, sync} end, 1, Self, RefSync),
+    receive
+        {transfer_result, RefSync, _} -> ok
+    after 1000 -> error(sync_timeout)
+    end,
+    ?assertEqual(0, queue:len((sys:get_state(Pid))#state.pending)),
     gen_server:stop(Pid).
 
 pacing_delays_when_exhausted_test() ->
