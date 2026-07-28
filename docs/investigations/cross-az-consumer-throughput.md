@@ -25,11 +25,11 @@ Throughput falls off sharply and monotonically with the number of AZ boundaries 
 
 | hops | samples | mean msg/s | stdev | CV |
 |---|---|---|---|---|
-| 0 (same AZ throughout) | 8 | 7429.4 | 116.0 | 0.016 |
-| 1 (one crossing) | 39 | 6176.0 | 437.3 | 0.071 |
-| 2 (both crossings) | 65 | 4374.0 | 604.6 | 0.138 |
+| 0 (same AZ throughout) | 8 | 6590.9 | 200.4 | 0.030 |
+| 1 (one crossing) | 39 | 5647.4 | 430.0 | 0.076 |
+| 2 (both crossings) | 65 | 4112.8 | 525.0 | 0.128 |
 
-Pairwise Welch's t-tests on these groups are all overwhelming: 0 vs 1 hop is +20.3% (p near 0, Cohen's d 3.06), 1 vs 2 hops is +41.2% (p near 0, d 3.26), 0 vs 2 hops is +69.9% (p near 0, d 5.27). The full 12-cell breakdown by entry AZ and server AZ shows the same pattern cell by cell.
+Pairwise Welch's t-tests on these groups are all overwhelming: 0 vs 1 hop is +16.7% (p near 0, Cohen's d 2.31), 1 vs 2 hops is +37.3% (p near 0, d 3.09), 0 vs 2 hops is +60.3% (p near 0, d 4.89). The full 12-cell breakdown by entry AZ and server AZ shows the same pattern cell by cell.
 
 <details><summary>Full 12-cell results table</summary>
 
@@ -37,18 +37,18 @@ The client is in AZ `d`. `entry AZ` is the AZ of the NLB node the client connect
 
 | entry AZ | server AZ | hops | samples | mean msg/s | stdev | CV |
 |---|---|---|---|---|---|---|
-| `a` | `b` | 2 | 5 | 4324.2 | 208.1 | 0.048 |
-| `a` | `c` | 2 | 10 | 3794.9 | 163.8 | 0.043 |
-| `a` | `d` | 2 | 10 | 4219.8 | 380.4 | 0.090 |
-| `b` | `b` | 1 | 10 | 5745.7 | 183.9 | 0.032 |
-| `b` | `c` | 2 | 10 | 4953.6 | 171.1 | 0.035 |
-| `b` | `d` | 2 | 10 | 3827.5 | 63.4 | 0.017 |
-| `c` | `b` | 2 | 10 | 5383.1 | 131.8 | 0.024 |
-| `c` | `c` | 1 | 10 | 5965.2 | 174.4 | 0.029 |
-| `c` | `d` | 2 | 10 | 4090.2 | 195.6 | 0.048 |
-| `d` | `b` | 1 | 9 | 6767.0 | 362.5 | 0.054 |
-| `d` | `c` | 1 | 10 | 6284.9 | 85.8 | 0.014 |
-| `d` | `d` | 0 | 8 | 7429.4 | 116.0 | 0.016 |
+| `a` | `b` | 2 | 5 | 4068.7 | 120.1 | 0.030 |
+| `a` | `c` | 2 | 10 | 3651.8 | 178.6 | 0.049 |
+| `a` | `d` | 2 | 10 | 3950.0 | 342.4 | 0.087 |
+| `b` | `b` | 1 | 10 | 5349.7 | 304.5 | 0.057 |
+| `b` | `c` | 2 | 10 | 4603.2 | 158.7 | 0.034 |
+| `b` | `d` | 2 | 10 | 3645.2 | 89.3 | 0.025 |
+| `c` | `b` | 2 | 10 | 4981.7 | 179.4 | 0.036 |
+| `c` | `c` | 1 | 10 | 5435.1 | 289.9 | 0.053 |
+| `c` | `d` | 2 | 10 | 3867.2 | 235.9 | 0.061 |
+| `d` | `b` | 1 | 9 | 6139.2 | 322.2 | 0.052 |
+| `d` | `c` | 1 | 10 | 5714.9 | 308.1 | 0.054 |
+| `d` | `d` | 0 | 8 | 6590.9 | 200.4 | 0.030 |
 
 112 of 120 planned runs total. The 8 missing runs were truncated by resolution effects at the CloudWatch measurement boundary and discarded rather than estimated.
 
@@ -58,10 +58,10 @@ The two hops are not interchangeable. Splitting the single-crossing cases by whi
 
 | crossing | samples | mean msg/s |
 |---|---|---|
-| client to NLB crosses, NLB to broker stays local | 20 | 5855.5 |
-| client to NLB stays local, NLB to broker crosses | 19 | 6513.3 |
+| client to NLB crosses, NLB to broker stays local | 20 | 5392.4 |
+| client to NLB stays local, NLB to broker crosses | 19 | 5915.9 |
 
-The client-to-NLB crossing costs noticeably more than the NLB-to-broker crossing (p near 0, d 2.22). This is consistent with the client-side leg traversing a longer network path than the NLB-to-broker leg, which stays inside the VPC.
+The client-to-NLB crossing costs noticeably more than the NLB-to-broker crossing (p = 0.00005, d 1.49). This is consistent with the client-side leg traversing a longer network path than the NLB-to-broker leg, which stays inside the VPC.
 
 ## Mechanism
 
