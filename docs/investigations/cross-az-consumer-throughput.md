@@ -71,6 +71,19 @@ This was confirmed independently by sweeping `--initial-credits` across 10, 50, 
 
 Because this is a latency-bound mechanism, it is specific to the credit-gated consumer path. A long-lived bulk transfer, such as the broker's own connection to S3 for uploads or remote reads, is not gated the same way and would not be expected to show the same sensitivity to a single AZ hop. That path was not part of this workload (no producers were active) and remains untested.
 
+### Confirming the mechanism by controlling AZ and credit window together
+
+The credit sweep above did not control AZ placement, so it could only show that variance goes down as the window grows, not that the specific AZ gap goes away. A follow-up sweep pinned AZ placement to the two most extreme cells from the grid above, the 0-hop cell (`d/d`) and the largest-gap 2-hop cell (`b/d`), and reran `--initial-credits` at 50, 200, and 1000 on each, 5 runs per cell per window. Throughput was computed from the same CloudWatch OTLP counter and active-window method as the main sweep.
+
+| window | d/d mean msg/s | b/d mean msg/s | gap | gap as % of the window 10 gap | p |
+|---|---|---|---|---|---|
+| 10 (from the main grid, same two cells) | 6590.9 | 3645.2 | 2945.7 | 100.0% | p < 0.0001 |
+| 50 | 7111.5 | 6963.3 | 148.2 | 5.0% | p = 0.58 |
+| 200 | 7408.2 | 7445.3 | -37.1 | -1.3% | p = 0.90 |
+| 1000 | 7782.1 | 7782.1 | 0.0 | 0.0% | p = 1.00 |
+
+The gap converges to near-zero by window 50 and stays there through window 1000. AZ placement stops mattering once the credit window is large enough to absorb the added RTT, which is exactly what the mechanism predicts and is the strongest evidence that credit-window size, not the AZ hop itself, is the actual lever.
+
 ## Implications
 
 - For latency-sensitive consumer workloads, AZ placement of the client relative to the NLB and broker matters more than raw network bandwidth between them.
@@ -83,4 +96,4 @@ Because this is a latency-bound mechanism, it is specific to the credit-gated co
 
 **Whether the client-vs-NLB hop asymmetry generalizes.** The observed asymmetry between the two hop types was measured on one specific client and one specific NLB and set of broker instances. It is not yet known whether this reflects a general property, and whether the results reproduce in different regions and combinations of AZs. This test was performed in us-west-2.
 
-**Default credit window tuning.** Given how sharply throughput responds to `initialCredits` at low values, it may be worth documenting/recommending that clients use an initial credit value larger than 10.
+**Default credit window tuning.** The AZ-controlled credit sweep confirms that a window well above 10 removes the AZ sensitivity entirely, 50 was already enough in this environment. It may be worth documenting or recommending that latency-sensitive clients raise `initialCredits` above the default, though the exact value needed likely depends on the RTT of the client's own network path and should not be assumed to be 50 in general.
