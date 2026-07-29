@@ -763,25 +763,13 @@ active_requests_balanced_across_checkout_ends_test() ->
         end
     end).
 
-%% Install a private counter at api_aws's persistent_term key so the pool's
-%% note_request_started/finished edges land somewhere readable, restoring
-%% whatever was there before. Returns a fun that reads the active_requests
-%% gauge. The key and index mirror rabbitmq_stream_s3_api_aws's own defines.
+%% Give Fun a reader for api_aws's active_requests gauge, which this module
+%% moves but api_aws owns. Delegating keeps the counter's key, size and indices
+%% in the one module that defines them.
 with_active_requests_counter(Fun) ->
-    Key = {rabbitmq_stream_s3_api_aws, counter},
-    ActiveRequestsIdx = 1,
-    Previous = persistent_term:get(Key, undefined),
-    Cnt = counters:new(6, []),
-    persistent_term:put(Key, Cnt),
-    ReadGauge = fun() -> counters:get(Cnt, ActiveRequestsIdx) end,
-    try
-        Fun(ReadGauge)
-    after
-        case Previous of
-            undefined -> persistent_term:erase(Key);
-            _ -> persistent_term:put(Key, Previous)
-        end
-    end.
+    rabbitmq_stream_s3_api_aws:with_counter(fun(Read) ->
+        Fun(fun() -> Read(active_requests) end)
+    end).
 
 await(Fun) ->
     await(Fun, 2000).
