@@ -71,6 +71,7 @@ truth.
 -export([init_counters/0]).
 
 -include("include/logging.hrl").
+-include_lib("kernel/include/logger.hrl").
 
 -define(REFILL_INTERVAL_MS, 100).
 
@@ -162,6 +163,9 @@ init(Opts) ->
     %% Without this, a supervisor-issued shutdown signal (application/node
     %% stop) would just kill this process outright, and terminate/2 below -
     %% which cancels running tasks on that specific path - would never run.
+    %% This is the flag's only purpose here. It also makes exit signals from
+    %% any other link land in handle_info/2, which has an explicit clause to
+    %% keep them from being silently discarded.
     process_flag(trap_exit, true),
     Bucket =
         case maps:get(rate, Opts, unlimited) of
@@ -257,7 +261,26 @@ handle_info(
             %% or a supervisor shutdown of the requester can reach.
             {noreply, derive_gauges(requester_down(MonRef, Pid, State))}
     end;
+handle_info({'EXIT', Pid, Reason}, State) when Reason =/= normal ->
+    %% `gen_server` turns only the *parent's* exit signal into a `terminate/2`
+    %% call; a signal from any other link is delivered here instead. `trap_exit`
+    %% is set for the parent-shutdown path alone (see `init/1`), so its effect on
+    %% these other signals is incidental, and letting them fall through to the
+    %% catchall below is strictly weaker than the untrapped default, where an
+    %% abnormal signal from a link takes the process down. Restore that default
+    %% rather than discard the signal: nothing links to the governor today, so
+    %% arriving here means an unexpected link exists, and dying loudly surfaces
+    %% it. `terminate/2` leaves running tasks alone on this reason, which is the
+    %% correct choice for a crash-like exit (see the moduledoc).
+    ?LOG_WARNING(
+        "Governor received an exit signal from linked process ~p: ~p. Stopping, "
+        "since only the supervisor is expected to be linked",
+        [Pid, Reason],
+        #{domain => ?RMQLOG_DOMAIN_STREAM_S3}
+    ),
+    {stop, Reason, State};
 handle_info(_Info, State) ->
+    %% Includes `{'EXIT', _, normal}`, which an untrapped process ignores too.
     {noreply, State}.
 
 %% Handle the death of a requester with tasks running. The monitor ref is
@@ -798,6 +821,55 @@ terminate_leaves_tasks_on_crash_reason_test() ->
     timer:sleep(50),
     ?assert(is_process_alive(TaskPid)),
     exit(TaskPid, kill).
+
+%% `trap_exit` is set for the parent-shutdown path, but `gen_server` routes
+%% only the parent's signal to `terminate/2`: every other link's signal is
+%% delivered to `handle_info/2`. Without an explicit clause the catchall
+%% swallowed those, leaving the governor running where an untrapped process
+%% would have died - a link's crash became invisible.
+abnormal_exit_from_non_parent_link_stops_test() ->
+    {ok, Pid} = start_link(#{rate => unlimited}),
+    %% start_link/1 links the governor to this test process, which is therefore
+    %% its parent. Drop that link before provoking the stop, or the governor's
+    %% exit reason propagates here and fails the test from the outside.
+    unlink(Pid),
+    Mon = monitor(process, Pid),
+    %% A process other than the parent links itself and then crashes. `link/1`
+    %% runs before the receive, so the link is established once `go` arrives.
+    Linker = spawn(fun() ->
+        link(Pid),
+        receive
+            go -> exit(boom)
+        end
+    end),
+    Linker ! go,
+    receive
+        {'DOWN', Mon, process, Pid, boom} -> ok
+    after ?AWAIT_MS -> error(governor_survived_linked_crash)
+    end.
+
+%% A `normal` exit from a link is ignored, matching the untrapped default. The
+%% governor must not stop because some linked helper finished cleanly.
+normal_exit_from_non_parent_link_is_ignored_test() ->
+    {ok, Pid} = start_link(#{rate => unlimited}),
+    Linker = spawn(fun() ->
+        link(Pid),
+        receive
+            go -> ok
+        end
+    end),
+    LinkerMon = monitor(process, Linker),
+    Linker ! go,
+    %% Wait for the linker to actually exit: only then is its signal guaranteed
+    %% to be in the governor's queue, so the round-trip below is ordered after
+    %% it. Asserting liveness without this barrier would pass either way.
+    receive
+        {'DOWN', LinkerMon, process, Linker, normal} -> ok
+    after ?AWAIT_MS -> error(linker_did_not_exit)
+    end,
+    _ = sys:get_state(Pid),
+    ?assert(is_process_alive(Pid)),
+    gen_server:stop(Pid).
 
 %% A requester that dies after its task was admitted must have that task
 %% killed. Only one reader teardown path calls cancel/1, so without the
