@@ -20,12 +20,23 @@ item at the same time, because a resubmit reuses its `Ref`; `cancel/1` reaches
 all of them.
 
 Cancellation does not depend on the requester asking for it. The requester is
-monitored for as long as its task runs, and the task is killed when the
-requester dies, whatever killed it. A requester has many ways to die and only
-one of them can call `cancel/1` on the way out (a brutal kill can call
-nothing), so relying on an explicit cancel per teardown path leaves uploads
-running for a stream nobody is reading. This is the same policy already applied
-at intake and while queued: never transfer for a requester that is gone.
+monitored for as long as the governor holds any of its work, queued or running,
+and that work is discarded when the requester dies, whatever killed it. A
+requester has many ways to die and only one of them can call `cancel/1` on the
+way out (a brutal kill can call nothing), so relying on an explicit cancel per
+teardown path leaves uploads running for a stream nobody is reading. This is the
+same policy already applied at intake: never transfer for a requester that is
+gone.
+
+The monitor is taken at intake rather than when a task is spawned. A queued item
+can wait a long time behind the token bucket, and monitoring only running tasks
+left a requester whose items were all still queued unmonitored: its death was
+noticed only if one of its items happened to reach the head of the queue on a
+refill tick, since `drain_pending/1` inspects the head alone and stops at the
+first item it cannot admit. Behind a live head that is short of tokens, an
+arbitrary number of dead requesters' items could sit in the queue indefinitely,
+counted in `governor_pending_submissions` and invisible to
+`governor_dropped_dead_replyto`.
 
 Spawned tasks are monitored, not linked, so a governor restart does not
 kill tasks already running - they keep delivering their results directly to
@@ -113,9 +124,12 @@ truth.
     %% Ref => [MonRef], the secondary index cancel/1 uses to reach every live
     %% attempt belonging to a caller-minted Ref.
     tasks_by_ref = #{} :: #{reference() => [reference()]},
-    %% ReplyTo => {MonRef, TaskCount} for every requester with at least one
-    %% task running. One monitor per requester however many tasks it has, so
-    %% the count is what decides when to demonitor.
+    %% ReplyTo => {MonRef, ItemCount} for every requester with at least one
+    %% outstanding item, queued or running. One monitor per requester however
+    %% many items it has, so the count is what decides when to demonitor.
+    %% Counting queued items and not just running tasks is what lets a
+    %% requester's death be noticed while its work is still behind the token
+    %% bucket; see requester_down/3.
     requesters = #{} :: #{pid() => {reference(), pos_integer()}}
 }).
 
@@ -283,32 +297,27 @@ handle_info(_Info, State) ->
     %% Includes `{'EXIT', _, normal}`, which an untrapped process ignores too.
     {noreply, State}.
 
-%% Handle the death of a requester with tasks running. The monitor ref is
-%% matched against the recorded one so a stale 'DOWN' (a demonitor/flush that
-%% raced) cannot kill a fresh incarnation's tasks: a restarted reader is a new
-%% pid, but the pid alone is not proof of which monitor the 'DOWN' belongs to.
+%% Handle the death of a requester with outstanding items, queued or running.
+%% The monitor ref is matched against the recorded one so a stale 'DOWN' (a
+%% demonitor/flush that raced) cannot kill a fresh incarnation's tasks: a
+%% restarted reader is a new pid, but the pid alone is not proof of which
+%% monitor the 'DOWN' belongs to.
 requester_down(MonRef, ReplyTo, #state{requesters = Requesters} = State) ->
     case Requesters of
         #{ReplyTo := {MonRef, _Count}} ->
-            Refs = refs_for_requester(ReplyTo, State),
-            State1 = State#state{requesters = maps:remove(ReplyTo, Requesters)},
-            %% Reuse the cancel path so a queued copy of the same Ref is
-            %% dropped too, not just the running attempts.
-            kill_requester_tasks(ReplyTo, cancel_pending(Refs, State1));
+            %% Drop the queued items by requester, not via the Refs its running
+            %% tasks carry: a requester can have queued items and no admitted
+            %% task at all, and those must go too. Then drop the whole
+            %% `requesters` entry - the monitor is already gone, and the running
+            %% tasks being killed below clean up through their own 'DOWN'.
+            State1 = drop_pending_for_requester(ReplyTo, State),
+            State2 = State1#state{
+                requesters = maps:remove(ReplyTo, State1#state.requesters)
+            },
+            kill_requester_tasks(ReplyTo, State2);
         _ ->
             State
     end.
-
-%% Every Ref this requester currently has admitted, for cancel_pending/2.
-refs_for_requester(ReplyTo, #state{tasks = Tasks}) ->
-    maps:fold(
-        fun
-            (_MonRef, {_Pid, Ref, Owner}, Acc) when Owner =:= ReplyTo -> [Ref | Acc];
-            (_MonRef, _Task, Acc) -> Acc
-        end,
-        [],
-        Tasks
-    ).
 
 %% Kill this requester's running tasks. The entries themselves are removed by
 %% each task's own 'DOWN', the single cleanup path shared with completion,
@@ -359,9 +368,18 @@ format_state(#state{bucket = Bucket, pending = Pending}) ->
 %% Internal
 %% ------------------------------------------------------------------
 
-dispatch(Item, #state{bucket = unlimited} = State) ->
+%% Take the requester's watch here, once, covering the item for as long as the
+%% governor holds it - queued, running, or moving between the two. Watching only
+%% from spawn_task/2 left a requester whose items were all still queued
+%% unmonitored, so its death went unnoticed until one of its items reached the
+%% head of the queue on a refill tick (see drain_pending/1).
+dispatch({_Fun, _Size, ReplyTo, _Ref} = Item, State0) ->
+    State = watch_requester(ReplyTo, State0),
+    dispatch1(Item, State).
+
+dispatch1(Item, #state{bucket = unlimited} = State) ->
     spawn_task(Item, State);
-dispatch(Item, #state{pending = Pending} = State) ->
+dispatch1(Item, #state{pending = Pending} = State) ->
     case queue:is_empty(Pending) of
         false ->
             %% Items are already waiting for tokens. Queue behind them rather
@@ -388,16 +406,42 @@ try_admit({_Fun, Size, _ReplyTo, _Ref} = Item, #state{bucket = Bucket0} = State)
 %% a live submission.
 cancel_pending([], State) ->
     State;
-cancel_pending(Refs, #state{pending = Pending0} = State) ->
+cancel_pending(Refs, State) ->
     RefSet = sets:from_list(Refs, [{version, 2}]),
-    Pending = queue:filter(
-        fun({_Fun, _Size, _ReplyTo, ItemRef}) -> not sets:is_element(ItemRef, RefSet) end,
-        Pending0
+    {_Dropped, State1} = drop_pending(
+        fun({_Fun, _Size, _ReplyTo, ItemRef}) -> sets:is_element(ItemRef, RefSet) end,
+        State
     ),
-    State#state{pending = Pending}.
+    State1.
+
+%% Remove every queued item belonging to `ReplyTo`. Used when a requester dies:
+%% its items must go whether or not it also had a task admitted, so they are
+%% matched by requester rather than by the Refs its running tasks happen to
+%% carry. Each one counts as dropped-for-a-dead-requester, the same as if
+%% drain_pending/1 had found it at the head.
+drop_pending_for_requester(ReplyTo, State) ->
+    {Dropped, State1} = drop_pending(
+        fun({_Fun, _Size, ItemReplyTo, _Ref}) -> ItemReplyTo =:= ReplyTo end,
+        State
+    ),
+    inc(?C_DROPPED_DEAD_REPLYTO, Dropped),
+    State1.
+
+%% Drop every queued item `Drop` selects, releasing each one's requester watch.
+%% One pass over the queue however many items match. Returns how many were
+%% dropped, so callers can account for them.
+drop_pending(Drop, #state{pending = Pending0} = State) ->
+    {Dropped, Kept} = lists:partition(Drop, queue:to_list(Pending0)),
+    State1 = lists:foldl(
+        fun({_Fun, _Size, ReplyTo, _Ref}, Acc) -> unwatch_requester(ReplyTo, Acc) end,
+        State#state{pending = queue:from_list(Kept)},
+        Dropped
+    ),
+    {length(Dropped), State1}.
 
 %% Append a submission to the pending queue and ensure the refill timer is
-%% running so it will eventually drain.
+%% running so it will eventually drain. The requester's watch is already held by
+%% dispatch/2 and spans the item's whole life, so there is nothing to take here.
 enqueue(Item, State) ->
     Pending = queue:in(Item, State#state.pending),
     State1 = State#state{pending = Pending},
@@ -414,13 +458,16 @@ drain_pending(#state{pending = Pending0, bucket = Bucket0} = State) ->
             case is_process_alive(ReplyTo) of
                 false ->
                     %% The requester died while this item waited behind the
-                    %% token bucket. Drop it for free (no tokens spent) and
+                    %% token bucket, and its 'DOWN' has not been processed yet
+                    %% (once it is, requester_down/3 drops every one of its
+                    %% items at once). Drop it for free (no tokens spent) and
                     %% keep draining: the head is being discarded outright,
                     %% not skipped-and-retried, so this doesn't let a later
                     %% item unfairly jump the FIFO order (see enqueue/2).
                     inc(?C_DROPPED_DEAD_REPLYTO, 1),
                     Pending = queue:drop(Pending0),
-                    drain_pending(State#state{pending = Pending});
+                    State1 = unwatch_requester(ReplyTo, State#state{pending = Pending}),
+                    drain_pending(State1);
                 true ->
                     drain_pending_admit(Item, Pending0, Bucket0, State)
             end
@@ -431,6 +478,8 @@ drain_pending_admit({_Fun, Size, _ReplyTo, _Ref} = Item, Pending0, Bucket0, Stat
         {ok, Bucket} ->
             count_oversized(Size, Bucket0),
             Pending = queue:drop(Pending0),
+            %% The item moves from `pending` to `tasks` and keeps the single
+            %% watch it took at dispatch; nothing to adjust here.
             drain_pending(
                 spawn_task(Item, State#state{
                     pending = Pending,
@@ -455,15 +504,17 @@ spawn_task({Fun, _Size, ReplyTo, Ref}, #state{tasks = Tasks, tasks_by_ref = ByRe
     %% A resubmit reuses the same Ref while the earlier attempt may still be
     %% running, so append to this Ref's monitor list rather than replacing it.
     MonRefs = maps:get(Ref, ByRef, []),
-    State1 = watch_requester(ReplyTo, State),
-    State1#state{
+    %% The requester's watch was taken by dispatch/2 and is released by this
+    %% task's own 'DOWN', so it is not touched here.
+    State#state{
         tasks = Tasks#{MonRef => {Pid, Ref, ReplyTo}},
         tasks_by_ref = ByRef#{Ref => [MonRef | MonRefs]}
     }.
 
-%% Start (or refcount) a monitor on a requester that now has a task running.
-%% One monitor covers all of a requester's tasks: a reader submits a fragment
-%% at a time and each extra monitor would mean an extra 'DOWN' to correlate.
+%% Start (or refcount) a monitor on a requester that now has one more
+%% outstanding item, queued or running. One monitor covers all of a requester's
+%% items: a reader submits a fragment at a time and each extra monitor would
+%% mean an extra 'DOWN' to correlate.
 watch_requester(ReplyTo, #state{requesters = Requesters} = State) ->
     case Requesters of
         #{ReplyTo := {ReqMon, Count}} ->
@@ -473,9 +524,10 @@ watch_requester(ReplyTo, #state{requesters = Requesters} = State) ->
             State#state{requesters = Requesters#{ReplyTo => {ReqMon, 1}}}
     end.
 
-%% Release one task's share of a requester's monitor, demonitoring once its
-%% last task is gone. The requester's own 'DOWN' does not come through here:
-%% requester_down/3 drops the whole entry in one step.
+%% Release one item's share of a requester's monitor, demonitoring once its last
+%% outstanding item is gone - whether that item completed, was cancelled while
+%% queued, or was dropped as dead. The requester's own 'DOWN' does not come
+%% through here: requester_down/3 drops the whole entry in one step.
 unwatch_requester(ReplyTo, #state{requesters = Requesters} = State) ->
     case Requesters of
         #{ReplyTo := {ReqMon, 1}} ->
@@ -1097,6 +1149,93 @@ drain_drops_dead_replyto_test() ->
     after 1000 -> error(sync_timeout)
     end,
     ?assertEqual(0, queue:len((sys:get_state(Pid))#state.pending)),
+    gen_server:stop(Pid).
+
+%% A dead requester's queued items must be reclaimed even when they are buried
+%% behind a live item that cannot be admitted. drain_pending/1 only ever looks at
+%% the head and stops at the first item short of tokens, so before the requester
+%% was monitored from intake these items sat in `pending` for as long as the head
+%% was stuck: counted in the gauge, uncounted in dropped_dead_replyto, and
+%% holding their funs (and whatever those close over) live.
+requester_death_drops_items_buried_behind_a_live_head_test() ->
+    with_counter(fun(Cnt) ->
+        %% Rate 1000 B/s, burst 1000. The first item exhausts the bucket.
+        {ok, Pid} = start_link(#{rate => 1000, burst => 1000}),
+        Self = self(),
+        RefDrain = make_ref(),
+        submit(fun() -> {ok, drained} end, 1000, Self, RefDrain),
+        receive
+            {transfer_result, RefDrain, _} -> ok
+        after 1000 -> error(drain_timeout)
+        end,
+        %% A live requester's item at the head: exactly burst, so it is not
+        %% "oversized" (which would be admitted on credit) but there are no
+        %% tokens, so it stays queued and blocks the drain.
+        submit(fun() -> {ok, head} end, 1000, Self, make_ref()),
+        %% Three items from a requester that dies, buried behind that head.
+        Parent = self(),
+        Requester = spawn(fun() ->
+            [submit(fun() -> error(should_not_run) end, 1, self(), make_ref()) || _ <- [1, 2, 3]],
+            _ = sys:get_status(?MODULE),
+            Parent ! submitted,
+            receive
+                die -> ok
+            end
+        end),
+        receive
+            submitted -> ok
+        after 1000 -> error(setup_failed)
+        end,
+        ?assertEqual(4, queue:len((sys:get_state(Pid))#state.pending)),
+        Before = counters:get(Cnt, ?C_DROPPED_DEAD_REPLYTO),
+        Requester ! die,
+        %% All three go on the requester's 'DOWN', without waiting for the head
+        %% to be admitted. Only the live head is left.
+        await_state(Pid, fun(#state{pending = P, requesters = R}) ->
+            queue:len(P) =:= 1 andalso not maps:is_key(Requester, R)
+        end),
+        ?assertEqual(Before + 3, counters:get(Cnt, ?C_DROPPED_DEAD_REPLYTO)),
+        %% The gauge follows the queue, and the surviving head is the live one.
+        ?assertEqual(1, counters:get(Cnt, ?C_PENDING_SUBMISSIONS)),
+        [{_Fun, _Size, HeadReplyTo, _Ref}] = queue:to_list((sys:get_state(Pid))#state.pending),
+        ?assertEqual(Self, HeadReplyTo),
+        gen_server:stop(Pid)
+    end).
+
+%% A requester with only queued work - nothing admitted - must still be
+%% monitored. Watching from spawn_task/2 alone left this requester invisible.
+queued_only_requester_is_monitored_test() ->
+    {ok, Pid} = start_link(#{rate => 1000, burst => 1000}),
+    Self = self(),
+    RefDrain = make_ref(),
+    submit(fun() -> {ok, drained} end, 1000, Self, RefDrain),
+    receive
+        {transfer_result, RefDrain, _} -> ok
+    after 1000 -> error(drain_timeout)
+    end,
+    Parent = self(),
+    Requester = spawn(fun() ->
+        submit(fun() -> error(should_not_run) end, 500, self(), make_ref()),
+        _ = sys:get_status(?MODULE),
+        Parent ! submitted,
+        receive
+            die -> ok
+        end
+    end),
+    receive
+        submitted -> ok
+    after 1000 -> error(setup_failed)
+    end,
+    %% The drain task's result arrives before its 'DOWN' is processed, so wait
+    %% for `tasks` to settle empty rather than asserting it outright. The
+    %% requester holds only a queued item, no admitted task, yet must be watched.
+    await_state(Pid, fun(#state{tasks = T, requesters = R}) ->
+        map_size(T) =:= 0 andalso maps:is_key(Requester, R)
+    end),
+    Requester ! die,
+    await_state(Pid, fun(#state{pending = P, requesters = R}) ->
+        queue:is_empty(P) andalso R =:= #{}
+    end),
     gen_server:stop(Pid).
 
 pacing_delays_when_exhausted_test() ->
