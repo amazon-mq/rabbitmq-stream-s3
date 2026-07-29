@@ -160,21 +160,22 @@ handle_cast({submit, Fun, Size, ReplyTo, Ref}, State) ->
             inc(?C_DROPPED_DEAD_REPLYTO, 1),
             {noreply, State}
     end;
-handle_cast({cancel, Refs0}, #state{tasks = Tasks} = State) ->
-    %% tasks/tasks_rev removal and the TASKS_IN_FLIGHT decrement happen in
-    %% the 'DOWN' handler below, the single cleanup path shared by normal
-    %% completion, a crash and a kill alike.
-    Refs = lists:filter(
+handle_cast({cancel, Refs}, #state{tasks = Tasks} = State) ->
+    %% Kill any admitted task for these Refs; tasks/tasks_rev removal and the
+    %% TASKS_IN_FLIGHT decrement happen in the 'DOWN' handler below, the single
+    %% cleanup path shared by normal completion, a crash and a kill alike.
+    %% A Ref can be admitted and still queued at the same time (a same-Ref
+    %% resubmit while the earlier attempt is still running), so every Ref is
+    %% also passed to cancel_pending/2: a still-queued copy must not be left
+    %% behind just because an admitted task for the same Ref existed.
+    lists:foreach(
         fun(Ref) ->
             case Tasks of
-                #{Ref := {Pid, _MonRef}} ->
-                    exit(Pid, kill),
-                    false;
-                #{} ->
-                    true
+                #{Ref := {Pid, _MonRef}} -> exit(Pid, kill);
+                #{} -> ok
             end
         end,
-        Refs0
+        Refs
     ),
     {noreply, cancel_pending(Refs, State)};
 handle_cast(_Msg, State) ->
@@ -557,6 +558,45 @@ resubmit_survives_stale_down_test() ->
     after 300 -> ok
     end,
     ?assertEqual(#{}, (sys:get_state(Pid))#state.tasks),
+    gen_server:stop(Pid).
+
+%% cancel/1 on a Ref that is both admitted (a running task) and still queued
+%% (a same-Ref resubmit while the earlier attempt is still running) must reach
+%% both: the running task is killed and the queued copy is dropped. Before the
+%% fix, finding a running task for the Ref filtered it out of the batch handed
+%% to cancel_pending/2, so the queued copy survived and would later be admitted
+%% and uploaded for an already-deleted stream.
+cancel_reaches_admitted_and_queued_same_ref_test() ->
+    {ok, Pid} = start_link(#{rate => 1000, burst => 1000}),
+    Self = self(),
+    Ref = make_ref(),
+    %% Attempt 1: admitted immediately (bucket full), then blocks forever,
+    %% leaving the bucket exhausted.
+    submit(
+        fun() ->
+            receive
+                never -> ok
+            end
+        end,
+        1000,
+        Self,
+        Ref
+    ),
+    %% Attempt 2 under the SAME Ref: bucket is exhausted, so it queues. The Ref
+    %% is now both in `tasks` (attempt 1) and in `pending` (attempt 2).
+    submit(fun() -> error(should_not_run) end, 500, Self, Ref),
+    #state{tasks = Tasks, pending = Pending} = sys:get_state(Pid),
+    ?assert(is_map_key(Ref, Tasks)),
+    ?assertEqual(1, queue:len(Pending)),
+    cancel([Ref]),
+    receive
+        {transfer_result, Ref, _} -> error(unexpected_result)
+    after 300 ->
+        %% Also gives the kill and the resulting 'DOWN' time to land.
+        ok
+    end,
+    ?assertEqual(#{}, (sys:get_state(Pid))#state.tasks),
+    ?assertEqual(0, queue:len((sys:get_state(Pid))#state.pending)),
     gen_server:stop(Pid).
 
 %% A planned stop (gen_server:stop/1, reason `normal`) kills every
