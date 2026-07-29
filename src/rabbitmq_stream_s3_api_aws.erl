@@ -36,7 +36,7 @@ A wrapper around the AWS S3 HTTP API.
 -export([get_credentials/0]).
 
 %% For the pool. Not to be called by anyone else.
--export([hostname/0]).
+-export([hostname/0, note_request_abandoned/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, format_status/1]).
@@ -1877,8 +1877,47 @@ aws_chunked_encoded_length(ContentLength) ->
 counter() ->
     persistent_term:get(?COUNTER_KEY).
 
+-doc """
+Called by the pool when it reclaims a connection whose checking-out process
+died without checking it back in. `?C_ACTIVE_REQUESTS` is otherwise only
+decremented by `finish_async`/`finish_async_close`, which run in the
+checking-out process itself; a process killed mid-request (e.g. by
+`rabbitmq_stream_s3_governor:cancel/1`) never reaches either, so the pool -
+the only place that reliably learns of such an abandoned request - reports
+it here instead.
+
+A no-op if this module's counters aren't initialized: the pool can be driven
+in isolation (e.g. api_aws_pool_statem_SUITE) without this gen_server, and
+its own request-tracking gauge has nothing to correct in that case.
+""".
+-spec note_request_abandoned() -> ok.
+note_request_abandoned() ->
+    case persistent_term:get(?COUNTER_KEY, undefined) of
+        undefined -> ok;
+        Cnt -> counters:sub(Cnt, ?C_ACTIVE_REQUESTS, 1)
+    end,
+    ok.
+
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
+
+note_request_abandoned_decrements_active_requests_test() ->
+    Cnt = counters:new(6, []),
+    counters:add(Cnt, ?C_ACTIVE_REQUESTS, 1),
+    persistent_term:put(?COUNTER_KEY, Cnt),
+    try
+        ?assertEqual(ok, note_request_abandoned()),
+        ?assertEqual(0, counters:get(Cnt, ?C_ACTIVE_REQUESTS))
+    after
+        persistent_term:erase(?COUNTER_KEY)
+    end.
+
+note_request_abandoned_is_noop_without_counters_test() ->
+    case persistent_term:get(?COUNTER_KEY, undefined) of
+        undefined -> ok;
+        _ -> persistent_term:erase(?COUNTER_KEY)
+    end,
+    ?assertEqual(ok, note_request_abandoned()).
 
 transient_status_test() ->
     %% Retryable: server-side 5xx (except 501) and throttling.

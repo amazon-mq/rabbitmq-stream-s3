@@ -335,6 +335,12 @@ handle_down(MRef, Pid, #?MODULE{monitors = Monitors} = State0) when
 %% is not `head`, crashing gun's gen_statem with `function_clause`. Drop the
 %% connection and grow a replacement.
 %% See: https://github.com/amazon-mq/rabbitmq-stream-s3/issues/177
+%%
+%% This is also the only place that reliably learns a request was abandoned
+%% (e.g. the caller was killed by rabbitmq_stream_s3_governor:cancel/1) rather
+%% than finishing normally, so it reports that to the api module too - it
+%% would otherwise never decrement api_aws's active-requests gauge, since
+%% that only happens in the checking-out process itself.
 handle_down(
     MRef,
     _Pid,
@@ -345,6 +351,7 @@ handle_down(
         checkouts = maps:remove(Conn, Checkouts),
         checkouts_rev = maps:remove(MRef, CheckoutsRev)
     },
+    ok = rabbitmq_stream_s3_api_aws:note_request_abandoned(),
     {noreply, grow(close_connection(Conn, State1))};
 %% A pending caller process is down. Remove it from the pending queue.
 handle_down(_MRef, Pid, #?MODULE{pending = Pending0} = State0) ->
