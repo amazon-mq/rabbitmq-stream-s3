@@ -18,6 +18,14 @@ spawned, and the pending queue is scanned once for the whole batch.
 Spawned tasks are monitored, not linked, so a governor restart does not
 kill tasks already running - they keep delivering their results directly to
 `ReplyTo` regardless of the governor's own lifecycle.
+
+A planned shutdown (the application or node stopping, or an explicit
+`gen_server:stop/1`) is different from a restart: `terminate/2` kills every
+still-running task, since nothing will be left running to service them.
+A crash takes neither path - it is not a planned shutdown, and it is not a
+restart either (the governor itself, not its tasks, is what's restarting) -
+so tasks are deliberately left alone, consistent with the monitor-not-link
+choice above.
 """.
 
 -behaviour(gen_server).
@@ -28,7 +36,8 @@ kill tasks already running - they keep delivering their results directly to
     handle_call/3,
     handle_cast/2,
     handle_info/2,
-    format_status/1
+    format_status/1,
+    terminate/2
 ]).
 
 -export([init_counters/0]).
@@ -115,6 +124,10 @@ cancel(Refs) ->
 %% ------------------------------------------------------------------
 
 init(Opts) ->
+    %% Without this, a supervisor-issued shutdown signal (application/node
+    %% stop) would just kill this process outright, and terminate/2 below -
+    %% which cancels running tasks on that specific path - would never run.
+    process_flag(trap_exit, true),
     Bucket =
         case maps:get(rate, Opts, unlimited) of
             unlimited ->
@@ -203,6 +216,25 @@ handle_info(_Info, State) ->
 
 format_status(#{state := State} = Status) ->
     Status#{state := format_state(State)}.
+
+%% Cancel every running task on a planned shutdown (application/node stop, or
+%% an explicit gen_server:stop/1) so nothing keeps running once nothing is
+%% left to service it. A crash takes a different path here - Reason is none
+%% of normal/shutdown/{shutdown, _} - and deliberately leaves tasks alone:
+%% they are spawn_monitor'd, not linked, precisely so a governor restart
+%% does not kill uploads already in flight (see moduledoc).
+terminate(Reason, #state{tasks = Tasks}) when
+    Reason =:= normal; Reason =:= shutdown
+->
+    kill_tasks(Tasks);
+terminate({shutdown, _}, #state{tasks = Tasks}) ->
+    kill_tasks(Tasks);
+terminate(_Reason, _State) ->
+    ok.
+
+kill_tasks(Tasks) ->
+    maps:foreach(fun(_Ref, {Pid, _MonRef}) -> exit(Pid, kill) end, Tasks),
+    ok.
 
 format_state(#state{bucket = Bucket, pending = Pending}) ->
     #{
@@ -526,6 +558,53 @@ resubmit_survives_stale_down_test() ->
     end,
     ?assertEqual(#{}, (sys:get_state(Pid))#state.tasks),
     gen_server:stop(Pid).
+
+%% A planned stop (gen_server:stop/1, reason `normal`) kills every
+%% still-running task rather than leaving it to finish on its own.
+terminate_kills_tasks_on_normal_stop_test() ->
+    {ok, Pid} = start_link(#{rate => unlimited}),
+    Self = self(),
+    Ref = make_ref(),
+    submit(
+        fun() ->
+            receive
+                never -> ok
+            end
+        end,
+        100,
+        Self,
+        Ref
+    ),
+    #state{tasks = Tasks} = sys:get_state(Pid),
+    {TaskPid, _MonRef} = maps:get(Ref, Tasks),
+    Mon = monitor(process, TaskPid),
+    gen_server:stop(Pid),
+    receive
+        {'DOWN', Mon, process, TaskPid, killed} -> ok
+    after 1000 -> error(task_not_killed)
+    end.
+
+%% terminate/2 leaves tasks alone for any reason other than a planned
+%% shutdown - specifically so a governor crash-restart does not kill uploads
+%% already in flight (see moduledoc).
+terminate_leaves_tasks_on_crash_reason_test() ->
+    TaskPid = spawn(fun() ->
+        receive
+            never -> ok
+        end
+    end),
+    MonRef = monitor(process, TaskPid),
+    Ref = make_ref(),
+    State = #state{
+        bucket = unlimited,
+        pending = queue:new(),
+        tasks = #{Ref => {TaskPid, MonRef}},
+        tasks_rev = #{MonRef => Ref}
+    },
+    ok = terminate({error, some_crash}, State),
+    timer:sleep(50),
+    ?assert(is_process_alive(TaskPid)),
+    exit(TaskPid, kill).
 
 %% A submission whose ReplyTo is already dead is dropped at intake, before
 %% ever touching the bucket or spawning anything.
