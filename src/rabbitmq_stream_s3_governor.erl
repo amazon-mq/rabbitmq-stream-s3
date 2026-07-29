@@ -506,6 +506,11 @@ set(Idx, V) ->
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
+%% Barrier budget for await_state/2, generous because it is only ever paid in
+%% full when a test is about to fail anyway.
+-define(AWAIT_MS, 2000).
+-define(AWAIT_INTERVAL_MS, 5).
+
 unlimited_passes_through_test() ->
     {ok, Pid} = start_link(#{rate => unlimited}),
     Ref = make_ref(),
@@ -822,15 +827,17 @@ requester_death_kills_running_task_test() ->
     ?assert(is_map_key(Requester, Requesters)),
     TaskMon = monitor(process, TaskPid),
     Requester ! die,
+    %% The task is killed as a direct consequence of the requester's death.
     receive
         {'DOWN', TaskMon, process, TaskPid, killed} -> ok
     after 1000 -> error(task_not_killed)
     end,
-    %% The task's own 'DOWN' clears the bookkeeping, including the monitor.
-    _ = sys:get_status(Pid),
-    ?assertEqual(#{}, (sys:get_state(Pid))#state.tasks),
-    ?assertEqual(#{}, (sys:get_state(Pid))#state.tasks_by_ref),
-    ?assertEqual(#{}, (sys:get_state(Pid))#state.requesters),
+    %% This 'DOWN' is delivered to the test; the governor's own copy is a
+    %% separate signal with no ordering relation to it, so await the governor's
+    %% state rather than assuming its 'DOWN' has already been processed.
+    await_state(Pid, fun(#state{tasks = T, tasks_by_ref = B, requesters = R}) ->
+        T =:= #{} andalso B =:= #{} andalso R =:= #{}
+    end),
     gen_server:stop(Pid).
 
 %% A dying requester's still-queued submissions are dropped as well as its
@@ -866,13 +873,12 @@ requester_death_drops_queued_submissions_test() ->
     ?assertEqual(1, map_size((sys:get_state(Pid))#state.tasks)),
     ?assertEqual(1, queue:len((sys:get_state(Pid))#state.pending)),
     Requester ! die,
-    %% Sync twice: the requester 'DOWN' lands first, then the killed task's own.
-    _ = sys:get_status(Pid),
-    timer:sleep(100),
-    _ = sys:get_status(Pid),
-    ?assertEqual(#{}, (sys:get_state(Pid))#state.tasks),
-    ?assertEqual(0, queue:len((sys:get_state(Pid))#state.pending)),
-    ?assertEqual(#{}, (sys:get_state(Pid))#state.requesters),
+    %% Two 'DOWN's have to land: the requester's, which kills the task and
+    %% drops the queued item, then the killed task's own, which clears the
+    %% bookkeeping. Await the end state rather than guessing how long that takes.
+    await_state(Pid, fun(#state{tasks = T, pending = P, requesters = R}) ->
+        T =:= #{} andalso queue:is_empty(P) andalso R =:= #{}
+    end),
     gen_server:stop(Pid).
 
 %% One requester's death must not disturb another's tasks. The requester
@@ -912,12 +918,16 @@ requester_death_spares_other_requesters_test() ->
     ?assertEqual(2, map_size(Tasks)),
     [SurvivorTask] = [P || {P, _R, Owner} <- maps:values(Tasks), Owner =:= Survivor],
     Doomed ! die,
-    timer:sleep(200),
-    _ = sys:get_status(Pid),
+    %% Await the doomed requester being fully reaped, then assert the survivor
+    %% was left untouched. Awaiting the reap first is what makes the survivor
+    %% assertions meaningful: they run after the governor has finished acting
+    %% on a death, not before it has started.
+    await_state(Pid, fun(#state{tasks = T, requesters = R}) ->
+        map_size(T) =:= 1 andalso maps:keys(R) =:= [Survivor]
+    end),
     ?assert(is_process_alive(SurvivorTask)),
-    #state{tasks = Tasks1, requesters = Requesters1} = sys:get_state(Pid),
-    ?assertEqual(1, map_size(Tasks1)),
-    ?assertEqual([Survivor], maps:keys(Requesters1)),
+    #state{tasks = Tasks1} = sys:get_state(Pid),
+    ?assertEqual([Survivor], [Owner || {_P, _R, Owner} <- maps:values(Tasks1)]),
     Survivor ! die,
     gen_server:stop(Pid).
 
@@ -941,14 +951,15 @@ requester_monitor_is_refcounted_test() ->
     ?assertMatch(#{Self := {_Mon, 2}}, Requesters),
     %% One task ends: the requester is still watched, with one task left.
     cancel([Ref1]),
-    timer:sleep(200),
-    _ = sys:get_status(Pid),
-    ?assertMatch(#{Self := {_Mon, 1}}, (sys:get_state(Pid))#state.requesters),
+    await_state(Pid, fun(#state{requesters = R}) ->
+        case R of
+            #{Self := {_Mon, Count}} -> Count =:= 1;
+            _ -> false
+        end
+    end),
     %% The last one ends: the monitor is released.
     cancel([Ref2]),
-    timer:sleep(200),
-    _ = sys:get_status(Pid),
-    ?assertEqual(#{}, (sys:get_state(Pid))#state.requesters),
+    await_state(Pid, fun(#state{requesters = R}) -> R =:= #{} end),
     gen_server:stop(Pid).
 
 %% A submission whose ReplyTo is already dead is dropped at intake, before
@@ -1076,6 +1087,27 @@ queued_item_is_not_starved_by_later_submissions_test() ->
     %% The head (submitted first) must complete before the later small item.
     ?assertEqual([RefHead, RefSmall], collect_order([RefHead, RefSmall], 5000)),
     gen_server:stop(Pid).
+
+%% Block until the governor's own state satisfies Fun, or fail the test.
+%% A killed task's 'DOWN' is delivered to the governor asynchronously, so the
+%% bookkeeping it drives (tasks, tasks_by_ref, requesters, pending) settles
+%% some time after the kill. Poll the state rather than sleeping a guessed
+%% duration: a sleep is either flaky under load or slower than it needs to be.
+%% sys:get_state is a sound barrier here because the governor is a plain
+%% gen_server (see docs/conventions.md on gen_batch_server, where it is not).
+await_state(Pid, Fun) ->
+    await_state(Pid, Fun, ?AWAIT_MS).
+
+await_state(Pid, _Fun, Remaining) when Remaining =< 0 ->
+    error({timeout_awaiting_state, sys:get_state(Pid)});
+await_state(Pid, Fun, Remaining) ->
+    case Fun(sys:get_state(Pid)) of
+        true ->
+            ok;
+        false ->
+            timer:sleep(?AWAIT_INTERVAL_MS),
+            await_state(Pid, Fun, Remaining - ?AWAIT_INTERVAL_MS)
+    end.
 
 collect_results(Refs, Timeout) ->
     collect_results(Refs, Timeout, #{}).
