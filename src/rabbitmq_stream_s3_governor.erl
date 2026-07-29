@@ -1371,6 +1371,65 @@ pending_gauge_is_derived_from_state_test() ->
         gen_server:stop(Pid)
     end).
 
+%% submissions_received counts intake, so it must count a submission whose
+%% requester is already dead too - that one never reaches a task, and the gap
+%% between it and dropped_dead_replyto is what makes the drop visible.
+submissions_received_counts_every_intake_test() ->
+    with_counter(fun(Cnt) ->
+        {ok, Pid} = start_link(#{rate => unlimited}),
+        Self = self(),
+        Ref = make_ref(),
+        submit(fun() -> {ok, live} end, 100, Self, Ref),
+        receive
+            {transfer_result, Ref, _} -> ok
+        after 1000 -> error(live_timeout)
+        end,
+        ?assertEqual(1, counters:get(Cnt, ?C_SUBMISSIONS_RECEIVED)),
+        Dead = spawn(fun() -> ok end),
+        await_dead(Dead),
+        submit(fun() -> error(should_not_run) end, 100, Dead, make_ref()),
+        await_state(Pid, fun(_) ->
+            counters:get(Cnt, ?C_SUBMISSIONS_RECEIVED) =:= 2
+        end),
+        ?assertEqual(1, counters:get(Cnt, ?C_DROPPED_DEAD_REPLYTO)),
+        gen_server:stop(Pid)
+    end).
+
+%% A transfer larger than the burst is admitted on credit rather than
+%% deadlocking, and is counted so a burst configured below typical fragment
+%% sizes is visible. Only the oversized admission counts, not the normal one.
+oversized_admissions_counts_credit_admissions_test() ->
+    with_counter(fun(Cnt) ->
+        {ok, Pid} = start_link(#{rate => 1000, burst => 1000}),
+        Self = self(),
+        RefNormal = make_ref(),
+        submit(fun() -> {ok, normal} end, 500, Self, RefNormal),
+        receive
+            {transfer_result, RefNormal, _} -> ok
+        after 1000 -> error(normal_timeout)
+        end,
+        ?assertEqual(0, counters:get(Cnt, ?C_OVERSIZED_ADMISSIONS)),
+        %% 1500 > burst 1000: admitted once the bucket is fully saved up, then
+        %% driven into debt. It has to wait for the refill, hence the budget.
+        RefBig = make_ref(),
+        submit(fun() -> {ok, big} end, 1500, Self, RefBig),
+        receive
+            {transfer_result, RefBig, _} -> ok
+        after 5000 -> error(big_timeout)
+        end,
+        ?assertEqual(1, counters:get(Cnt, ?C_OVERSIZED_ADMISSIONS)),
+        gen_server:stop(Pid)
+    end).
+
+%% Wait until Pid is really gone, so is_process_alive/1 in the governor's intake
+%% is guaranteed to see it dead rather than racing the spawn.
+await_dead(Pid) ->
+    Mon = monitor(process, Pid),
+    receive
+        {'DOWN', Mon, process, Pid, _} -> ok
+    after 1000 -> error({still_alive, Pid})
+    end.
+
 %% Run Fun with a private counter installed, restoring whatever was there
 %% before. The key is global to the node, so a test must not leave the module's
 %% real counter erased or replaced for whatever runs next.

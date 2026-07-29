@@ -32,6 +32,14 @@ For the manifest cache this is enforced structurally, not by convention: branchi
 
 The direction of each explicit miss clause matters: consumers must fail in the direction that cannot lose data. Readers fail closed (error, the consumer retries), retention deletes nothing, GC skips, resolution goes to the authoritative store. A fallback that degrades silently reads as robustness in review and is exactly where correctness leaks out.
 
+## Derived gauges
+
+A gauge whose value is a pure function of process state should be published from that state on every handler return, not incremented and decremented at the edges. Counters live in `persistent_term` and outlive the process that maintains them; the state they describe does not. An inc/dec gauge therefore ratchets permanently on the one path that deliberately runs no cleanup - a crash, where the pending decrements are lost with the old incarnation's mailbox and the fresh one starts from empty state. A derived gauge self-heals, because `init/1` publishes from the empty state and each later mutation republishes the truth. It also cannot drift from the state it reports, since there is no second place to forget an edge.
+
+`rabbitmq_stream_s3_governor:derive_gauges/1` is the reference shape: one function, called on every callback return that can change what it reports. See the Derived gauges section of that module's moduledoc.
+
+Where a gauge spans several processes it cannot be derived from any one of them, and inc/dec is the only option. Then weld both edges to the single state mutation they mirror, so an edge cannot be added without the counter following: api_aws's `active_requests` counts one in-flight request per pool checkout across every pool, and its two edges live in `rabbitmq_stream_s3_api_aws_pool:add_checkout/3` and `del_checkout/3`, the only two places the `checkouts` maps change. Keep the counter's key, size, and indices private to the module that defines `?COUNTERS`, and reach it from elsewhere (including tests in other modules) through an exported accessor keyed by metric name rather than a restated index.
+
 ## Cold-state test dimension
 
 Every stateful fixture a test warms up implicitly is a state the suite must also construct cold. An end-to-end test that publishes and then reads has, as a side effect, seeded the manifest cache, attached the hooks, and resolved the manifest: the act of arranging the fixture destroys the cold-start state, so the warm path is the only path such suites can ever exercise.

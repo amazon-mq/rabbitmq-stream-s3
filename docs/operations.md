@@ -304,8 +304,13 @@ Owned by `rabbitmq_stream_s3_governor`. Single counter set per node, no per-stre
 |-------------------------------------|---------|-------------------------------------------------------------------|
 | `rabbitmq_stream_s3_governor_submissions_received`     | counter | Total transfer submissions received                               |
 | `rabbitmq_stream_s3_governor_oversized_admissions`     | counter | Transfers admitted on credit because they exceed the burst allowance; a persistently climbing value means the configured rate is low relative to fragment sizes |
+| `rabbitmq_stream_s3_governor_dropped_dead_replyto`     | counter | Submissions dropped because the requester was already dead, either at intake or while queued behind the token bucket; expected to climb during stream deletion or replica-reader restarts, and not an error |
 | `rabbitmq_stream_s3_governor_tasks_in_flight`          | gauge   | Transfer tasks currently executing                                |
 | `rabbitmq_stream_s3_governor_pending_submissions`      | gauge   | Submissions queued waiting for token-bucket capacity              |
+
+Both governor gauges are derived from the state they describe rather than incremented and decremented, so they self-heal after a governor crash instead of ratcheting. See the Derived gauges section of the `rabbitmq_stream_s3_governor` moduledoc, and [conventions.md](./conventions.md#derived-gauges).
+
+A transfer is cancelled when its requester dies (any death: crash, restart, or stream deletion) or when the replica reader explicitly cancels it. Cancellation reaches both queued and running work: queued submissions are dropped without spending tokens, and running tasks are killed. Queued drops for a dead requester are counted in `governor_dropped_dead_replyto`; an explicit cancel is not counted, since nothing went wrong.
 
 ### Reaper (per-node)
 
