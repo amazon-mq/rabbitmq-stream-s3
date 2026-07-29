@@ -36,7 +36,7 @@ A wrapper around the AWS S3 HTTP API.
 -export([get_credentials/0]).
 
 %% For the pool. Not to be called by anyone else.
--export([hostname/0, note_request_abandoned/0]).
+-export([hostname/0, note_request_started/0, note_request_finished/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, format_status/1]).
@@ -391,19 +391,12 @@ stream_put(Key, ContentLength, Opts0) when is_binary(Key) andalso is_map(Opts0) 
             of
                 {ok, Headers} ->
                     Pool = ?UPLOAD_POOL,
-                    %% Acquire the connection before touching the request
-                    %% gauges. checkout/2 returns {error, pool_busy} on a
-                    %% saturated pool, and C_ACTIVE_REQUESTS is only decremented
-                    %% by finish_async, which runs once we hold a connection and
-                    %% have built State. Incrementing before the checkout leaked
-                    %% the gauge on every failed checkout (a sustained partial
-                    %% outage that drains the pool drove active_requests up with
-                    %% no way back down).
+                    %% active_requests is owned by the pool and moved on the
+                    %% checkout itself, so a failed checkout cannot leak it and a
+                    %% caller killed mid-request is still balanced by the pool.
                     case rabbitmq_stream_s3_api_aws_pool:checkout(Pool, 10_000) of
                         {ok, Conn} ->
-                            Cnt = counter(),
-                            counters:add(Cnt, ?C_ACTIVE_REQUESTS, 1),
-                            counters:add(Cnt, ?C_TOTAL_REQUESTS, 1),
+                            counters:add(counter(), ?C_TOTAL_REQUESTS, 1),
                             StreamRef = gun:headers(Conn, Method, Path, Headers),
                             State = #{
                                 pool => Pool,
@@ -489,11 +482,11 @@ send_chunk(Conn, StreamRef, Chunk) when is_binary(Chunk) ->
 -spec stream_abort(async_state()) -> ok.
 stream_abort(#{conn := Conn} = State) ->
     %% The streaming PUT body was only partially sent, so this HTTP/1.1
-    %% connection is mid-request and cannot be reused. Close it (the pool's
-    %% 'DOWN' handler removes it and opens a replacement) and release the
-    %% active-request gauge without checking the connection back in. Mirrors
-    %% the timeout/cancel path; the half-sent PUT never reaches S3 as an
-    %% object, so nothing is left behind except an orphan at most.
+    %% connection is mid-request and cannot be reused. Close it without checking
+    %% it back in; the pool's 'DOWN' handler removes it, accounts the checkout
+    %% end (active_requests), and opens a replacement. Mirrors the timeout/cancel
+    %% path; the half-sent PUT never reaches S3 as an object, so nothing is left
+    %% behind except an orphan at most.
     gun:close(Conn),
     finish_async_close(State).
 
@@ -1029,12 +1022,15 @@ finish_async(#{conn := Conn, pool := Pool} = State) ->
         _ ->
             ok
     end,
-    counters:sub(counter(), ?C_ACTIVE_REQUESTS, 1),
+    %% The pool decrements active_requests on the checkin below (see
+    %% note_request_finished/0).
     ok = rabbitmq_stream_s3_api_aws_pool:checkin(Pool, Conn).
 
 %% Finish an async request when the connection is being closed (e.g. on
 %% timeout). Same bookkeeping as `finish_async` but omits the pool checkin -
-%% the pool's 'DOWN' handler removes the conn and grows a replacement.
+%% the caller has already closed the connection, so the pool's 'DOWN' handler
+%% removes the conn, accounts the checkout end (active_requests), and grows a
+%% replacement.
 finish_async_close(State) ->
     case State of
         #{timer_ref := TimerRef, stream_ref := StreamRef} ->
@@ -1050,7 +1046,6 @@ finish_async_close(State) ->
         _ ->
             ok
     end,
-    counters:sub(counter(), ?C_ACTIVE_REQUESTS, 1),
     ok.
 
 -spec request(http_method(), key(), req_headers(), iodata(), request_opts()) ->
@@ -1078,14 +1073,11 @@ request(Method, Path, Headers0, Body, Opts) when
                 )
             of
                 {ok, Headers} ->
-                    Cnt = counter(),
-                    counters:add(Cnt, ?C_ACTIVE_REQUESTS, 1),
-                    counters:add(Cnt, ?C_TOTAL_REQUESTS, 1),
-                    try
-                        request0(Method, Path, Headers, Body, Opts)
-                    after
-                        counters:sub(Cnt, ?C_ACTIVE_REQUESTS, 1)
-                    end;
+                    %% active_requests is owned by the pool, tied to the
+                    %% checkout that request1/5 does below (see
+                    %% note_request_started/0).
+                    counters:add(counter(), ?C_TOTAL_REQUESTS, 1),
+                    request0(Method, Path, Headers, Body, Opts);
                 {error, _} = Err ->
                     Err
             end;
@@ -1187,9 +1179,8 @@ request_async(Method, Path, Headers0, Body, Opts) ->
 start_async_request(Pool, Method, Path, Headers, Body, Opts) ->
     case rabbitmq_stream_s3_api_aws_pool:checkout(Pool, ?READ_CHECKOUT_TIMEOUT_MS) of
         {ok, Conn} ->
-            Cnt = counter(),
-            counters:add(Cnt, ?C_ACTIVE_REQUESTS, 1),
-            counters:add(Cnt, ?C_TOTAL_REQUESTS, 1),
+            %% active_requests is owned by the pool, tied to this checkout.
+            counters:add(counter(), ?C_TOTAL_REQUESTS, 1),
             %% NOTE: no need to wrap this in try/catch and checkin the conn
             %% since gun:request/5 cannot exit/error/throw.
             StreamRef = gun:request(Conn, Method, Path, Headers, Body),
@@ -1878,20 +1869,34 @@ counter() ->
     persistent_term:get(?COUNTER_KEY).
 
 -doc """
-Called by the pool when it reclaims a connection whose checking-out process
-died without checking it back in. `?C_ACTIVE_REQUESTS` is otherwise only
-decremented by `finish_async`/`finish_async_close`, which run in the
-checking-out process itself; a process killed mid-request (e.g. by
-`rabbitmq_stream_s3_governor:cancel/1`) never reaches either, so the pool -
-the only place that reliably learns of such an abandoned request - reports
-it here instead.
+`active_requests` counts connections currently checked out of a pool: one
+in-flight S3 request per checkout. The pool owns both edges, calling
+`note_request_started/0` when it hands a connection to a caller and
+`note_request_finished/0` when that checkout ends, whether by check-in, by the
+caller dying while holding it, or by the connection dying under it.
 
-A no-op if this module's counters aren't initialized: the pool can be driven
-in isolation (e.g. api_aws_pool_statem_SUITE) without this gen_server, and
-its own request-tracking gauge has nothing to correct in that case.
+Keeping both edges in the pool, at the checkout lifecycle points, is what makes
+the gauge balanced by construction. The alternative - incrementing in the
+requesting process and decrementing on each of its completion paths - left the
+gauge to drift: a caller killed mid-request (e.g. by
+`rabbitmq_stream_s3_governor:cancel/1`) or killed while still queued for a
+connection ran none of those paths, so an increment had no matching decrement.
+
+Both are a no-op if this module's counters aren't initialized: the pool can be
+driven in isolation (e.g. api_aws_pool_statem_SUITE) without this gen_server,
+and there is no gauge to move in that case.
 """.
--spec note_request_abandoned() -> ok.
-note_request_abandoned() ->
+-spec note_request_started() -> ok.
+note_request_started() ->
+    case persistent_term:get(?COUNTER_KEY, undefined) of
+        undefined -> ok;
+        Cnt -> counters:add(Cnt, ?C_ACTIVE_REQUESTS, 1)
+    end,
+    ok.
+
+-doc #{equiv => note_request_started / 0}.
+-spec note_request_finished() -> ok.
+note_request_finished() ->
     case persistent_term:get(?COUNTER_KEY, undefined) of
         undefined -> ok;
         Cnt -> counters:sub(Cnt, ?C_ACTIVE_REQUESTS, 1)
@@ -1901,23 +1906,25 @@ note_request_abandoned() ->
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
-note_request_abandoned_decrements_active_requests_test() ->
+note_request_started_and_finished_balance_test() ->
     Cnt = counters:new(6, []),
-    counters:add(Cnt, ?C_ACTIVE_REQUESTS, 1),
     persistent_term:put(?COUNTER_KEY, Cnt),
     try
-        ?assertEqual(ok, note_request_abandoned()),
+        ?assertEqual(ok, note_request_started()),
+        ?assertEqual(1, counters:get(Cnt, ?C_ACTIVE_REQUESTS)),
+        ?assertEqual(ok, note_request_finished()),
         ?assertEqual(0, counters:get(Cnt, ?C_ACTIVE_REQUESTS))
     after
         persistent_term:erase(?COUNTER_KEY)
     end.
 
-note_request_abandoned_is_noop_without_counters_test() ->
+note_request_edges_are_noop_without_counters_test() ->
     case persistent_term:get(?COUNTER_KEY, undefined) of
         undefined -> ok;
         _ -> persistent_term:erase(?COUNTER_KEY)
     end,
-    ?assertEqual(ok, note_request_abandoned()).
+    ?assertEqual(ok, note_request_started()),
+    ?assertEqual(ok, note_request_finished()).
 
 transient_status_test() ->
     %% Retryable: server-side 5xx (except 501) and throttling.
