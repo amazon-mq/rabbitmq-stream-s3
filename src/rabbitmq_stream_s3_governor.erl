@@ -12,9 +12,12 @@ The transfer function is opaque to the governor.
 When the configured rate is `unlimited`, submissions execute immediately
 with no pacing.
 
-A caller can cancel a batch of submissions by their `Ref`s via `cancel/1`: an
-admitted task is killed, a still-queued item is dropped before ever being
-spawned, and the pending queue is scanned once for the whole batch.
+A caller can cancel a batch of submissions by their `Ref`s via `cancel/1`:
+every admitted task for a `Ref` is killed, a still-queued item is dropped
+before ever being spawned, and the pending queue is scanned once for the whole
+batch. A single `Ref` can have both more than one running task and a queued
+item at the same time, because a resubmit reuses its `Ref`; `cancel/1` reaches
+all of them.
 Spawned tasks are monitored, not linked, so a governor restart does not
 kill tasks already running - they keep delivering their results directly to
 `ReplyTo` regardless of the governor's own lifecycle.
@@ -75,12 +78,15 @@ choice above.
     %% Pending submissions waiting for tokens.
     pending :: queue:queue(pending_item()),
     timer_ref :: reference() | undefined,
-    %% Ref => {Pid, MonRef} for every task currently executing, so cancel/1
-    %% can reach an admitted task by its caller-minted Ref.
+    %% MonRef => {Pid, Ref} for every task currently executing, one entry per
+    %% live attempt. Keyed by the monitor reference rather than the
+    %% caller-minted Ref because a resubmit reuses the same Ref: keying by Ref
+    %% let a second live attempt overwrite the first, orphaning a running task
+    %% that neither cancel/1 nor kill_tasks/1 could then reach.
     tasks = #{} :: #{reference() => {pid(), reference()}},
-    %% MonRef => Ref, the reverse index the 'DOWN' handler uses to find which
-    %% submission a completed, crashed or killed monitor belonged to.
-    tasks_rev = #{} :: #{reference() => reference()}
+    %% Ref => [MonRef], the secondary index cancel/1 uses to reach every live
+    %% attempt belonging to a caller-minted Ref.
+    tasks_by_ref = #{} :: #{reference() => [reference()]}
 }).
 
 -type pending_item() :: {
@@ -160,20 +166,24 @@ handle_cast({submit, Fun, Size, ReplyTo, Ref}, State) ->
             inc(?C_DROPPED_DEAD_REPLYTO, 1),
             {noreply, State}
     end;
-handle_cast({cancel, Refs}, #state{tasks = Tasks} = State) ->
-    %% Kill any admitted task for these Refs; tasks/tasks_rev removal and the
-    %% TASKS_IN_FLIGHT decrement happen in the 'DOWN' handler below, the single
-    %% cleanup path shared by normal completion, a crash and a kill alike.
-    %% A Ref can be admitted and still queued at the same time (a same-Ref
-    %% resubmit while the earlier attempt is still running), so every Ref is
-    %% also passed to cancel_pending/2: a still-queued copy must not be left
-    %% behind just because an admitted task for the same Ref existed.
+handle_cast({cancel, Refs}, #state{tasks = Tasks, tasks_by_ref = ByRef} = State) ->
+    %% Kill every admitted attempt for these Refs; tasks/tasks_by_ref removal
+    %% and the TASKS_IN_FLIGHT decrement happen in the 'DOWN' handler below,
+    %% the single cleanup path shared by normal completion, a crash and a kill
+    %% alike. A Ref can have more than one live attempt (a same-Ref resubmit
+    %% while the earlier one is still running), so all of them are killed.
+    %% A Ref can also be admitted and still queued at the same time, so every
+    %% Ref is passed to cancel_pending/2 as well: a still-queued copy must not
+    %% be left behind just because an admitted attempt for the same Ref existed.
     lists:foreach(
         fun(Ref) ->
-            case Tasks of
-                #{Ref := {Pid, _MonRef}} -> exit(Pid, kill);
-                #{} -> ok
-            end
+            lists:foreach(
+                fun(MonRef) ->
+                    {Pid, _Ref} = maps:get(MonRef, Tasks),
+                    exit(Pid, kill)
+                end,
+                maps:get(Ref, ByRef, [])
+            )
         end,
         Refs
     ),
@@ -193,22 +203,21 @@ handle_info(refill, #state{bucket = Bucket0} = State0) ->
     {noreply, State2#state{timer_ref = TimerRef}};
 handle_info(
     {'DOWN', MonRef, process, _Pid, _Reason},
-    #state{tasks = Tasks, tasks_rev = TasksRev} = State
+    #state{tasks = Tasks, tasks_by_ref = ByRef} = State
 ) ->
-    case maps:take(MonRef, TasksRev) of
-        {Ref, TasksRev1} ->
+    case maps:take(MonRef, Tasks) of
+        {{_, Ref}, Tasks1} ->
             dec(?C_TASKS_IN_FLIGHT, 1),
-            %% A resubmit (same-Ref retry) may have already overwritten this
-            %% Ref's entry with a newer, still-running task by the time this
-            %% DOWN (from the earlier attempt) is processed. Only remove the
-            %% entry if it still belongs to this MonRef, so a stale DOWN can't
-            %% erase a live task and leave it unreachable by cancel/1.
-            Tasks1 =
-                case Tasks of
-                    #{Ref := {_, MonRef}} -> maps:remove(Ref, Tasks);
-                    #{} -> Tasks
+            %% Drop only this attempt's monitor from the Ref's list; a same-Ref
+            %% resubmit may still have another attempt running under it. Remove
+            %% the Ref key entirely once its last attempt is gone, so the index
+            %% does not accumulate empty lists.
+            ByRef1 =
+                case maps:get(Ref, ByRef, []) -- [MonRef] of
+                    [] -> maps:remove(Ref, ByRef);
+                    Rest -> ByRef#{Ref => Rest}
                 end,
-            {noreply, State#state{tasks = Tasks1, tasks_rev = TasksRev1}};
+            {noreply, State#state{tasks = Tasks1, tasks_by_ref = ByRef1}};
         error ->
             {noreply, State}
     end;
@@ -234,7 +243,7 @@ terminate(_Reason, _State) ->
     ok.
 
 kill_tasks(Tasks) ->
-    maps:foreach(fun(_Ref, {Pid, _MonRef}) -> exit(Pid, kill) end, Tasks),
+    maps:foreach(fun(_MonRef, {Pid, _Ref}) -> exit(Pid, kill) end, Tasks),
     ok.
 
 format_state(#state{bucket = Bucket, pending = Pending}) ->
@@ -344,7 +353,7 @@ drain_pending_admit({_Fun, Size, _ReplyTo, _Ref} = Item, Pending0, Bucket0, Stat
             State
     end.
 
-spawn_task({Fun, _Size, ReplyTo, Ref}, #state{tasks = Tasks, tasks_rev = TasksRev} = State) ->
+spawn_task({Fun, _Size, ReplyTo, Ref}, #state{tasks = Tasks, tasks_by_ref = ByRef} = State) ->
     inc(?C_TASKS_IN_FLIGHT, 1),
     {Pid, MonRef} = spawn_monitor(fun() ->
         logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
@@ -356,9 +365,12 @@ spawn_task({Fun, _Size, ReplyTo, Ref}, #state{tasks = Tasks, tasks_rev = TasksRe
             end,
         ReplyTo ! {transfer_result, Ref, Result}
     end),
+    %% A resubmit reuses the same Ref while the earlier attempt may still be
+    %% running, so append to this Ref's monitor list rather than replacing it.
+    MonRefs = maps:get(Ref, ByRef, []),
     State#state{
-        tasks = Tasks#{Ref => {Pid, MonRef}},
-        tasks_rev = TasksRev#{MonRef => Ref}
+        tasks = Tasks#{MonRef => {Pid, Ref}},
+        tasks_by_ref = ByRef#{Ref => [MonRef | MonRefs]}
     }.
 
 schedule_refill() ->
@@ -520,13 +532,11 @@ cancel_batch_test() ->
     ?assertEqual(0, queue:len((sys:get_state(Pid))#state.pending)),
     gen_server:stop(Pid).
 
-%% Regression test for a Ref-reuse race: a resubmit (a transient-retry
-%% resubmission reuses the same Ref) can install a new, live task under a Ref
-%% before the earlier attempt's own 'DOWN' (sent by the runtime when that
-%% attempt's process exits) is processed by the governor. Before the identity
-%% check in the 'DOWN' handler, that stale DOWN would erase the live task's
-%% entry, leaving it unreachable - and therefore unkillable - by cancel/1.
-resubmit_survives_stale_down_test() ->
+%% A resubmit (a transient-retry resubmission reuses the same Ref) can install
+%% a second, still-running task under a Ref while the earlier attempt is also
+%% still running. Both attempts must be tracked independently, and a late
+%% 'DOWN' from the earlier one must not disturb the live sibling.
+resubmit_tracks_both_attempts_test() ->
     {ok, Pid} = start_link(#{rate => unlimited}),
     Self = self(),
     Ref = make_ref(),
@@ -536,21 +546,26 @@ resubmit_survives_stale_down_test() ->
         end
     end,
     submit(Fun, 100, Self, Ref),
-    #state{tasks = Tasks0} = sys:get_state(Pid),
-    {OldTaskPid, OldMonRef} = maps:get(Ref, Tasks0),
-    %% Resubmit with the same Ref, as a transient-retry resubmission does:
-    %% installs a new, still-running task under the same key.
+    #state{tasks = Tasks0, tasks_by_ref = ByRef0} = sys:get_state(Pid),
+    [OldMonRef] = maps:get(Ref, ByRef0),
+    {OldTaskPid, Ref} = maps:get(OldMonRef, Tasks0),
+    %% Resubmit with the same Ref, as a transient-retry resubmission does. The
+    %% earlier attempt is still running, so both are now tracked.
     submit(Fun, 100, Self, Ref),
-    #state{tasks = Tasks1} = sys:get_state(Pid),
-    {NewTaskPid, NewMonRef} = maps:get(Ref, Tasks1),
-    ?assertNotEqual({OldTaskPid, OldMonRef}, {NewTaskPid, NewMonRef}),
-    %% Simulate the earlier attempt's own 'DOWN' arriving late, after the
-    %% resubmit already overwrote the entry.
+    #state{tasks = Tasks1, tasks_by_ref = ByRef1} = sys:get_state(Pid),
+    ?assertEqual(2, map_size(Tasks1)),
+    [NewMonRef] = maps:get(Ref, ByRef1) -- [OldMonRef],
+    {NewTaskPid, Ref} = maps:get(NewMonRef, Tasks1),
+    ?assertNotEqual(OldTaskPid, NewTaskPid),
+    %% The earlier attempt's own 'DOWN' must drop only its entry, leaving the
+    %% live sibling reachable.
     Pid ! {'DOWN', OldMonRef, process, OldTaskPid, normal},
     %% Sync: sys:get_status round-trips through the gen_server, guaranteeing
     %% the DOWN above has already been processed.
     _ = sys:get_status(Pid),
-    ?assertEqual({NewTaskPid, NewMonRef}, maps:get(Ref, (sys:get_state(Pid))#state.tasks)),
+    #state{tasks = Tasks2, tasks_by_ref = ByRef2} = sys:get_state(Pid),
+    ?assertEqual([NewMonRef], maps:get(Ref, ByRef2)),
+    ?assertEqual({NewTaskPid, Ref}, maps:get(NewMonRef, Tasks2)),
     %% cancel/1 must still be able to reach (and kill) the live task.
     cancel([Ref]),
     receive
@@ -558,6 +573,44 @@ resubmit_survives_stale_down_test() ->
     after 300 -> ok
     end,
     ?assertEqual(#{}, (sys:get_state(Pid))#state.tasks),
+    ?assertEqual(#{}, (sys:get_state(Pid))#state.tasks_by_ref),
+    gen_server:stop(Pid).
+
+%% cancel/1 must kill EVERY live attempt under a Ref, not just the most recent
+%% one. Before keying `tasks` by monitor reference, a same-Ref resubmit
+%% overwrote the earlier attempt's entry, so cancel/1 killed only the newer
+%% task and the earlier one kept streaming its fragment to S3 for a deleted
+%% stream, holding an upload-pool connection and writing an orphan object.
+cancel_kills_every_attempt_under_a_ref_test() ->
+    {ok, Pid} = start_link(#{rate => unlimited}),
+    Self = self(),
+    Ref = make_ref(),
+    Fun = fun() ->
+        receive
+            never -> ok
+        end
+    end,
+    submit(Fun, 100, Self, Ref),
+    submit(Fun, 100, Self, Ref),
+    #state{tasks = Tasks, tasks_by_ref = ByRef} = sys:get_state(Pid),
+    ?assertEqual(2, map_size(Tasks)),
+    MonRefs = maps:get(Ref, ByRef),
+    ?assertEqual(2, length(MonRefs)),
+    Pids = [P || MonRef <- MonRefs, {P, _} <- [maps:get(MonRef, Tasks)]],
+    Mons = [monitor(process, P) || P <- Pids],
+    cancel([Ref]),
+    %% Both attempts must die, not just the most recently installed one.
+    lists:foreach(
+        fun(Mon) ->
+            receive
+                {'DOWN', Mon, process, _, killed} -> ok
+            after 1000 -> error(attempt_not_killed)
+            end
+        end,
+        Mons
+    ),
+    ?assertEqual(#{}, (sys:get_state(Pid))#state.tasks),
+    ?assertEqual(#{}, (sys:get_state(Pid))#state.tasks_by_ref),
     gen_server:stop(Pid).
 
 %% cancel/1 on a Ref that is both admitted (a running task) and still queued
@@ -585,8 +638,8 @@ cancel_reaches_admitted_and_queued_same_ref_test() ->
     %% Attempt 2 under the SAME Ref: bucket is exhausted, so it queues. The Ref
     %% is now both in `tasks` (attempt 1) and in `pending` (attempt 2).
     submit(fun() -> error(should_not_run) end, 500, Self, Ref),
-    #state{tasks = Tasks, pending = Pending} = sys:get_state(Pid),
-    ?assert(is_map_key(Ref, Tasks)),
+    #state{tasks_by_ref = ByRef, pending = Pending} = sys:get_state(Pid),
+    ?assert(is_map_key(Ref, ByRef)),
     ?assertEqual(1, queue:len(Pending)),
     cancel([Ref]),
     receive
@@ -615,8 +668,9 @@ terminate_kills_tasks_on_normal_stop_test() ->
         Self,
         Ref
     ),
-    #state{tasks = Tasks} = sys:get_state(Pid),
-    {TaskPid, _MonRef} = maps:get(Ref, Tasks),
+    #state{tasks = Tasks, tasks_by_ref = ByRef} = sys:get_state(Pid),
+    [MonRef] = maps:get(Ref, ByRef),
+    {TaskPid, Ref} = maps:get(MonRef, Tasks),
     Mon = monitor(process, TaskPid),
     gen_server:stop(Pid),
     receive
@@ -638,8 +692,8 @@ terminate_leaves_tasks_on_crash_reason_test() ->
     State = #state{
         bucket = unlimited,
         pending = queue:new(),
-        tasks = #{Ref => {TaskPid, MonRef}},
-        tasks_rev = #{MonRef => Ref}
+        tasks = #{MonRef => {TaskPid, Ref}},
+        tasks_by_ref = #{Ref => [MonRef]}
     },
     ok = terminate({error, some_crash}, State),
     timer:sleep(50),
