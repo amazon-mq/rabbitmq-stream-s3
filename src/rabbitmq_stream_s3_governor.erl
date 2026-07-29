@@ -38,6 +38,22 @@ A crash takes neither path - it is not a planned shutdown, and it is not a
 restart either (the governor itself, not its tasks, is what's restarting) -
 so tasks are deliberately left alone, consistent with the monitor-not-link
 choice above.
+
+## Derived gauges
+
+Both gauges are pure functions of the state they describe, published by
+`derive_gauges/1` on every handler return, not independently mutated counters:
+
+- `governor_tasks_in_flight`     = `map_size(tasks)`
+- `governor_pending_submissions` = `queue:len(pending)`
+
+The counters live in `persistent_term` and so outlive the process, while `tasks`
+and `pending` do not. An inc/dec gauge therefore ratchets permanently on the one
+path that deliberately runs no cleanup: a crash leaves every running task's
+`'DOWN'` in a dead mailbox, and the fresh incarnation starts from `tasks = #{}`
+with no decrement left to issue. A derived gauge self-heals instead, because
+`init/1` publishes from the empty state and each later mutation republishes the
+truth.
 """.
 
 -behaviour(gen_server).
@@ -160,8 +176,11 @@ init(Opts) ->
             unlimited -> undefined;
             _ -> schedule_refill()
         end,
-    %% Counter is created by init_counters/0 from the API init step.
-    {ok, #state{bucket = Bucket, pending = queue:new(), timer_ref = TimerRef}}.
+    %% Counter is created by init_counters/0 from the API init step. It lives in
+    %% persistent_term, so it outlives this process: publish the gauges from the
+    %% empty state so a restart does not inherit the previous incarnation's
+    %% values (whose tasks and queue are gone along with its state).
+    {ok, derive_gauges(#state{bucket = Bucket, pending = queue:new(), timer_ref = TimerRef})}.
 
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown}, State}.
@@ -170,7 +189,7 @@ handle_cast({submit, Fun, Size, ReplyTo, Ref}, State) ->
     inc(?C_SUBMISSIONS_RECEIVED, 1),
     case is_process_alive(ReplyTo) of
         true ->
-            {noreply, dispatch({Fun, Size, ReplyTo, Ref}, State)};
+            {noreply, derive_gauges(dispatch({Fun, Size, ReplyTo, Ref}, State))};
         false ->
             %% The requester died between calling submit/4 and this cast
             %% landing (e.g. a stream deletion or a crash). Drop it now
@@ -181,10 +200,10 @@ handle_cast({submit, Fun, Size, ReplyTo, Ref}, State) ->
     end;
 handle_cast({cancel, Refs}, #state{tasks = Tasks, tasks_by_ref = ByRef} = State) ->
     %% Kill every admitted attempt for these Refs; tasks/tasks_by_ref removal
-    %% and the TASKS_IN_FLIGHT decrement happen in the 'DOWN' handler below,
-    %% the single cleanup path shared by normal completion, a crash and a kill
-    %% alike. A Ref can have more than one live attempt (a same-Ref resubmit
-    %% while the earlier one is still running), so all of them are killed.
+    %% happens in the 'DOWN' handler below, the single cleanup path shared by
+    %% normal completion, a crash and a kill alike. A Ref can have more than one
+    %% live attempt (a same-Ref resubmit while the earlier one is still
+    %% running), so all of them are killed.
     %% A Ref can also be admitted and still queued at the same time, so every
     %% Ref is passed to cancel_pending/2 as well: a still-queued copy must not
     %% be left behind just because an admitted attempt for the same Ref existed.
@@ -200,7 +219,7 @@ handle_cast({cancel, Refs}, #state{tasks = Tasks, tasks_by_ref = ByRef} = State)
         end,
         Refs
     ),
-    {noreply, cancel_pending(Refs, State)};
+    {noreply, derive_gauges(cancel_pending(Refs, State))};
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
@@ -213,14 +232,13 @@ handle_info(refill, #state{bucket = Bucket0} = State0) ->
             true -> undefined;
             false -> schedule_refill()
         end,
-    {noreply, State2#state{timer_ref = TimerRef}};
+    {noreply, derive_gauges(State2#state{timer_ref = TimerRef})};
 handle_info(
     {'DOWN', MonRef, process, Pid, _Reason},
     #state{tasks = Tasks, tasks_by_ref = ByRef} = State
 ) ->
     case maps:take(MonRef, Tasks) of
         {{_, Ref, ReplyTo}, Tasks1} ->
-            dec(?C_TASKS_IN_FLIGHT, 1),
             %% Drop only this attempt's monitor from the Ref's list; a same-Ref
             %% resubmit may still have another attempt running under it. Remove
             %% the Ref key entirely once its last attempt is gone, so the index
@@ -231,13 +249,13 @@ handle_info(
                     Rest -> ByRef#{Ref => Rest}
                 end,
             State1 = State#state{tasks = Tasks1, tasks_by_ref = ByRef1},
-            {noreply, unwatch_requester(ReplyTo, State1)};
+            {noreply, derive_gauges(unwatch_requester(ReplyTo, State1))};
         error ->
             %% Not a task: a requester died. Kill everything it submitted -
             %% running or still queued - since its results now have nowhere to
             %% go. This is the only cancellation path a brutal kill, a crash,
             %% or a supervisor shutdown of the requester can reach.
-            {noreply, requester_down(MonRef, Pid, State)}
+            {noreply, derive_gauges(requester_down(MonRef, Pid, State))}
     end;
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -353,21 +371,12 @@ cancel_pending(Refs, #state{pending = Pending0} = State) ->
         fun({_Fun, _Size, _ReplyTo, ItemRef}) -> not sets:is_element(ItemRef, RefSet) end,
         Pending0
     ),
-    Len0 = queue:len(Pending0),
-    Len = queue:len(Pending),
-    case Len of
-        Len0 ->
-            State;
-        _ ->
-            set(?C_PENDING_SUBMISSIONS, Len),
-            State#state{pending = Pending}
-    end.
+    State#state{pending = Pending}.
 
 %% Append a submission to the pending queue and ensure the refill timer is
 %% running so it will eventually drain.
 enqueue(Item, State) ->
     Pending = queue:in(Item, State#state.pending),
-    set(?C_PENDING_SUBMISSIONS, queue:len(Pending)),
     State1 = State#state{pending = Pending},
     case State1#state.timer_ref of
         undefined -> State1#state{timer_ref = schedule_refill()};
@@ -388,7 +397,6 @@ drain_pending(#state{pending = Pending0, bucket = Bucket0} = State) ->
                     %% item unfairly jump the FIFO order (see enqueue/2).
                     inc(?C_DROPPED_DEAD_REPLYTO, 1),
                     Pending = queue:drop(Pending0),
-                    set(?C_PENDING_SUBMISSIONS, queue:len(Pending)),
                     drain_pending(State#state{pending = Pending});
                 true ->
                     drain_pending_admit(Item, Pending0, Bucket0, State)
@@ -400,7 +408,6 @@ drain_pending_admit({_Fun, Size, _ReplyTo, _Ref} = Item, Pending0, Bucket0, Stat
         {ok, Bucket} ->
             count_oversized(Size, Bucket0),
             Pending = queue:drop(Pending0),
-            set(?C_PENDING_SUBMISSIONS, queue:len(Pending)),
             drain_pending(
                 spawn_task(Item, State#state{
                     pending = Pending,
@@ -412,7 +419,6 @@ drain_pending_admit({_Fun, Size, _ReplyTo, _Ref} = Item, Pending0, Bucket0, Stat
     end.
 
 spawn_task({Fun, _Size, ReplyTo, Ref}, #state{tasks = Tasks, tasks_by_ref = ByRef} = State) ->
-    inc(?C_TASKS_IN_FLIGHT, 1),
     {Pid, MonRef} = spawn_monitor(fun() ->
         logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
         Result =
@@ -491,17 +497,20 @@ inc(Idx, N) ->
         Cnt -> counters:add(Cnt, Idx, N)
     end.
 
-dec(Idx, N) ->
-    case counter() of
-        undefined -> ok;
-        Cnt -> counters:sub(Cnt, Idx, N)
-    end.
-
 set(Idx, V) ->
     case counter() of
         undefined -> ok;
         Cnt -> counters:put(Cnt, Idx, V)
     end.
+
+%% Publish both gauges from the state they describe, rather than incrementing
+%% and decrementing them independently. Called on every callback return that can
+%% change `tasks` or `pending`, and from `init/1`, so a gauge is never more than
+%% one in-progress callback away from the truth. See the moduledoc.
+derive_gauges(#state{tasks = Tasks, pending = Pending} = State) ->
+    set(?C_TASKS_IN_FLIGHT, map_size(Tasks)),
+    set(?C_PENDING_SUBMISSIONS, queue:len(Pending)),
+    State.
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
@@ -1087,6 +1096,85 @@ queued_item_is_not_starved_by_later_submissions_test() ->
     %% The head (submitted first) must complete before the later small item.
     ?assertEqual([RefHead, RefSmall], collect_order([RefHead, RefSmall], 5000)),
     gen_server:stop(Pid).
+
+%% The tasks gauge must equal `map_size(tasks)` at all times, including after a
+%% crash and restart. The counters live in persistent_term and outlive the
+%% process; `tasks` does not. An inc/dec gauge ratcheted permanently here: a
+%% crash leaves each running task's 'DOWN' in a dead mailbox, so the decrement
+%% is never issued, and the new incarnation starts from `tasks = #{}` with
+%% nothing left to decrement.
+tasks_gauge_is_derived_from_state_test() ->
+    with_counter(fun(Cnt) ->
+        ?assertEqual(0, counters:get(Cnt, ?C_TASKS_IN_FLIGHT)),
+        {ok, Pid} = start_link(#{rate => unlimited}),
+        Self = self(),
+        Block = fun() ->
+            receive
+                never -> ok
+            end
+        end,
+        submit(Block, 100, Self, make_ref()),
+        submit(Block, 100, Self, make_ref()),
+        await_state(Pid, fun(#state{tasks = T}) -> map_size(T) =:= 2 end),
+        ?assertEqual(2, counters:get(Cnt, ?C_TASKS_IN_FLIGHT)),
+        #state{tasks = Tasks} = sys:get_state(Pid),
+        TaskPids = [P || {P, _Ref, _Owner} <- maps:values(Tasks)],
+        %% Kill the governor outright, as a supervisor shutdown timeout does.
+        %% No terminate/2 runs, and the tasks outlive it (they are monitored,
+        %% not linked), so both 'DOWN's are lost with the mailbox.
+        unlink(Pid),
+        Mon = monitor(process, Pid),
+        exit(Pid, kill),
+        receive
+            {'DOWN', Mon, process, Pid, _} -> ok
+        after 1000 -> error(governor_survived_kill)
+        end,
+        %% The restart the supervisor would do. init/1 publishes from the empty
+        %% state, so the stale 2 is corrected rather than inherited forever.
+        {ok, Pid2} = start_link(#{rate => unlimited}),
+        ?assertEqual(0, counters:get(Cnt, ?C_TASKS_IN_FLIGHT)),
+        lists:foreach(fun(P) -> exit(P, kill) end, TaskPids),
+        gen_server:stop(Pid2)
+    end).
+
+%% The pending gauge must equal `queue:len(pending)`, including on the paths
+%% that shrink the queue without admitting anything.
+pending_gauge_is_derived_from_state_test() ->
+    with_counter(fun(Cnt) ->
+        {ok, Pid} = start_link(#{rate => 1000, burst => 1000}),
+        Self = self(),
+        RefA = make_ref(),
+        RefQueued = make_ref(),
+        %% Drain the bucket so the next submission has to queue.
+        submit(fun() -> {ok, a} end, 1000, Self, RefA),
+        receive
+            {transfer_result, RefA, _} -> ok
+        after 1000 -> error(a_timeout)
+        end,
+        submit(fun() -> {ok, queued} end, 900, Self, RefQueued),
+        await_state(Pid, fun(#state{pending = P}) -> queue:len(P) =:= 1 end),
+        ?assertEqual(1, counters:get(Cnt, ?C_PENDING_SUBMISSIONS)),
+        cancel([RefQueued]),
+        await_state(Pid, fun(#state{pending = P}) -> queue:is_empty(P) end),
+        ?assertEqual(0, counters:get(Cnt, ?C_PENDING_SUBMISSIONS)),
+        gen_server:stop(Pid)
+    end).
+
+%% Run Fun with a private counter installed, restoring whatever was there
+%% before. The key is global to the node, so a test must not leave the module's
+%% real counter erased or replaced for whatever runs next.
+with_counter(Fun) ->
+    Previous = persistent_term:get(?COUNTER_KEY, undefined),
+    Cnt = counters:new(length(?COUNTERS), []),
+    persistent_term:put(?COUNTER_KEY, Cnt),
+    try
+        Fun(Cnt)
+    after
+        case Previous of
+            undefined -> persistent_term:erase(?COUNTER_KEY);
+            _ -> persistent_term:put(?COUNTER_KEY, Previous)
+        end
+    end.
 
 %% Block until the governor's own state satisfies Fun, or fail the test.
 %% A killed task's 'DOWN' is delivered to the governor asynchronously, so the
