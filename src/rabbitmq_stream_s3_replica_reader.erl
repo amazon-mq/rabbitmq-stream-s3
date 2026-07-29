@@ -2230,6 +2230,14 @@ reset_for_recovery(
     %% persist tick (the core is about to be replaced).
     maps:foreach(fun(_Ref, TimerRef) -> erlang:cancel_timer(TimerRef) end, Timers0),
     _ = cancel_timer(PersistTimer),
+    %% Recovery abandons these transfers: `recover` below clears the transfer
+    %% map, so their results are dropped as stale. This reader stays alive, so
+    %% the governor's requester monitor will not reap them either. Cancel them
+    %% here, while their Refs are still known, rather than leaving uploads
+    %% running whose results nothing will accept.
+    rabbitmq_stream_s3_governor:cancel(
+        maps:keys(rabbitmq_stream_s3_replica_reader_tasks:transfers(Tasks0))
+    ),
     State1 = close_log(State0),
     %% Tear down every in-flight async task before recovery replaces the core: a
     %% task's result is an ordinary message that demonitor's flush does not

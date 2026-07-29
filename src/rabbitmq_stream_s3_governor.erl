@@ -18,6 +18,15 @@ before ever being spawned, and the pending queue is scanned once for the whole
 batch. A single `Ref` can have both more than one running task and a queued
 item at the same time, because a resubmit reuses its `Ref`; `cancel/1` reaches
 all of them.
+
+Cancellation does not depend on the requester asking for it. The requester is
+monitored for as long as its task runs, and the task is killed when the
+requester dies, whatever killed it. A requester has many ways to die and only
+one of them can call `cancel/1` on the way out (a brutal kill can call
+nothing), so relying on an explicit cancel per teardown path leaves uploads
+running for a stream nobody is reading. This is the same policy already applied
+at intake and while queued: never transfer for a requester that is gone.
+
 Spawned tasks are monitored, not linked, so a governor restart does not
 kill tasks already running - they keep delivering their results directly to
 `ReplyTo` regardless of the governor's own lifecycle.
@@ -78,15 +87,19 @@ choice above.
     %% Pending submissions waiting for tokens.
     pending :: queue:queue(pending_item()),
     timer_ref :: reference() | undefined,
-    %% MonRef => {Pid, Ref} for every task currently executing, one entry per
-    %% live attempt. Keyed by the monitor reference rather than the
+    %% MonRef => {Pid, Ref, ReplyTo} for every task currently executing, one
+    %% entry per live attempt. Keyed by the monitor reference rather than the
     %% caller-minted Ref because a resubmit reuses the same Ref: keying by Ref
     %% let a second live attempt overwrite the first, orphaning a running task
     %% that neither cancel/1 nor kill_tasks/1 could then reach.
-    tasks = #{} :: #{reference() => {pid(), reference()}},
+    tasks = #{} :: #{reference() => {pid(), reference(), pid()}},
     %% Ref => [MonRef], the secondary index cancel/1 uses to reach every live
     %% attempt belonging to a caller-minted Ref.
-    tasks_by_ref = #{} :: #{reference() => [reference()]}
+    tasks_by_ref = #{} :: #{reference() => [reference()]},
+    %% ReplyTo => {MonRef, TaskCount} for every requester with at least one
+    %% task running. One monitor per requester however many tasks it has, so
+    %% the count is what decides when to demonitor.
+    requesters = #{} :: #{pid() => {reference(), pos_integer()}}
 }).
 
 -type pending_item() :: {
@@ -179,7 +192,7 @@ handle_cast({cancel, Refs}, #state{tasks = Tasks, tasks_by_ref = ByRef} = State)
         fun(Ref) ->
             lists:foreach(
                 fun(MonRef) ->
-                    {Pid, _Ref} = maps:get(MonRef, Tasks),
+                    {Pid, _Ref, _ReplyTo} = maps:get(MonRef, Tasks),
                     exit(Pid, kill)
                 end,
                 maps:get(Ref, ByRef, [])
@@ -202,11 +215,11 @@ handle_info(refill, #state{bucket = Bucket0} = State0) ->
         end,
     {noreply, State2#state{timer_ref = TimerRef}};
 handle_info(
-    {'DOWN', MonRef, process, _Pid, _Reason},
+    {'DOWN', MonRef, process, Pid, _Reason},
     #state{tasks = Tasks, tasks_by_ref = ByRef} = State
 ) ->
     case maps:take(MonRef, Tasks) of
-        {{_, Ref}, Tasks1} ->
+        {{_, Ref, ReplyTo}, Tasks1} ->
             dec(?C_TASKS_IN_FLIGHT, 1),
             %% Drop only this attempt's monitor from the Ref's list; a same-Ref
             %% resubmit may still have another attempt running under it. Remove
@@ -217,12 +230,57 @@ handle_info(
                     [] -> maps:remove(Ref, ByRef);
                     Rest -> ByRef#{Ref => Rest}
                 end,
-            {noreply, State#state{tasks = Tasks1, tasks_by_ref = ByRef1}};
+            State1 = State#state{tasks = Tasks1, tasks_by_ref = ByRef1},
+            {noreply, unwatch_requester(ReplyTo, State1)};
         error ->
-            {noreply, State}
+            %% Not a task: a requester died. Kill everything it submitted -
+            %% running or still queued - since its results now have nowhere to
+            %% go. This is the only cancellation path a brutal kill, a crash,
+            %% or a supervisor shutdown of the requester can reach.
+            {noreply, requester_down(MonRef, Pid, State)}
     end;
 handle_info(_Info, State) ->
     {noreply, State}.
+
+%% Handle the death of a requester with tasks running. The monitor ref is
+%% matched against the recorded one so a stale 'DOWN' (a demonitor/flush that
+%% raced) cannot kill a fresh incarnation's tasks: a restarted reader is a new
+%% pid, but the pid alone is not proof of which monitor the 'DOWN' belongs to.
+requester_down(MonRef, ReplyTo, #state{requesters = Requesters} = State) ->
+    case Requesters of
+        #{ReplyTo := {MonRef, _Count}} ->
+            Refs = refs_for_requester(ReplyTo, State),
+            State1 = State#state{requesters = maps:remove(ReplyTo, Requesters)},
+            %% Reuse the cancel path so a queued copy of the same Ref is
+            %% dropped too, not just the running attempts.
+            kill_requester_tasks(ReplyTo, cancel_pending(Refs, State1));
+        _ ->
+            State
+    end.
+
+%% Every Ref this requester currently has admitted, for cancel_pending/2.
+refs_for_requester(ReplyTo, #state{tasks = Tasks}) ->
+    maps:fold(
+        fun
+            (_MonRef, {_Pid, Ref, Owner}, Acc) when Owner =:= ReplyTo -> [Ref | Acc];
+            (_MonRef, _Task, Acc) -> Acc
+        end,
+        [],
+        Tasks
+    ).
+
+%% Kill this requester's running tasks. The entries themselves are removed by
+%% each task's own 'DOWN', the single cleanup path shared with completion,
+%% a crash and cancel/1.
+kill_requester_tasks(ReplyTo, #state{tasks = Tasks} = State) ->
+    maps:foreach(
+        fun
+            (_MonRef, {Pid, _Ref, Owner}) when Owner =:= ReplyTo -> exit(Pid, kill);
+            (_MonRef, _Task) -> ok
+        end,
+        Tasks
+    ),
+    State.
 
 format_status(#{state := State} = Status) ->
     Status#{state := format_state(State)}.
@@ -243,7 +301,7 @@ terminate(_Reason, _State) ->
     ok.
 
 kill_tasks(Tasks) ->
-    maps:foreach(fun(_MonRef, {Pid, _Ref}) -> exit(Pid, kill) end, Tasks),
+    maps:foreach(fun(_MonRef, {Pid, _Ref, _ReplyTo}) -> exit(Pid, kill) end, Tasks),
     ok.
 
 format_state(#state{bucket = Bucket, pending = Pending}) ->
@@ -368,10 +426,37 @@ spawn_task({Fun, _Size, ReplyTo, Ref}, #state{tasks = Tasks, tasks_by_ref = ByRe
     %% A resubmit reuses the same Ref while the earlier attempt may still be
     %% running, so append to this Ref's monitor list rather than replacing it.
     MonRefs = maps:get(Ref, ByRef, []),
-    State#state{
-        tasks = Tasks#{MonRef => {Pid, Ref}},
+    State1 = watch_requester(ReplyTo, State),
+    State1#state{
+        tasks = Tasks#{MonRef => {Pid, Ref, ReplyTo}},
         tasks_by_ref = ByRef#{Ref => [MonRef | MonRefs]}
     }.
+
+%% Start (or refcount) a monitor on a requester that now has a task running.
+%% One monitor covers all of a requester's tasks: a reader submits a fragment
+%% at a time and each extra monitor would mean an extra 'DOWN' to correlate.
+watch_requester(ReplyTo, #state{requesters = Requesters} = State) ->
+    case Requesters of
+        #{ReplyTo := {ReqMon, Count}} ->
+            State#state{requesters = Requesters#{ReplyTo => {ReqMon, Count + 1}}};
+        _ ->
+            ReqMon = monitor(process, ReplyTo),
+            State#state{requesters = Requesters#{ReplyTo => {ReqMon, 1}}}
+    end.
+
+%% Release one task's share of a requester's monitor, demonitoring once its
+%% last task is gone. The requester's own 'DOWN' does not come through here:
+%% requester_down/3 drops the whole entry in one step.
+unwatch_requester(ReplyTo, #state{requesters = Requesters} = State) ->
+    case Requesters of
+        #{ReplyTo := {ReqMon, 1}} ->
+            demonitor(ReqMon, [flush]),
+            State#state{requesters = maps:remove(ReplyTo, Requesters)};
+        #{ReplyTo := {ReqMon, Count}} ->
+            State#state{requesters = Requesters#{ReplyTo => {ReqMon, Count - 1}}};
+        _ ->
+            State
+    end.
 
 schedule_refill() ->
     erlang:send_after(?REFILL_INTERVAL_MS, self(), refill).
@@ -548,14 +633,14 @@ resubmit_tracks_both_attempts_test() ->
     submit(Fun, 100, Self, Ref),
     #state{tasks = Tasks0, tasks_by_ref = ByRef0} = sys:get_state(Pid),
     [OldMonRef] = maps:get(Ref, ByRef0),
-    {OldTaskPid, Ref} = maps:get(OldMonRef, Tasks0),
+    {OldTaskPid, Ref, Self} = maps:get(OldMonRef, Tasks0),
     %% Resubmit with the same Ref, as a transient-retry resubmission does. The
     %% earlier attempt is still running, so both are now tracked.
     submit(Fun, 100, Self, Ref),
     #state{tasks = Tasks1, tasks_by_ref = ByRef1} = sys:get_state(Pid),
     ?assertEqual(2, map_size(Tasks1)),
     [NewMonRef] = maps:get(Ref, ByRef1) -- [OldMonRef],
-    {NewTaskPid, Ref} = maps:get(NewMonRef, Tasks1),
+    {NewTaskPid, Ref, Self} = maps:get(NewMonRef, Tasks1),
     ?assertNotEqual(OldTaskPid, NewTaskPid),
     %% The earlier attempt's own 'DOWN' must drop only its entry, leaving the
     %% live sibling reachable.
@@ -565,7 +650,7 @@ resubmit_tracks_both_attempts_test() ->
     _ = sys:get_status(Pid),
     #state{tasks = Tasks2, tasks_by_ref = ByRef2} = sys:get_state(Pid),
     ?assertEqual([NewMonRef], maps:get(Ref, ByRef2)),
-    ?assertEqual({NewTaskPid, Ref}, maps:get(NewMonRef, Tasks2)),
+    ?assertEqual({NewTaskPid, Ref, Self}, maps:get(NewMonRef, Tasks2)),
     %% cancel/1 must still be able to reach (and kill) the live task.
     cancel([Ref]),
     receive
@@ -596,7 +681,7 @@ cancel_kills_every_attempt_under_a_ref_test() ->
     ?assertEqual(2, map_size(Tasks)),
     MonRefs = maps:get(Ref, ByRef),
     ?assertEqual(2, length(MonRefs)),
-    Pids = [P || MonRef <- MonRefs, {P, _} <- [maps:get(MonRef, Tasks)]],
+    Pids = [P || MonRef <- MonRefs, {P, _, _} <- [maps:get(MonRef, Tasks)]],
     Mons = [monitor(process, P) || P <- Pids],
     cancel([Ref]),
     %% Both attempts must die, not just the most recently installed one.
@@ -670,7 +755,7 @@ terminate_kills_tasks_on_normal_stop_test() ->
     ),
     #state{tasks = Tasks, tasks_by_ref = ByRef} = sys:get_state(Pid),
     [MonRef] = maps:get(Ref, ByRef),
-    {TaskPid, Ref} = maps:get(MonRef, Tasks),
+    {TaskPid, Ref, Self} = maps:get(MonRef, Tasks),
     Mon = monitor(process, TaskPid),
     gen_server:stop(Pid),
     receive
@@ -692,13 +777,179 @@ terminate_leaves_tasks_on_crash_reason_test() ->
     State = #state{
         bucket = unlimited,
         pending = queue:new(),
-        tasks = #{MonRef => {TaskPid, Ref}},
+        tasks = #{MonRef => {TaskPid, Ref, self()}},
         tasks_by_ref = #{Ref => [MonRef]}
     },
     ok = terminate({error, some_crash}, State),
     timer:sleep(50),
     ?assert(is_process_alive(TaskPid)),
     exit(TaskPid, kill).
+
+%% A requester that dies after its task was admitted must have that task
+%% killed. Only one reader teardown path calls cancel/1, so without the
+%% requester monitor a writer-DOWN stop, a crash, a supervisor shutdown or a
+%% brutal kill all left the upload streaming a fragment to S3 for a stream
+%% nobody is reading, holding an upload-pool connection.
+requester_death_kills_running_task_test() ->
+    {ok, Pid} = start_link(#{rate => unlimited}),
+    Parent = self(),
+    %% Stands in for a replica reader: submits, then dies without cancelling.
+    Requester = spawn(fun() ->
+        Ref = make_ref(),
+        submit(
+            fun() ->
+                receive
+                    never -> ok
+                end
+            end,
+            100,
+            self(),
+            Ref
+        ),
+        %% Sync inside the requester: the state read below must see the task.
+        _ = sys:get_status(?MODULE),
+        Parent ! submitted,
+        receive
+            die -> ok
+        end
+    end),
+    receive
+        submitted -> ok
+    after 1000 -> error(setup_failed)
+    end,
+    #state{tasks = Tasks, requesters = Requesters} = sys:get_state(Pid),
+    [{_MonRef, {TaskPid, _Ref, Requester}}] = maps:to_list(Tasks),
+    ?assert(is_map_key(Requester, Requesters)),
+    TaskMon = monitor(process, TaskPid),
+    Requester ! die,
+    receive
+        {'DOWN', TaskMon, process, TaskPid, killed} -> ok
+    after 1000 -> error(task_not_killed)
+    end,
+    %% The task's own 'DOWN' clears the bookkeeping, including the monitor.
+    _ = sys:get_status(Pid),
+    ?assertEqual(#{}, (sys:get_state(Pid))#state.tasks),
+    ?assertEqual(#{}, (sys:get_state(Pid))#state.tasks_by_ref),
+    ?assertEqual(#{}, (sys:get_state(Pid))#state.requesters),
+    gen_server:stop(Pid).
+
+%% A dying requester's still-queued submissions are dropped as well as its
+%% running ones: admitting a queued item after its requester is gone would
+%% spend tokens uploading a fragment whose result has nowhere to go.
+requester_death_drops_queued_submissions_test() ->
+    {ok, Pid} = start_link(#{rate => 1000, burst => 1000}),
+    Parent = self(),
+    Requester = spawn(fun() ->
+        %% Attempt 1 is admitted immediately and blocks, exhausting the bucket.
+        submit(
+            fun() ->
+                receive
+                    never -> ok
+                end
+            end,
+            1000,
+            self(),
+            make_ref()
+        ),
+        %% A second Ref queues behind the exhausted bucket.
+        submit(fun() -> error(should_not_run) end, 500, self(), make_ref()),
+        _ = sys:get_status(?MODULE),
+        Parent ! submitted,
+        receive
+            die -> ok
+        end
+    end),
+    receive
+        submitted -> ok
+    after 1000 -> error(setup_failed)
+    end,
+    ?assertEqual(1, map_size((sys:get_state(Pid))#state.tasks)),
+    ?assertEqual(1, queue:len((sys:get_state(Pid))#state.pending)),
+    Requester ! die,
+    %% Sync twice: the requester 'DOWN' lands first, then the killed task's own.
+    _ = sys:get_status(Pid),
+    timer:sleep(100),
+    _ = sys:get_status(Pid),
+    ?assertEqual(#{}, (sys:get_state(Pid))#state.tasks),
+    ?assertEqual(0, queue:len((sys:get_state(Pid))#state.pending)),
+    ?assertEqual(#{}, (sys:get_state(Pid))#state.requesters),
+    gen_server:stop(Pid).
+
+%% One requester's death must not disturb another's tasks. The requester
+%% monitor is refcounted per requester, so the surviving reader keeps both its
+%% task and its monitor.
+requester_death_spares_other_requesters_test() ->
+    {ok, Pid} = start_link(#{rate => unlimited}),
+    Parent = self(),
+    Blocker = fun() ->
+        submit(
+            fun() ->
+                receive
+                    never -> ok
+                end
+            end,
+            100,
+            self(),
+            make_ref()
+        ),
+        _ = sys:get_status(?MODULE),
+        Parent ! submitted,
+        receive
+            die -> ok
+        end
+    end,
+    Doomed = spawn(Blocker),
+    receive
+        submitted -> ok
+    after 1000 -> error(setup_failed)
+    end,
+    Survivor = spawn(Blocker),
+    receive
+        submitted -> ok
+    after 1000 -> error(setup_failed)
+    end,
+    #state{tasks = Tasks} = sys:get_state(Pid),
+    ?assertEqual(2, map_size(Tasks)),
+    [SurvivorTask] = [P || {P, _R, Owner} <- maps:values(Tasks), Owner =:= Survivor],
+    Doomed ! die,
+    timer:sleep(200),
+    _ = sys:get_status(Pid),
+    ?assert(is_process_alive(SurvivorTask)),
+    #state{tasks = Tasks1, requesters = Requesters1} = sys:get_state(Pid),
+    ?assertEqual(1, map_size(Tasks1)),
+    ?assertEqual([Survivor], maps:keys(Requesters1)),
+    Survivor ! die,
+    gen_server:stop(Pid).
+
+%% A requester submitting several transfers is monitored once, and the monitor
+%% is released only when its last task is gone: an unbalanced refcount would
+%% either leak monitors or stop watching a requester that still has uploads
+%% running.
+requester_monitor_is_refcounted_test() ->
+    {ok, Pid} = start_link(#{rate => unlimited}),
+    Self = self(),
+    Ref1 = make_ref(),
+    Ref2 = make_ref(),
+    Fun = fun() ->
+        receive
+            never -> ok
+        end
+    end,
+    submit(Fun, 100, Self, Ref1),
+    submit(Fun, 100, Self, Ref2),
+    #state{requesters = Requesters} = sys:get_state(Pid),
+    ?assertMatch(#{Self := {_Mon, 2}}, Requesters),
+    %% One task ends: the requester is still watched, with one task left.
+    cancel([Ref1]),
+    timer:sleep(200),
+    _ = sys:get_status(Pid),
+    ?assertMatch(#{Self := {_Mon, 1}}, (sys:get_state(Pid))#state.requesters),
+    %% The last one ends: the monitor is released.
+    cancel([Ref2]),
+    timer:sleep(200),
+    _ = sys:get_status(Pid),
+    ?assertEqual(#{}, (sys:get_state(Pid))#state.requesters),
+    gen_server:stop(Pid).
 
 %% A submission whose ReplyTo is already dead is dropped at intake, before
 %% ever touching the bucket or spawning anything.
