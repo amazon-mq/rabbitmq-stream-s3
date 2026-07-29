@@ -215,6 +215,25 @@ handle_call(Request, From, State) ->
     ?LOG_INFO(?MODULE_STRING " received unexpected call from ~p: ~W", [From, Request, 10]),
     {noreply, State}.
 
+%% Record a connection as checked out and account the request. `add_checkout`
+%% and `del_checkout` are the only two places `checkouts`/`checkouts_rev` change,
+%% so api_aws's `active_requests` gauge - one in-flight request per checkout,
+%% shared across every pool and therefore incremented rather than derived - is
+%% welded to the map and cannot drift from it, whichever way the checkout ends.
+add_checkout(Conn, MRef, #?MODULE{checkouts = Checkouts, checkouts_rev = CheckoutsRev} = State) ->
+    ok = rabbitmq_stream_s3_api_aws:note_request_started(),
+    State#?MODULE{
+        checkouts = Checkouts#{Conn => MRef},
+        checkouts_rev = CheckoutsRev#{MRef => Conn}
+    }.
+
+del_checkout(Conn, MRef, #?MODULE{checkouts = Checkouts, checkouts_rev = CheckoutsRev} = State) ->
+    ok = rabbitmq_stream_s3_api_aws:note_request_finished(),
+    State#?MODULE{
+        checkouts = maps:remove(Conn, Checkouts),
+        checkouts_rev = maps:remove(MRef, CheckoutsRev)
+    }.
+
 %% Return a checked-in connection to `available` if it is still monitored
 %% (alive as far as we know). Otherwise drop it; the `DOWN` handler owns the
 %% cleanup of a connection that died while checked out.
@@ -227,15 +246,12 @@ maybe_make_available(_Conn, State) ->
 
 handle_checkin(
     Conn,
-    #?MODULE{checkouts = Checkouts0, checkouts_rev = CheckoutsRev0, counter = Cnt} = State0
+    #?MODULE{checkouts = Checkouts0, counter = Cnt} = State0
 ) when is_map_key(Conn, Checkouts0) ->
     MRef = maps:get(Conn, Checkouts0),
     counters:add(Cnt, ?C_CHECKINS, 1),
     erlang:demonitor(MRef, [flush]),
-    State1 = State0#?MODULE{
-        checkouts = maps:remove(Conn, Checkouts0),
-        checkouts_rev = maps:remove(MRef, CheckoutsRev0)
-    },
+    State1 = del_checkout(Conn, MRef, State0),
     {noreply, maybe_make_available(Conn, State1)};
 handle_checkin(_Conn, State) ->
     {noreply, State}.
@@ -335,16 +351,18 @@ handle_down(MRef, Pid, #?MODULE{monitors = Monitors} = State0) when
 %% is not `head`, crashing gun's gen_statem with `function_clause`. Drop the
 %% connection and grow a replacement.
 %% See: https://github.com/amazon-mq/rabbitmq-stream-s3/issues/177
+%%
+%% This is also the only place that reliably learns a request was abandoned
+%% (e.g. the caller was killed by rabbitmq_stream_s3_governor:cancel/1) rather
+%% than finishing normally. `del_checkout` accounts it like any other checkout
+%% end: the caller never ran a completion path, so nothing else would.
 handle_down(
     MRef,
     _Pid,
-    #?MODULE{checkouts = Checkouts, checkouts_rev = CheckoutsRev} = State0
+    #?MODULE{checkouts_rev = CheckoutsRev} = State0
 ) when is_map_key(MRef, CheckoutsRev) ->
     Conn = maps:get(MRef, CheckoutsRev),
-    State1 = State0#?MODULE{
-        checkouts = maps:remove(Conn, Checkouts),
-        checkouts_rev = maps:remove(MRef, CheckoutsRev)
-    },
+    State1 = del_checkout(Conn, MRef, State0),
     {noreply, grow(close_connection(Conn, State1))};
 %% A pending caller process is down. Remove it from the pending queue.
 handle_down(_MRef, Pid, #?MODULE{pending = Pending0} = State0) ->
@@ -494,8 +512,6 @@ take_available(
     Pid,
     #?MODULE{
         available = Available0,
-        checkouts = Checkouts0,
-        checkouts_rev = CheckoutsRev0,
         usable_fun = UsableFun
     } = State0
 ) ->
@@ -504,11 +520,7 @@ take_available(
             case UsableFun(Conn) of
                 true ->
                     MRef = erlang:monitor(process, Pid),
-                    State = State0#?MODULE{
-                        available = Available,
-                        checkouts = Checkouts0#{Conn => MRef},
-                        checkouts_rev = CheckoutsRev0#{MRef => Conn}
-                    },
+                    State = add_checkout(Conn, MRef, State0#?MODULE{available = Available}),
                     {ok, Conn, cancel_idle_timer(Conn, State)};
                 false ->
                     %% Connection is down or disconnected; drop it and try the
@@ -525,8 +537,6 @@ checkout(
     #?MODULE{
         pending = Pending0,
         available = Available0,
-        checkouts = Checkouts0,
-        checkouts_rev = CheckoutsRev0,
         counter = Cnt,
         usable_fun = UsableFun
     } = State0
@@ -537,12 +547,13 @@ checkout(
                 true ->
                     counters:add(Cnt, ?C_CHECKOUTS, 1),
                     gen_server:reply(From, Conn),
-                    State1 = cancel_idle_timer(Conn, State0#?MODULE{
-                        pending = Pending,
-                        available = Available,
-                        checkouts = Checkouts0#{Conn => MRef},
-                        checkouts_rev = CheckoutsRev0#{MRef => Conn}
-                    }),
+                    State1 = cancel_idle_timer(
+                        Conn,
+                        add_checkout(Conn, MRef, State0#?MODULE{
+                            pending = Pending,
+                            available = Available
+                        })
+                    ),
                     checkout(State1);
                 false ->
                     %% Down connection at the head; drop it (leaving `monitors`
@@ -555,15 +566,12 @@ checkout(
             State0
     end.
 
-cancel(Conn, #?MODULE{checkouts = Checkouts0, checkouts_rev = CheckoutsRev0} = State0) when
+cancel(Conn, #?MODULE{checkouts = Checkouts0} = State0) when
     is_map_key(Conn, Checkouts0)
 ->
     CallerMRef = maps:get(Conn, Checkouts0),
     erlang:demonitor(CallerMRef, [flush]),
-    State0#?MODULE{
-        checkouts = maps:remove(Conn, Checkouts0),
-        checkouts_rev = maps:remove(CallerMRef, CheckoutsRev0)
-    };
+    del_checkout(Conn, CallerMRef, State0);
 cancel(Conn, State) ->
     %% Not checked out; if it is available, removing it from `available` (and
     %% cancelling its idle timer) is exactly `remove_available/2`.
@@ -699,6 +707,82 @@ checkout_timeout_returns_pool_busy_test() ->
         ok = checkin(busy_pool, Conn)
     after
         gen_server:stop(Pid)
+    end.
+
+%% api_aws's active_requests gauge is owned here. Prove it is balanced across
+%% every way a checkout ends: a clean check-in, the caller dying while holding
+%% the connection (the abandon path a governor-cancel kill takes), and the
+%% connection itself dying under a live caller.
+active_requests_balanced_across_checkout_ends_test() ->
+    with_active_requests_counter(fun(ActiveRequests) ->
+        Config = #{
+            name => balance_pool,
+            min_size => 2,
+            max_size => 2,
+            open_fun => fun test_open/0,
+            usable_fun => fun erlang:is_process_alive/1,
+            close_fun => fun test_close/1
+        },
+        {ok, Pid} = start_link(balance_pool, Config),
+        try
+            ?assertEqual(0, ActiveRequests()),
+
+            %% Clean check-in.
+            {ok, Conn1} = checkout(balance_pool, 1000),
+            ?assertEqual(1, ActiveRequests()),
+            ok = checkin(balance_pool, Conn1),
+            await(fun() -> ActiveRequests() =:= 0 end),
+
+            %% Caller dies while holding the connection: the pool's caller-DOWN
+            %% handler must account the end, since the caller ran no completion
+            %% path. This is the leak the old inc-in-caller design had.
+            Parent = self(),
+            Holder = spawn(fun() ->
+                {ok, _} = checkout(balance_pool, 1000),
+                Parent ! checked_out,
+                receive
+                    die -> ok
+                end
+            end),
+            receive
+                checked_out -> ok
+            after 1000 -> error(holder_setup_failed)
+            end,
+            ?assertEqual(1, ActiveRequests()),
+            Holder ! die,
+            await(fun() -> ActiveRequests() =:= 0 end),
+
+            %% Connection dies under a live caller: the connection-DOWN handler
+            %% must account the end too.
+            {ok, Conn3} = checkout(balance_pool, 1000),
+            ?assertEqual(1, ActiveRequests()),
+            exit(Conn3, kill),
+            await(fun() -> ActiveRequests() =:= 0 end)
+        after
+            gen_server:stop(Pid)
+        end
+    end).
+
+%% Give Fun a reader for api_aws's active_requests gauge, which this module
+%% moves but api_aws owns. Delegating keeps the counter's key, size and indices
+%% in the one module that defines them.
+with_active_requests_counter(Fun) ->
+    rabbitmq_stream_s3_api_aws:with_counter(fun(Read) ->
+        Fun(fun() -> Read(active_requests) end)
+    end).
+
+await(Fun) ->
+    await(Fun, 2000).
+
+await(_Fun, Remaining) when Remaining =< 0 ->
+    error(timeout_awaiting_condition);
+await(Fun, Remaining) ->
+    case Fun() of
+        true ->
+            ok;
+        false ->
+            timer:sleep(5),
+            await(Fun, Remaining - 5)
     end.
 
 %% A fake connection is a plain process that only understands `stop`; the pool

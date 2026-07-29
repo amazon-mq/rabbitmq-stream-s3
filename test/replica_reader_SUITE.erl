@@ -84,6 +84,7 @@ groups() ->
             stream_deletion_cleans_remote_tier,
             stream_deletion_during_active_upload,
             persist_not_found_stops_reader,
+            in_flight_uploads_cancelled_on_stream_deletion,
             discover_attaches_to_existing_writer,
             on_init_writer_tolerates_already_started,
             two_layer_supervision_structure,
@@ -1004,6 +1005,99 @@ persist_not_found_stops_reader(Config) ->
         ct:fail("reader did not stop after a not_found persist")
     end,
     ?assertEqual(undefined, rabbitmq_stream_s3_registry:whereis_name({StreamId, node()})).
+
+in_flight_uploads_cancelled_on_stream_deletion(Config) ->
+    %% Issue #342: fragment uploads already submitted to the governor when a
+    %% stream is deleted must be cancelled immediately, not left running to
+    %% completion and wasting upload-pool capacity for a stream that no
+    %% longer exists.
+    StreamId = ?config(stream_id, Config),
+    ok = application:set_env(
+        rabbitmq_stream_s3, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_fault
+    ),
+    ok = rabbitmq_stream_s3_api_fault:setup(),
+
+    Writer = start_writer(Config, #{}, #{fragment_target_size => 500}),
+    Record = binary:copy(<<"D">>, 600),
+    Write = fun() ->
+        osiris_writer:write(Writer, Record),
+        flush_writer(Writer)
+    end,
+
+    %% First write: establishes the metadata node at a revision > 0, same as
+    %% persist_not_found_stops_reader. Its upload is not blocked.
+    Write(),
+    await_offset(Config, 1),
+    ?assertMatch({ok, #{revision := R}} when R > 0, rabbitmq_stream_s3_db:get(StreamId)),
+
+    ReaderPid = rabbitmq_stream_s3_registry:whereis_name({StreamId, node()}),
+
+    %% Delete the metadata node out from under the reader.
+    ok = khepri:delete(
+        rabbitmq_metadata, ?RABBITMQ_KHEPRI_ROOT_PATH([rabbitmq_stream_s3, StreamId])
+    ),
+    ?awaitMatch({error, not_found}, rabbitmq_stream_s3_db:get(StreamId), 1000),
+
+    %% Park a "trigger" fragment upload, held at stream_put like the two
+    %% below, but not released yet. Draining is strictly FIFO (a later
+    %% fragment can never apply to the manifest ahead of an earlier one still
+    %% in flight - see transfer_failed/3's issue #206 invariant), so this
+    %% must be the *first* of the three parked uploads: once released it
+    %% drains ahead of the other two, which is what triggers the persist that
+    %% fails with not_found and cancels them. Holding it (instead of letting
+    %% it complete immediately) avoids racing its completion against arming
+    %% the blocks for the writes below.
+    RefTrigger = rabbitmq_stream_s3_api_fault:block_once(stream_put, StreamId),
+    Write(),
+    TaskPidTrigger = rabbitmq_stream_s3_api_fault:await_blocked(RefTrigger, 10_000),
+
+    %% Now park two more fragment uploads in flight, one at a time
+    %% (block_once is one-shot; awaiting each before arming the next keeps
+    %% this deterministic, as in upload_path_recovers_from_trimmed_segment).
+    %% Nothing else is running at this point (the trigger is parked), so
+    %% there is no task left to race for these blocks.
+    Ref1 = rabbitmq_stream_s3_api_fault:block_once(stream_put, StreamId),
+    Write(),
+    TaskPid1 = rabbitmq_stream_s3_api_fault:await_blocked(Ref1, 10_000),
+
+    Ref2 = rabbitmq_stream_s3_api_fault:block_once(stream_put, StreamId),
+    Write(),
+    TaskPid2 = rabbitmq_stream_s3_api_fault:await_blocked(Ref2, 10_000),
+
+    Mon1 = monitor(process, TaskPid1),
+    Mon2 = monitor(process, TaskPid2),
+    ReaderMon = monitor(process, ReaderPid),
+
+    %% Release the trigger: it completes, drains first (it's ahead of the
+    %% other two in submission order), and its persist fails with not_found,
+    %% cancelling the two uploads still parked above.
+    ok = rabbitmq_stream_s3_api_fault:release(TaskPidTrigger, RefTrigger),
+
+    %% Both blocked uploads must be killed promptly: nothing would otherwise
+    %% ever release them, since they're parked in the fault backend forever.
+    %% The not_found persist triggered by releasing the trigger above fires
+    %% the core's stop effect asynchronously, so this may take a moment.
+    receive
+        {'DOWN', Mon1, process, TaskPid1, Reason1} -> ?assertEqual(killed, Reason1)
+    after 5000 -> ct:fail("upload task 1 was not cancelled")
+    end,
+    receive
+        {'DOWN', Mon2, process, TaskPid2, Reason2} -> ?assertEqual(killed, Reason2)
+    after 5000 -> ct:fail("upload task 2 was not cancelled")
+    end,
+    receive
+        {'DOWN', ReaderMon, process, ReaderPid, Reason} -> ?assertEqual(normal, Reason)
+    after 5000 -> ct:fail("reader did not stop")
+    end,
+
+    ?awaitMatch(
+        0,
+        maps:get(
+            governor_tasks_in_flight,
+            seshat:counters(rabbitmq_stream_s3, rabbitmq_stream_s3_governor)
+        ),
+        2000
+    ).
 
 discover_attaches_to_existing_writer(Config) ->
     StreamId = ?config(stream_id, Config),
