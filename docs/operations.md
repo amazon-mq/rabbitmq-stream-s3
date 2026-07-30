@@ -174,6 +174,13 @@ stream_s3.rebalance_threshold = 1024
 # persistently climbing value means the configured rate is low relative
 # to fragment sizes.
 stream_s3.max_transfer_bytes_per_sec = unlimited
+
+# Burst allowance (in bytes) the governor's token bucket may accumulate
+# while idle, ignored when the rate above is unlimited. Raising it lets
+# more traffic through immediately after an idle period, at the cost of
+# a larger momentary spike above the average rate. Default: rate / 5
+# (a 5-second reservoir at the configured rate).
+stream_s3.max_transfer_burst_bytes = 10485760
 ```
 
 ### Read-path integrity
