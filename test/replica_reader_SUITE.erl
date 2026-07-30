@@ -870,9 +870,10 @@ reconcile_reattaches_orphaned_writer(Config) ->
 reconcile_reseeds_writer_cache_after_restart(Config) ->
     %% On the writer node the manifest cache is filled by each persist. If the
     %% node's manifest_replica restarts and the stream is then idle (no further
-    %% persist), the cache stays empty and consumers on this node resolve the
-    %% remote tier as absent, silently skipping remote data. Writer-side
-    %% reconciliation must re-seed the local cache from the reader's manifest.
+    %% persist), the cache stays empty and consumers on this node fail closed
+    %% on it (retrying) instead of resolving the manifest this writer already
+    %% knows. Writer-side reconciliation must re-seed the local cache from the
+    %% reader's manifest.
     StreamId = ?config(stream_id, Config),
     Cache = rabbitmq_stream_s3_manifest_replica,
     Writer = start_writer(Config, #{fragment_target_size => 1000}),

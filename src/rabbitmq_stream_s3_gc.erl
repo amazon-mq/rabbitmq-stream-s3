@@ -301,8 +301,7 @@ still_dangling(#{reason := below_first_offset, stream_id := StreamId, key := Key
         %% No live manifest to compare against (a pending marker whose manifest
         %% has not resolved yet, or a missing row): do not delete (a later
         %% sweep reclaims a genuine orphan once a floor is known again).
-        pending => fun() -> false end,
-        absent => fun() -> false end
+        pending => fun() -> false end
     }).
 
 %% Whether the group object Key is protected by the LIVE manifest's leading-group

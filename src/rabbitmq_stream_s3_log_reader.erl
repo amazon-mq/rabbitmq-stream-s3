@@ -253,14 +253,11 @@ resolve_remote_location(first, #{name := StreamId, shared := Shared}) ->
                 %% local first offset is the stream's beginning.
                 {local, first}
         end,
-        %% Attached but the manifest is not yet resolved or synced, so where
-        %% the stream begins is unknown. Fail closed: a local fallback here
-        %% would silently skip the remote range below the local floor. The
-        %% consumer retries.
-        pending => fun() -> {error, {manifest_not_resolved, StreamId}} end,
-        %% No plugin state for this stream on this node (un-tiered): the local
-        %% log is the whole stream.
-        absent => fun() -> {local, first} end
+        %% Not yet resolved (explicitly pending) or no row at all: either way
+        %% where the stream begins is unknown. Fail closed: a local fallback
+        %% here would silently skip the remote range below the local floor.
+        %% The consumer retries.
+        pending => fun() -> {error, {manifest_not_resolved, StreamId}} end
     });
 resolve_remote_location(Offset, #{name := StreamId, shared := Shared}) when
     is_integer(Offset)
@@ -319,18 +316,12 @@ resolve_remote_location(Offset, #{name := StreamId, shared := Shared}) when
                         %% entry array.
                         {local, first}
                 end,
-                %% Attached but not yet resolved or synced: the remote tier's
-                %% extent is unknown and the offset is below the local floor,
-                %% so it cannot be served without it. Fail closed rather than
-                %% silently skip; the consumer retries.
-                pending => fun() -> {error, {manifest_not_resolved, StreamId}} end,
-                %% No plugin state for this stream on this node (un-tiered):
-                %% the local log is the whole stream. The requested offset is
-                %% below the local floor, so emulate osiris_log and attach at
-                %% the local first offset. Returning {local, next} here would
-                %% attach at the tail and silently skip all local data the
-                %% consumer asked for.
-                absent => fun() -> {local, first} end
+                %% Not yet resolved (explicitly pending) or no row at all: the
+                %% remote tier's extent is unknown either way and the offset
+                %% is below the local floor, so it cannot be served without
+                %% it. Fail closed rather than silently skip; the consumer
+                %% retries.
+                pending => fun() -> {error, {manifest_not_resolved, StreamId}} end
             })
     end;
 resolve_remote_location({timestamp, Ts} = Spec, #{name := StreamId}) ->
@@ -355,10 +346,10 @@ resolve_remote_location({timestamp, Ts} = Spec, #{name := StreamId}) ->
                         {local, Spec}
                 end
         end,
-        %% Attached but not yet resolved or synced: the timestamp may live in
-        %% the remote tier. Fail closed rather than silently skip.
-        pending => fun() -> {error, {manifest_not_resolved, StreamId}} end,
-        absent => fun() -> {local, Spec} end
+        %% Not yet resolved (explicitly pending) or no row at all: the
+        %% timestamp may live in the remote tier either way. Fail closed
+        %% rather than silently skip.
+        pending => fun() -> {error, {manifest_not_resolved, StreamId}} end
     });
 resolve_remote_location({abs, Offset}, #{name := StreamId} = Config) ->
     CheckRange = fun() ->
@@ -372,11 +363,10 @@ resolve_remote_location({abs, Offset}, #{name := StreamId} = Config) ->
     rabbitmq_stream_s3_manifest_replica:with_manifest(StreamId, #{
         resolved => fun(_) -> CheckRange() end,
         %% {abs, Offset} validates the offset against the stream's total range,
-        %% which is unknown until the manifest resolves. Fail closed with a
-        %% retryable error; an out_of_range here would be a lie the client
-        %% treats as permanent.
-        pending => fun() -> {error, {manifest_not_resolved, StreamId}} end,
-        absent => fun() -> CheckRange() end
+        %% which is unknown until the manifest resolves (explicitly pending or
+        %% no row at all). Fail closed with a retryable error; an
+        %% out_of_range here would be a lie the client treats as permanent.
+        pending => fun() -> {error, {manifest_not_resolved, StreamId}} end
     }).
 
 -doc "Finds the range of offsets in both local and remote tiers".
@@ -1238,14 +1228,12 @@ resolve_first(StreamId, FirstOffset) ->
                 %% first offset is the oldest data that exists.
                 {local, first}
         end,
-        %% Unreachable from the resolution clauses (they only call in after
-        %% observing a resolved manifest, and a row is never downgraded), but
-        %% stated: a pending row must never be collapsed into the local
-        %% fallback.
-        pending => fun() -> {error, {manifest_not_resolved, StreamId}} end,
-        %% The row was released concurrently (the member is going down); the
-        %% local fallback is moot, the reader is about to die with it.
-        absent => fun() -> {local, first} end
+        %% Unreachable from the resolution clauses in steady state (they only
+        %% call in after observing a resolved manifest, and a row is never
+        %% downgraded), but stated: a pending row, or one released concurrently
+        %% (the member going down evicts it), must never be collapsed into the
+        %% local fallback -- fail closed regardless of why the row is missing.
+        pending => fun() -> {error, {manifest_not_resolved, StreamId}} end
     }).
 
 %% Interpret the first-fragment lookup returned by the fragment iterator. Total
@@ -1331,11 +1319,13 @@ read(RemoteReader, Offset, Bytes, Hint, Attempt) ->
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
-%% A stream with no cache row at all is un-tiered on this node (the plugin
-%% never attached to it), so the local log is the whole stream: emulate
-%% osiris_log and attach at the local first offset, not the tail. Attaching at
-%% the tail ({local, next}) silently skips every record the consumer asked for.
-resolve_below_floor_unattached_falls_back_to_first_test_() ->
+%% A stream with no cache row at all is unresolved, exactly like an explicitly
+%% pending row: tiering is unconditional and plugin-wide, so a missing row is
+%% never a positive "un-tiered stream" statement, and it defaults to the same
+%% fail-closed obligation as pending (see resolve_pending_fails_closed_test_
+%% below) rather than falling back to the local tier and silently skipping the
+%% remote range below the local floor.
+resolve_missing_row_fails_closed_test_() ->
     {setup,
         fun() ->
             {ok, Pid} = rabbitmq_stream_s3_manifest_replica:start_link(),
@@ -1343,14 +1333,15 @@ resolve_below_floor_unattached_falls_back_to_first_test_() ->
             Pid
         end,
         fun(Pid) -> gen_server:stop(Pid) end, fun(_) ->
+            StreamId = <<"missing-row-stream">>,
             Shared = osiris_log_shared:new(),
             ok = osiris_log_shared:set_first_chunk_id(Shared, 100),
-            Config = #{name => <<"untiered-stream">>, shared => Shared},
+            Config = #{name => StreamId, shared => Shared},
+            Err = {error, {manifest_not_resolved, StreamId}},
             [
-                %% Below the local floor, no plugin state: fall back to local
-                %% first.
-                ?_assertEqual({local, first}, resolve_remote_location(5, Config)),
-                ?_assertEqual({local, first}, resolve_remote_location(first, Config)),
+                %% Below the local floor, no row at all: fail closed.
+                ?_assertEqual(Err, resolve_remote_location(5, Config)),
+                ?_assertEqual(Err, resolve_remote_location(first, Config)),
                 %% At/above the local floor: local reader at the offset (no
                 %% cache needed).
                 ?_assertEqual({local, 150}, resolve_remote_location(150, Config))

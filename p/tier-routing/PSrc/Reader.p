@@ -1,12 +1,19 @@
 /* The reader routing an integer offset to a tier (resolve_remote_location/2).
 
-   Two injectable bugs, each a shipped defect this model gates on:
+   Two injectable bugs live here, each a shipped defect this model gates on:
    - bugNoMinusOneGuard drops the `first_chunk_id =/= -1` guard from the
      local-tier check, reproducing the empty-local-log silent remote skip.
    - bugMissFallsLocal collapses a PENDING cache reply into the local fallback
      ({local, first}), reproducing the boot-window silent remote skip that
      shipped when the cache had no pending state and a miss meant "no remote
      tier".
+
+   A third, retired bug -- classifying a missing cache row as ABSENT instead
+   of defaulting it to PENDING -- lives on ManifestStore's
+   bugColdReportsAbsent, not here: the defect is in what the cache reports
+   for a missing row, not in how the Reader routes a given reply. The
+   Reader's ABSENT branch below is unconditional LOCAL and unchanged; it is
+   only ever reached when that toggle is on.
 
    The Reader never sees the ground-truth extent: it decides from the cache
    reply alone, exactly like the real code. The monitor judges the decision
@@ -57,7 +64,11 @@ machine Reader {
         /* Attached but unresolved: fail closed, the consumer retries. */
         outcome = RETRY;
       } else {
-        /* ABSENT: un-tiered stream, the local log is the whole stream. */
+        /* ABSENT only occurs when ManifestStore's bugColdReportsAbsent
+           regression toggle is on; the default cold-cache classification is
+           PENDING (handled above). This branch stays LOCAL on purpose: it
+           reproduces the retired "missing row = un-tiered stream"
+           classification bug for tcTierRoutingBuggyColdAbsent. */
         outcome = LOCAL;
       }
       announce eResolution, (outcome = outcome, offset = p.offset, firstChunkId = p.firstChunkId);

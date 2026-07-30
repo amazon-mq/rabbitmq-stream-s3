@@ -658,24 +658,43 @@ jobs:
       - name: Tests that must hold
         run: |
           cd p/tier-routing
-          echo "::group::tcTierRoutingGuarded (expect hold)"
-          p check -tc tcTierRoutingGuarded -i 5000
-          echo "::endgroup::"
-      - name: Validation gate (removing the first_chunk_id == -1 guard must misroute)
+          # tcTierRoutingBuggyNoMarker now holds: Cold defaults to PENDING, so a
+          # missing pending marker no longer causes a silent remote skip by
+          # itself -- tcTierRoutingBuggyColdAbsent below isolates the
+          # classification axis, which still fails.
+          for tc in tcTierRoutingGuardedWarm tcTierRoutingGuardedColdStart tcTierRoutingBuggyNoMarker; do
+            echo "::group::$tc (expect hold)"
+            p check -tc "$tc" -i 5000
+            echo "::endgroup::"
+          done
+      - name: Validation gate (each shipped guard is load-bearing)
         run: |
           cd p/tier-routing
-          echo "::group::tcTierRoutingBuggy (expect the INV#4 silent remote skip)"
-          if p check -tc tcTierRoutingBuggy -i 2000; then
-            echo "ERROR: tcTierRoutingBuggy passed; the model no longer misroutes an empty-local read."
-            echo "Removing the first_chunk_id =/= -1 guard must route a remote-only offset locally."
-            exit 1
-          fi
-          if ! grep -rqF 'INV#4 violated: an offset held only by the remote tier' PCheckerOutput/BugFinding/; then
-            echo "ERROR: the guard-removed run failed, but not with the expected INV#4 misrouting counterexample."
-            exit 1
-          fi
-          echo "Gate satisfied: the guard-removed model routes a remote-only offset to the local tier."
-          echo "::endgroup::"
+          # Each gate removes one guard or restores a retired classification and
+          # must reproduce the INV#4 silent remote skip, otherwise the guarded
+          # results above are not trustworthy.
+          check_gate() {
+            tc="$1"
+            rm -rf PCheckerOutput/
+            echo "::group::$tc (expect the INV#4 silent remote skip)"
+            if p check -tc "$tc" -i 2000; then
+              echo "ERROR: $tc passed; the model no longer reproduces this defect."
+              exit 1
+            fi
+            if ! grep -rqF 'INV#4 violated: an offset held only by the remote tier routed to the local tier (silent remote skip)' PCheckerOutput/BugFinding/; then
+              echo "ERROR: $tc failed, but not with the expected INV#4 silent-skip counterexample."
+              exit 1
+            fi
+            echo "Gate satisfied: $tc reproduces the silent remote skip."
+            echo "::endgroup::"
+          }
+          # The =/= -1 floor guard removed on a warm cache.
+          check_gate tcTierRoutingBuggyNoMinusOneGuard
+          # The pre-fix miss collapse (PENDING -> local): the boot-window bug.
+          check_gate tcTierRoutingBuggyMissFallsLocal
+          # The retired ABSENT classification restored directly, independent of
+          # marker timing: the cold-classification bug this task retires.
+          check_gate tcTierRoutingBuggyColdAbsent
 
   writer-fencing:
     needs: changes

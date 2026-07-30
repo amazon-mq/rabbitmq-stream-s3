@@ -481,10 +481,10 @@ execute_effect(stop, State) ->
 %% Rebuild the fragment iterator from the manifest cache, advancing past
 %% the given offset (the fragment known to be 404).
 refresh_iterator(StreamId, NotFoundOffset) ->
-    %% A resolved row is never downgraded, so a pending or absent row mid-read
-    %% means the row was released: the member is going down and this reader is
-    %% about to die with it. end_of_manifest hands off to the local tier, whose
-    %% own teardown handles the rest.
+    %% A resolved row is never downgraded, so an unresolved (pending, or
+    %% missing entirely) row mid-read means the row was released: the member
+    %% is going down and this reader is about to die with it. end_of_manifest
+    %% hands off to the local tier, whose own teardown handles the rest.
     Released = fun() ->
         ?LOG_DEBUG(
             "refresh_iterator for stream '~ts': not_found_offset=~b"
@@ -495,8 +495,7 @@ refresh_iterator(StreamId, NotFoundOffset) ->
     end,
     rabbitmq_stream_s3_manifest_replica:with_manifest(StreamId, #{
         resolved => fun(Manifest) -> refresh_iterator1(StreamId, NotFoundOffset, Manifest) end,
-        pending => Released,
-        absent => Released
+        pending => Released
     }).
 
 refresh_iterator1(
