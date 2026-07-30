@@ -138,16 +138,18 @@ start_link() ->
 -doc """
 Get the cached manifest for a stream. Direct ETS read.
 
-Returns three distinct states, and callers must not conflate them:
-`#manifest{}` is the resolved manifest (possibly empty); `pending` means the
-plugin is attached to this stream on this node but the manifest has not been
-resolved or synced yet, so the remote tier's extent is unknown (readers must
-fail closed, not fall back to the local tier); `undefined` means no plugin
-state exists for the stream on this node (an un-tiered stream), so the local
-log is the whole stream.
+Returns two distinct states, and callers must not conflate them: `#manifest{}`
+is the resolved manifest (possibly empty); `pending` (explicitly marked) or
+`undefined` (no row at all) both mean the remote tier's extent is unknown, so
+readers must fail closed, not fall back to the local tier. A missing row is
+not a positive statement of anything: tiering is unconditional and
+plugin-wide, so there is no "un-tiered stream" a missing row could mean, and
+it defaults to the same fail-closed obligation as an explicit marker because
+the marker write can itself fail (the registration call to the per-node cache
+singleton can transiently error).
 
 Code that branches on the state must use `with_manifest/2` instead, which
-makes handling all three states a structural property of the call site. This
+makes handling both states a structural property of the call site. This
 accessor exists for non-branching uses (diagnostics, tests) and for callers
 that immediately re-dispatch through their own total interface.
 """.
@@ -159,28 +161,27 @@ get_manifest(StreamId) ->
     end.
 
 -doc """
-Fold over the cache row's state. The three handlers are mandatory map keys, so
-a caller that fails to consider a state does not compile a quiet fallback into
+Fold over the cache row's state. The two handlers are mandatory map keys, so a
+caller that fails to consider a state does not compile a quiet fallback into
 place; it fails to match at the call site. This is the enforcement mechanism
 for the Miss semantics invariant (see the Cached state section of
 docs/invariants.md). When a new state is ever added, every `with_manifest/2`
 caller crashes loudly rather than inheriting a neighbor's behavior.
 
-`resolved` receives the manifest (possibly empty); `pending` means attached but
-not yet resolved or synced (readers fail closed, mutators do nothing
-destructive); `absent` means the plugin never attached on this node (an
-un-tiered stream, the local log is the whole stream).
+`resolved` receives the manifest (possibly empty); `pending` means the remote
+tier's extent is unknown, whether because the row is explicitly marked pending
+(attached but not yet resolved or synced) or missing entirely (readers fail
+closed, mutators do nothing destructive either way).
 """.
 -spec with_manifest(stream_id(), #{
     resolved := fun((#manifest{}) -> Result),
-    pending := fun(() -> Result),
-    absent := fun(() -> Result)
+    pending := fun(() -> Result)
 }) -> Result.
-with_manifest(StreamId, #{resolved := Resolved, pending := Pending, absent := Absent}) ->
+with_manifest(StreamId, #{resolved := Resolved, pending := Pending}) ->
     case get_manifest(StreamId) of
         #manifest{} = Manifest -> Resolved(Manifest);
         pending -> Pending();
-        undefined -> Absent()
+        undefined -> Pending()
     end.
 
 -doc """
@@ -217,7 +218,7 @@ get_range(StreamId) ->
 -doc """
 Mark a stream's cache row as `pending` (synchronous): the plugin is attached on
 this node but the manifest is not yet resolved or synced, so readers must fail
-closed rather than treat the remote tier as absent. `register_replica_context/5`
+closed rather than serve from the local tier alone. `register_replica_context/5`
 marks pending automatically for every replica context registration; call this
 directly only for the writer node, which has no replica context to register
 before its remote replica reader resolves the manifest. Insert-if-absent: a row
@@ -488,8 +489,7 @@ handle_call({evaluate_local_retention, StreamId}, _From, #state{contexts = Ctxs}
                             run_local_retention(StreamId, Manifest, Ctx),
                             ok
                     end,
-                    pending => fun() -> {error, manifest_not_resolved} end,
-                    absent => fun() -> {error, manifest_not_resolved} end
+                    pending => fun() -> {error, manifest_not_resolved} end
                 });
             undefined ->
                 {error, {not_found, StreamId}}

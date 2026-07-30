@@ -91,8 +91,8 @@ on_init(acceptor, Pid, #{name := Name, leader_pid := LeaderPid, counter := Count
     Dir = maps:get(dir, Config),
     %% register_replica_context marks the cache row pending before the member
     %% finishes init, so a consumer attaching on this node fails closed (and
-    %% retries) until the writer's sync lands, rather than resolving the
-    %% remote tier as absent.
+    %% retries) until the writer's sync lands, rather than serving from the
+    %% local tier alone.
     _ = rabbitmq_stream_s3_manifest_replica:register_replica_context(
         StreamId, Pid, Dir, Shared, Counter
     ),
@@ -162,9 +162,9 @@ on_retention_evaluated(Cnt, #{name := Name}) ->
                     Cnt, ?C_OSIRIS_LOG_FIRST_TIMESTAMP, min(LocalFirstTs, RemoteFirstTs)
                 )
         end,
-        %% Not yet resolved: nothing known to override the counters with.
-        pending => fun() -> ok end,
-        absent => fun() -> ok end
+        %% Not yet resolved (explicitly pending, or no row at all): nothing
+        %% known to override the counters with.
+        pending => fun() -> ok end
     }).
 
 -doc """

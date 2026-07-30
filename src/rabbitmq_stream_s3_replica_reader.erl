@@ -657,7 +657,7 @@ terminate(
     %% when the stream is being torn down. `stopping` is set only when the
     %% stream's metadata node was deleted; a transient reader restart leaves it
     %% false so the cache survives (and is reseeded), avoiding a window where a
-    %% consumer resolves the remote tier as absent.
+    %% consumer fails closed on a manifest this writer already knows.
     case Stopping of
         true -> rabbitmq_stream_s3_manifest_replica:forget(StreamId);
         false -> ok
@@ -764,8 +764,8 @@ identity_formatter(Evt) -> Evt.
 %% Re-seed the writer node's own manifest cache from the committed manifest when
 %% it is missing. The cache is normally filled by each persist's put_manifest,
 %% but if the node's manifest_replica restarts and the stream is then idle (no
-%% further persist), the cache stays empty and consumers on this node resolve
-%% the remote tier as absent ({local, first}), silently skipping remote data.
+%% further persist), the cache stays empty and consumers on this node fail
+%% closed on it (retrying) instead of resolving the already-known manifest.
 %% Only repairs a genuine cache miss; a no-op once seeded.
 maybe_reseed_local_cache(#state{core = undefined}) ->
     ok;
@@ -775,10 +775,10 @@ maybe_reseed_local_cache(#state{core = Core, cfg = #cfg{stream = StreamId, epoch
             %% No remote tier yet; nothing to cache.
             ok;
         #manifest{} = Manifest ->
-            %% An absent row means the manifest_replica restarted and lost it;
+            %% A missing row means the manifest_replica restarted and lost it;
             %% a pending row is a marker leaked from an incarnation that died
-            %% between init and resolution. Both leave readers unable to
-            %% resolve the remote tier, so re-seed.
+            %% between init and resolution. Both leave readers fail-closed on
+            %% a manifest this writer already knows, so re-seed.
             Reseed = fun() ->
                 ?LOG_INFO(
                     "Reconciliation: re-seeding the local manifest cache for "
@@ -791,8 +791,7 @@ maybe_reseed_local_cache(#state{core = Core, cfg = #cfg{stream = StreamId, epoch
             end,
             rabbitmq_stream_s3_manifest_replica:with_manifest(StreamId, #{
                 resolved => fun(_) -> ok end,
-                pending => Reseed,
-                absent => Reseed
+                pending => Reseed
             })
     end.
 
@@ -1304,8 +1303,8 @@ maybe_spawn_group_retention(_Manifest, _Retention, _Now, _StreamId, State) ->
 -spec resolve_manifest(stream_id()) -> {ok, #manifest{}} | {retry, term()}.
 resolve_manifest(StreamId) ->
     %% A pending row is this incarnation's own init marker (or a
-    %% predecessor's): there is no cached manifest to trust, so resolve
-    %% authoritatively, exactly as for an absent row.
+    %% predecessor's), same as a missing row entirely: there is no cached
+    %% manifest to trust either way, so resolve authoritatively.
     FromStore = fun() -> resolve_manifest_from_store(StreamId) end,
     rabbitmq_stream_s3_manifest_replica:with_manifest(StreamId, #{
         resolved => fun(M) ->
@@ -1314,8 +1313,7 @@ resolve_manifest(StreamId) ->
                 resolve_from_store -> resolve_manifest_from_store(StreamId)
             end
         end,
-        pending => FromStore,
-        absent => FromStore
+        pending => FromStore
     }).
 
 %% Decide whether the locally cached manifest may be trusted on resolution
