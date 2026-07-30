@@ -93,7 +93,7 @@ on_init(acceptor, Pid, #{name := Name, leader_pid := LeaderPid, counter := Count
     %% finishes init, so a consumer attaching on this node fails closed (and
     %% retries) until the writer's sync lands, rather than resolving the
     %% remote tier as absent.
-    rabbitmq_stream_s3_manifest_replica:register_replica_context(
+    _ = rabbitmq_stream_s3_manifest_replica:register_replica_context(
         StreamId, Pid, Dir, Shared, Counter
     ),
     append_retention(StreamId, Config);
@@ -105,7 +105,7 @@ on_init(acceptor, Pid, #{name := Name, counter := Counter} = Config) ->
     %% periodic replica reconciliation will register this node and sync it.
     %% Until then readers fail closed on the pending row that
     %% register_replica_context marks.
-    rabbitmq_stream_s3_manifest_replica:register_replica_context(
+    _ = rabbitmq_stream_s3_manifest_replica:register_replica_context(
         StreamId, Pid, Dir, Shared, Counter
     ),
     append_retention(StreamId, Config).
@@ -369,7 +369,7 @@ attach_replica(Pid) ->
     %% Same pending marker as on_init(acceptor, ...), applied by
     %% register_replica_context: readers fail closed until the writer's sync
     %% lands. Re-discovery of an already synced replica changes nothing.
-    rabbitmq_stream_s3_manifest_replica:register_replica_context(
+    _ = rabbitmq_stream_s3_manifest_replica:register_replica_context(
         StreamId, Pid, Dir, Shared, Counter
     ),
     %% Register with the writer's replica reader for manifest broadcast.

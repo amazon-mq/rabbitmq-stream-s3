@@ -302,9 +302,20 @@ its predecessor's DOWN evict the live context.
 """.
 -spec register_replica_context(
     stream_id(), pid(), file:filename_all(), atomics:atomics_ref(), counters:counters_ref()
-) -> ok.
+) -> ok | {error, noproc | shutdown | timeout}.
 register_replica_context(StreamId, MemberPid, Dir, Shared, Counter) ->
-    gen_server:call(?MODULE, {register_replica_context, StreamId, MemberPid, Dir, Shared, Counter}).
+    try
+        gen_server:call(
+            ?MODULE, {register_replica_context, StreamId, MemberPid, Dir, Shared, Counter}
+        )
+    catch
+        exit:{noproc, _} ->
+            {error, noproc};
+        exit:{shutdown, _} ->
+            {error, shutdown};
+        exit:{timeout, _} ->
+            {error, timeout}
+    end.
 
 -doc "Whether a replica context is registered for the stream on this node.".
 -spec is_context_registered(stream_id()) -> boolean().
