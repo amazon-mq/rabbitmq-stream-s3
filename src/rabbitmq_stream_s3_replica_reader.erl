@@ -461,6 +461,8 @@ handle_call(
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown}, State}.
 
+handle_cast({register_acceptor, _Node}, #state{core = undefined} = State) ->
+    {noreply, State};
 handle_cast(
     {register_acceptor, Node},
     #state{
@@ -490,9 +492,16 @@ handle_cast(
     {retention_updated, Retention}, #state{core = Core, cfg = #cfg{stream = StreamId}} = State
 ) ->
     UserRetention = [S || S <- Retention, element(1, S) =/= 'fun'],
-    Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(Core),
     State1 = State#state{retention = UserRetention},
-    {noreply, maybe_evaluate_remote_retention(Manifest, UserRetention, StreamId, State1)};
+    case Core of
+        undefined ->
+            {noreply, State1};
+        _ ->
+            Manifest = rabbitmq_stream_s3_replica_reader_core:manifest(Core),
+            {noreply, maybe_evaluate_remote_retention(Manifest, UserRetention, StreamId, State1)}
+    end;
+handle_cast({resync, _Node}, #state{core = undefined} = State) ->
+    {noreply, State};
 handle_cast(
     {resync, Node},
     #state{
@@ -800,6 +809,8 @@ maybe_reseed_local_cache(#state{core = Core, cfg = #cfg{stream = StreamId, epoch
 register_replicas(Nodes, State) ->
     lists:foldl(fun register_replica/2, State, Nodes).
 
+register_replica(_Node, #state{core = undefined} = State) ->
+    State;
 register_replica(
     Node,
     #state{
