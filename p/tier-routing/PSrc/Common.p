@@ -3,19 +3,33 @@
    log_reader:resolve_remote_location/2 routes an integer offset to the local or
    remote tier by consulting the node's manifest CACHE, which is not the same
    thing as the remote tier itself. The cache row for a stream is in one of
-   three states, and the reader's obligation differs per state:
+   three ETS representations, but only two states are ever safe to route on:
 
    - RESOLVED: the manifest is known; route by extent comparison.
    - PENDING: the plugin is attached but the manifest has not resolved or
-     synced yet. The remote extent is unknown, so an offset below the local
-     floor must FAIL CLOSED (retry), never fall back to the local tier.
-   - ABSENT: no plugin state for the stream on this node (un-tiered stream).
-     The local log is the whole stream, so local fallback is correct.
+     synced yet -- or there is simply no row at all yet. The remote extent is
+     unknown, so an offset below the local floor must FAIL CLOSED (retry),
+     never fall back to the local tier. A missing row defaults to PENDING:
+     tiering is unconditional and plugin-wide (no per-stream opt-out, so "no
+     row" never means "un-tiered stream"), and a brand-new stream with no
+     persisted manifest yet is already handled by the replica reader's eager
+     empty-manifest resolve (on_manifest_resolved with next_offset = 0 writes
+     a RESOLVED empty row before any reader can attach).
+   - ABSENT: a retired classification, reproduced only via ManifestStore's
+     bugColdReportsAbsent for regression coverage. Historically a missing row
+     reported ABSENT and the reader took that as "un-tiered stream, local
+     fallback is correct" -- unsafe, since a row can go missing because a
+     registration call transiently failed (register_replica_context's
+     gen_server:call silently dropping noproc/shutdown/timeout), not only
+     because the stream is untiered.
 
-   The historical bug modeled here (alongside the older =/= -1 floor-guard bug)
-   is collapsing PENDING/ABSENT into "no remote tier -> local", which silently
-   skips the remote range below the local floor for up to one reconciliation
-   period after a node restart.
+   Two historical bugs are modeled here, alongside the older =/= -1
+   floor-guard bug: (1) collapsing an unresolved PENDING row into "no remote
+   tier -> local" (bugMissFallsLocal, Reader.p), and (2) classifying a
+   missing row as ABSENT instead of defaulting it to PENDING
+   (bugColdReportsAbsent, ManifestStore.p). Both silently skip the remote
+   range below the local floor for up to one reconciliation period after a
+   node restart.
 
    The local-tier check itself is
 

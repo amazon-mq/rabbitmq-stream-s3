@@ -1,9 +1,11 @@
 /* Test drivers and declarations for the offset -> tier routing seam.
 
    The remote tier covers [0, 100) in every tiered scenario. Guarded tests must
-   hold; each buggy test removes one load-bearing piece and MUST fail with the
-   INV#4 silent remote skip, proving the spec has discriminating power against
-   that exact defect (the validation gate):
+   hold; each buggy test either removes one load-bearing piece or restores a
+   retired classification, and MUST fail with the INV#4 silent remote skip,
+   proving the spec has discriminating power against that exact defect (the
+   validation gate) -- except tcTierRoutingBuggyNoMarker, which now holds
+   (see below):
 
    - tcTierRoutingGuardedWarm: full lifecycle (mark pending, resolve), then the
      probe grid. Holds.
@@ -18,10 +20,19 @@
      bug, a consumer attaching below the local floor after a node restart and
      before resolution.
    - tcTierRoutingBuggyNoMarker: the environment weakened instead of the code:
-     no eMarkPending, reader attaches while the cache row is absent on a tiered
-     stream (models the code before the member-init marker existed). Must
-     fail, proving the marker's placement (before readers can attach) is
-     load-bearing, not just the reader's PENDING branch. */
+     no eMarkPending, reader attaches while the cache row is missing (Cold) on
+     a tiered stream (models the code before the member-init marker existed).
+     Now HOLDS: Cold defaults to PENDING (fail closed), so a missing marker no
+     longer causes a silent remote skip by itself -- marker placement is no
+     longer load-bearing for INV#4. Kept as a regression test: it proves the
+     fix does not regress if marker-writing breaks again (register_replica_
+     context's gen_server:call silently failing).
+   - tcTierRoutingBuggyColdAbsent: the retired classification restored
+     directly via ManifestStore's bugColdReportsAbsent, independent of marker
+     timing (no eMarkPending here either, same setup as BuggyNoMarker, but
+     the variable under test is the cache's classification of a missing row,
+     not the marker). Must fail: this is the historical "no row = un-tiered
+     stream" bug this task retires. */
 
 fun Probe(self: machine, reader: machine, fcid: int, off: int) : Outcome {
   var o: Outcome;
@@ -72,7 +83,7 @@ machine DriverGuardedWarm {
       var store: machine;
       var reader: machine;
       announce eGroundTruth, (nonEmpty = true, remoteFirst = 0, remoteNext = 100);
-      store = new ManifestStore((nonEmpty = true, remoteFirst = 0, remoteNext = 100));
+      store = new ManifestStore((nonEmpty = true, remoteFirst = 0, remoteNext = 100, bugColdReportsAbsent = false));
       MarkPending(this, store);
       ResolveManifest(this, store);
       reader = new Reader((bugNoMinusOneGuard = false, bugMissFallsLocal = false, manifest = store, driver = this));
@@ -93,7 +104,7 @@ machine DriverGuardedColdStart {
       var o: Outcome;
       var i: int;
       announce eGroundTruth, (nonEmpty = true, remoteFirst = 0, remoteNext = 100);
-      store = new ManifestStore((nonEmpty = true, remoteFirst = 0, remoteNext = 100));
+      store = new ManifestStore((nonEmpty = true, remoteFirst = 0, remoteNext = 100, bugColdReportsAbsent = false));
       MarkPending(this, store);
       reader = new Reader((bugNoMinusOneGuard = false, bugMissFallsLocal = false, manifest = store, driver = this));
       i = 0;
@@ -125,7 +136,7 @@ machine DriverBuggyNoMinusOneGuard {
       var reader: machine;
       var o: Outcome;
       announce eGroundTruth, (nonEmpty = true, remoteFirst = 0, remoteNext = 100);
-      store = new ManifestStore((nonEmpty = true, remoteFirst = 0, remoteNext = 100));
+      store = new ManifestStore((nonEmpty = true, remoteFirst = 0, remoteNext = 100, bugColdReportsAbsent = false));
       MarkPending(this, store);
       ResolveManifest(this, store);
       reader = new Reader((bugNoMinusOneGuard = true, bugMissFallsLocal = false, manifest = store, driver = this));
@@ -143,7 +154,7 @@ machine DriverBuggyMissFallsLocal {
       var reader: machine;
       var o: Outcome;
       announce eGroundTruth, (nonEmpty = true, remoteFirst = 0, remoteNext = 100);
-      store = new ManifestStore((nonEmpty = true, remoteFirst = 0, remoteNext = 100));
+      store = new ManifestStore((nonEmpty = true, remoteFirst = 0, remoteNext = 100, bugColdReportsAbsent = false));
       MarkPending(this, store);
       reader = new Reader((bugNoMinusOneGuard = false, bugMissFallsLocal = true, manifest = store, driver = this));
       o = Probe(this, reader, 30, 5);
@@ -152,9 +163,12 @@ machine DriverBuggyMissFallsLocal {
 }
 
 /* The environment weakened: no pending marker at all (the code before the
-   member-init marker existed). The reader is fully guarded, yet a reader
-   attaching while the row is absent on a tiered stream still routes LOCAL,
-   because ABSENT is indistinguishable from an un-tiered stream. */
+   member-init marker existed). The reader is fully guarded and ManifestStore
+   uses its safe default (Cold answers PENDING, bugColdReportsAbsent off), so
+   a reader attaching while the row is merely missing (no marker written yet)
+   correctly RETRYs instead of routing LOCAL. This now HOLDS: proves marker
+   placement is no longer load-bearing for INV#4 -- only the cold-cache
+   default is (see DriverBuggyColdAbsent for that axis in isolation). */
 machine DriverBuggyNoMarker {
   start state Init {
     entry {
@@ -162,7 +176,27 @@ machine DriverBuggyNoMarker {
       var reader: machine;
       var o: Outcome;
       announce eGroundTruth, (nonEmpty = true, remoteFirst = 0, remoteNext = 100);
-      store = new ManifestStore((nonEmpty = true, remoteFirst = 0, remoteNext = 100));
+      store = new ManifestStore((nonEmpty = true, remoteFirst = 0, remoteNext = 100, bugColdReportsAbsent = false));
+      reader = new Reader((bugNoMinusOneGuard = false, bugMissFallsLocal = false, manifest = store, driver = this));
+      o = Probe(this, reader, 30, 5);
+    }
+  }
+}
+
+/* The retired classification bug, reproduced directly: the cache row is
+   truly missing (Cold, no marker -- same setup as DriverBuggyNoMarker), but
+   Cold is toggled to answer ABSENT instead of the safe PENDING default. This
+   isolates the classification axis from the marker-timing axis: unlike
+   DriverBuggyNoMarker (which now holds), this must still fail, because the
+   bug here is what the cache reports, not whether a marker was written. */
+machine DriverBuggyColdAbsent {
+  start state Init {
+    entry {
+      var store: machine;
+      var reader: machine;
+      var o: Outcome;
+      announce eGroundTruth, (nonEmpty = true, remoteFirst = 0, remoteNext = 100);
+      store = new ManifestStore((nonEmpty = true, remoteFirst = 0, remoteNext = 100, bugColdReportsAbsent = true));
       reader = new Reader((bugNoMinusOneGuard = false, bugMissFallsLocal = false, manifest = store, driver = this));
       o = Probe(this, reader, 30, 5);
     }
@@ -185,6 +219,14 @@ test tcTierRoutingBuggyNoMinusOneGuard [main = DriverBuggyNoMinusOneGuard]:
 test tcTierRoutingBuggyMissFallsLocal [main = DriverBuggyMissFallsLocal]:
   assert TierRoutingCorrect in { DriverBuggyMissFallsLocal, ManifestStore, Reader };
 
-/* No marker in the lifecycle: MUST fail with the INV#4 silent remote skip. */
+/* No marker in the lifecycle, Cold defaults to PENDING: now HOLDS. Marker
+   placement is no longer load-bearing for INV#4 (see
+   tcTierRoutingBuggyColdAbsent for the classification axis, which still
+   fails). */
 test tcTierRoutingBuggyNoMarker [main = DriverBuggyNoMarker]:
   assert TierRoutingCorrect in { DriverBuggyNoMarker, ManifestStore, Reader };
+
+/* Retired ABSENT classification restored directly: MUST fail with the INV#4
+   silent remote skip, independent of marker timing. */
+test tcTierRoutingBuggyColdAbsent [main = DriverBuggyColdAbsent]:
+  assert TierRoutingCorrect in { DriverBuggyColdAbsent, ManifestStore, Reader };
