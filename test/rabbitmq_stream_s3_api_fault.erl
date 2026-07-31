@@ -22,6 +22,10 @@ specific operation. The control surface (minimal for now):
   one-shot failure before the call under test reaches the backend.
 - `delay(Op, KeyPattern, Ms)` sleeps before every matching call to `Op`,
   simulating slow S3 (cleared by `reset/0`).
+- `reorder(KeyPattern, Ms)` answers matching async range GETs from a courier
+  process instead of inline, alternating a long and a short delay so that
+  concurrent requests are answered out of the order they were issued in. This
+  is what exercises the remote reader's reassembly of interleaved responses.
 
 Operation is one of: get, get_range, get_range_async, put, stream_put. Key
 matching is a binary substring (`binary:match/2`). When the control table is
@@ -58,7 +62,9 @@ passthrough to the FS backend.
     release/2,
     fail_next/3,
     fail_matching/3,
-    delay/3
+    delay/3,
+    reorder/2,
+    reorder_count/0
 ]).
 
 -define(TBL, ?MODULE).
@@ -123,6 +129,19 @@ delay(Op, KeyPat, Ms) ->
     true = ets:insert(?TBL, {{delay, Op}, KeyPat, Ms}),
     ok.
 
+%% Deliver every matching async range response from a courier process, so
+%% `get_range_async/3` returns immediately and the responses to concurrent
+%% requests land out of the order they were issued in. The FS backend answers
+%% synchronously and in issue order, which never exercises the remote reader's
+%% reassembly of interleaved responses.
+%%
+%% `delay/3` cannot do this: it sleeps in the calling process, which is the
+%% reader itself, so it delays everything uniformly and reorders nothing.
+-spec reorder(binary(), pos_integer()) -> ok.
+reorder(KeyPat, DelayMs) ->
+    true = ets:insert(?TBL, {{reorder, get_range_async}, KeyPat, DelayMs}),
+    ok.
+
 %%----------------------------------------------------------------------------
 %% Behaviour callbacks
 %%----------------------------------------------------------------------------
@@ -144,7 +163,63 @@ get_range_async(Key, RangeSpec, Opts) ->
             self() ! {'$async', Req, {done, {error, Reason}}},
             {ok, Req, undefined};
         ok ->
-            ?FS:get_range_async(Key, RangeSpec, Opts)
+            maybe_reorder(Key, RangeSpec, Opts)
+    end.
+
+maybe_reorder(Key, RangeSpec, Opts) ->
+    case lookup_reorder(Key) of
+        false ->
+            ?FS:get_range_async(Key, RangeSpec, Opts);
+        DelayMs ->
+            %% Read the range now (so the answer matches what the object holds
+            %% at this instant, as a real GET would) but hand it to a courier
+            %% that delivers it to the reader later.
+            Reader = self(),
+            Req = make_ref(),
+            {ok, FsReq, _} = ?FS:get_range_async(Key, RangeSpec, Opts),
+            Reply =
+                receive
+                    {'$async', FsReq, R} -> R
+                after 5_000 -> error({fault_reorder_no_reply, Key})
+                end,
+            %% Alternate long and short delays rather than random ones, so that
+            %% whenever two requests are in flight together the second one
+            %% overtakes the first: reordering is then a property of the test,
+            %% not of how the scheduler happened to run.
+            N = ets:update_counter(?TBL, reorder_count, 1, {reorder_count, 0}),
+            Sleep =
+                case N rem 2 of
+                    1 -> DelayMs;
+                    0 -> 1
+                end,
+            _ = spawn(fun() ->
+                timer:sleep(Sleep),
+                Reader ! {'$async', Req, Reply}
+            end),
+            {ok, Req, undefined}
+    end.
+
+%% How many async range requests the reorder mode has answered.
+-spec reorder_count() -> non_neg_integer().
+reorder_count() ->
+    try ets:lookup(?TBL, reorder_count) of
+        [{_, N}] -> N;
+        _ -> 0
+    catch
+        error:badarg -> 0
+    end.
+
+lookup_reorder(Key) ->
+    try ets:lookup(?TBL, {reorder, get_range_async}) of
+        [{_, KeyPat, DelayMs}] ->
+            case matches(KeyPat, Key) of
+                true -> DelayMs;
+                false -> false
+            end;
+        _ ->
+            false
+    catch
+        error:badarg -> false
     end.
 
 put(Key, Data, Opts) -> with_faults(put, Key, fun() -> ?FS:put(Key, Data, Opts) end).

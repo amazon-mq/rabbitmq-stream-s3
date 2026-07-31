@@ -69,6 +69,8 @@ groups() ->
             remote_reader_restart_self_heals,
             become_local_stops_remote_reader,
             read_retries_transient_remote_error,
+            read_with_out_of_order_remote_responses,
+            read_with_out_of_order_responses_and_a_failure,
             read_tolerates_slow_remote,
             read_group_fetch_error_is_surfaced
         ]},
@@ -122,6 +124,10 @@ end_per_testcase(_TestCase, Config) ->
         rabbitmq_stream_s3, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_fs
     ),
     catch rabbitmq_stream_s3_api_fault:reset(),
+    %% Restore the default prefetch sizing if a test shrank it.
+    application:unset_env(rabbitmq_stream_s3, prefetch_request_size),
+    application:unset_env(rabbitmq_stream_s3, prefetch_window_max),
+    application:unset_env(rabbitmq_stream_s3, prefetch_max_depth),
     Config.
 
 %% ------------------------------------------------------------------
@@ -171,6 +177,74 @@ read_retries_transient_remote_error(Config) ->
     ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),
     Records = read_all(Reader0),
     assert_sequential(Records, N).
+
+%% Shrink the prefetch sizing so each fragment takes several range requests and
+%% more than one is in flight at a time. At the production request size a
+%% fragment these tests write is a single request, which never interleaves.
+pipeline_within_fragments() ->
+    ok = application:set_env(rabbitmq_stream_s3, prefetch_request_size, 256),
+    ok = application:set_env(rabbitmq_stream_s3, prefetch_window_max, 8192),
+    ok = application:set_env(rabbitmq_stream_s3, prefetch_max_depth, 8).
+
+read_with_out_of_order_remote_responses(Config) ->
+    %% Several ranges of a fragment are fetched at once, so their responses
+    %% interleave. The reader stages bytes for a range whose predecessors are
+    %% unfinished and appends them only once it heads the queue; if that
+    %% reassembly were wrong the consumer would see corrupt or missing records
+    %% rather than an error. The fault backend delivers every range response
+    %% from a courier after a random delay, so they land out of issue order.
+    StreamId = ?config(stream_id, Config),
+    ok = application:set_env(
+        rabbitmq_stream_s3, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_fault
+    ),
+    ok = rabbitmq_stream_s3_api_fault:setup(),
+    ok = pipeline_within_fragments(),
+
+    Writer = start_writer(Config, #{fragment_target_size => 1000}),
+    N = 200,
+    write_sequential(Writer, N, 5),
+    ReaderCfg = reader_config(Writer, Config),
+    #{shared := Shared} = ReaderCfg,
+    ?awaitMatch([S] when S > 0, list_segment_offsets(Config), 1000),
+    ?awaitMatch(F when F > 0, osiris_log_shared:first_chunk_id(Shared), 1000),
+
+    ok = rabbitmq_stream_s3_api_fault:reorder(StreamId, 20),
+
+    {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg),
+    ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),
+    Records = read_all(Reader0),
+    assert_sequential(Records, N),
+    %% Guard against the test going vacuous: the reorder path must have
+    %% answered several requests, or nothing was interleaved.
+    ?assert(rabbitmq_stream_s3_api_fault:reorder_count() > 1).
+
+read_with_out_of_order_responses_and_a_failure(Config) ->
+    %% The same, with one range failing mid-pipeline: only that range may be
+    %% re-requested, and the ranges queued behind it must keep the bytes they
+    %% have already received rather than leaving a hole.
+    StreamId = ?config(stream_id, Config),
+    ok = application:set_env(
+        rabbitmq_stream_s3, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_fault
+    ),
+    ok = rabbitmq_stream_s3_api_fault:setup(),
+    ok = pipeline_within_fragments(),
+
+    Writer = start_writer(Config, #{fragment_target_size => 1000}),
+    N = 200,
+    write_sequential(Writer, N, 5),
+    ReaderCfg = reader_config(Writer, Config),
+    #{shared := Shared} = ReaderCfg,
+    ?awaitMatch([S] when S > 0, list_segment_offsets(Config), 1000),
+    ?awaitMatch(F when F > 0, osiris_log_shared:first_chunk_id(Shared), 1000),
+
+    ok = rabbitmq_stream_s3_api_fault:reorder(StreamId, 20),
+    ok = rabbitmq_stream_s3_api_fault:fail_next(get_range_async, StreamId, slow_down),
+
+    {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg),
+    ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),
+    Records = read_all(Reader0),
+    assert_sequential(Records, N),
+    ?assert(rabbitmq_stream_s3_api_fault:reorder_count() > 1).
 
 read_tolerates_slow_remote(Config) ->
     %% A slow remote tier (latency on every fragment GET) must still deliver the

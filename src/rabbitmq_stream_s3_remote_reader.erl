@@ -53,27 +53,9 @@ synchronous feedback is generated.
     {remote_reader_fatal_errors, ?C_FATAL_ERRORS, counter,
         "Number of remote readers stopped by a non-retryable S3 error"}
 ]).
-%% Upper bucket boundaries follow the values the window can actually take. It
-%% starts at prefetch_request_size (4 MiB), doubles on a miss up to
-%% prefetch_window_max (32 MiB) and gives a request back at a time, so at the
-%% default sizing it is always a multiple of 4 MiB in [4, 32] MiB: boundaries
-%% spaced by the request size resolve every step it can make. The lower ones
-%% cover a request size configured smaller than the default. The window never
-%% exceeds its ceiling, so in normal operation +Inf stays empty.
--define(PREFETCH_WINDOW_BUCKETS, [
-    262_144,
-    1_048_576,
-    2_097_152,
-    4_194_304,
-    8_388_608,
-    12_582_912,
-    16_777_216,
-    20_971_520,
-    25_165_824,
-    29_360_128,
-    33_554_432,
-    infinity
-]).
+%% The most bucket boundaries the prefetch window histogram may have. A window
+%% many requests wide would otherwise get one time series per step it can make.
+-define(PREFETCH_WINDOW_BUCKET_LIMIT, 16).
 
 -type hint() :: chunk_boundary | within_chunk.
 -export_type([hint/0]).
@@ -153,13 +135,33 @@ synchronous feedback is generated.
 init_counters() ->
     Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?COUNTERS, #{module => ?MODULE}),
     persistent_term:put(?COUNTER_KEY, Cnt),
-    rabbitmq_stream_s3_histogram:new(?MODULE, ?PREFETCH_WINDOW_BUCKETS),
+    rabbitmq_stream_s3_histogram:new(?MODULE, prefetch_window_buckets()),
     ok.
+
+%% Upper bucket boundaries follow the values the window can actually take: it
+%% starts at `prefetch_request_size`, doubles on a miss up to
+%% `prefetch_window_max` and gives a request back at a time, so it is always in
+%% `[RequestSize, WindowMax]` and moves in whole requests. Boundaries spaced by
+%% the request size therefore resolve every step it can make, and the top one
+%% is the window's ceiling, so in normal operation +Inf stays empty.
+%%
+%% They are derived from the configured sizes rather than fixed because both are
+%% settings: a fixed list would put every observation of a raised
+%% `prefetch_window_max` into +Inf, and collapse the steps of a raised
+%% `prefetch_request_size` into a handful of buckets. Where the window spans
+%% more than `?PREFETCH_WINDOW_BUCKET_LIMIT` requests the spacing is widened to
+%% keep the series count bounded; the ceiling stays a boundary either way.
+prefetch_window_buckets() ->
+    RequestSize = rabbitmq_stream_s3_config:prefetch_request_size(),
+    WindowMax = max(RequestSize, rabbitmq_stream_s3_config:prefetch_window_max()),
+    Steps = ceil(WindowMax / RequestSize),
+    Stride = RequestSize * ceil(Steps / ?PREFETCH_WINDOW_BUCKET_LIMIT),
+    lists:usort(lists:seq(Stride, WindowMax, Stride) ++ [WindowMax]) ++ [infinity].
 
 -spec prefetch_window_prometheus_format() -> map().
 prefetch_window_prometheus_format() ->
     {Buckets, Count, Sum} = rabbitmq_stream_s3_histogram:prometheus_format(
-        ?MODULE, fun(X) -> X end, ?PREFETCH_WINDOW_BUCKETS
+        ?MODULE, fun(X) -> X end
     ),
     #{
         prefetch_window_bytes => #{
@@ -767,13 +769,69 @@ stale_retry_is_ignored_per_kind_test() ->
 prefetch_window_buckets_resolve_every_window_step_test() ->
     RequestSize = rabbitmq_stream_s3_config:prefetch_request_size(),
     WindowMax = rabbitmq_stream_s3_config:prefetch_window_max(),
+    Buckets = prefetch_window_buckets(),
     Windows = lists:seq(RequestSize, WindowMax, RequestSize),
-    Buckets = [bucket_of(W) || W <- Windows],
-    ?assertEqual(length(Windows), length(lists:usort(Buckets))),
-    ?assertNot(lists:member(infinity, Buckets)).
+    Observed = [bucket_of(W, Buckets) || W <- Windows],
+    ?assertEqual(length(Windows), length(lists:usort(Observed))),
+    ?assertNot(lists:member(infinity, Observed)).
 
-bucket_of(Value) ->
-    hd([UB || UB <- ?PREFETCH_WINDOW_BUCKETS, UB =:= infinity orelse Value =< UB]).
+%% The boundaries are derived, so sizings other than the default have to hold
+%% up too: the ceiling is always the top finite boundary (nothing the window can
+%% take falls into +Inf), and a window many requests wide is spaced out rather
+%% than given a boundary per step.
+prefetch_window_buckets_follow_the_configured_sizes_test_() ->
+    Sizings = [
+        %% Default.
+        {4_194_304, 33_554_432},
+        %% A raised ceiling: fixed boundaries would have put all of it in +Inf.
+        {4_194_304, 268_435_456},
+        %% A raised request size, which is also the floor the window sits at.
+        {33_554_432, 134_217_728},
+        %% A ceiling that is not a whole number of requests.
+        {4_194_304, 30_000_000},
+        %% Degenerate: no room to grow at all.
+        {4_194_304, 4_194_304},
+        %% Degenerate: a ceiling below the floor, which the core clamps away.
+        {4_194_304, 1_048_576}
+    ],
+    [
+        {
+            lists:flatten(io_lib:format("~b/~b", [RequestSize, WindowMax])),
+            fun() ->
+                with_prefetch_config(RequestSize, WindowMax, fun() ->
+                    Ceiling = max(RequestSize, WindowMax),
+                    Buckets = prefetch_window_buckets(),
+                    ?assertEqual(infinity, lists:last(Buckets)),
+                    ?assertEqual(Ceiling, lists:last(lists:droplast(Buckets))),
+                    ?assertNotEqual(infinity, bucket_of(Ceiling, Buckets)),
+                    ?assert(length(Buckets) =< ?PREFETCH_WINDOW_BUCKET_LIMIT + 1)
+                end)
+            end
+        }
+     || {RequestSize, WindowMax} <- Sizings
+    ].
+
+with_prefetch_config(RequestSize, WindowMax, Fun) ->
+    Set = fun(Key, Value) ->
+        Prev = application:get_env(rabbitmq_stream_s3, Key),
+        application:set_env(rabbitmq_stream_s3, Key, Value),
+        Prev
+    end,
+    Reset = fun
+        (Key, {ok, Value}) -> application:set_env(rabbitmq_stream_s3, Key, Value);
+        (Key, undefined) -> application:unset_env(rabbitmq_stream_s3, Key)
+    end,
+    PrevSize = Set(prefetch_request_size, RequestSize),
+    PrevMax = Set(prefetch_window_max, WindowMax),
+    try
+        Fun()
+    after
+        Reset(prefetch_request_size, PrevSize),
+        Reset(prefetch_window_max, PrevMax)
+    end.
+
+bucket_of(Value, Buckets) ->
+    hd([UB || UB <- Buckets, UB =:= infinity orelse Value =< UB]).
 
 %% Checking a connection out of a saturated pool costs a 100ms timeout, so once
 %% one request in a batch has come back pool_busy the rest must be reported to

@@ -945,7 +945,12 @@ init_remote_reader(
     Conf = #{
         reader => self(),
         stream => StreamId,
-        location => Location
+        location => Location,
+        opts => #{
+            request_size => rabbitmq_stream_s3_config:prefetch_request_size(),
+            window_max => rabbitmq_stream_s3_config:prefetch_window_max(),
+            max_depth => rabbitmq_stream_s3_config:prefetch_max_depth()
+        }
     },
     %% The remote reader is a data pipe for large refc binaries with a small
     %% heap of its own, the same profile as the pool's gun processes. Full

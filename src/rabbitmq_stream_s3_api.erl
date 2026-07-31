@@ -360,8 +360,7 @@ request_duration_prometheus_format() ->
         begin
             {Buckets, Count, Sum} = rabbitmq_stream_s3_histogram:prometheus_format(
                 {?MODULE, request_duration, Kind},
-                fun(Ms) -> Ms / 1000 end,
-                ?REQUEST_DURATION_BUCKETS
+                fun(Ms) -> Ms / 1000 end
             ),
             {[{kind, Kind}], Buckets, Count, Sum}
         end

@@ -455,7 +455,7 @@ Owned by `rabbitmq_stream_s3_remote_reader`. One counter set per node, summed ac
 |-------------------------------------|-------------------------------------------------------------------|
 | `rabbitmq_stream_s3_prefetch_window_bytes_bucket`      | Distribution of the remote reader's prefetch window                |
 
-Buckets: 256 KiB, 1 MiB, 2 MiB, 4 MiB, 8 MiB, 12 MiB, 16 MiB, 20 MiB, 24 MiB, 28 MiB, 32 MiB, +Inf. The window moves in whole requests between `prefetch_request_size` (4 MiB) and `prefetch_window_max` (32 MiB), so at the default sizing the boundaries from 4 MiB up resolve every value it can take. The top finite boundary matches the window cap, so `+Inf` stays empty in normal operation.
+The boundaries are derived from the configured sizes at boot: the window moves in whole requests between `prefetch_request_size` and `prefetch_window_max`, so they are spaced by the request size up to the window cap. At the default sizing that is 4, 8, 12, 16, 20, 24, 28, 32 MiB and `+Inf`. The top finite boundary is always the window cap, so `+Inf` stays empty in normal operation. A window that spans more than 16 requests is spaced out rather than given a boundary per step, which bounds the number of series.
 
 The window grows on a miss and shrinks on sustained hits, so it reads as a load signal rather than a health one. A window pinned at its ceiling while `rabbitmq_stream_s3_buffer_miss` still climbs means consumers are outrunning the remote tier: prefetch has grown as far as it is allowed to and reads are still waiting on S3. A window sitting at its floor means the reader is staying ahead of its consumers and has given back every request it took.
 

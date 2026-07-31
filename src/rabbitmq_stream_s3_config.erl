@@ -25,6 +25,9 @@ lives here. Callers use these functions instead of calling
     upload_pool_max_size/0,
     general_pool_min_size/0,
     general_pool_max_size/0,
+    prefetch_request_size/0,
+    prefetch_window_max/0,
+    prefetch_max_depth/0,
     fragment_target_size/0,
     persist_threshold/0,
     persist_interval_ms/0,
@@ -117,9 +120,41 @@ upload_pool_max_size() ->
 general_pool_min_size() ->
     application:get_env(?APP, general_pool_min_size, 2).
 
+%% The general pool also serves manifest, group and index GETs, and every
+%% remote reader can hold `prefetch_max_depth` connections at once, so the
+%% ceiling has to cover several lagging consumers per node. Connections are
+%% opened on demand and closed when idle, so a high ceiling costs nothing at
+%% rest; exhausting it degrades a reader's depth rather than failing its reads.
 -spec general_pool_max_size() -> pos_integer().
 general_pool_max_size() ->
-    application:get_env(?APP, general_pool_max_size, 50).
+    application:get_env(?APP, general_pool_max_size, 200).
+
+%% ------------------------------------------------------------------
+%% Remote read prefetch
+%%
+%% A single S3 connection transfers at roughly 40 MB/s whatever range size is
+%% asked of it, so a remote reader's bandwidth is set by how many range GETs it
+%% runs concurrently. Request size is fixed and the prefetch window is what
+%% adapts; see rabbitmq_stream_s3_remote_reader_core.
+%% ------------------------------------------------------------------
+
+%% Bytes per range GET. Large enough to amortise time-to-first-byte over the
+%% transfer, small enough that a window is several requests wide.
+-spec prefetch_request_size() -> pos_integer().
+prefetch_request_size() ->
+    application:get_env(?APP, prefetch_request_size, 4_194_304).
+
+%% Ceiling on how far ahead of the consumer a reader fetches, and so on its
+%% memory: it holds or has outstanding at most this plus one request.
+-spec prefetch_window_max() -> pos_integer().
+prefetch_window_max() ->
+    application:get_env(?APP, prefetch_window_max, 33_554_432).
+
+%% Most range GETs one reader may have in flight. Also its share of the general
+%% connection pool.
+-spec prefetch_max_depth() -> pos_integer().
+prefetch_max_depth() ->
+    application:get_env(?APP, prefetch_max_depth, 8).
 
 %% Target byte size at which the replica reader cuts a fragment for upload.
 -spec fragment_target_size() -> pos_integer().
@@ -310,7 +345,10 @@ defaults_test_() ->
         ?_assertEqual(0, upload_pool_min_size()),
         ?_assertEqual(20, upload_pool_max_size()),
         ?_assertEqual(2, general_pool_min_size()),
-        ?_assertEqual(50, general_pool_max_size()),
+        ?_assertEqual(200, general_pool_max_size()),
+        ?_assertEqual(4_194_304, prefetch_request_size()),
+        ?_assertEqual(33_554_432, prefetch_window_max()),
+        ?_assertEqual(8, prefetch_max_depth()),
         ?_assertEqual(?MAX_FRAGMENT_SIZE_B, fragment_target_size()),
         ?_assertEqual(5, persist_threshold()),
         ?_assertEqual(2000, persist_interval_ms()),
