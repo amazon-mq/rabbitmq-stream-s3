@@ -15,10 +15,10 @@ with the runtime once reads are served from it:
   underlying writable binary (the runtime pins it when the sub-binary is
   copied into a message), so the next append copies the entire window rather
   than appending in place. In steady state nearly every delivery re-copies
-  the whole prefetch window (up to `read_size_max`, 64 MiB).
+  the whole prefetch window (up to `prefetch_window_max`, 32 MiB).
 - A reply sub-binary keeps the entire window generation alive in the
-  consumer's heap: a ~300-byte chunk-header read can pin 64 MiB until the
-  consumer process happens to collect garbage.
+  consumer's heap: a ~300-byte chunk-header read can pin the whole window
+  until the consumer process happens to collect garbage.
 
 This module avoids both by never appending into a binary. Deliveries are
 retained as-is, in order, as sealed blocks; consumed blocks are dropped

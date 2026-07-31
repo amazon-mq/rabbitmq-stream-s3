@@ -449,13 +449,15 @@ Owned by `rabbitmq_stream_s3_remote_reader`. One counter set per node, summed ac
 | `rabbitmq_stream_s3_remote_reader_total_requests`      | counter | S3 requests initiated                                             |
 | `rabbitmq_stream_s3_remote_reader_fatal_errors`        | counter | Remote readers stopped by a non-retryable S3 error                |
 
-### Read size histogram
+### Prefetch window histogram
 
 | Metric                              | Description                                                       |
 |-------------------------------------|-------------------------------------------------------------------|
-| `rabbitmq_stream_s3_read_size_bytes_bucket`            | Distribution of read sizes from S3                                |
+| `rabbitmq_stream_s3_prefetch_window_bytes_bucket`      | Distribution of the remote reader's prefetch window                |
 
-Buckets: 48 B, 128 B, 512 B, 2 KiB, 8 KiB, 32 KiB, 128 KiB, 512 KiB, 2 MiB, 8 MiB, 16 MiB, 32 MiB, 64 MiB, +Inf. The top finite boundary matches the remote reader's 64 MiB AIMD read-size cap, so `+Inf` stays empty in normal operation.
+Buckets: 256 KiB, 1 MiB, 2 MiB, 4 MiB, 8 MiB, 12 MiB, 16 MiB, 20 MiB, 24 MiB, 28 MiB, 32 MiB, +Inf. The window moves in whole requests between `prefetch_request_size` (4 MiB) and `prefetch_window_max` (32 MiB), so at the default sizing the boundaries from 4 MiB up resolve every value it can take. The top finite boundary matches the window cap, so `+Inf` stays empty in normal operation.
+
+The window grows on a miss and shrinks on sustained hits, so it reads as a load signal rather than a health one. A window pinned at its ceiling while `rabbitmq_stream_s3_buffer_miss` still climbs means consumers are outrunning the remote tier: prefetch has grown as far as it is allowed to and reads are still waiting on S3. A window sitting at its floor means the reader is staying ahead of its consumers and has given back every request it took.
 
 ## Dashboards
 

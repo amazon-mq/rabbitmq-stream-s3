@@ -44,6 +44,7 @@ over the invariants above.
 -behaviour(proper_statem).
 
 -include_lib("common_test/include/ct.hrl").
+-include_lib("stdlib/include/assert.hrl").
 -include_lib("proper/include/proper.hrl").
 
 -define(POOL, statem_aws_pool).
@@ -57,7 +58,10 @@ over the invariants above.
 -define(AWAIT_MS, 1500).
 
 all() ->
-    [no_leak_or_inconsistency].
+    [
+        no_leak_or_inconsistency,
+        one_process_may_hold_several_checkouts
+    ].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(seshat),
@@ -72,6 +76,39 @@ end_per_suite(Config) ->
 %% ------------------------------------------------------------------
 %% Test case
 %% ------------------------------------------------------------------
+
+%% A remote reader pipelines its range GETs, so one process holds several
+%% checkouts at once. The statem model spawns a fresh caller per checkout and
+%% never covers that: checkouts are keyed by connection with a monitor taken
+%% per checkout, so the same caller monitored several times must not collapse
+%% the `checkouts`/`checkouts_rev` mirror.
+one_process_may_hold_several_checkouts(_Config) ->
+    _ = seshat:new_group(rabbitmq_stream_s3),
+    Config = maps:merge(pool_config(), #{min_size => 0, max_size => 3}),
+    {ok, Pid} = rabbitmq_stream_s3_api_aws_pool:start_link(?POOL, Config),
+    unlink(Pid),
+    try
+        Conns = [Conn || {ok, Conn} <- [checkout() || _ <- lists:seq(1, 3)]],
+        ?assertEqual(3, length(Conns)),
+        ?assertEqual(3, length(lists:usort(Conns))),
+        ?assert(invariant_ok()),
+        #{checkouts := Checkouts, available := Available} = test_inspect(),
+        ?assertEqual(3, map_size(Checkouts)),
+        ?assertEqual(0, length(Available)),
+        %% The pool is now saturated, and the same process asking for a fourth
+        %% waits and then reports it busy rather than being served twice over.
+        ?assertEqual({error, pool_busy}, checkout()),
+        [ok = rabbitmq_stream_s3_api_aws_pool:checkin(?POOL, Conn) || Conn <- Conns],
+        ?assert(invariant_ok()),
+        #{checkouts := Checkouts1, available := Available1} = test_inspect(),
+        ?assertEqual(0, map_size(Checkouts1)),
+        ?assertEqual(3, length(Available1))
+    after
+        gen_server:stop(?POOL)
+    end.
+
+checkout() ->
+    rabbitmq_stream_s3_api_aws_pool:checkout(?POOL, ?CHECKOUT_TIMEOUT_MS).
 
 no_leak_or_inconsistency(_Config) ->
     rabbit_ct_proper_helpers:run_proper(fun prop_no_leak_or_inconsistency/0, [], 150).

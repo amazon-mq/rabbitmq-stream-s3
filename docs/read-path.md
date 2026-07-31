@@ -76,6 +76,10 @@ The starting byte position within a fragment is determined once, at offset-spec 
 
 Read size grows using AIMD (additive increase, multiplicative decrease). The window starts at `initial_read_size` (4 MiB). After a run of consecutive buffer hits it grows additively (by 1 MiB, capped at `read_size_max`, 64 MiB); a buffer miss (the consumer outrunning the prefetch) halves it (floored at `read_size_min`, 1 MiB). The decrease is driven by buffer misses, not by S3 errors, which instead drive a separate exponential retry-delay backoff. This avoids wasting bandwidth on consumers that read a few records and disconnect, while allowing sustained sequential readers to approach local-tier throughput.
 
+A read deadline expiring drops every outstanding range, so both timers are cancelled with them, and a message either had already left is dropped on arrival — by its token, since the batch that cancels a kind's timer can arm a fresh one for that same kind. A timer carries the delay it was armed with — up to `max_retry_delay_ms` — so one left running would land part-way through a later backoff round and release that round's ranges before the pause they earned had elapsed.
+
+The bytes prefetched for the next fragment are dropped as well. They count against the window like any other, and the ranges that were filling them have just been cancelled, so keeping them would hold window space nothing is left to fetch into: with the window at its ceiling no range would ever be issued again and every later read would wait out a deadline of its own.
+
 ### Fragment transitions
 
 When the consumer reads past the end of the current fragment:
@@ -96,8 +100,8 @@ This transition is transparent to the consumer. The stream of chunks is continuo
 
 If a GET returns 404 (fragment deleted by retention between iterator creation and fetch):
 
-1. The remote reader marks the current fragment as not found.
-2. On the next read attempt, it checks the manifest cache for the current range.
+1. The remote reader marks the current fragment as not found and stops fetching: every range it still holds is dropped and no new one is issued, since the fetch frontier points into an object that is gone. Reads that the bytes already buffered can serve are still served from them.
+2. On the first read attempt those bytes cannot serve, it checks the manifest cache for the current range.
 3. It repositions at the oldest available offset (`first_offset` from the manifest).
 4. Reading continues from the new position.
 
