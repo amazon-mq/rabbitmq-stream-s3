@@ -36,6 +36,7 @@ all() ->
         transfer_failed_retriable_resubmits,
         transfer_failed_status_map_retriable_resubmits,
         transfer_failed_pool_busy_retriable_resubmits,
+        transfer_failed_stream_error_retriable_resubmits,
         transfer_failed_fatal_retries_no_gap,
         transfer_failed_attempt_counter_escalates_and_resets,
         fatal_failure_does_not_drain_subsequent,
@@ -343,6 +344,15 @@ transfer_failed_pool_busy_retriable_resubmits(_Config) ->
     {S0, _} = init_core(),
     {S1, Ref, _} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(0, 100), S0),
     {_S2, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(Ref, pool_busy, S1),
+    ?assertMatch([{resubmit_transfer, Ref, _, _, _, 1}], Effects).
+
+transfer_failed_stream_error_retriable_resubmits(_Config) ->
+    %% A pooled upload connection torn down with the PUT stream checked out.
+    {S0, _} = init_core(),
+    {S1, Ref, _} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(0, 100), S0),
+    {_S2, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(
+        Ref, stream_error, S1
+    ),
     ?assertMatch([{resubmit_transfer, Ref, _, _, _, 1}], Effects).
 
 transfer_failed_fatal_retries_no_gap(_Config) ->

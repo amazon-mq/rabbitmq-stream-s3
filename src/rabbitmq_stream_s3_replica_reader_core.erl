@@ -891,6 +891,12 @@ is_retriable(transfer_deadline) ->
     true;
 is_retriable(connection_error) ->
     true;
+%% The upload connection was torn down with the PUT stream checked out, which
+%% rabbitmq_stream_s3_api_aws:normalize_transport_error/1 reports as this atom
+%% (gun's own {stream_error, _}). The fragment never reached S3, so retrying it
+%% on the fast path is safe and correct.
+is_retriable(stream_error) ->
+    true;
 is_retriable(slow_down) ->
     true;
 is_retriable(internal_error) ->

@@ -476,7 +476,7 @@ stream_finish(
             log_unexpected_status(?FUNCTION_NAME, Other),
             {error, Other};
         {error, _} = Err ->
-            Err
+            normalize_transport_error(Err)
     after
         finish_async(State)
     end.
@@ -1083,7 +1083,9 @@ request(Method, Path, Headers0, Body, Opts) when
                     %% checkout that request1/5 does below (see
                     %% note_request_started/0).
                     inc(?C_TOTAL_REQUESTS, 1),
-                    request0(Method, Path, Headers, Body, Opts);
+                    normalize_transport_error(
+                        request0(Method, Path, Headers, Body, Opts)
+                    );
                 {error, _} = Err ->
                     Err
             end;
@@ -1147,6 +1149,16 @@ await_response(Conn, StreamRef, Timeout) ->
         {error, _} = Err ->
             Err
     end.
+
+-spec normalize_transport_error(Result) -> Result when Result :: term().
+normalize_transport_error({error, {stream_error, _}}) ->
+    {error, stream_error};
+normalize_transport_error({error, {connection_error, _}}) ->
+    {error, connection_error};
+normalize_transport_error({error, {down, _}}) ->
+    {error, connection_error};
+normalize_transport_error(Result) ->
+    Result.
 
 postprocess_response(#{status := 403}) ->
     inc(?C_RESPONSE_403, 1);
@@ -1991,6 +2003,28 @@ transient_status_test() ->
     ?assertNot(transient_status(400)),
     ?assertNot(transient_status(403)),
     ?assertNot(transient_status(404)),
+    ok.
+
+normalize_transport_error_test() ->
+    %% The exact terms gun produces when the upload pool takes a connection
+    %% down with a PUT stream checked out.
+    ?assertEqual({error, stream_error}, normalize_transport_error({error, {stream_error, closed}})),
+    ?assertEqual(
+        {error, stream_error},
+        normalize_transport_error({error, {stream_error, {closed, {error, timeout}}}})
+    ),
+    ?assertEqual(
+        {error, connection_error},
+        normalize_transport_error({error, {connection_error, closed}})
+    ),
+    ?assertEqual({error, connection_error}, normalize_transport_error({error, {down, normal}})),
+    %% Everything else passes through untouched.
+    ?assertEqual({error, timeout}, normalize_transport_error({error, timeout})),
+    ?assertEqual({error, not_found}, normalize_transport_error({error, not_found})),
+    ?assertEqual(
+        {error, #{status => 403}}, normalize_transport_error({error, #{status => 403}})
+    ),
+    ?assertEqual({ok, #{status => 200}}, normalize_transport_error({ok, #{status => 200}})),
     ok.
 
 hex_digits_test() ->
