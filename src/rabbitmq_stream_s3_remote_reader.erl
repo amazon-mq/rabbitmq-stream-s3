@@ -79,13 +79,16 @@ synchronous feedback is generated.
     %% remove an already-fired message, so a deadline_expired carrying a stale
     %% token (its read was served, or superseded by a newer read) is ignored.
     deadline_token :: reference() | undefined,
-    %% Maps the backend's request id to the range it was issued for. Keyed by
-    %% the backend id because that is what arriving frames carry; the core keys
-    %% the same request by `{Fragment, RangeStart}`, which is what its events
-    %% carry back.
+    %% Maps the backend's request id to the core's. Keyed by the backend id
+    %% because that is what arriving frames carry; the core knows the same
+    %% request by the id it minted for it, which is what its events carry back.
+    %% The fragment travels alongside for the 404 path, which is about the
+    %% object rather than the request.
     requests = #{} :: #{
         rabbitmq_stream_s3_api:async_req() => {
-            osiris:offset(), byte_offset(), rabbitmq_stream_s3_api:async_state()
+            rabbitmq_stream_s3_remote_reader_core:request_id(),
+            osiris:offset(),
+            rabbitmq_stream_s3_api:async_state()
         }
     },
     %% Cancelled request refs (gun may still deliver frames).
@@ -409,12 +412,12 @@ handle_async_response(
     Msg, RequestId, #state{requests = Requests0, cancelled = Cancelled0} = State0
 ) ->
     %% Find the range this request was issued for.
-    #{RequestId := {FragOffset, RangeStart, AsyncState0}} = Requests0,
+    #{RequestId := {Id, FragOffset, AsyncState0}} = Requests0,
     case rabbitmq_stream_s3_api:handle_async(Msg, RequestId, AsyncState0) of
         ignore ->
             {noreply, State0};
         {continue, AsyncState} ->
-            Requests = Requests0#{RequestId := {FragOffset, RangeStart, AsyncState}},
+            Requests = Requests0#{RequestId := {Id, FragOffset, AsyncState}},
             {noreply, State0#state{requests = Requests}};
         {data, Data, Result} ->
             {Requests, DoneOrContinue} =
@@ -423,10 +426,10 @@ handle_async_response(
                         counters:sub(counter(), ?C_REQUESTS_IN_FLIGHT, 1),
                         {maps:remove(RequestId, Requests0), done};
                     AsyncState ->
-                        {Requests0#{RequestId := {FragOffset, RangeStart, AsyncState}}, continue}
+                        {Requests0#{RequestId := {Id, FragOffset, AsyncState}}, continue}
                 end,
             step_and_execute(
-                {data, FragOffset, RangeStart, Data, DoneOrContinue},
+                {data, Id, Data, DoneOrContinue},
                 State0#state{requests = Requests}
             );
         {done, ok} ->
@@ -434,14 +437,14 @@ handle_async_response(
             counters:sub(counter(), ?C_REQUESTS_IN_FLIGHT, 1),
             Requests = maps:remove(RequestId, Requests0),
             step_and_execute(
-                {request_error, FragOffset, RangeStart, timeout},
+                {request_error, Id, FragOffset, timeout},
                 State0#state{requests = Requests}
             );
         {done, {error, Reason}} ->
             counters:sub(counter(), ?C_REQUESTS_IN_FLIGHT, 1),
             Requests = maps:remove(RequestId, Requests0),
             step_and_execute(
-                {request_error, FragOffset, RangeStart, Reason},
+                {request_error, Id, FragOffset, Reason},
                 State0#state{requests = Requests}
             );
         {done_cancel, {error, Reason}} ->
@@ -449,7 +452,7 @@ handle_async_response(
             Requests = maps:remove(RequestId, Requests0),
             Cancelled = Cancelled0#{RequestId => ok},
             step_and_execute(
-                {request_error, FragOffset, RangeStart, Reason},
+                {request_error, Id, FragOffset, Reason},
                 State0#state{requests = Requests, cancelled = Cancelled}
             )
     end.
@@ -521,7 +524,7 @@ execute_effect({observe, fragment_transition, Window}, PoolBusy, State) ->
     rabbitmq_stream_s3_histogram:observe(?MODULE, Window),
     {State, PoolBusy};
 execute_effect(
-    {start_request, Key, {RangeStart, _} = Range, FragOffset},
+    {start_request, Id, Key, {RangeStart, _} = Range, FragOffset},
     false,
     #state{
         stream = StreamId, cfg = #cfg{request_timeout_ms = Timeout}, requests = Requests0
@@ -531,14 +534,14 @@ execute_effect(
         {ok, RequestId, AsyncState} ->
             counters:add(counter(), ?C_REQUESTS_IN_FLIGHT, 1),
             counters:add(counter(), ?C_TOTAL_REQUESTS, 1),
-            Requests = Requests0#{RequestId => {FragOffset, RangeStart, AsyncState}},
+            Requests = Requests0#{RequestId => {Id, FragOffset, AsyncState}},
             {State#state{requests = Requests}, false};
         {error, pool_busy} ->
             ?LOG_DEBUG(
                 "remote_reader start_request: pool_busy key=~ts frag=~b pos=~b",
                 [Key, FragOffset, RangeStart]
             ),
-            report_pool_busy(FragOffset, RangeStart, State);
+            report_pool_busy(Id, FragOffset, State);
         {error, Reason} ->
             %% The request never reached the pool: credentials could not be
             %% obtained or the region could not be resolved, so signing failed.
@@ -552,14 +555,14 @@ execute_effect(
                 "(key=~ts frag=~b pos=~b): ~0p",
                 [StreamId, Key, FragOffset, RangeStart, Reason]
             ),
-            report_request_error(FragOffset, RangeStart, connection_error, false, State)
+            report_request_error(Id, FragOffset, connection_error, false, State)
     end;
-execute_effect({start_request, _Key, {RangeStart, _}, FragOffset}, true, State) ->
+execute_effect({start_request, Id, _Key, _Range, FragOffset}, true, State) ->
     %% A checkout in this batch has already timed out; do not spend another
     %% timeout finding out the pool is still saturated.
-    report_pool_busy(FragOffset, RangeStart, State);
-execute_effect({cancel_request, Key}, PoolBusy, State) ->
-    {cancel_request(Key, State), PoolBusy};
+    report_pool_busy(Id, FragOffset, State);
+execute_effect({cancel_request, Id}, PoolBusy, State) ->
+    {cancel_request(Id, State), PoolBusy};
 execute_effect({cancel_requests, all}, PoolBusy, State) ->
     {cancel_all_requests(State), PoolBusy};
 execute_effect(
@@ -598,8 +601,8 @@ execute_effect({fatal_error, Reason}, PoolBusy, #state{stream = StreamId} = Stat
 execute_effect(stop, PoolBusy, State) ->
     {State#state{stopping = true}, PoolBusy}.
 
-report_pool_busy(FragOffset, RangeStart, State) ->
-    report_request_error(FragOffset, RangeStart, pool_busy, true, State).
+report_pool_busy(Id, FragOffset, State) ->
+    report_request_error(Id, FragOffset, pool_busy, true, State).
 
 %% Tell the core that a range the shell was asked to start never got off the
 %% ground. An error step can ask for requests to be started (a range that owed
@@ -622,9 +625,9 @@ report_pool_busy(FragOffset, RangeStart, State) ->
 %% requests it went on to start then found the pool saturated, discarding that
 %% would leave the outer batch spending a 100ms checkout on each of its
 %% remaining ranges - the cost the short-circuit exists to cap.
-report_request_error(FragOffset, RangeStart, Reason, PoolBusy, #state{core = Core0} = State) ->
+report_request_error(Id, FragOffset, Reason, PoolBusy, #state{core = Core0} = State) ->
     {Core, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
-        Core0, {request_error, FragOffset, RangeStart, Reason}
+        Core0, {request_error, Id, FragOffset, Reason}
     ),
     execute_effects(Effects, PoolBusy, State#state{core = Core}).
 
@@ -687,7 +690,7 @@ build_cfg(Opts) ->
 
 cancel_all_requests(#state{requests = Requests, cancelled = Cancelled0} = State) ->
     maps:foreach(
-        fun(ReqId, {_FragOffset, _RangeStart, AsyncState}) ->
+        fun(ReqId, {_CoreRequestId, _FragOffset, AsyncState}) ->
             rabbitmq_stream_s3_api:cancel_async(ReqId, AsyncState)
         end,
         Requests
@@ -699,11 +702,8 @@ cancel_all_requests(#state{requests = Requests, cancelled = Cancelled0} = State)
 %% Abandon one range. The core drops requests individually when a fragment it
 %% no longer reads still has ranges outstanding; frames for them may still
 %% arrive, so the id is remembered as cancelled and matched away.
-cancel_request({FragOffset, RangeStart}, #state{requests = Requests} = State) ->
-    Matching = [
-        ReqId
-     || ReqId := {Frag, Start, _} <- Requests, Frag =:= FragOffset, Start =:= RangeStart
-    ],
+cancel_request(Id, #state{requests = Requests} = State) ->
+    Matching = [ReqId || ReqId := {ReqCoreId, _, _} <- Requests, ReqCoreId =:= Id],
     lists:foldl(fun cancel_request_id/2, State, Matching).
 
 cancel_request_id(ReqId, #state{requests = Requests, cancelled = Cancelled} = State) ->
@@ -885,8 +885,9 @@ pool_busy_short_circuits_the_rest_of_a_batch_test() ->
     ),
     Core2 = lists:foldl(
         fun({Fragment, Start, _End}, Acc) ->
+            {ok, Id} = rabbitmq_stream_s3_remote_reader_core:request_id(Acc, Fragment, Start),
             {Acc1, _} = rabbitmq_stream_s3_remote_reader_core:step(
-                Acc, {request_error, Fragment, Start, slow_down}
+                Acc, {request_error, Id, Fragment, slow_down}
             ),
             Acc1
         end,
@@ -894,7 +895,7 @@ pool_busy_short_circuits_the_rest_of_a_batch_test() ->
         rabbitmq_stream_s3_remote_reader_core:outstanding_ranges(Core1)
     ),
     {Core, Effects} = rabbitmq_stream_s3_remote_reader_core:step(Core2, {retry, fault}),
-    Starts = [E || {start_request, _, _, _} = E <- Effects],
+    Starts = [E || {start_request, _, _, _, _} = E <- Effects],
     ?assert(length(Starts) > 1),
     State = #state{stream = StreamId, cfg = build_cfg(#{}), core = Core},
     %% Enter the batch as if a checkout had already timed out.
@@ -902,7 +903,7 @@ pool_busy_short_circuits_the_rest_of_a_batch_test() ->
     %% No request was issued, and the core has every range queued for retry.
     ?assertEqual(#{}, State1#state.requests),
     ?assertEqual(
-        [{0, Start, End} || {start_request, _, {Start, End}, 0} <- Starts],
+        [{0, Start, End} || {start_request, _, _, {Start, End}, 0} <- Starts],
         rabbitmq_stream_s3_remote_reader_core:outstanding_ranges(State1#state.core)
     ).
 

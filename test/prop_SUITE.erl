@@ -1697,7 +1697,7 @@ prop_remote_reader_core_reply_size_bounded() ->
             %% Provide data.
             Data = binary:copy(<<0>>, DataSize),
             {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(
-                S0, {data, 0, 8, Data, done}
+                S0, {data, rrc_id(S0, 0, 8), Data, done}
             ),
             %% Issue a read.
             {_S2, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
@@ -1800,7 +1800,7 @@ run_rrc_events([{deliver, Which, Data, DoneOrContinue} | Rest], State0) ->
                 State0;
             {Fragment, Start} ->
                 {State1, _} = rabbitmq_stream_s3_remote_reader_core:step(
-                    State0, {data, Fragment, Start, Data, DoneOrContinue}
+                    State0, {data, rrc_id(State0, Fragment, Start), Data, DoneOrContinue}
                 ),
                 State1
         end,
@@ -1812,7 +1812,7 @@ run_rrc_events([{fail, Which, Reason} | Rest], State0) ->
                 State0;
             {Fragment, Start} ->
                 {State1, _} = rabbitmq_stream_s3_remote_reader_core:step(
-                    State0, {request_error, Fragment, Start, Reason}
+                    State0, {request_error, rrc_id(State0, Fragment, Start), Fragment, Reason}
                 ),
                 State1
         end,
@@ -1930,7 +1930,7 @@ answer_rrc_ranges(Ranges, State, DataEnd) ->
                     1 -> continue
                 end,
             {StateAcc1, _} = rabbitmq_stream_s3_remote_reader_core:step(
-                StateAcc, {data, 0, Start, Data, DoneOrContinue}
+                StateAcc, {data, rrc_id(StateAcc, 0, Start), Data, DoneOrContinue}
             ),
             {StateAcc1, max(MaxEnd0, End + 1), N + 1}
         end,
@@ -1938,6 +1938,15 @@ answer_rrc_ranges(Ranges, State, DataEnd) ->
         Ranges
     ),
     {Acc, MaxEnd}.
+
+%% The core addresses a request by the id the pipeline minted for it; a property
+%% knows which range S3 is answering. An id it cannot match is dropped as stale,
+%% which is the right outcome for a range that has left the queue.
+rrc_id(State, Fragment, Start) ->
+    case rabbitmq_stream_s3_remote_reader_core:request_id(State, Fragment, Start) of
+        {ok, Id} -> Id;
+        error -> 0
+    end.
 
 outstanding_rrc_ranges(State) ->
     rabbitmq_stream_s3_remote_reader_core:outstanding_ranges(State).
@@ -2134,7 +2143,7 @@ rrc_await_reply(State0, ReadFloor, ProbeLen, Effects, Rounds) ->
                         fun({Fragment, Start, End}, {Acc, EffAcc}) ->
                             Data = rb_pattern(Start, End - Start + 1),
                             {Acc1, Eff} = rabbitmq_stream_s3_remote_reader_core:step(
-                                Acc, {data, Fragment, Start, Data, done}
+                                Acc, {data, rrc_id(Acc, Fragment, Start), Data, done}
                             ),
                             {Acc1, EffAcc ++ Eff}
                         end,
@@ -2160,7 +2169,7 @@ rrc_drain(State0, Rounds) ->
                 fun({Fragment, Start, End}, Acc) ->
                     Data = rb_pattern(Start, End - Start + 1),
                     {Acc1, _} = rabbitmq_stream_s3_remote_reader_core:step(
-                        Acc, {data, Fragment, Start, Data, done}
+                        Acc, {data, rrc_id(Acc, Fragment, Start), Data, done}
                     ),
                     Acc1
                 end,
@@ -2186,19 +2195,19 @@ apply_rrc_outcome(skip, _Start, _End, State) ->
     State;
 apply_rrc_outcome({fail, Reason}, Start, _End, State0) ->
     {State, _} = rabbitmq_stream_s3_remote_reader_core:step(
-        State0, {request_error, 0, Start, Reason}
+        State0, {request_error, rrc_id(State0, 0, Start), 0, Reason}
     ),
     State;
 apply_rrc_outcome({short, Frac}, Start, End, State0) ->
     Len = ((End - Start + 1) * Frac) div 100,
     {State, _} = rabbitmq_stream_s3_remote_reader_core:step(
-        State0, {data, 0, Start, rb_pattern(Start, Len), done}
+        State0, {data, rrc_id(State0, 0, Start), rb_pattern(Start, Len), done}
     ),
     State;
 apply_rrc_outcome(DoneOrContinue, Start, End, State0) ->
     Data = rb_pattern(Start, End - Start + 1),
     {State, _} = rabbitmq_stream_s3_remote_reader_core:step(
-        State0, {data, 0, Start, Data, DoneOrContinue}
+        State0, {data, rrc_id(State0, 0, Start), Data, DoneOrContinue}
     ),
     State.
 
@@ -2304,7 +2313,9 @@ rrc_looks_ahead_again(State0, ReadFloor, Rounds) ->
             State1 = lists:foldl(
                 fun({Fragment, Start, End}, Acc) ->
                     {Acc1, _} = rabbitmq_stream_s3_remote_reader_core:step(
-                        Acc, {data, Fragment, Start, rb_pattern(Start, End - Start + 1), done}
+                        Acc,
+                        {data, rrc_id(Acc, Fragment, Start), rb_pattern(Start, End - Start + 1),
+                            done}
                     ),
                     Acc1
                 end,
@@ -2508,7 +2519,7 @@ apply_rp_op({deliver, Which, How}, P0, Got, _FragSize) ->
     case pick_rp_inflight(Which, P0) of
         none ->
             {P0, Got};
-        {Start, End} ->
+        {Id, Start, End} ->
             %% S3 continues a range from where it left off, not from its start:
             %% a response that was left open owes only the bytes after the ones
             %% it has already sent.
@@ -2516,7 +2527,7 @@ apply_rp_op({deliver, Which, How}, P0, Got, _FragSize) ->
             Remaining = End - Pos + 1,
             {Bytes, Close} = rp_delivery(How, Remaining),
             Data = rb_pattern(Pos, Bytes),
-            {_Signals, P} = rabbitmq_stream_s3_read_pipeline:data(0, Start, Data, Close, P0),
+            {_Signals, P} = rabbitmq_stream_s3_read_pipeline:data(Id, Data, Close, P0),
             %% The pipeline clips an over-delivery to the range, so the model
             %% records only what the range owns.
             {P, rp_received(Pos, min(Bytes, Remaining), Got)}
@@ -2525,8 +2536,8 @@ apply_rp_op({fail, Which}, P0, Got, _FragSize) ->
     case pick_rp_inflight(Which, P0) of
         none ->
             {P0, Got};
-        {Start, End} ->
-            case rabbitmq_stream_s3_read_pipeline:fail(0, Start, fault, P0) of
+        {Id, Start, End} ->
+            case rabbitmq_stream_s3_read_pipeline:fail(Id, fault, P0) of
                 {ok, P} -> {P, rp_drop_staged(Start, End, Got)};
                 {dropped, P} -> {P, Got};
                 stale -> {P0, Got}
@@ -2614,8 +2625,9 @@ pick_rp_inflight(Which, P) ->
         [] ->
             none;
         Ranges ->
-            {_F, Start, End} = lists:nth(Which rem length(Ranges) + 1, Ranges),
-            {Start, End}
+            {F, Start, End} = lists:nth(Which rem length(Ranges) + 1, Ranges),
+            {ok, Id} = rabbitmq_stream_s3_read_pipeline:find_request(F, Start, P),
+            {Id, Start, End}
     end.
 
 read_buffer_matches_model(_Config) ->

@@ -21,10 +21,14 @@ was asked for and what S3 said.
 
 ## Identity
 
-A range is addressed by `{Fragment, RangeStart}`, which is unique because ranges
-within a fragment never overlap, and is what the shell's frames carry back.
-Note that a failure rewrites `range_start` to the last flushed byte (see
-`fail/4`), so a range's key changes when it is put back.
+A range carries an id of its own, minted when it is queued and kept for as long
+as the range exists - including across a failure, which restarts the range at
+its last flushed byte and so moves the position it would otherwise be addressed
+by. Position made a serviceable key, since ranges within a fragment never
+overlap, but it is a mutable one: the restart could land a range's key exactly
+on its successor's, which had to be detected and dropped rather than being
+impossible. The shell records the id against the request it started and hands it
+back with every frame.
 
 ## Invariants
 
@@ -65,6 +69,7 @@ stays four blocks: flattening them here would undo what the block queue is for.
 %% - `complete` - the response closed; the request is dropped once its bytes
 %%   have reached a buffer
 -record(req, {
+    id :: request_id(),
     fragment :: fragment_offset(),
     frag_ref :: #fragment_ref{},
     key :: rabbitmq_stream_s3:key(),
@@ -85,6 +90,12 @@ stays four blocks: flattening them here would undo what the block queue is for.
 
 -record(pipeline, {
     stream :: stream_id(),
+
+    %% Mints the next range's id. Never rewound, including when the reader is
+    %% placed on a new fragment (`replace_fragment/3` carries it over), so an id
+    %% is never reused for the life of the shell - which is what matters, since
+    %% the shell is what may still have frames in flight for an old one.
+    next_id = 1 :: request_id(),
 
     %% Current fragment
     frag_ref :: #fragment_ref{},
@@ -107,16 +118,19 @@ stays four blocks: flattening them here would undo what the block queue is for.
 
 -opaque pipeline() :: #pipeline{}.
 -type fragment_offset() :: osiris:offset().
--doc "Identifies one outstanding range: the fragment read and where it starts.".
--type request_key() :: {fragment_offset(), byte_offset()}.
+-doc "Identifies one outstanding range for as long as it exists.".
+-type request_id() :: pos_integer().
 -doc """
 The two backoff clocks: `fault` for an S3 request that failed, `pool_busy` for
 one that never left the node because the connection pool had nothing free.
 """.
 -type backoff() :: fault | pool_busy.
--doc "What the shell needs to start one range GET: object key, range, fragment.".
+-doc """
+What the shell needs to start one range GET: the id to record it against, the
+object key, the range, and the fragment it belongs to.
+""".
 -type start_spec() ::
-    {rabbitmq_stream_s3:key(), {byte_offset(), byte_offset()}, fragment_offset()}.
+    {request_id(), rabbitmq_stream_s3:key(), {byte_offset(), byte_offset()}, fragment_offset()}.
 -doc """
 Something that happened while absorbing a delivery which is the core's business,
 not this module's. `empty_completion` is a response that closed without
@@ -125,10 +139,11 @@ arms it.
 """.
 -type signal() :: empty_completion.
 
--export_type([pipeline/0, request_key/0, backoff/0, start_spec/0, signal/0]).
+-export_type([pipeline/0, request_id/0, backoff/0, start_spec/0, signal/0]).
 
 -export([
     new/3,
+    replace_fragment/3,
     current_fragment/1,
     current_fragment_offset/1,
     read_position/1,
@@ -138,8 +153,8 @@ arms it.
     waits_on/2,
     push/3,
     ready/2,
-    data/5,
-    fail/4,
+    data/4,
+    fail/3,
     release/2,
     drop_fragment/2,
     clear_requests/1,
@@ -151,7 +166,13 @@ arms it.
 ]).
 
 -ifdef(TEST).
--export([outstanding_ranges/1, inflight_ranges/1, request_count/1, queued_on/2]).
+-export([
+    outstanding_ranges/1,
+    inflight_ranges/1,
+    find_request/3,
+    request_count/1,
+    queued_on/2
+]).
 -endif.
 
 %% ------------------------------------------------------------------
@@ -168,6 +189,19 @@ new(StreamId, FragRef, Position) ->
         read_pos = Position,
         next = undefined
     }.
+
+-doc """
+Places the reader on a different fragment, dropping the queue and both buffers.
+
+For a reader whose iterator has been refreshed past a fragment that is gone:
+everything about where it was is invalid, but the ids it handed the shell are
+not, so the id counter carries over rather than restarting under frames that may
+still arrive for the ranges it just dropped.
+""".
+-spec replace_fragment(#fragment_ref{}, byte_offset(), pipeline()) -> pipeline().
+replace_fragment(FragRef, Position, #pipeline{stream = StreamId, next_id = NextId}) ->
+    P = new(StreamId, FragRef, Position),
+    P#pipeline{next_id = NextId}.
 
 -spec current_fragment(pipeline()) -> #fragment_ref{}.
 current_fragment(#pipeline{frag_ref = FragRef}) ->
@@ -209,12 +243,12 @@ Records that the next fragment is known to be missing, so nothing is prefetched
 for it and the core can decide what to do when the consumer reaches it.
 """.
 -spec drop_fragment(fragment_offset() | next_not_found, pipeline()) ->
-    {[request_key()], pipeline()}.
+    {[request_id()], pipeline()}.
 drop_fragment(next_not_found, #pipeline{} = P) ->
     {[], checked(P#pipeline{next = not_found})};
 drop_fragment(Fragment, #pipeline{reqs = Reqs} = P) ->
     {Dropped, Kept} = lists:partition(fun(#req{fragment = F}) -> F =:= Fragment end, Reqs),
-    {[req_key(Req) || Req <- Dropped], checked(P#pipeline{reqs = Kept})}.
+    {[Id || #req{id = Id} <- Dropped], checked(P#pipeline{reqs = Kept})}.
 
 -doc """
 Drops every outstanding range, keeping the buffer.
@@ -246,7 +280,7 @@ In practice the transition can only happen once the old fragment's data region
 is fully buffered, so the list is normally empty; dropping them defensively
 costs nothing and turns a possible deadlock into a cancelled request.
 """.
--spec advance(pipeline()) -> {fragment_offset(), all | [request_key()], pipeline()}.
+-spec advance(pipeline()) -> {fragment_offset(), all | [request_id()], pipeline()}.
 advance(#pipeline{next = {NextFragRef, Buffer}, frag_ref = FragRef} = P0) ->
     #fragment_ref{offset = NextOffset} = NextFragRef,
     #fragment_ref{offset = CurrentOffset} = FragRef,
@@ -267,7 +301,7 @@ advance(#pipeline{next = {NextFragRef, Buffer}, frag_ref = FragRef} = P0) ->
     {Stale, Reqs} = lists:partition(
         fun(#req{fragment = Fragment}) -> Fragment < NextOffset end, P#pipeline.reqs
     ),
-    {NextOffset, [req_key(Req) || Req <- Stale], checked(P#pipeline{reqs = Reqs})};
+    {NextOffset, [Id || #req{id = Id} <- Stale], checked(P#pipeline{reqs = Reqs})};
 advance(#pipeline{frag_ref = #fragment_ref{offset = CurrentOffset}, reqs = Reqs} = P0) ->
     %% There was no prefetched fragment to move to, so the fragment does not
     %% change and the buffer is reset under the requests still reading it. Those
@@ -301,10 +335,11 @@ takes. The range is queued as in flight: the caller starts it in the same pass.
 push(
     #fragment_ref{offset = Fragment, uid = Uid} = FragRef,
     {Start, End},
-    #pipeline{stream = StreamId, reqs = Reqs} = P
+    #pipeline{stream = StreamId, next_id = Id, reqs = Reqs} = P
 ) ->
     Key = rabbitmq_stream_s3:fragment_key(StreamId, Fragment, Uid),
     Req = #req{
+        id = Id,
         fragment = Fragment,
         frag_ref = FragRef,
         key = Key,
@@ -314,7 +349,7 @@ push(
         pos = Start,
         status = inflight
     },
-    {start_spec(Req), checked(P#pipeline{reqs = insert_req(Req, Reqs)})}.
+    {start_spec(Req), checked(P#pipeline{next_id = Id + 1, reqs = insert_req(Req, Reqs)})}.
 
 %% (Re-)issue ranges that are queued and not in flight. Their bytes are already
 %% counted in `outstanding/1`, so the caller does not window-gate them - a range
@@ -335,8 +370,8 @@ ready(MaxDepth, #pipeline{reqs = Reqs} = P) ->
     ),
     {lists:reverse(Specs), checked(P#pipeline{reqs = Reqs1})}.
 
-start_spec(#req{key = Key, fragment = Fragment, range_start = Start, range_end = End}) ->
-    {Key, {Start, End}, Fragment}.
+start_spec(#req{id = Id, key = Key, fragment = Fragment, range_start = Start, range_end = End}) ->
+    {Id, Key, {Start, End}, Fragment}.
 
 %% Keep the queue ordered by `{fragment, range_start}`. A new range is always
 %% the last one for its own fragment, but not necessarily for the queue: a
@@ -425,10 +460,9 @@ waits_on(Kind, #pipeline{reqs = Reqs}) ->
 %% a request cancelled by a read deadline or an iterator refresh can still have
 %% frames in flight, and appending those bytes would corrupt the buffer's
 %% addressing.
--spec data(fragment_offset(), byte_offset(), binary(), done | continue, pipeline()) ->
-    {[signal()], pipeline()}.
-data(Fragment, RangeStart, Data, DoneOrContinue, #pipeline{reqs = Reqs} = P) ->
-    case take_req(Fragment, RangeStart, Reqs) of
+-spec data(request_id(), binary(), done | continue, pipeline()) -> {[signal()], pipeline()}.
+data(Id, Data, DoneOrContinue, #pipeline{reqs = Reqs} = P) ->
+    case take_req(Id, Reqs) of
         {Before, #req{status = inflight} = Req0, After} ->
             Req = stage(Data, Req0),
             case DoneOrContinue of
@@ -478,9 +512,10 @@ complete_req(Before, #req{pos = Pos, range_start = Pos} = Req, After, P0) ->
     %% The request ended without delivering a byte. Re-issuing it straight away
     %% would spin against whatever is answering that way, so it goes into the
     %% fault backoff as if it had failed and the core arms that clock.
-    P = flush_reqs(P0#pipeline{reqs = Before ++ [Req#req{status = {backoff, fault}} | After]}),
+    P = flush_reqs(P0#pipeline{reqs = Before ++ [backoff_req(fault, Req) | After]}),
     {[empty_completion], checked(P)};
 complete_req(Before, #req{pos = Pos, range_end = RangeEnd} = Req0, After, P) ->
+    #pipeline{next_id = GapId} = P,
     %% Short completion: the response ended before the range did (a truncated
     %% response, or a fragment smaller than the manifest claims). Shrink the
     %% request to what actually arrived and queue the bytes that never came as a
@@ -495,6 +530,10 @@ complete_req(Before, #req{pos = Pos, range_end = RangeEnd} = Req0, After, P) ->
     %% `ready/2` is not window-gated for exactly this reason.
     Req = Req0#req{status = complete, range_end = Pos - 1},
     Gap = Req0#req{
+        %% The gap is a range of its own and outlives the response that opened
+        %% it, so it gets an id of its own: inheriting the completed request's
+        %% would put two ranges in the queue under one identity.
+        id = GapId,
         status = ready,
         range_start = Pos,
         range_end = RangeEnd,
@@ -505,43 +544,28 @@ complete_req(Before, #req{pos = Pos, range_end = RangeEnd} = Req0, After, P) ->
         %% one delivered, which is what a backoff clock is waiting to hear.
         retried = undefined
     },
-    {[], checked(flush_reqs(P#pipeline{reqs = Before ++ [Req, Gap | After]}))}.
+    {[], checked(flush_reqs(P#pipeline{next_id = GapId + 1, reqs = Before ++ [Req, Gap | After]}))}.
 
 %% Put a failed range back in the queue. Bytes already appended to a buffer
 %% cannot be un-appended, so the range restarts at `flushed`; anything staged
 %% beyond that is dropped and fetched again. An error for a range that is not in
 %% flight is stale - a duplicate, or one already abandoned - and must not double
 %% the backoff for a single failure.
--spec fail(fragment_offset(), byte_offset(), backoff(), pipeline()) ->
+-spec fail(request_id(), backoff(), pipeline()) ->
     {ok, pipeline()} | {dropped, pipeline()} | stale.
-fail(Fragment, RangeStart, Kind, #pipeline{reqs = Reqs} = P) ->
-    case take_req(Fragment, RangeStart, Reqs) of
+fail(Id, Kind, #pipeline{reqs = Reqs} = P) ->
+    case take_req(Id, Reqs) of
         {Before, #req{status = inflight, flushed = Flushed, range_end = RangeEnd}, After} when
             Flushed > RangeEnd
         ->
             %% Every byte the range owed is already in a buffer; only its
             %% closing frame was outstanding (see `advance_past/3`), so there is
             %% nothing left to fetch. Restarting it at `flushed` would leave
-            %% `range_start = range_end + 1`: an inverted range whose key is
-            %% exactly its successor's, so deliveries for the successor would be
-            %% routed to it and dropped, and re-issuing it would ask S3 for a
-            %% backwards range. Drop it instead.
+            %% `range_start = range_end + 1`, an inverted range: re-issuing it
+            %% would ask S3 for a backwards range. Drop it instead.
             {dropped, checked(P#pipeline{reqs = Before ++ After})};
         {Before, #req{status = inflight, flushed = Flushed} = Req0, After} ->
-            Req = Req0#req{
-                range_start = Flushed,
-                pos = Flushed,
-                staged = [],
-                status = {backoff, Kind},
-                %% Whatever clock released this range last has had its answer:
-                %% the range went back on the wire and failed. It now waits on
-                %% `Kind`, which `status` says, and leaving the old kind here
-                %% would keep `waits_on/2` true for a clock nothing is waiting
-                %% on - so a range failed by one kind after a retry round of the
-                %% other would hold that other's delay at whatever it had grown
-                %% to, for as long as the range lives.
-                retried = undefined
-            },
+            Req = backoff_req(Kind, Req0#req{range_start = Flushed, pos = Flushed, staged = []}),
             {ok, checked(P#pipeline{reqs = Before ++ [Req | After]})};
         _ ->
             stale
@@ -557,19 +581,26 @@ release_req(Kind, #req{status = {backoff, Kind}} = Req) ->
 release_req(_Kind, Req) ->
     Req.
 
-req_key(#req{fragment = Fragment, range_start = RangeStart}) ->
-    {Fragment, RangeStart}.
+%% Put a range on a clock. Every way a range lands in a backoff goes through
+%% here, because `status` is only half of it: the `retried` stamp a previous
+%% release left has to come off in the same breath. That stamp says "a round of
+%% that clock is still owed an answer", and a range that has just failed or come
+%% back empty has given the answer. Left on, `waits_on/2` reports the other
+%% clock busy for as long as the range lives, and `reset_idle_backoffs/1` never
+%% hands its delay back - so the next failure of that kind is paced from
+%% whatever the last round had grown to, against a path that has since
+%% recovered.
+backoff_req(Kind, Req) ->
+    Req#req{status = {backoff, Kind}, retried = undefined}.
 
-take_req(Fragment, RangeStart, Reqs) ->
-    take_req(Fragment, RangeStart, Reqs, []).
+take_req(Id, Reqs) ->
+    take_req(Id, Reqs, []).
 
-take_req(
-    Fragment, RangeStart, [#req{fragment = Fragment, range_start = RangeStart} = Req | Rest], Acc
-) ->
+take_req(Id, [#req{id = Id} = Req | Rest], Acc) ->
     {lists:reverse(Acc), Req, Rest};
-take_req(Fragment, RangeStart, [Req | Rest], Acc) ->
-    take_req(Fragment, RangeStart, Rest, [Req | Acc]);
-take_req(_Fragment, _RangeStart, [], _Acc) ->
+take_req(Id, [Req | Rest], Acc) ->
+    take_req(Id, Rest, [Req | Acc]);
+take_req(_Id, [], _Acc) ->
     false.
 
 %% ------------------------------------------------------------------
@@ -782,9 +813,10 @@ checked(#pipeline{reqs = Reqs, next = Next, frag_ref = #fragment_ref{offset = Cu
     %% `buffer_for/2`) and send the reader back to an object retention deleted.
     (Next =/= not_found orelse lists:all(fun(#req{fragment = F}) -> F =< Current end, Reqs)) orelse
         error({prefetch_after_not_found, Current, Reqs}),
-    Keys = [req_key(Req) || Req <- Reqs],
-    length(lists:usort(Keys)) =:= length(Keys) orelse error({duplicate_range_keys, Keys}),
-    Keys =:= lists:sort(Keys) orelse error({queue_out_of_order, Keys}),
+    Ids = [Id || #req{id = Id} <- Reqs],
+    length(lists:usort(Ids)) =:= length(Ids) orelse error({duplicate_request_ids, Ids}),
+    Positions = [{F, S} || #req{fragment = F, range_start = S} <- Reqs],
+    Positions =:= lists:sort(Positions) orelse error({queue_out_of_order, Positions}),
     lists:foreach(
         fun(#req{range_start = Start, range_end = End, flushed = Flushed, pos = Pos} = Req) ->
             (Start =< Flushed andalso Flushed =< Pos andalso Pos =< End + 1) orelse
@@ -823,6 +855,22 @@ inflight_ranges(#pipeline{reqs = Reqs}) ->
      || #req{fragment = Fragment, range_start = RangeStart, range_end = RangeEnd, status = inflight} <-
             Reqs
     ].
+
+%% The id of the range a fragment has outstanding at a position. Tests describe
+%% what S3 answers - a range of bytes - rather than which id the pipeline
+%% happened to mint for it, so this is how they address a delivery.
+-spec find_request(fragment_offset(), byte_offset(), pipeline()) ->
+    {ok, request_id()} | error.
+find_request(Fragment, RangeStart, #pipeline{reqs = Reqs}) ->
+    case
+        [
+            Id
+         || #req{id = Id, fragment = F, range_start = S} <- Reqs, F =:= Fragment, S =:= RangeStart
+        ]
+    of
+        [Id | _] -> {ok, Id};
+        [] -> error
+    end.
 
 -spec request_count(pipeline()) -> non_neg_integer().
 request_count(#pipeline{reqs = Reqs}) ->

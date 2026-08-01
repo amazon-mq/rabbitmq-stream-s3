@@ -16,21 +16,23 @@ returns a new state plus a list of effects describing what should happen next.
 ## Events (inputs)
 
 - `{read, Offset, Bytes, Hint}` - caller wants data at this position
-- `{data, Fragment, RangeStart, Data, done | continue}` - S3 delivered bytes
-- `{request_error, Fragment, RangeStart, Reason}` - S3 request failed
+- `{data, Id, Data, done | continue}` - S3 delivered bytes for that request
+- `{request_error, Id, Fragment, Reason}` - that request failed. The fragment
+  travels with it because a 404 is about the object, not the request: it is
+  acted on even when the request it arrived for is long gone
 - `{retry, Kind}` - the retry timer of that backoff kind fired
 - `deadline_expired` - pending read exceeded its deadline
 - `{iterator_refreshed, Iterator}` - manifest cache provided new iterator
 
-Requests are identified by the fragment they read and the start of the range
-they were issued for. Ranges never overlap, so that pair is unique, and using
-it rather than an opaque id keeps the core free of `make_ref/0`.
+Requests are identified by an id the pipeline mints when it queues the range and
+keeps for as long as the range exists. The shell records it against the request
+it starts and hands it back with every frame.
 
 ## Effects (outputs)
 
 - `{reply, Result}` - respond to the pending read
-- `{start_request, Key, Range, Fragment}` - initiate an S3 GET
-- `{cancel_request, {Fragment, RangeStart}}` - abandon one in-flight GET
+- `{start_request, Id, Key, Range, Fragment}` - initiate an S3 GET
+- `{cancel_request, Id}` - abandon one in-flight GET
 - `{cancel_requests, all}` - abandon every in-flight GET
 - `{set_timer, Kind, Duration}` - schedule that backoff kind's retry timer
 - `{cancel_timers, all}` - drop every armed retry timer, and any `retry` event
@@ -158,13 +160,13 @@ and transitions immediately if available, or signals that more data is needed.
 
 -type state() :: #state{}.
 -type fragment_offset() :: osiris:offset().
--type request_key() :: rabbitmq_stream_s3_read_pipeline:request_key().
+-type request_id() :: rabbitmq_stream_s3_read_pipeline:request_id().
 -type backoff() :: rabbitmq_stream_s3_read_pipeline:backoff().
 
 -type event() ::
     {read, byte_offset(), pos_integer(), chunk_boundary | within_chunk}
-    | {data, fragment_offset(), byte_offset(), binary(), done | continue}
-    | {request_error, fragment_offset(), byte_offset(), term()}
+    | {data, request_id(), binary(), done | continue}
+    | {request_error, request_id(), fragment_offset(), term()}
     | {retry, backoff()}
     | deadline_expired
     | {iterator_refreshed, rabbitmq_stream_s3_fragment_iterator:iterator() | end_of_manifest}.
@@ -173,8 +175,9 @@ and transitions immediately if available, or signals that more data is needed.
 
 -type effect() ::
     {reply, read_result()}
-    | {start_request, rabbitmq_stream_s3:key(), {byte_offset(), byte_offset()}, fragment_offset()}
-    | {cancel_request, request_key()}
+    | {start_request, request_id(), rabbitmq_stream_s3:key(), {byte_offset(), byte_offset()},
+        fragment_offset()}
+    | {cancel_request, request_id()}
     | {cancel_requests, all}
     | {set_timer, backoff(), pos_integer()}
     | {cancel_timers, all}
@@ -193,7 +196,7 @@ and transitions immediately if available, or signals that more data is needed.
     | {become_local, osiris:offset()}
     | end_of_stream.
 
--export_type([state/0, event/0, effect/0, read_result/0, request_key/0, backoff/0]).
+-export_type([state/0, event/0, effect/0, read_result/0, request_id/0, backoff/0]).
 
 %% ------------------------------------------------------------------
 %% API
@@ -210,7 +213,15 @@ and transitions immediately if available, or signals that more data is needed.
 %% The ranges the core is still waiting on, in queue order. Tests describe what
 %% S3 answers rather than which byte range the core happened to ask for, so
 %% they use this to address a delivery to the right request.
--export([outstanding_ranges/1, window_bytes/1, read_position/1, load/1]).
+-export([outstanding_ranges/1, window_bytes/1, read_position/1, load/1, request_id/3]).
+
+%% The id the pipeline minted for the range a fragment has outstanding at a
+%% position. Tests describe what S3 answers - a range of bytes - rather than
+%% which id it happened to be given.
+-spec request_id(state(), fragment_offset(), byte_offset()) ->
+    {ok, rabbitmq_stream_s3_read_pipeline:request_id()} | error.
+request_id(State, Fragment, RangeStart) ->
+    rabbitmq_stream_s3_read_pipeline:find_request(Fragment, RangeStart, pipeline(State)).
 -endif.
 
 %% @doc Initialize the read core.
@@ -277,19 +288,19 @@ step_(State, {read, Offset, Bytes, Hint}) ->
         missed_pending = false
     },
     try_serve(State1);
-step_(State0, {data, Fragment, RangeStart, Data, DoneOrContinue}) ->
+step_(State0, {data, Id, Data, DoneOrContinue}) ->
     %% The backoffs are judged after the delivery has been absorbed, not before:
     %% that is when the range it closes has left the queue, and when a response
     %% that closed without delivering a byte has been put back into backoff.
     {Signals, Pipeline} = rabbitmq_stream_s3_read_pipeline:data(
-        Fragment, RangeStart, Data, DoneOrContinue, pipeline(State0)
+        Id, Data, DoneOrContinue, pipeline(State0)
     ),
     {State1, Effects1} = absorb_signals(Signals, State0#state{pipeline = Pipeline}),
     State2 = reset_idle_backoffs(State1),
     {State3, Effects2} = maybe_start_requests(State2),
     {State4, Effects3} = try_serve(State3),
     {State4, Effects1 ++ Effects2 ++ Effects3};
-step_(State0, {request_error, Fragment, _RangeStart, not_found}) ->
+step_(State0, {request_error, _Id, Fragment, not_found}) ->
     case Fragment =:= current_fragment_offset(State0) of
         true ->
             %% Current fragment 404. Refresh the iterator past this offset.
@@ -304,7 +315,7 @@ step_(State0, {request_error, Fragment, _RangeStart, not_found}) ->
         false ->
             other_fragment_not_found(Fragment, State0)
     end;
-step_(State0, {request_error, Fragment, RangeStart, Reason}) when
+step_(State0, {request_error, Id, _Fragment, Reason}) when
     Reason =:= slow_down;
     Reason =:= internal_error;
     Reason =:= timeout;
@@ -315,15 +326,15 @@ step_(State0, {request_error, Fragment, RangeStart, Reason}) when
     %% exponential backoff. Only the failed range is retried: co-pending
     %% requests keep streaming, and the range is restarted at the last byte that
     %% reached a buffer so no bytes are re-fetched or lost.
-    fail_range(Fragment, RangeStart, fault, State0);
-step_(State0, {request_error, Fragment, RangeStart, pool_busy}) ->
+    fail_range(Id, fault, State0);
+step_(State0, {request_error, Id, _Fragment, pool_busy}) ->
     %% Pool is growing — a connection becomes available once its TLS handshake
     %% completes (fast on same-region S3, but not instant). Use a mild backoff
     %% (25, 50, 100, 200, 400, 500, 500...) starting low to catch the connection
     %% as soon as it is ready, doubling up to a 500ms cap so we don't spin if the
     %% pool cannot grow (e.g. S3 unreachable).
-    fail_range(Fragment, RangeStart, pool_busy, State0);
-step_(State0, {request_error, _Fragment, _RangeStart, Reason}) ->
+    fail_range(Id, pool_busy, State0);
+step_(State0, {request_error, _Id, _Fragment, Reason}) ->
     %% Non-retryable error (e.g. 403 AccessDenied, an unexpected status). Report
     %% the reason before stopping so an operator can answer "why did this
     %% consumer's remote read stop?". Without this the shutdown is silent: the
@@ -423,14 +434,25 @@ step_(State0, {iterator_refreshed, end_of_manifest}) ->
     %% with it, or a frame still in flight would step `try_serve/1` for a read
     %% that has already been answered - counting a hit or a miss for it, and
     %% growing the window on the way out.
+    %%
+    %% The clocks go with it. A `retry` already in the shell's mailbox is
+    %% honoured until its timer is cancelled, and it would land on a state this
+    %% event has just emptied: `advance/1` has re-based the buffer at the start
+    %% of the fragment, so the pass it drives re-requests that fragment from
+    %% byte 8 - GETs and pooled connections spent on bytes the consumer is on
+    %% its way to reading locally, and a look-ahead group GET on top, which is
+    %% the very cost this clause avoids by leaving the iterator alone.
     {_Offset, Cancels, Pipeline} = rabbitmq_stream_s3_read_pipeline:advance(pipeline(State0)),
     State = State0#state{
         pipeline = Pipeline,
         pending = undefined,
         next_peek = unknown,
-        current_not_found = false
+        current_not_found = false,
+        timers = #{}
     },
-    {State, cancel_effects(Cancels) ++ [{reply, {become_local, current_fragment_offset(State0)}}]};
+    {State,
+        cancel_effects(Cancels) ++
+            [{cancel_timers, all}, {reply, {become_local, current_fragment_offset(State0)}}]};
 step_(State0, {iterator_refreshed, Iterator}) ->
     %% Iterator has been refreshed past the 404'd fragment. Reinitialize
     %% at the next available fragment.
@@ -452,8 +474,8 @@ step_(State0, {iterator_refreshed, Iterator}) ->
                 cfg = Cfg,
                 window = Cfg#cfg.request_size,
                 retry_delay = Cfg#cfg.min_retry_delay_ms,
-                pipeline = rabbitmq_stream_s3_read_pipeline:new(
-                    StreamId, FragRef, ?SEGMENT_HEADER_B
+                pipeline = rabbitmq_stream_s3_read_pipeline:replace_fragment(
+                    FragRef, ?SEGMENT_HEADER_B, pipeline(State0)
                 ),
                 iterator = Iterator1
             },
@@ -470,9 +492,13 @@ step_(State0, {iterator_refreshed, Iterator}) ->
                 | Effects
             ]};
         end_of_manifest ->
-            %% Iterator exhausted after refresh. Become local.
-            Local = Cancelled#state{pending = undefined},
-            {Local, [{reply, {become_local, current_fragment_offset(Local)}}]};
+            %% Iterator exhausted after refresh. Become local, dropping the
+            %% clocks with the read for the same reason the other become-local
+            %% path does.
+            Local = Cancelled#state{pending = undefined, timers = #{}},
+            {Local, [
+                {cancel_timers, all}, {reply, {become_local, current_fragment_offset(Local)}}
+            ]};
         {error, {group_fetch_failed, _Reason}} ->
             %% A group object could not be fetched while advancing the
             %% refreshed iterator. Transient S3 error, not end of manifest:
@@ -508,7 +534,7 @@ other_fragment_not_found(Fragment, State0) ->
     %% Try to serve: a recorded 404 may trigger a refresh when the consumer
     %% reads past the current fragment.
     {State, Effects} = try_serve(State0#state{pipeline = Pipeline}),
-    {State, [{cancel_request, Key} || Key <- Dropped] ++ Effects}.
+    {State, [{cancel_request, Id} || Id <- Dropped] ++ Effects}.
 
 %% Whether `Fragment` is the fragment the reader is prefetching. The pipeline
 %% knows it once bytes have arrived for it; before that the look-ahead memo is
@@ -733,7 +759,7 @@ goto_next_fragment(State0) ->
     {State, cancel_effects(Cancels)}.
 
 cancel_effects(all) -> [{cancel_requests, all}];
-cancel_effects(Keys) -> [{cancel_request, Key} || Key <- Keys].
+cancel_effects(Ids) -> [{cancel_request, Id} || Id <- Ids].
 
 %% The peek already advanced the iterator past the entry being moved to, and
 %% paid for the group fetch that took, so take its answer rather than descending
@@ -755,8 +781,8 @@ absorb_signals([empty_completion | Rest], State0) ->
     {State1, Effects1} = absorb_signals(Rest, State),
     {State1, Effects ++ Effects1}.
 
-fail_range(Fragment, RangeStart, Kind, State0) ->
-    case rabbitmq_stream_s3_read_pipeline:fail(Fragment, RangeStart, Kind, pipeline(State0)) of
+fail_range(Id, Kind, State0) ->
+    case rabbitmq_stream_s3_read_pipeline:fail(Id, Kind, pipeline(State0)) of
         {ok, Pipeline} ->
             arm_retry(Kind, State0#state{pipeline = Pipeline});
         {dropped, Pipeline} ->
@@ -946,8 +972,8 @@ extend_frontier(State, Peek0, Attempted0, Acc) ->
             end
     end.
 
-start_request_effect({Key, Range, Fragment}) ->
-    {start_request, Key, Range, Fragment}.
+start_request_effect({Id, Key, Range, Fragment}) ->
+    {start_request, Id, Key, Range, Fragment}.
 
 has_room(#state{cfg = #cfg{max_depth = MaxDepth}} = State) ->
     inflight_count(State) < MaxDepth andalso outstanding(State) < fetch_ceiling(State).
@@ -1075,7 +1101,11 @@ range_in_fragment(Frontier, FragSize, State) ->
 %% ------------------------------------------------------------------
 
 build_cfg(Opts) ->
-    RequestSize = maps:get(request_size, Opts, 4_194_304),
+    %% At least one byte per request. Zero makes `range_in_fragment/3` return
+    %% `{Frontier, Frontier - 1}` - an inverted range, which is a `bytes=8-7`
+    %% header S3 rejects and which counts nothing against the window, so the
+    %% reader fills its whole depth with them and never gets a byte.
+    RequestSize = max(1, maps:get(request_size, Opts, 4_194_304)),
     #cfg{
         request_size = RequestSize,
         %% Never below one request. These are plain app-env settings with no
@@ -1088,7 +1118,11 @@ build_cfg(Opts) ->
         %% window in the bottom bucket of a histogram whose boundaries are
         %% derived from these same two numbers.
         window_max = max(RequestSize, maps:get(window_max, Opts, 33_554_432)),
-        max_depth = maps:get(max_depth, Opts, 8),
+        %% At least one request in flight. Zero leaves `has_room/1` false
+        %% however far behind the consumer falls, so nothing is ever requested
+        %% and every read waits out its whole deadline - three times over, with
+        %% nothing in the log to say why.
+        max_depth = max(1, maps:get(max_depth, Opts, 8)),
         min_retry_delay_ms = maps:get(min_retry_delay_ms, Opts, 1_000),
         max_retry_delay_ms = maps:get(max_retry_delay_ms, Opts, 30_000)
     }.
