@@ -29,6 +29,7 @@ all() ->
         window_grows_on_miss,
         window_capped_at_window_max,
         window_decays_after_sustained_hits,
+        served_read_frees_its_bytes_from_the_window,
         pipeline_fills_to_window_and_depth,
         out_of_order_arrival_is_reassembled,
         mid_pipeline_error_reissues_only_that_range,
@@ -44,6 +45,8 @@ all() ->
         spill_stops_one_fragment_ahead,
         placement_pass_does_not_look_ahead,
         window_ceiling_below_the_request_size_is_clamped,
+        become_local_answers_the_pending_read,
+        become_local_does_not_advance_the_iterator,
         next_fragment_404_refresh_reuses_the_peek,
         next_fragment_flushes_while_current_range_streams,
         exponential_backoff_caps_at_max,
@@ -60,6 +63,7 @@ all() ->
         header_overread_capped_at_index_boundary,
         tail_header_overread_below_guard_serves_remaining,
         next_fragment_404_triggers_refresh_iterator,
+        stale_404_for_a_left_behind_fragment_keeps_the_prefetch,
         prefetch_404_full_recovery,
         deadline_expired_replies_error_timeout,
         deadline_expired_keeps_the_buffer_for_the_retry,
@@ -84,9 +88,11 @@ all() ->
         pool_busy_delay_resets_on_data,
         pool_busy_backoff_independent_of_network_errors,
         pool_busy_retry_does_not_release_a_throttled_range,
+        pool_busy_delay_resets_once_its_range_waits_on_the_other_clock,
         partial_throttling_does_not_reset_the_backoff,
         retry_round_in_flight_does_not_reset_the_backoff,
         backoff_resets_once_the_retried_range_delivers,
+        backoff_resets_when_the_retried_range_delivers_but_stays_queued,
         %% Looking one fragment ahead can cost an S3 GET, so it is memoised
         next_fragment_peek_is_fetched_once,
         failed_group_peek_is_retried_on_the_backoff,
@@ -613,6 +619,31 @@ window_decays_after_sustained_hits(_Config) ->
     ),
     ?assert(window(Final) < 16_384).
 
+served_read_frees_its_bytes_from_the_window(_Config) ->
+    %% The window bounds how far ahead of the *consumer* the reader fetches, so
+    %% the bytes a read carries away stop counting against it the moment they
+    %% are served. Measuring from the start of the last read instead held a
+    %% read's worth of the window shut until the next one arrived, and the
+    %% frontier trailed that much behind where the window allows.
+    FragRef = frag_ref(0, 100_000_000, 42),
+    Iterator = mock_iterator([{0, 100_000_000, 42}]),
+    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, #{
+        request_size => 1000, window_max => 1000, max_depth => 32
+    }),
+    ?assertEqual([{8, 1007}], fragment_ranges(S0, 0)),
+    %% One range, a window's worth, answered in full. Nothing follows it: the
+    %% bytes are buffered and nobody has read them yet.
+    {S1, E1} = deliver(S0, 0, pattern(8, 1000), done),
+    ?assertEqual([], starts(E1)),
+    ?assertEqual({1000, 0}, load(S1)),
+    %% Reading half of them frees half the window, which the reader spends at
+    %% once on the next range. Measuring from the start of the last read instead
+    %% freed nothing, so this asked for nothing.
+    {S2, E2} = read(S1, ?SEGMENT_HEADER_B, 500),
+    ?assertEqual([{reply, {ok, pattern(?SEGMENT_HEADER_B, 500)}}], replies(E2)),
+    ?assertEqual([{key(), {1008, 2007}, 0}], starts(E2)),
+    ?assertEqual({1500, 1}, load(S2)).
+
 %% A reader on a fragment far larger than any window it can reach, so the
 %% fragment's size never bounds what these tests observe.
 window_test_state(Opts) ->
@@ -748,20 +779,21 @@ open_range_does_not_pull_the_frontier_back(_Config) ->
     {S0, _} = pipelined_state(#{window_max => 2000, max_depth => 4}),
     ?assertEqual([{8, 1007}, {1008, 2007}], fragment_ranges(S0, 0)),
     %% The head owes nothing but stays open; its successor delivers, flushes
-    %% past it and is dropped. The queue now ends at 1007, the buffer at 2008.
+    %% past it and is dropped. The queue now ends at 1007, the buffer at 2008,
+    %% and the read that flush serves frees the window for the next range. That
+    %% range must start at the buffer's end, not after the stale queue entry -
+    %% asking for 1008 again would re-fetch bytes the buffer already holds.
     {S1, _} = deliver(S0, 0, 8, pattern(8, 1000), continue),
     {S2, _} = deliver(S1, 0, 1008, pattern(1008, 1000), done),
-    ?assertEqual([{8, 1007}], fragment_ranges(S2, 0)),
-    %% The consumer walks through the buffered bytes.
+    ?assertEqual([{8, 1007}, {2008, 3007}], fragment_ranges(S2, 0)),
+    %% The consumer walks through the buffered bytes, pulling the frontier along
+    %% behind it - always forwards, never back over what is buffered.
     {S3, E3} = read(S2, 8, 1000),
     ?assertEqual([{reply, {ok, pattern(8, 1000)}}], replies(E3)),
     {S4, E4} = read(S3, 1008, 1000),
     ?assertEqual([{reply, {ok, pattern(1008, 1000)}}], replies(E4)),
-    %% Reading on past them is what asks for the next range. It must start at
-    %% the buffer's end, not after the stale queue entry - asking for 1008 again
-    %% would re-fetch bytes the buffer already holds.
     {S5, _} = read(S4, 2008, 1000),
-    ?assertEqual([{8, 1007}, {2008, 3007}], fragment_ranges(S5, 0)),
+    ?assertEqual([{8, 1007}, {2008, 3007}, {3008, 4007}], fragment_ranges(S5, 0)),
     %% And it flushes, so the fragment stays readable.
     {S6, _} = deliver(S5, 0, 2008, pattern(2008, 1000), done),
     {_S7, E7} = read(S6, 2008, 1000),
@@ -777,7 +809,12 @@ short_completion_refetches_the_gap(_Config) ->
     %% The delivered prefix is complete and already in the buffer, so what is
     %% left in the queue is the gap ahead of the untouched successors - including
     %% the one whose bytes have arrived but cannot flush until the gap closes.
-    ?assertEqual([{408, 1007}, {1008, 2007}, {2008, 3007}, {3008, 4007}], fragment_ranges(S2, 0)),
+    %% The prefix also serves the pending read, and the window that read frees
+    %% goes into a new range at the frontier.
+    ?assertEqual(
+        [{408, 1007}, {1008, 2007}, {2008, 3007}, {3008, 4007}, {4008, 5007}],
+        fragment_ranges(S2, 0)
+    ),
     %% Filling the gap releases the bytes staged behind it too.
     {S3, _} = deliver(S2, 0, 408, pattern(408, 600), done),
     {_S4, E4} = read(S3, 8, 2000),
@@ -870,6 +907,45 @@ spill_stops_one_fragment_ahead(_Config) ->
     ?assertEqual([{8, 507}], fragment_ranges(S1, 0)),
     ?assertEqual([{8, 507}], fragment_ranges(S1, 100)),
     ?assertEqual([], fragment_ranges(S1, 200)).
+
+become_local_answers_the_pending_read(_Config) ->
+    %% The become_local reply answers the read, so it has to be cleared with it.
+    %% Left pending, a frame still in flight steps `try_serve/1` for a read that
+    %% has already been answered: a second reply the shell drops, and a hit or a
+    %% miss counted - with the window grown on the way out - for a read that no
+    %% longer exists.
+    FragRef = frag_ref(0, 2000, 42),
+    Iterator = mock_iterator([{0, 2000, 42}]),
+    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator),
+    {S1, _} = read(S0, ?SEGMENT_HEADER_B, 1500),
+    {S2, E2} = rabbitmq_stream_s3_remote_reader_core:step(
+        S1, {iterator_refreshed, end_of_manifest}
+    ),
+    ?assertMatch([{become_local, 0}], [R || {reply, R} <- E2]),
+    %% A frame for a range the transition dropped, arriving after the reply. It
+    %% is stale, but the reader is still fetching until the shell stops it, so
+    %% the pass issues a range for the reset buffer.
+    {S3, E3} = deliver(S2, 0, ?SEGMENT_HEADER_B, pattern(8, 100), done),
+    ?assertMatch([_ | _], starts(E3)),
+    %% Which then delivers enough to serve the read. This is where a read left
+    %% pending is answered a second time, and counted as a hit, long after it
+    %% was replied to.
+    {_S4, E4} = deliver(S3, 0, ?SEGMENT_HEADER_B, pattern(8, 2000), done),
+    ?assertEqual([], [E || {reply, _} = E <- E4]),
+    ?assertEqual([], [E || {observe, _, _} = E <- E4]).
+
+become_local_does_not_advance_the_iterator(_Config) ->
+    %% Nothing reads the answer: the reply hands the consumer to the local tier
+    %% and the shell stops the reader. Advancing the iterator to get it can cost
+    %% a synchronous group GET.
+    Fetches = counters:new(1, []),
+    Iterator = mock_iterator_counting_groups([{0, 2000, 42}], [{2000, 1000, 7}], Fetches),
+    {S0, _} = init(stream_id(), frag_ref(0, 2000, 42), ?SEGMENT_HEADER_B, Iterator),
+    ?assertEqual(0, counters:get(Fetches, 1)),
+    {_S1, _} = rabbitmq_stream_s3_remote_reader_core:step(
+        S0, {iterator_refreshed, end_of_manifest}
+    ),
+    ?assertEqual(0, counters:get(Fetches, 1)).
 
 window_ceiling_below_the_request_size_is_clamped(_Config) ->
     %% `prefetch_window_max` and `prefetch_request_size` are independent
@@ -1235,6 +1311,30 @@ next_fragment_404_triggers_refresh_iterator(_Config) ->
         S2, {read, 208, 50, chunk_boundary}
     ),
     ?assertMatch([{refresh_iterator, 100}], Effects).
+
+stale_404_for_a_left_behind_fragment_keeps_the_prefetch(_Config) ->
+    %% A 404 says something about the prefetch only if it is the prefetched
+    %% fragment that 404'd. Acted on for a fragment the reader has just left
+    %% behind at a transition, it marks the next fragment missing - and the read
+    %% that follows then repositions the consumer past a fragment that is there.
+    FragRef = frag_ref(0, 200, 42),
+    Iterator = mock_iterator([{0, 200, 42}, {100, 300, 43}, {200, 300, 44}]),
+    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator),
+    {S1, _} = deliver(S0, 0, binary:copy(<<0>>, 200), done),
+    {S2, _} = deliver(S1, 100, binary:copy(<<1>>, 300), done),
+    %% The consumer reads past fragment 0, so the reader moves onto 100 and
+    %% leaves 0 behind.
+    {S3, E3} = read(S2, ?SEGMENT_HEADER_B + 200, 50),
+    ?assertMatch([{reply, {next_fragment, 100}} | _], E3),
+    %% A 404 for the fragment left behind, from a range the transition dropped.
+    {S4, _} = fail(S3, 0, ?SEGMENT_HEADER_B, not_found),
+    %% Fragment 200 is still being prefetched, so reading past the current
+    %% fragment awaits its bytes rather than refreshing the iterator past it.
+    {S5, E5} = read(S4, ?SEGMENT_HEADER_B + 300, 50),
+    ?assertEqual([], [E || {refresh_iterator, _} = E <- E5]),
+    ?assertMatch([_ | _], fragment_ranges(S5, 200)),
+    {_S6, E6} = deliver(S5, 200, binary:copy(<<2>>, 300), done),
+    ?assertMatch([{next_fragment, 200} | _], [R || {reply, R} <- E6]).
 
 prefetch_404_full_recovery(_Config) ->
     %% Full cycle: prefetch of next fragment returns 404, consumer reads past
@@ -1643,6 +1743,27 @@ pool_busy_backoff_independent_of_network_errors(_Config) ->
     {_S4, [{set_timer, fault, 2000}]} = fail_then_retry(S3, 0, slow_down),
     ok.
 
+pool_busy_delay_resets_once_its_range_waits_on_the_other_clock(_Config) ->
+    %% A range released by a pool_busy retry stops waiting on the pool_busy
+    %% clock the moment it fails again on the network one: it is queued on that
+    %% clock now, and `status` says so. Leaving the pool_busy stamp on it kept
+    %% the pool_busy clock looking busy for the life of the range, so its delay
+    %% was never handed back and the next genuine pool-busy waited as long as
+    %% the last round had grown to - against a pool that had recovered in
+    %% between.
+    {S0, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    {S1, E1} = fail(S0, 0, 8, pool_busy),
+    ?assertEqual([{set_timer, pool_busy, 25}], E1),
+    %% The retry re-issues that range, and this time it fails on the network.
+    {S2, _} = retry(S1, pool_busy),
+    {S3, E3} = fail(S2, 0, 8, slow_down),
+    ?assertEqual([{set_timer, fault, 1000}], E3),
+    %% Any delivery is where idle clocks are handed back. Nothing waits on
+    %% pool_busy now, so the next one starts from the minimum again.
+    {S4, _} = deliver(S3, 0, 1008, pattern(1008, 1000), done),
+    {_S5, E5} = fail(S4, 0, 2008, pool_busy),
+    ?assertEqual([{set_timer, pool_busy, 25}], E5).
+
 group_fetch_failure_retries_not_become_local(_Config) ->
     %% Advancing past the current fragment, the next entry is a group object
     %% whose fetch fails transiently. The core must retry (set_timer), not route
@@ -1863,12 +1984,14 @@ read_larger_than_the_window_is_still_served(_Config) ->
     {Served, S} = answer_until_served(S1, 20),
     ?assertEqual(pattern(?SEGMENT_HEADER_B, 3000), Served),
     %% Exceeding the window is confined to the read that needed it: once served,
-    %% the ceiling governs again.
-    ?assertEqual([], outstanding_ranges(S)),
-    {_S2, E} = read(S, ?SEGMENT_HEADER_B + 3000, 10),
-    ?assertEqual([], [R || {reply, {ok, _}} = R <- E]),
+    %% the ceiling governs again, so what the reader fetches from there fits the
+    %% window rather than the 3000 bytes that one read licensed.
     {Outstanding, _} = load(S),
-    ?assert(Outstanding >= 3000).
+    ?assert(Outstanding =< window(S)),
+    %% What it fetched is genuinely ahead of the consumer: the served bytes are
+    %% behind it, so the read that follows them still waits on the wire.
+    {_S2, E} = read(S, ?SEGMENT_HEADER_B + 3000, 10),
+    ?assertEqual([], [R || {reply, {ok, _}} = R <- E]).
 
 %% Answer every outstanding range in full, round after round, until the pending
 %% read is replied to. Returns the served bytes.
@@ -1996,6 +2119,25 @@ backoff_resets_once_the_retried_range_delivers(_Config) ->
     {S2, _} = retry(S1, fault),
     {S3, _} = deliver(S2, 0, A, pattern(A, 1000), done),
     {_S4, E} = fail(S3, 0, B, slow_down),
+    ?assertEqual([{set_timer, fault, 1000}], E).
+
+backoff_resets_when_the_retried_range_delivers_but_stays_queued(_Config) ->
+    %% Delivering is what answers a retry round, not leaving the queue. A range
+    %% that has delivered every byte can sit in the queue for a while yet -
+    %% blocked behind an unfinished predecessor, as here - and while it does,
+    %% counting it as still owing the clock an answer holds the delay wherever
+    %% the burst grew it. A throttling burst that recovers would then pace the
+    %% next unrelated failure from seconds rather than from the minimum.
+    {S0, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    [{0, A, _}, {0, B, _} | _] = outstanding_ranges(S0),
+    {S1, [{set_timer, fault, 1000}]} = fail(S0, 0, B, slow_down),
+    {S2, _} = retry(S1, fault),
+    %% B answers in full, but A is still owed, so B cannot flush and keeps its
+    %% place in the queue.
+    {S3, _} = deliver(S2, 0, B, pattern(B, 1000), done),
+    ?assert(lists:member({B, B + 999}, fragment_ranges(S3, 0))),
+    %% The round has come back all the same: the next failure starts over.
+    {_S4, E} = fail(S3, 0, A, slow_down),
     ?assertEqual([{set_timer, fault, 1000}], E).
 
 end_of_manifest_transition_drops_outstanding_requests(_Config) ->

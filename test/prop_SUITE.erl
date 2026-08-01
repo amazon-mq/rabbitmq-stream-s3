@@ -73,6 +73,8 @@ all() ->
         remote_reader_core_survives_failure_interleavings,
         remote_reader_core_load_bounded,
         remote_reader_core_look_ahead_recovers,
+        %% Read pipeline (reassembly queue over the block buffer)
+        read_pipeline_matches_model,
         %% Read buffer (block queue)
         read_buffer_matches_model,
         %% Garbage collection reap decision
@@ -2417,6 +2419,204 @@ check_rrc_load([Event | Rest], State0, MaxOutstanding, MaxDepth) ->
 %% block-granular drops occurs, the retained window and every in-range read
 %% must be byte-identical to the corresponding slice of that history.
 %% =========================================================================
+
+%% =========================================================================
+%% Read pipeline properties
+%% =========================================================================
+
+%% The reassembly queue's whole job is to turn range responses that interleave,
+%% arrive short, arrive empty or fail into a contiguous buffer without ever
+%% papering over a hole. The oracle for that does not need to model the queue:
+%% a byte is in the buffer exactly when every byte below it in the fragment has
+%% been received, whatever order the ranges were answered in. So the model is
+%% just the bytes S3 has said, by position, and everything observable is
+%% recomputed from them.
+%%
+%% Two things are asserted after every command, and they are the two halves of
+%% one statement. A read is served if and only if the model says every byte
+%% below its end has arrived - serving one it cannot is a hole papered over,
+%% refusing one it can is a stall - and a served read carries exactly the bytes
+%% of the positions it claims.
+%%
+%% Single fragment on purpose: the prefetched next fragment's own queue is
+%% driven by the core's properties above. What is exercised here is the
+%% reassembly, which is per fragment.
+read_pipeline_matches_model(_Config) ->
+    rabbit_ct_proper_helpers:run_proper(fun prop_read_pipeline_matches_model/0, [], 500).
+
+prop_read_pipeline_matches_model() ->
+    ?FORALL(
+        Ops,
+        non_empty(list(gen_rp_op())),
+        begin
+            FragSize = 20_000,
+            FragRef = #fragment_ref{offset = 0, uid = 1, size = FragSize},
+            P = rabbitmq_stream_s3_read_pipeline:new(<<"prop-stream">>, FragRef, ?SEGMENT_HEADER_B),
+            check_rp_ops(Ops, P, #{}, FragSize)
+        end
+    ).
+
+gen_rp_op() ->
+    frequency([
+        {4, {push, range(1, 3000)}},
+        %% `Which` picks among the outstanding ranges, so responses land out of
+        %% issue order.
+        {5, {deliver, range(0, 7), gen_rp_delivery()}},
+        {2, {fail, range(0, 7)}},
+        {1, release},
+        {1, ready},
+        {3, {read, range(1, 4000)}}
+    ]).
+
+gen_rp_delivery() ->
+    frequency([
+        %% Exactly the range, properly closed.
+        {5, full},
+        %% Ends before the range does, which queues the rest as a gap request.
+        {3, ?LET(Frac, range(0, 100), {short, Frac})},
+        %% Closes without a byte.
+        {1, empty},
+        %% More bytes than the range asked for: must be clipped, never spill
+        %% into the successor's range.
+        {1, over},
+        %% Not closed, so the range stays in flight owing the rest.
+        {2, partial}
+    ]).
+
+check_rp_ops([], _P, _Got, _FragSize) ->
+    true;
+check_rp_ops([Op | Ops], P0, Got0, FragSize) ->
+    {P, Got} = apply_rp_op(Op, P0, Got0, FragSize),
+    case check_rp_read(P, Got, FragSize) of
+        true -> check_rp_ops(Ops, P, Got, FragSize);
+        false -> false
+    end.
+
+apply_rp_op({push, Len}, P0, Got, FragSize) ->
+    Frontier = rabbitmq_stream_s3_read_pipeline:frontier(0, P0),
+    IdxStart = ?SEGMENT_HEADER_B + FragSize,
+    case Frontier < IdxStart of
+        true ->
+            End = min(Frontier + Len - 1, IdxStart - 1),
+            FragRef = rabbitmq_stream_s3_read_pipeline:current_fragment(P0),
+            {_Spec, P} = rabbitmq_stream_s3_read_pipeline:push(FragRef, {Frontier, End}, P0),
+            {P, Got};
+        false ->
+            {P0, Got}
+    end;
+apply_rp_op({deliver, Which, How}, P0, Got, _FragSize) ->
+    case pick_rp_inflight(Which, P0) of
+        none ->
+            {P0, Got};
+        {Start, End} ->
+            %% S3 continues a range from where it left off, not from its start:
+            %% a response that was left open owes only the bytes after the ones
+            %% it has already sent.
+            Pos = rp_range_pos(Start, End, Got),
+            Remaining = End - Pos + 1,
+            {Bytes, Close} = rp_delivery(How, Remaining),
+            Data = rb_pattern(Pos, Bytes),
+            {_Signals, P} = rabbitmq_stream_s3_read_pipeline:data(0, Start, Data, Close, P0),
+            %% The pipeline clips an over-delivery to the range, so the model
+            %% records only what the range owns.
+            {P, rp_received(Pos, min(Bytes, Remaining), Got)}
+    end;
+apply_rp_op({fail, Which}, P0, Got, _FragSize) ->
+    case pick_rp_inflight(Which, P0) of
+        none ->
+            {P0, Got};
+        {Start, End} ->
+            case rabbitmq_stream_s3_read_pipeline:fail(0, Start, fault, P0) of
+                {ok, P} -> {P, rp_drop_staged(Start, End, Got)};
+                {dropped, P} -> {P, Got};
+                stale -> {P0, Got}
+            end
+    end;
+apply_rp_op(release, P0, Got, _FragSize) ->
+    {rabbitmq_stream_s3_read_pipeline:release(fault, P0), Got};
+apply_rp_op(ready, P0, Got, _FragSize) ->
+    {_Specs, P} = rabbitmq_stream_s3_read_pipeline:ready(8, P0),
+    {P, Got};
+apply_rp_op({read, Len}, P0, Got, _FragSize) ->
+    ReadPos = rabbitmq_stream_s3_read_pipeline:read_position(P0),
+    case rabbitmq_stream_s3_read_pipeline:read(ReadPos, Len, P0) of
+        {ok, _Data, P} -> {P, Got};
+        _ -> {P0, Got}
+    end.
+
+rp_delivery(full, Len) -> {Len, done};
+rp_delivery(empty, _Len) -> {0, done};
+rp_delivery(over, Len) -> {Len + 64, done};
+rp_delivery(partial, Len) -> {max(1, Len div 2), continue};
+rp_delivery({short, Frac}, Len) -> {max(1, Len * Frac div 100), done}.
+
+%% A failure drops what *that range* had received but not yet appended, which is
+%% everything of its own above the contiguous run: the buffer keeps what it has
+%% already taken and the range restarts there. Other ranges' staged bytes are
+%% untouched - they are held on their own request.
+rp_drop_staged(Start, End, Got) ->
+    Contiguous = rp_contiguous(Got),
+    maps:filter(
+        fun(Pos, _Byte) -> Pos < Contiguous orelse Pos < Start orelse Pos > End end,
+        Got
+    ).
+
+rp_received(_Start, Len, Got) when Len =< 0 ->
+    Got;
+rp_received(Start, Len, Got) ->
+    Data = rb_pattern(Start, Len),
+    lists:foldl(
+        fun(I, Acc) -> Acc#{Start + I => binary:at(Data, I)} end,
+        Got,
+        lists:seq(0, Len - 1)
+    ).
+
+%% Where a range's next delivery starts: past its own contiguous prefix. A
+%% range's received bytes are contiguous from its start, since a failure puts it
+%% back at the last byte that reached a buffer and drops the rest.
+rp_range_pos(Start, End, _Got) when Start > End ->
+    Start;
+rp_range_pos(Start, End, Got) ->
+    case is_map_key(Start, Got) of
+        true -> rp_range_pos(Start + 1, End, Got);
+        false -> Start
+    end.
+
+%% One past the last byte of the contiguous run from the start of the data
+%% region: exactly what the buffer can hold, whatever order the ranges arrived.
+rp_contiguous(Got) ->
+    rp_contiguous(Got, ?SEGMENT_HEADER_B).
+
+rp_contiguous(Got, Pos) ->
+    case is_map_key(Pos, Got) of
+        true -> rp_contiguous(Got, Pos + 1);
+        false -> Pos
+    end.
+
+%% Both halves of the statement: a read is served exactly when the model says
+%% the bytes are there, and a served read carries exactly those bytes.
+check_rp_read(P, Got, FragSize) ->
+    ReadPos = rabbitmq_stream_s3_read_pipeline:read_position(P),
+    Len = 64,
+    Contiguous = rp_contiguous(Got),
+    Servable = ReadPos + Len =< Contiguous,
+    case rabbitmq_stream_s3_read_pipeline:read(ReadPos, Len, P) of
+        {ok, Data, _P} ->
+            Servable andalso iolist_to_binary(Data) =:= rb_pattern(ReadPos, Len);
+        await ->
+            not Servable;
+        past_end ->
+            ReadPos >= ?SEGMENT_HEADER_B + FragSize
+    end.
+
+pick_rp_inflight(Which, P) ->
+    case rabbitmq_stream_s3_read_pipeline:inflight_ranges(P) of
+        [] ->
+            none;
+        Ranges ->
+            {_F, Start, End} = lists:nth(Which rem length(Ranges) + 1, Ranges),
+            {Start, End}
+    end.
 
 read_buffer_matches_model(_Config) ->
     rabbit_ct_proper_helpers:run_proper(fun prop_read_buffer_matches_model/0, [], 500).
