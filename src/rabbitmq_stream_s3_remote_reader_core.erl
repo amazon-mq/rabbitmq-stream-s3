@@ -302,17 +302,43 @@ init(StreamId, FragRef, Position, Iterator, Opts) ->
     },
     %% Immediately request data for the current fragment.
     {State1, Effects} = start_current_request(State),
-    {State1, Effects}.
+    checked({State1, Effects}, init).
 
 %% @doc Feed an event into the core, get back new state and effects.
 -spec step(state(), event()) -> {state(), [effect()]}.
-step(State, {read, Offset, Bytes, Hint}) ->
+step(State, Event) ->
+    checked(step_(State, Event), Event).
+
+-ifdef(TEST).
+%% Every transition passes through here, so this is where the invariants the
+%% state machine is written against are checked rather than described. They cost
+%% nothing in a release build (`checked/2` is the identity there) and everything
+%% that drives the core - the suite's cases, the property suite's random event
+%% sequences - checks them on every step for free.
+%%
+%% This is aimed at a specific recurring defect: a fact that is derived being
+%% stored as a field of its own, so that each clause has to remember to reset it
+%% along with the thing it was derived from. What that produces is not a crash
+%% but a quiet degradation - a reader that has stopped fetching, a clock nobody
+%% will ever fire - which every safety property passes and no unit test thinks
+%% to look for.
+checked({State, Effects}, Event) ->
+    assert_clocks_have_waiters(State, Event),
+    assert_queue_well_formed(State, Event),
+    assert_not_wedged(State, Effects, Event),
+    {State, Effects}.
+-else.
+checked(Result, _Event) ->
+    Result.
+-endif.
+
+step_(State, {read, Offset, Bytes, Hint}) ->
     State1 = State#state{
         pending = #pending{offset = Offset, bytes = Bytes, hint = Hint},
         missed_pending = false
     },
     try_serve(State1);
-step(State0, {data, Fragment, RangeStart, Data, DoneOrContinue}) ->
+step_(State0, {data, Fragment, RangeStart, Data, DoneOrContinue}) ->
     %% The backoffs are judged after the delivery has been absorbed, not before:
     %% that is when the range it closes has left the queue, and when a response
     %% that closed without delivering a byte has been put back into backoff.
@@ -321,7 +347,7 @@ step(State0, {data, Fragment, RangeStart, Data, DoneOrContinue}) ->
     {State3, Effects2} = maybe_start_requests(State2),
     {State4, Effects3} = try_serve(State3),
     {State4, Effects1 ++ Effects2 ++ Effects3};
-step(State0, {request_error, Fragment, _RangeStart, not_found}) ->
+step_(State0, {request_error, Fragment, _RangeStart, not_found}) ->
     case Fragment =:= current_fragment_offset(State0) of
         true ->
             %% Current fragment 404. Refresh the iterator past this offset.
@@ -338,7 +364,7 @@ step(State0, {request_error, Fragment, _RangeStart, not_found}) ->
             {State1, Effects} = try_serve(State),
             {State1, [{cancel_request, Key} || Key <- Dropped] ++ Effects}
     end;
-step(State0, {request_error, Fragment, RangeStart, Reason}) when
+step_(State0, {request_error, Fragment, RangeStart, Reason}) when
     Reason =:= slow_down;
     Reason =:= internal_error;
     Reason =:= timeout;
@@ -357,7 +383,7 @@ step(State0, {request_error, Fragment, RangeStart, Reason}) when
         stale ->
             {State0, []}
     end;
-step(State0, {request_error, Fragment, RangeStart, pool_busy}) ->
+step_(State0, {request_error, Fragment, RangeStart, pool_busy}) ->
     %% Pool is growing — a connection becomes available once its TLS handshake
     %% completes (fast on same-region S3, but not instant). Use a mild backoff
     %% (25, 50, 100, 200, 400, 500, 500...) starting low to catch the connection
@@ -371,7 +397,7 @@ step(State0, {request_error, Fragment, RangeStart, pool_busy}) ->
         stale ->
             {State0, []}
     end;
-step(State0, {request_error, _Fragment, _RangeStart, Reason}) ->
+step_(State0, {request_error, _Fragment, _RangeStart, Reason}) ->
     %% Non-retryable error (e.g. 403 AccessDenied, an unexpected status). Report
     %% the reason before stopping so an operator can answer "why did this
     %% consumer's remote read stop?". Without this the shutdown is silent: the
@@ -382,7 +408,7 @@ step(State0, {request_error, _Fragment, _RangeStart, Reason}) ->
     %% the reader's credentials, not about one range, so a stale one still
     %% means every subsequent request would fail too.
     {State0, [{fatal_error, Reason}, stop]};
-step(State0, {retry, Kind}) ->
+step_(State0, {retry, Kind}) ->
     %% Only the ranges waiting on this clock are released. The other kind's
     %% ranges keep waiting for their own timer: a pool_busy retry that released
     %% them would put a range S3 has just asked us to slow down straight back on
@@ -397,7 +423,7 @@ step(State0, {retry, Kind}) ->
     {State2, Effects} = maybe_start_requests(State1),
     {State3, Effects2} = try_serve(State2),
     {State3, Effects ++ Effects2};
-step(#state{cfg = #cfg{min_retry_delay_ms = MinDelay}} = State0, deadline_expired) ->
+step_(#state{cfg = #cfg{min_retry_delay_ms = MinDelay}} = State0, deadline_expired) ->
     %% The shell's pending-read deadline fired. Reply with an error and drop
     %% everything the retry cannot use: the ranges in flight, the bytes staged
     %% behind them, and both backoff clocks.
@@ -458,11 +484,11 @@ step(#state{cfg = #cfg{min_retry_delay_ms = MinDelay}} = State0, deadline_expire
         pool_busy_delay = ?MIN_POOL_BUSY_DELAY_MS
     },
     {State, [{cancel_requests, all}, {cancel_timers, all}, {reply, {error, timeout}}]};
-step(State0, {iterator_refreshed, end_of_manifest}) ->
+step_(State0, {iterator_refreshed, end_of_manifest}) ->
     %% No new entries. Become local.
     {State, Effects} = goto_next_fragment(State0),
     {State, Effects ++ [{reply, {become_local, current_fragment_offset(State0)}}]};
-step(State0, {iterator_refreshed, Iterator}) ->
+step_(State0, {iterator_refreshed, Iterator}) ->
     %% Iterator has been refreshed past the 404'd fragment. Reinitialize
     %% at the next available fragment.
     %%
@@ -1542,3 +1568,107 @@ decay(#state{cfg = #cfg{request_size = RequestSize}, window = Window} = State) w
     };
 decay(State) ->
     State.
+
+%% ------------------------------------------------------------------
+%% Internal: invariants (see `checked/2`)
+%% ------------------------------------------------------------------
+
+-ifdef(TEST).
+
+%% Nothing may wait on a clock that is not running. A range put back by a
+%% failure is released only when its kind's timer fires, so a clause that drops
+%% the timer without releasing what waited on it leaves those ranges queued for
+%% a round that will never come: `issue_ready/1` starts `ready` requests only,
+%% and `flushable/2` reports the stranded one blocked, holding back every byte
+%% queued behind it in its fragment.
+%%
+%% The look-ahead memo used to be a waiter here too, in its own field, and was
+%% stranded exactly this way by `deadline_expired`. It is derived from the clock
+%% now (see `peek_next_fragment/2`) rather than kept in step with it, which is
+%% why it is not in this check: there is no longer a state for it to be in.
+assert_clocks_have_waiters(#state{reqs = Reqs, timers = Timers}, Event) ->
+    Waiting = lists:usort([Kind || #req{status = {backoff, Kind}} <- Reqs]),
+    case [Kind || Kind <- Waiting, not is_map_key(Kind, Timers)] of
+        [] -> ok;
+        Stranded -> error({stranded_waiters, Stranded, Event, Timers})
+    end.
+
+%% The queue is ordered by `{fragment, range_start}` and its ranges are disjoint,
+%% which is what lets `flush_reqs/1` treat it as a reassembly queue and what
+%% keeps `{Fragment, RangeStart}` a key. Two ranges of one fragment that overlap
+%% mean bytes fetched twice and a buffer that can never be appended to
+%% contiguously; a duplicate key means a delivery routed to the wrong request.
+assert_queue_well_formed(#state{reqs = Reqs}, Event) ->
+    Keys = [{F, S} || #req{fragment = F, range_start = S} <- Reqs],
+    length(lists:usort(Keys)) =:= length(Keys) orelse
+        error({duplicate_range_keys, Keys, Event}),
+    Keys =:= lists:sort(Keys) orelse error({queue_out_of_order, Keys, Event}),
+    lists:foreach(
+        fun(#req{} = Req) ->
+            #req{range_start = Start, range_end = End, flushed = Flushed, pos = Pos} = Req,
+            (Start =< Flushed andalso Flushed =< Pos andalso Pos =< End + 1) orelse
+                error({range_positions_out_of_order, Req, Event})
+        end,
+        Reqs
+    ),
+    assert_ranges_disjoint(Reqs, Event).
+
+assert_ranges_disjoint(
+    [#req{fragment = F, range_end = End} | [#req{fragment = F} = Next | _] = Rest], Event
+) ->
+    Next#req.range_start > End orelse error({overlapping_ranges, End, Next, Event}),
+    assert_ranges_disjoint(Rest, Event);
+assert_ranges_disjoint([_ | Rest], Event) ->
+    assert_ranges_disjoint(Rest, Event);
+assert_ranges_disjoint([], _Event) ->
+    ok.
+
+%% A reader that owes a reply must be doing something about it: a range on the
+%% wire or queued, a clock armed to put one back, or an effect handing the
+%% problem to the shell. One that is doing none of those while the current
+%% fragment still holds bytes it has never asked for has stopped for good - the
+%% read waits out its deadline, and the retry behind it meets the same state,
+%% because nothing about that state is going to change on its own.
+%%
+%% This is the shape of every wedge found in this module so far: a fetch ceiling
+%% that could not admit the read in hand, a short response re-requested at a
+%% range that could never flush, a stale prefetch holding window space nothing
+%% could fetch into. Each was a different cause, and all of them looked like
+%% this from here.
+%%
+%% "Bytes it has never asked for" is measured against the fragment's data region
+%% directly, not by asking `extend_frontier/1` what it would issue. Two of those
+%% three wedges were bugs *in* the issuance predicates, and a check that consults
+%% `has_room/1` inherits whatever is wrong with it: asked whether it should have
+%% fetched, a broken ceiling answers no and the check agrees the reader is
+%% resting. It also keeps this side-effect free - resolving the look-ahead memo
+%% would fetch a group object from inside an assertion.
+assert_not_wedged(
+    #state{pending = #pending{}, reqs = [], timers = Timers, current_not_found = false} = State,
+    Effects,
+    Event
+) when map_size(Timers) =:= 0 ->
+    #state{fragment_ref = #fragment_ref{size = FragSize}, buffer = Buffer} = State,
+    Unfetched = rabbitmq_stream_s3_read_buffer:end_pos(Buffer) < ?SEGMENT_HEADER_B + FragSize,
+    case Unfetched andalso not handed_off(Effects) of
+        false -> ok;
+        true -> error({wedged, Event, State#state.pending})
+    end;
+assert_not_wedged(_State, _Effects, _Event) ->
+    ok.
+
+%% The read is no longer this state's problem: it has been answered, or the
+%% shell has been asked to refresh the iterator, or the reader is stopping.
+handed_off(Effects) ->
+    lists:any(
+        fun
+            ({reply, _}) -> true;
+            ({refresh_iterator, _}) -> true;
+            ({fatal_error, _}) -> true;
+            (stop) -> true;
+            (_) -> false
+        end,
+        Effects
+    ).
+
+-endif.
