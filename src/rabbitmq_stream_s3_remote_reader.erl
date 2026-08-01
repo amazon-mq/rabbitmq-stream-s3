@@ -28,8 +28,7 @@ synchronous feedback is generated.
 -behaviour(gen_server).
 
 -record(cfg, {
-    request_timeout_ms :: pos_integer(),
-    pending_read_deadline_ms :: pos_integer()
+    request_timeout_ms :: pos_integer()
 }).
 
 -define(C_BUFFER_HIT, 1).
@@ -205,7 +204,10 @@ stop(Pid) ->
 %% The gen_server:call timeout must exceed the internal deadline so the deadline
 %% always fires first and replies {error, timeout} to the caller. This avoids
 %% overlapping reads (caller times out, new read arrives while from is still
-%% set) which require unsafe buffer resets.
+%% set) which require unsafe buffer resets. `read/4` runs in the caller and has
+%% no access to the server's config, so the base is a constant on both sides
+%% rather than an option: a configurable base could be raised past the caller's
+%% timeout and invert the ordering.
 -define(READ_TIMEOUT_MARGIN_MS, 5_000).
 
 read(Server, Offset, Bytes, Hint) ->
@@ -271,14 +273,14 @@ init(
 handle_call(
     #read{offset = Offset, bytes = Bytes, hint = Hint},
     From,
-    #state{cfg = #cfg{pending_read_deadline_ms = BaseDeadline}, core = Core0} = State0
+    #state{core = Core0} = State0
 ) ->
     ?assertEqual(undefined, State0#state.from),
     {Core1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
         Core0, {read, Offset, Bytes, Hint}
     ),
     Token = make_ref(),
-    Deadline = read_deadline_ms(Offset, Bytes, BaseDeadline),
+    Deadline = read_deadline_ms(Offset, Bytes, ?PENDING_READ_DEADLINE_MS),
     Timer = erlang:send_after(Deadline, self(), {deadline_expired, Token}),
     State1 = State0#state{
         core = Core1,
@@ -659,12 +661,7 @@ maybe_stop(State) ->
     {noreply, State}.
 
 build_cfg(Opts) ->
-    #cfg{
-        request_timeout_ms = maps:get(request_timeout_ms, Opts, 15_000),
-        pending_read_deadline_ms = maps:get(
-            pending_read_deadline_ms, Opts, ?PENDING_READ_DEADLINE_MS
-        )
-    }.
+    #cfg{request_timeout_ms = maps:get(request_timeout_ms, Opts, 15_000)}.
 
 cancel_all_requests(#state{requests = Requests, cancelled = Cancelled0} = State) ->
     maps:foreach(
