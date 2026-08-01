@@ -1702,7 +1702,7 @@ prop_remote_reader_core_reply_size_bounded() ->
                 S1, {read, ReadOffset, ReadBytes, chunk_boundary}
             ),
             %% If a reply was produced, its data must be <= ReadBytes.
-            case [D || {reply, {ok, D}} <- Effects] of
+            case [iolist_to_binary(D) || {reply, {ok, D}} <- Effects] of
                 [] -> true;
                 [ReplyData] -> byte_size(ReplyData) =< ReadBytes
             end
@@ -1901,7 +1901,7 @@ run_rrc_exact_steps([{Rot, LenWant, PosFrac} | Steps], S0, DataEnd0, ReadFloor) 
             {S2, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
                 S1, {read, ReadPos, ReadLen, chunk_boundary}
             ),
-            case [D || {reply, {ok, D}} <- Effects] of
+            case [iolist_to_binary(D) || {reply, {ok, D}} <- Effects] of
                 [Reply] ->
                     Reply =:= rb_pattern(ReadPos, ReadLen) andalso
                         run_rrc_exact_steps(Steps, S2, DataEnd, ReadPos);
@@ -2043,7 +2043,7 @@ run_rrc_failure_steps([{Rot, Outcomes, LenWant} | Steps], S0, ReadFloor, Probe) 
                 false ->
                     false;
                 true ->
-                    case [D || {reply, {ok, D}} <- Effects] of
+                    case [iolist_to_binary(D) || {reply, {ok, D}} <- Effects] of
                         [] ->
                             run_rrc_failure_steps(Steps, S3, ReadFloor, Probe);
                         [Reply] ->
@@ -2117,7 +2117,7 @@ await_rounds(ProbeLen, RequestSize) ->
 rrc_await_reply(_State, _ReadFloor, _ProbeLen, _Effects, 0) ->
     false;
 rrc_await_reply(State0, ReadFloor, ProbeLen, Effects, Rounds) ->
-    case [D || {reply, {ok, D}} <- Effects] of
+    case [iolist_to_binary(D) || {reply, {ok, D}} <- Effects] of
         [Reply] ->
             Reply =:= rb_pattern(ReadFloor, ProbeLen);
         [] ->
@@ -2323,7 +2323,7 @@ rrc_looks_ahead_again(State0, ReadFloor, Rounds) ->
                         Rounds - 1
                     );
                 [{ok, Data}] ->
-                    rrc_looks_ahead_again(State, ReadFloor + byte_size(Data), Rounds - 1);
+                    rrc_looks_ahead_again(State, ReadFloor + iolist_size(Data), Rounds - 1);
                 _ ->
                     rrc_looks_ahead_again(State, ReadFloor, Rounds - 1)
             end

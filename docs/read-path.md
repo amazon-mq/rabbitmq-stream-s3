@@ -66,9 +66,9 @@ This design complements the Erlang VM binary implementation. A naive approach, g
 
 - Blocks are contiguous and immutable: `end_pos - start_pos` equals the sum of block sizes, and a delivery is never copied into place (append is O(1)).
 - Consumed data is freed block-by-block: reads are non-decreasing, so when a read is served every block entirely below its start offset is dropped. `start_pos` advances block-granularly, never past the last read's start.
-- A read pins at most the blocks it overlaps: reads ≤ 512 bytes (chunk-header over-reads are 303 bytes) are copied and pin nothing; larger single-block reads share a sub-binary of one block; reads spanning blocks are assembled into a fresh binary.
+- A read pins at most the blocks it overlaps: reads ≤ 512 bytes (chunk-header over-reads are 303 bytes) are copied and pin nothing, however they are taken; larger reads share the blocks they cover, as a sub-binary at each edge.
 
-Reads spanning blocks concatenate only the requested bytes (chunk-sized, not window-sized), which is rare and cheap once the prefetch window is large relative to chunks.
+Reads come back as those blocks. The send path puts them straight into the socket's iolist, so a read spanning blocks costs no copy at all; callers that need one binary to slice — the chunk iterator, record by record — flatten it themselves, concatenating only the requested bytes (chunk-sized, not window-sized), which is rare and cheap once the prefetch window is large relative to chunks.
 
 Because several ranges of a fragment are in flight at once, their responses interleave, but the buffer only accepts contiguous appends. Outstanding ranges are therefore held in an ordered queue that doubles as a reassembly queue: bytes for a range whose predecessors have not finished are staged against that range and appended once it reaches the head. Staged bytes count against the prefetch window, so reassembly cannot grow memory beyond the window bound.
 

@@ -472,7 +472,12 @@ send_file0(
             } = Remote1} ->
             {ToSkip, ToSend} = select_amount_to_send(ChunkSelector, Header),
             DataPos = Position + ?CHUNK_HEADER_B + ToSkip,
-            case read(Pid, DataPos, ToSend, within_chunk) of
+            %% This is the high-throughput path: the chunk goes straight to the
+            %% socket in an iolist, so it never needs to be one binary. Reading
+            %% it as iodata keeps the blocks S3 delivered - flattening a range
+            %% that spans two of them would copy the whole chunk to build a term
+            %% that is taken apart again three lines later.
+            case read_iodata(Pid, DataPos, ToSend, within_chunk) of
                 {ok, Data} ->
                     ok = maybe_validate_crc(ChId, Crc, Data, DataSize, VerifyCrc),
                     PrefixData = Callback(Header, ToSend + byte_size(HeaderData)),
@@ -739,6 +744,27 @@ send(tcp, Socket, Data) ->
 send(ssl, Socket, Data) ->
     ssl:send(Socket, Data).
 
+%% The first `Len` bytes of a read, which is a binary on the chunk-iterator
+%% path and a list of blocks on the send path. Taken without flattening:
+%% `erlang:crc32/1` accepts iodata, and the send path reads iodata precisely to
+%% avoid a copy of the chunk.
+iodata_prefix(Data, Len) when is_binary(Data) ->
+    binary:part(Data, 0, Len);
+iodata_prefix(IoData, Len) ->
+    iodata_prefix(IoData, Len, []).
+
+iodata_prefix(_IoData, 0, Acc) ->
+    lists:reverse(Acc);
+iodata_prefix([Block | Blocks], Len, Acc) when byte_size(Block) =< Len ->
+    iodata_prefix(Blocks, Len - byte_size(Block), [Block | Acc]);
+iodata_prefix([Block | _Blocks], Len, Acc) ->
+    lists:reverse([binary:part(Block, 0, Len) | Acc]);
+iodata_prefix([], Len, _Acc) ->
+    %% Fewer bytes than the chunk header says the chunk holds. The read was
+    %% sized from that header, so this means the two disagree; fail loudly
+    %% rather than validate a CRC over a short prefix.
+    error({short_chunk_data, Len}).
+
 %% This helper is mostly the same as osiris_log:read_header0/1. There are some
 %% simplifications:
 %% * Always over-read the chunk header so that we also read the chunk filter in
@@ -876,7 +902,7 @@ verify_crc(Config) ->
 maybe_validate_crc(_ChunkId, _Crc, _Data, _DataSize, false) ->
     ok;
 maybe_validate_crc(ChunkId, Crc, Data, DataSize, true) ->
-    RecordData = binary:part(Data, 0, DataSize),
+    RecordData = iodata_prefix(Data, DataSize),
     case erlang:crc32(RecordData) of
         Crc ->
             ok;
@@ -1273,20 +1299,30 @@ resolve_first_lookup({error, {group_fetch_failed, _} = Reason}) ->
 -define(READ_RETRY_ATTEMPTS, 3).
 -define(READ_RETRY_DELAY_MS, 500).
 
--spec read(pid(), byte_offset(), pos_integer(), rabbitmq_stream_s3_remote_reader:hint()) ->
-    {ok, binary()}
+-type read_result(Data) ::
+    {ok, Data}
     | {next_fragment, osiris:offset()}
     | {become_local, osiris:offset()}
     | end_of_stream
     | {error, timeout}
     | {error, {remote_reader_down, term()}}.
-read(RemoteReader, Offset, Bytes, Hint) ->
-    read(RemoteReader, Offset, Bytes, Hint, 1).
 
-read(RemoteReader, Offset, Bytes, Hint, Attempt) ->
+-spec read(pid(), byte_offset(), pos_integer(), rabbitmq_stream_s3_remote_reader:hint()) ->
+    read_result(binary()).
+read(RemoteReader, Offset, Bytes, Hint) ->
+    read(RemoteReader, Offset, Bytes, Hint, read, 1).
+
+%% As `read/4`, but without flattening the reader's blocks into one binary. For
+%% callers that hand the bytes on as iodata; see `rabbitmq_stream_s3_remote_reader:read/4`.
+-spec read_iodata(pid(), byte_offset(), pos_integer(), rabbitmq_stream_s3_remote_reader:hint()) ->
+    read_result([binary()]).
+read_iodata(RemoteReader, Offset, Bytes, Hint) ->
+    read(RemoteReader, Offset, Bytes, Hint, read_iodata, 1).
+
+read(RemoteReader, Offset, Bytes, Hint, ReadFun, Attempt) ->
     {Ms, Result} = timer:tc(
         rabbitmq_stream_s3_remote_reader,
-        read,
+        ReadFun,
         [RemoteReader, Offset, Bytes, Hint],
         millisecond
     ),
@@ -1308,7 +1344,7 @@ read(RemoteReader, Offset, Bytes, Hint, Attempt) ->
                 ?DOMAIN
             ),
             timer:sleep(?READ_RETRY_DELAY_MS),
-            read(RemoteReader, Offset, Bytes, Hint, Attempt + 1);
+            read(RemoteReader, Offset, Bytes, Hint, ReadFun, Attempt + 1);
         {error, timeout} ->
             ?LOG_DEBUG(
                 "Remote tier read timeout after ~bms, giving up"

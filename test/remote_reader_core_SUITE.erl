@@ -281,6 +281,15 @@ range_start(State, Fragment) ->
 read(State, Offset, Bytes) ->
     rabbitmq_stream_s3_remote_reader_core:step(State, {read, Offset, Bytes, chunk_boundary}).
 
+%% The reply effects, with their payloads flattened. A read is answered with
+%% iodata - the blocks the buffer holds, unflattened, so the send path can put
+%% them straight on the socket - and what a test is checking is the bytes.
+replies(Effects) ->
+    [flatten_reply(E) || {reply, _} = E <- Effects].
+
+flatten_reply({reply, {ok, Data}}) -> {reply, {ok, iolist_to_binary(Data)}};
+flatten_reply(Effect) -> Effect.
+
 %% The ranges the core has asked for and not yet been answered.
 outstanding_ranges(State) ->
     rabbitmq_stream_s3_remote_reader_core:outstanding_ranges(State).
@@ -340,7 +349,7 @@ read_served_from_buffer(_Config) ->
         S1, {read, 64, 100, chunk_boundary}
     ),
     ?assertMatch([{reply, {ok, _}} | _], Effects),
-    [{reply, {ok, ResultData}} | _] = Effects,
+    [{reply, {ok, ResultData}} | _] = replies(Effects),
     ?assertEqual(100, byte_size(ResultData)).
 
 read_awaits_when_buffer_empty(_Config) ->
@@ -353,7 +362,7 @@ read_awaits_when_buffer_empty(_Config) ->
         S0, {read, 64, 100, chunk_boundary}
     ),
     %% No reply effect — the read is pending.
-    Replies = [E || {reply, _} = E <- Effects],
+    Replies = replies(Effects),
     ?assertEqual([], Replies).
 
 retry_after_transient_error(_Config) ->
@@ -389,7 +398,7 @@ two_timeouts_then_retry_succeeds(_Config) ->
     %% Data arrives, read is served.
     Data = binary:copy(<<0>>, 1024),
     {_S5, E4} = deliver(S4, 0, Data, done),
-    Replies4 = [E || {reply, _} = E <- E4],
+    Replies4 = replies(E4),
     ?assertMatch([{reply, {ok, _}}], Replies4).
 
 fragment_transition_with_prefetch(_Config) ->
@@ -634,13 +643,13 @@ out_of_order_arrival_is_reassembled(_Config) ->
     %% Answer the third and second ranges; nothing can be served yet.
     {S1, _} = deliver(S0, 0, 2008, pattern(2008, 1000), done),
     {S2, E2} = read(S1, 8, 3000),
-    ?assertEqual([], [E || {reply, _} = E <- E2]),
+    ?assertEqual([], replies(E2)),
     {S3, _} = deliver(S2, 0, 1008, pattern(1008, 1000), done),
     {S4, E4} = read(S3, 8, 3000),
-    ?assertEqual([], [E || {reply, _} = E <- E4]),
+    ?assertEqual([], replies(E4)),
     %% The first range closes the gap, and all three flush in order.
     {_S5, E5} = deliver(S4, 0, 8, pattern(8, 1000), done),
-    ?assertEqual([{reply, {ok, pattern(8, 3000)}}], [E || {reply, _} = E <- E5]).
+    ?assertEqual([{reply, {ok, pattern(8, 3000)}}], replies(E5)).
 
 mid_pipeline_error_reissues_only_that_range(_Config) ->
     %% One range failing must not disturb the others, and the retry must re-issue
@@ -697,7 +706,7 @@ fully_delivered_range_failing_before_fin_is_dropped(_Config) ->
     %% The successor's bytes still reach the buffer, and the read is served.
     {S3, _} = deliver(S2, 0, 1008, pattern(1008, 1000), done),
     {_S4, E4} = read(S3, 8, 2000),
-    ?assertEqual([{reply, {ok, pattern(8, 2000)}}], [X || {reply, _} = X <- E4]).
+    ?assertEqual([{reply, {ok, pattern(8, 2000)}}], replies(E4)).
 
 open_range_keeps_flushing_its_successors(_Config) ->
     %% The same range that owes nothing while its closing frame is outstanding,
@@ -719,13 +728,13 @@ open_range_keeps_flushing_its_successors(_Config) ->
     %% Everything after it must still flush, on this delivery and on the next.
     {S3, _} = deliver(S2, 0, 2008, pattern(2008, 1000), done),
     {S4, E4} = read(S3, 8, 3000),
-    ?assertEqual([{reply, {ok, pattern(8, 3000)}}], [X || {reply, _} = X <- E4]),
+    ?assertEqual([{reply, {ok, pattern(8, 3000)}}], replies(E4)),
     %% Closing the head at last drops it and leaves the queue readable.
     {S5, _} = deliver(S4, 0, 8, <<>>, done),
     ?assertEqual([], [R || {_, 8, 1007} = R <- outstanding_ranges(S5)]),
     {S6, _} = deliver(S5, 0, 3008, pattern(3008, 1000), done),
     {_S7, E7} = read(S6, 3008, 1000),
-    ?assertEqual([{reply, {ok, pattern(3008, 1000)}}], [X || {reply, _} = X <- E7]).
+    ?assertEqual([{reply, {ok, pattern(3008, 1000)}}], replies(E7)).
 
 open_range_does_not_pull_the_frontier_back(_Config) ->
     %% Where the next range starts cannot be read off the queue alone. A range
@@ -745,9 +754,9 @@ open_range_does_not_pull_the_frontier_back(_Config) ->
     ?assertEqual([{8, 1007}], fragment_ranges(S2, 0)),
     %% The consumer walks through the buffered bytes.
     {S3, E3} = read(S2, 8, 1000),
-    ?assertEqual([{reply, {ok, pattern(8, 1000)}}], [X || {reply, _} = X <- E3]),
+    ?assertEqual([{reply, {ok, pattern(8, 1000)}}], replies(E3)),
     {S4, E4} = read(S3, 1008, 1000),
-    ?assertEqual([{reply, {ok, pattern(1008, 1000)}}], [X || {reply, _} = X <- E4]),
+    ?assertEqual([{reply, {ok, pattern(1008, 1000)}}], replies(E4)),
     %% Reading on past them is what asks for the next range. It must start at
     %% the buffer's end, not after the stale queue entry - asking for 1008 again
     %% would re-fetch bytes the buffer already holds.
@@ -756,7 +765,7 @@ open_range_does_not_pull_the_frontier_back(_Config) ->
     %% And it flushes, so the fragment stays readable.
     {S6, _} = deliver(S5, 0, 2008, pattern(2008, 1000), done),
     {_S7, E7} = read(S6, 2008, 1000),
-    ?assertEqual([{reply, {ok, pattern(2008, 1000)}}], [X || {reply, _} = X <- E7]).
+    ?assertEqual([{reply, {ok, pattern(2008, 1000)}}], replies(E7)).
 
 short_completion_refetches_the_gap(_Config) ->
     %% A response that ends before its range does must not leave a hole: the
@@ -772,7 +781,7 @@ short_completion_refetches_the_gap(_Config) ->
     %% Filling the gap releases the bytes staged behind it too.
     {S3, _} = deliver(S2, 0, 408, pattern(408, 600), done),
     {_S4, E4} = read(S3, 8, 2000),
-    ?assertEqual([{reply, {ok, pattern(8, 2000)}}], [X || {reply, _} = X <- E4]).
+    ?assertEqual([{reply, {ok, pattern(8, 2000)}}], replies(E4)).
 
 short_completion_at_the_frontier_refetches_the_gap(_Config) ->
     %% The same hole, but in the last range of a fragment, with the window
@@ -806,7 +815,7 @@ short_completion_at_the_frontier_refetches_the_gap(_Config) ->
     %% The byte arrives and the fragment can be read to its end.
     {S5, _} = deliver(S4, 0, 2007, pattern(2007, 1), done),
     {_S6, E6} = read(S5, 1008, 1000),
-    ?assertEqual([{reply, {ok, pattern(1008, 1000)}}], [E || {reply, _} = E <- E6]).
+    ?assertEqual([{reply, {ok, pattern(1008, 1000)}}], replies(E6)).
 
 empty_completion_backs_off(_Config) ->
     %% A response that closes without a byte would otherwise be re-issued
@@ -825,7 +834,7 @@ over_delivery_is_clipped(_Config) ->
     {S1, _} = deliver(S0, 0, 8, pattern(8, 2500), done),
     {S2, _} = deliver(S1, 0, 1008, pattern(1008, 1000), done),
     {_S3, E3} = read(S2, 8, 2000),
-    ?assertEqual([{reply, {ok, pattern(8, 2000)}}], [E || {reply, _} = E <- E3]).
+    ?assertEqual([{reply, {ok, pattern(8, 2000)}}], replies(E3)).
 
 stale_data_for_dropped_range_is_ignored(_Config) ->
     %% A range cancelled by a read deadline can still have frames in flight.
@@ -838,13 +847,13 @@ stale_data_for_dropped_range_is_ignored(_Config) ->
     ),
     ?assertEqual([], fragment_ranges(S2, 0)),
     {S3, E3} = deliver(S2, 0, 1008, pattern(1008, 1000), done),
-    ?assertEqual([], [E || {reply, _} = E <- E3]),
+    ?assertEqual([], replies(E3)),
     %% The reader refills from the end of the buffer it kept - here the position
     %% it started at, since nothing had been delivered - and keeps nothing of the
     %% stale range, so a read still has to wait.
     ?assertMatch([{?SEGMENT_HEADER_B, _} | _], fragment_ranges(S3, 0)),
     {_S4, E4} = read(S3, 8, 100),
-    ?assertEqual([], [E || {reply, _} = E <- E4]).
+    ?assertEqual([], replies(E4)).
 
 spill_stops_one_fragment_ahead(_Config) ->
     %% The frontier spills into the next fragment once the current one is fully
@@ -1010,11 +1019,11 @@ multi_chunk_data_accumulation(_Config) ->
     %% Data arrives in 3 pieces of 100 bytes each.
     Chunk = binary:copy(<<$A>>, 100),
     {S2, E1} = deliver(S1, 0, Chunk, continue),
-    ?assertEqual([], [E || {reply, _} = E <- E1]),
+    ?assertEqual([], replies(E1)),
     {S3, E2} = deliver(S2, 0, Chunk, continue),
-    ?assertEqual([], [E || {reply, _} = E <- E2]),
+    ?assertEqual([], replies(E2)),
     {_S4, E3} = deliver(S3, 0, Chunk, done),
-    Replies = [E || {reply, _} = E <- E3],
+    Replies = replies(E3),
     ?assertMatch([{reply, {ok, _}}], Replies),
     [{reply, {ok, ResultData}}] = Replies,
     ?assertEqual(300, byte_size(ResultData)).
@@ -1072,7 +1081,7 @@ fragment_transition_without_prefetch_awaits(_Config) ->
         S1, {read, 264, 50, chunk_boundary}
     ),
     %% No reply — awaiting next fragment data.
-    Replies = [E || {reply, _} = E <- Effects],
+    Replies = replies(Effects),
     ?assertEqual([], Replies).
 
 read_at_exact_fragment_boundary(_Config) ->
@@ -1152,7 +1161,7 @@ read_larger_than_buffer_awaits(_Config) ->
     ),
     %% No reply — awaiting more data. A new request may or may not be emitted
     %% (depends on whether one was already started when data arrived).
-    Replies = [E || {reply, _} = E <- Effects],
+    Replies = replies(Effects),
     ?assertEqual([], Replies).
 
 header_overread_capped_at_index_boundary(_Config) ->
@@ -1175,7 +1184,7 @@ header_overread_capped_at_index_boundary(_Config) ->
     {_S2, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
         S1, {read, 400, 200, chunk_boundary}
     ),
-    Replies = [E || {reply, _} = E <- Effects],
+    Replies = replies(Effects),
     ?assertMatch([{reply, {ok, _}}], Replies),
     [{reply, {ok, ResultData}}] = Replies,
     ?assertEqual(108, byte_size(ResultData)).
@@ -1204,7 +1213,7 @@ tail_header_overread_below_guard_serves_remaining(_Config) ->
     {_S2, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
         S1, {read, 460, 64, chunk_boundary}
     ),
-    Replies = [E || {reply, _} = E <- Effects],
+    Replies = replies(Effects),
     ?assertMatch([{reply, {ok, _}}], Replies),
     [{reply, {ok, ResultData}}] = Replies,
     ?assertEqual(48, byte_size(ResultData)).
@@ -1304,7 +1313,7 @@ deadline_expired_keeps_the_buffer_for_the_retry(_Config) ->
     ?assertEqual([], outstanding_ranges(S4)),
     %% The retry re-reads the chunk header, behind the read that timed out.
     {S5, E5} = read(S4, 64, 100),
-    ?assertEqual([{reply, {ok, pattern(64, 100)}}], [E || {reply, _} = E <- E5]),
+    ?assertEqual([{reply, {ok, pattern(64, 100)}}], replies(E5)),
     %% Nothing the consumer has already read through is fetched again.
     ?assertMatch([{5064, _} | _], fragment_ranges(S5, 0)),
     ?assertEqual([], [Range || {start_request, _, {Start, _} = Range, _} <- E5, Start < 5064]).
@@ -1324,7 +1333,7 @@ deadline_expired_at_a_fragment_boundary_refetches_nothing(_Config) ->
     {S1, _} = deliver(S0, 0, ?SEGMENT_HEADER_B, pattern(8, 1000), done),
     {S2, _} = read(S1, ?SEGMENT_HEADER_B, 1500),
     {S3, E3} = deliver(S2, 0, 1008, pattern(1008, 1000), done),
-    ?assertEqual([{reply, {ok, pattern(8, 1500)}}], [E || {reply, _} = E <- E3]),
+    ?assertEqual([{reply, {ok, pattern(8, 1500)}}], replies(E3)),
     %% The consumer reads past the fragment and waits on the transition.
     {S4, _} = read(S3, ?SEGMENT_HEADER_B + 2000, 100),
     {S5, _} = rabbitmq_stream_s3_remote_reader_core:step(S4, deadline_expired),
@@ -1750,7 +1759,7 @@ next_fragment_peek_is_fetched_once(_Config) ->
     %% after the new current one is looked up afresh.
     {S3, _} = deliver(S2, 2000, 8, pattern(8, 1000), done),
     {_S4, E} = read(S3, ?SEGMENT_HEADER_B + 1000, 50),
-    ?assertMatch([{next_fragment, 2000}], [R || {reply, R} <- E]),
+    ?assertMatch([{next_fragment, 2000}], [R || {reply, R} <- replies(E)]),
     ?assertEqual(2, counters:get(Fetches, 1)).
 
 failed_group_peek_is_retried_on_the_backoff(_Config) ->
@@ -1880,7 +1889,7 @@ answer_until_served(State0, Rounds) ->
                 {State0, []},
                 Ranges
             ),
-            case [D || {reply, {ok, D}} <- Effects] of
+            case [D || {reply, {ok, D}} <- replies(Effects)] of
                 [Served] -> {Served, State};
                 [] -> answer_until_served(State, Rounds - 1)
             end

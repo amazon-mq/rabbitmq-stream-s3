@@ -112,6 +112,8 @@ synchronous feedback is generated.
     stop/1,
     read/4,
     read/5,
+    read_iodata/4,
+    read_iodata/5,
     init_counters/0,
     prefetch_window_prometheus_format/0
 ]).
@@ -210,9 +212,26 @@ stop(Pid) ->
 %% timeout and invert the ordering.
 -define(READ_TIMEOUT_MARGIN_MS, 5_000).
 
+%% Reads come back as iodata: the reader holds its window as the blocks S3
+%% delivered, and a range spanning two of them is a list of two rather than a
+%% copy of the range. `read/4,5` flattens that for callers that need a single
+%% binary to slice - which is what the chunk-iterator path does, record by
+%% record - and `read_iodata/4,5` is for the callers that do not: the
+%% high-throughput send path puts the result straight into an iolist for the
+%% socket, so flattening it first is a copy of every byte for nothing.
+%%
+%% The flattening happens here, in the caller, rather than in the reader: the
+%% blocks cross the process boundary as refc binaries either way, so this only
+%% moves the copy off the reader, which is a data pipe shared by nothing else.
 read(Server, Offset, Bytes, Hint) ->
+    flatten(read_iodata(Server, Offset, Bytes, Hint)).
+
+read_iodata(Server, Offset, Bytes, Hint) ->
     Timeout = read_deadline_ms(Offset, Bytes, ?PENDING_READ_DEADLINE_MS) + ?READ_TIMEOUT_MARGIN_MS,
-    read(Server, Offset, Bytes, Hint, Timeout).
+    read_iodata(Server, Offset, Bytes, Hint, Timeout).
+
+flatten({ok, IoData}) -> {ok, iolist_to_binary(IoData)};
+flatten(Other) -> Other.
 
 %% The deadline for a read, and the basis for its caller's call timeout. Both
 %% derive from this so the ordering between them holds at every read size.
@@ -221,6 +240,9 @@ read_deadline_ms(Offset, Bytes, BaseMs) ->
     BaseMs + ToFetch div ?DEADLINE_BYTES_PER_MS.
 
 read(Server, Offset, Bytes, Hint, Timeout) ->
+    flatten(read_iodata(Server, Offset, Bytes, Hint, Timeout)).
+
+read_iodata(Server, Offset, Bytes, Hint, Timeout) ->
     T0 = erlang:monotonic_time(),
     Result =
         try

@@ -240,8 +240,11 @@ one that never left the node because the connection pool had nothing free.
     | {fatal_error, term()}
     | stop.
 
+%% A served read carries iodata - the buffer's own blocks, so a read spanning
+%% two of them is not copied to build one binary. See
+%% `rabbitmq_stream_s3_read_buffer`.
 -type read_result() ::
-    {ok, binary()}
+    {ok, [binary()]}
     | {error, timeout}
     | {next_fragment, osiris:offset()}
     | {become_local, osiris:offset()}
@@ -583,7 +586,7 @@ try_serve(#state{pending = undefined} = State) ->
 try_serve(#state{pending = #pending{offset = Offset, bytes = Bytes}} = State) ->
     case try_read(State, Offset, Bytes) of
         {ok, Data, State1} ->
-            State2 = note_hit(byte_size(Data), State1#state{pending = undefined}),
+            State2 = note_hit(iolist_size(Data), State1#state{pending = undefined}),
             {State3, Effects} = maybe_start_requests(State2),
             {State3, [
                 {reply, {ok, Data}},
@@ -661,7 +664,12 @@ try_read(
             end;
         false ->
             ReadBytes = min(Bytes, IdxStartPos - Offset),
-            Data = rabbitmq_stream_s3_read_buffer:read(Offset, ReadBytes, Buffer),
+            %% iodata, not a binary: the buffer holds the bytes as the blocks S3
+            %% delivered them, and a read that spans two of them would otherwise
+            %% be flattened here - copying the whole range - for a caller that
+            %% may well only want to write it to a socket. Callers that need one
+            %% binary say so at the edge (see `read/5` in the shell).
+            Data = rabbitmq_stream_s3_read_buffer:read_iodata(Offset, ReadBytes, Buffer),
             %% Reads are non-decreasing, so blocks entirely below this read's
             %% start are consumed; drop them so they are freed incrementally.
             Buffer1 = rabbitmq_stream_s3_read_buffer:drop_before(Offset, Buffer),
