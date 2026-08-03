@@ -63,8 +63,8 @@ baseline row.
 %% copying dominates, small enough that a bench run takes seconds.
 -define(DELIVERY_B, 1_048_576).
 -define(DELIVERIES, 16).
-%% The prefetch runs ahead of the consumer; that is what the AIMD window is
-%% for. The consumer starts reading only once this many unconsumed bytes are
+%% The prefetch runs ahead of the consumer; that is what the prefetch window
+%% is for. The consumer starts reading only once this many unconsumed bytes are
 %% buffered and then consumes one delivery's worth per delivery, holding the
 %% lag steady (half the window). Without the lag the consumer tracks the
 %% delivery edge, the old compaction keeps even the flat binary tiny, and

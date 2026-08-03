@@ -33,6 +33,7 @@ all() ->
         drop_before_end_drops_everything,
         drop_never_moves_empty_buffer,
         small_read_is_copied,
+        small_read_as_iodata_is_copied,
         large_read_shares_block,
         whole_block_read_shares_block_term,
         read_iodata_copies_nothing_at_edges,
@@ -200,11 +201,28 @@ read_iodata_copies_nothing_at_edges(_Config) ->
     ?assertEqual(500, byte_size(Last)),
     ?assertEqual(pattern(500, 2000), iolist_to_binary(IoData)).
 
+small_read_as_iodata_is_copied(_Config) ->
+    %% The cutoff has to hold for iodata reads too, which is how the read path
+    %% takes its bytes. Flattening does not save a caller that skips it:
+    %% `iolist_to_binary/1` of a one-element list returns that element
+    %% unchanged, so a shared sub-binary would still pin its block after the
+    %% caller had flattened it - which is what the chunk-header over-read does,
+    %% once per chunk, for a ~1 MiB delivery block.
+    Buf = build(8, [100_000]),
+    [Data] = ?BUF:read_iodata(50, 303, Buf),
+    ?assertEqual(303, binary:referenced_byte_size(Data)),
+    ?assertEqual(303, binary:referenced_byte_size(iolist_to_binary([Data]))),
+    %% Straddling two blocks is the same read, assembled rather than copied.
+    Spanning = build(0, [1000, 1000]),
+    [Across] = ?BUF:read_iodata(950, 100, Spanning),
+    ?assertEqual(pattern(950, 100), Across),
+    ?assertEqual(100, binary:referenced_byte_size(Across)).
+
 copy_share_boundary(_Config) ->
     %% Pins down the copy-vs-share cutoff (?COPY_MAX_B = 512). A read at the
     %% threshold is copied and pins nothing; one byte over it is shared as a
-    %% sub-binary of the whole block. A flip of `=<` to `<` in read/3 would
-    %% regress the threshold read into pinning the block.
+    %% sub-binary of the whole block. A flip of `=<` to `<` in `copy_short/2`
+    %% would regress the threshold read into pinning the block.
     Buf = build(8, [100_000]),
     AtLimit = ?BUF:read(50, 512, Buf),
     ?assertEqual(512, byte_size(AtLimit)),

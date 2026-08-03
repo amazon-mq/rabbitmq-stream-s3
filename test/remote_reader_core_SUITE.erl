@@ -26,8 +26,29 @@ all() ->
         become_local_at_end_of_manifest,
         not_found_triggers_refresh_iterator,
         %% New tests
-        aimd_growth_after_consecutive_hits,
-        aimd_shrink_on_miss,
+        window_grows_on_miss,
+        window_capped_at_window_max,
+        window_decays_after_sustained_hits,
+        served_read_frees_its_bytes_from_the_window,
+        pipeline_fills_to_window_and_depth,
+        out_of_order_arrival_is_reassembled,
+        mid_pipeline_error_reissues_only_that_range,
+        failing_batch_arms_one_timer,
+        fully_delivered_range_failing_before_fin_is_dropped,
+        open_range_keeps_flushing_its_successors,
+        open_range_does_not_pull_the_frontier_back,
+        short_completion_refetches_the_gap,
+        short_completion_at_the_frontier_refetches_the_gap,
+        empty_completion_backs_off,
+        over_delivery_is_clipped,
+        stale_data_for_dropped_range_is_ignored,
+        spill_stops_one_fragment_ahead,
+        placement_pass_does_not_look_ahead,
+        window_ceiling_below_the_request_size_is_clamped,
+        become_local_answers_the_pending_read,
+        become_local_does_not_advance_the_iterator,
+        next_fragment_404_refresh_reuses_the_peek,
+        next_fragment_flushes_while_current_range_streams,
         exponential_backoff_caps_at_max,
         fatal_error_emits_stop,
         fatal_error_reports_reason_before_stop,
@@ -42,10 +63,20 @@ all() ->
         header_overread_capped_at_index_boundary,
         tail_header_overread_below_guard_serves_remaining,
         next_fragment_404_triggers_refresh_iterator,
+        stale_404_for_a_left_behind_fragment_keeps_the_prefetch,
         prefetch_404_full_recovery,
         deadline_expired_replies_error_timeout,
-        deadline_expired_resets_buffer_for_retry,
+        deadline_expired_keeps_the_buffer_for_the_retry,
+        deadline_expired_at_a_fragment_boundary_refetches_nothing,
+        deadline_expired_disowns_the_retry_timer,
+        deadline_expired_clears_a_failed_look_ahead,
+        deadline_expired_keeps_an_answered_look_ahead,
+        deadline_expired_cancels_the_retry_timers,
+        deadline_expired_drops_the_prefetched_next_fragment,
+        deadline_expired_keeps_a_404_next_fragment,
+        iterator_refresh_cancels_the_retry_timers,
         fragment_404_emits_refresh_iterator,
+        known_404_fragment_is_not_refetched,
         last_fragment_404_no_pending_read_refreshes_past_current,
         current_fragment_404_no_pending_read_keeps_next_live_fragment,
         current_and_next_404_read_past_current_keeps_surviving_fragment,
@@ -56,9 +87,27 @@ all() ->
         pool_busy_backoff_capped_at_500,
         pool_busy_delay_resets_on_data,
         pool_busy_backoff_independent_of_network_errors,
+        pool_busy_retry_does_not_release_a_throttled_range,
+        pool_busy_delay_resets_once_its_range_waits_on_the_other_clock,
+        pool_busy_delay_resets_once_its_range_completes_empty,
+        become_local_cancels_the_retry_timers,
+        partial_throttling_does_not_reset_the_backoff,
+        retry_round_in_flight_does_not_reset_the_backoff,
+        backoff_resets_once_the_retried_range_delivers,
+        backoff_resets_when_the_retried_range_delivers_but_stays_queued,
+        degenerate_prefetch_settings_are_clamped,
+        %% Looking one fragment ahead can cost an S3 GET, so it is memoised
+        next_fragment_peek_is_fetched_once,
+        failed_group_peek_is_retried_on_the_backoff,
+        failed_group_peek_is_not_retried_on_the_pool_clock,
+        failed_group_peek_arms_its_own_retry,
+        group_fetch_failure_keeps_the_ranges_in_flight,
+        read_larger_than_the_window_is_still_served,
+        end_of_manifest_transition_drops_outstanding_requests,
         %% Transient group fetch errors must retry, not become local (F3)
         group_fetch_failure_retries_not_become_local,
         group_fetch_failure_on_refreshed_iterator_retries,
+        group_fetch_failure_on_refreshed_iterator_drops_cancelled_requests,
         group_fetch_failure_backs_off_and_retries
     ].
 
@@ -95,33 +144,28 @@ mock_iterator(Entries) ->
 build_manifest([]) ->
     #manifest{entries = <<>>};
 build_manifest(Entries) ->
-    EntriesBin = lists:foldl(
+    #manifest{
+        first_offset = element(1, hd(Entries)),
+        next_offset = element(1, lists:last(Entries)) + 100,
+        entries = entries_bin(Entries)
+    }.
+
+entries_bin(Entries) ->
+    lists:foldl(
         fun({Offset, Size, Uid}, Acc) ->
             E = ?ENTRY(Offset, 0, 0, ?MANIFEST_KIND_FRAGMENT, Size, Uid),
             <<Acc/binary, E/binary>>
         end,
         <<>>,
         Entries
-    ),
-    #manifest{
-        first_offset = element(1, hd(Entries)),
-        next_offset = element(1, lists:last(Entries)) + 100,
-        entries = EntriesBin
-    }.
+    ).
 
 %% Build an iterator whose manifest is the given fragment entries followed by a
 %% group entry, and whose group fetch fails transiently. After init advances
 %% past the first fragment the iterator points at the group, so the next call to
 %% `next/1` descends into it and returns `{error, {group_fetch_failed, _}}`.
 mock_iterator_failing_group(FragEntries, {GroupOffset, _, GroupUid}) ->
-    FragBin = lists:foldl(
-        fun({Offset, Size, Uid}, Acc) ->
-            E = ?ENTRY(Offset, 0, 0, ?MANIFEST_KIND_FRAGMENT, Size, Uid),
-            <<Acc/binary, E/binary>>
-        end,
-        <<>>,
-        FragEntries
-    ),
+    FragBin = entries_bin(FragEntries),
     GroupEntry = ?ENTRY(GroupOffset, 0, 0, ?MANIFEST_KIND_GROUP, 0, GroupUid),
     FirstOffset = element(1, hd(FragEntries)),
     Manifest = #manifest{
@@ -138,6 +182,56 @@ mock_iterator_failing_group(FragEntries, {GroupOffset, _, GroupUid}) ->
         _ -> Iterator0
     end.
 
+%% As `mock_iterator_failing_group/2`, but counting the attempts.
+mock_iterator_counting_failing_group(FragEntries, {GroupOffset, _, GroupUid}, Counter) ->
+    GroupEntry = ?ENTRY(GroupOffset, 0, 0, ?MANIFEST_KIND_GROUP, 0, GroupUid),
+    FirstOffset = element(1, hd(FragEntries)),
+    Manifest = #manifest{
+        first_offset = FirstOffset,
+        next_offset = GroupOffset + 100,
+        entries = <<(entries_bin(FragEntries))/binary, GroupEntry/binary>>
+    },
+    GetGroupFun = fun(_) ->
+        counters:add(Counter, 1, 1),
+        {error, slow_down}
+    end,
+    Iterator0 = rabbitmq_stream_s3_fragment_iterator:init(Manifest, FirstOffset, GetGroupFun),
+    case rabbitmq_stream_s3_fragment_iterator:next(Iterator0) of
+        {ok, _, It} -> It;
+        _ -> Iterator0
+    end.
+
+%% Build an iterator whose manifest is the given fragment entries followed by
+%% one group node per `Children` entry, each holding that one fragment. Every
+%% descent into a group counts against `Counter`, which is what makes the cost
+%% of looking one fragment ahead - a synchronous S3 GET in production - visible
+%% to a test.
+mock_iterator_counting_groups(FragEntries, Children, Counter) ->
+    GroupsBin = lists:foldl(
+        fun({Offset, _, Uid}, Acc) ->
+            E = ?ENTRY(Offset, 0, 0, ?MANIFEST_KIND_GROUP, 0, Uid),
+            <<Acc/binary, E/binary>>
+        end,
+        <<>>,
+        Children
+    ),
+    FirstOffset = element(1, hd(FragEntries)),
+    Manifest = #manifest{
+        first_offset = FirstOffset,
+        next_offset = element(1, lists:last(Children)) + 100,
+        entries = <<(entries_bin(FragEntries))/binary, GroupsBin/binary>>
+    },
+    GetGroupFun = fun(#group_ref{offset = Offset}) ->
+        counters:add(Counter, 1, 1),
+        [Child] = [C || {O, _, _} = C <- Children, O =:= Offset],
+        {ok, entries_bin([Child])}
+    end,
+    Iterator0 = rabbitmq_stream_s3_fragment_iterator:init(Manifest, FirstOffset, GetGroupFun),
+    case rabbitmq_stream_s3_fragment_iterator:next(Iterator0) of
+        {ok, _, It} -> It;
+        _ -> Iterator0
+    end.
+
 frag_ref(Offset, Size, Uid) ->
     #fragment_ref{offset = Offset, uid = Uid, size = Size}.
 
@@ -146,6 +240,110 @@ init(StreamId, FragRef, Position, Iterator) ->
 
 init(StreamId, FragRef, Position, Iterator, Opts) ->
     rabbitmq_stream_s3_remote_reader_core:init(StreamId, FragRef, Position, Iterator, Opts).
+
+%% The core addresses a request by the id the pipeline minted for it, which is
+%% not something a test should have to track: what a test knows is which byte
+%% range S3 is answering. These resolve one to the other, so a case still reads
+%% as "the response to the range starting here". `deliver/4` and `fail/3` take
+%% the fragment's oldest outstanding range; tests that pipeline several ranges
+%% of one fragment name the range explicitly with `deliver/5` and `fail/4`.
+deliver(State, Fragment, Data, DoneOrContinue) ->
+    deliver(State, Fragment, range_start(State, Fragment), Data, DoneOrContinue).
+
+deliver(State, Fragment, RangeStart, Data, DoneOrContinue) ->
+    rabbitmq_stream_s3_remote_reader_core:step(
+        State, {data, request_id(State, Fragment, RangeStart), Data, DoneOrContinue}
+    ).
+
+fail(State, Fragment, Reason) ->
+    fail(State, Fragment, range_start(State, Fragment), Reason).
+
+fail(State, Fragment, RangeStart, Reason) ->
+    rabbitmq_stream_s3_remote_reader_core:step(
+        State, {request_error, request_id(State, Fragment, RangeStart), Fragment, Reason}
+    ).
+
+%% A range no longer in the queue has no id; the core drops such an event as
+%% stale, so any id it cannot match will do. Zero is never minted.
+request_id(State, Fragment, RangeStart) ->
+    case rabbitmq_stream_s3_remote_reader_core:request_id(State, Fragment, RangeStart) of
+        {ok, Id} -> Id;
+        error -> 0
+    end.
+
+%% Fail a range and let its retry timer fire, which is the only thing that puts
+%% the range back in flight. Tests that escalate a backoff must go through this:
+%% a second error for a range already queued for retry is a stale duplicate and
+%% is ignored, so back-to-back `fail/3` calls would not advance the delay.
+%% Returns the failure's effects, not the retry's.
+fail_then_retry(State0, Fragment, Reason) ->
+    {State1, Effects} = fail(State0, Fragment, Reason),
+    {State, _} = retry(State1, backoff_kind(Reason)),
+    {State, Effects}.
+
+%% Each backoff kind has its own timer, so a range waits on the one its failure
+%% armed: releasing it means firing that kind's timer, not the other's.
+backoff_kind(pool_busy) -> pool_busy;
+backoff_kind(_Reason) -> fault.
+
+retry(State, Kind) ->
+    rabbitmq_stream_s3_remote_reader_core:step(State, {retry, Kind}).
+
+range_start(State, Fragment) ->
+    Ranges = rabbitmq_stream_s3_remote_reader_core:outstanding_ranges(State),
+    case [Start || {F, Start, _} <- Ranges, F =:= Fragment] of
+        [Start | _] -> Start;
+        [] -> error({no_outstanding_range, Fragment, Ranges})
+    end.
+
+read(State, Offset, Bytes) ->
+    rabbitmq_stream_s3_remote_reader_core:step(State, {read, Offset, Bytes, chunk_boundary}).
+
+%% The `start_request` effects, without the id the core minted for each: what a
+%% case is checking is which range of which fragment was asked for.
+starts(Effects) ->
+    [{Key, Range, Fragment} || {start_request, _Id, Key, Range, Fragment} <- Effects].
+
+%% The reply effects, with their payloads flattened. A read is answered with
+%% iodata - the blocks the buffer holds, unflattened, so the send path can put
+%% them straight on the socket - and what a test is checking is the bytes.
+replies(Effects) ->
+    [flatten_reply(E) || {reply, _} = E <- Effects].
+
+flatten_reply({reply, {ok, Data}}) -> {reply, {ok, iolist_to_binary(Data)}};
+flatten_reply(Effect) -> Effect.
+
+%% The ranges the core has asked for and not yet been answered.
+outstanding_ranges(State) ->
+    rabbitmq_stream_s3_remote_reader_core:outstanding_ranges(State).
+
+fragment_ranges(State, Fragment) ->
+    [{Start, End} || {F, Start, End} <- outstanding_ranges(State), F =:= Fragment].
+
+%% The prefetch window: how far ahead of the consumer the reader will fetch.
+window(State) ->
+    rabbitmq_stream_s3_remote_reader_core:window_bytes(State).
+
+%% What the window and the depth cap are bounding: `{Outstanding, InFlight}`.
+load(State) ->
+    rabbitmq_stream_s3_remote_reader_core:load(State).
+
+%% Answer every outstanding range of a fragment, in queue order, with the
+%% fragment's byte pattern.
+serve_all(State0, Fragment) ->
+    lists:foldl(
+        fun({Start, End}, Acc) ->
+            {Acc1, _} = deliver(Acc, Fragment, Start, pattern(Start, End - Start + 1), done),
+            Acc1
+        end,
+        State0,
+        fragment_ranges(State0, Fragment)
+    ).
+
+%% A fragment's bytes: each byte is its own offset modulo 251, so any read can
+%% be checked against the position it claims to come from.
+pattern(Pos, Len) ->
+    <<<<(P rem 251)>> || P <- lists:seq(Pos, Pos + Len - 1)>>.
 
 %% ------------------------------------------------------------------
 %% Tests
@@ -156,25 +354,25 @@ init_requests_data(_Config) ->
     FragRef = frag_ref(0, 1_000_000, 42),
     Iterator = mock_iterator([{0, 1_000_000, 42}]),
     {_State, Effects} = init(stream_id(), FragRef, 64, Iterator),
-    ?assertMatch([{start_request, _, _, 0}], Effects).
+    ?assertMatch([{start_request, _, _, _, 0}], Effects).
 
 read_served_from_buffer(_Config) ->
     %% After data arrives, a read at that position is served immediately.
     FragRef = frag_ref(0, 1_000_000, 42),
     Iterator = mock_iterator([{0, 1_000_000, 42}]),
-    {S0, [{start_request, _Key, _Range, 0}]} =
+    {S0, [{start_request, _Id, _Key, _Range, 0}]} =
         init(stream_id(), FragRef, 64, Iterator),
 
     %% Simulate data arriving (1024 bytes starting at position 64).
     Data = binary:copy(<<0>>, 1024),
-    {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {data, make_ref(), 0, Data, done}),
+    {S1, _} = deliver(S0, 0, Data, done),
 
     %% Now request a read at position 64, 100 bytes.
     {_S2, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
         S1, {read, 64, 100, chunk_boundary}
     ),
     ?assertMatch([{reply, {ok, _}} | _], Effects),
-    [{reply, {ok, ResultData}} | _] = Effects,
+    [{reply, {ok, ResultData}} | _] = replies(Effects),
     ?assertEqual(100, byte_size(ResultData)).
 
 read_awaits_when_buffer_empty(_Config) ->
@@ -187,7 +385,7 @@ read_awaits_when_buffer_empty(_Config) ->
         S0, {read, 64, 100, chunk_boundary}
     ),
     %% No reply effect — the read is pending.
-    Replies = [E || {reply, _} = E <- Effects],
+    Replies = replies(Effects),
     ?assertEqual([], Replies).
 
 retry_after_transient_error(_Config) ->
@@ -196,10 +394,8 @@ retry_after_transient_error(_Config) ->
     Iterator = mock_iterator([{0, 1_000_000, 42}]),
     {S0, _} = init(stream_id(), FragRef, 64, Iterator),
 
-    {_S1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
-        S0, {request_error, make_ref(), 0, slow_down}
-    ),
-    ?assertMatch([{set_timer, _}], Effects).
+    {_S1, Effects} = fail(S0, 0, slow_down),
+    ?assertMatch([{set_timer, _, _}], Effects).
 
 two_timeouts_then_retry_succeeds(_Config) ->
     %% Two timeouts increase retry delay. Then retry + data arrival serves the read.
@@ -211,25 +407,21 @@ two_timeouts_then_retry_succeeds(_Config) ->
     {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {read, 64, 100, chunk_boundary}),
 
     %% First timeout.
-    {S2, E1} = rabbitmq_stream_s3_remote_reader_core:step(
-        S1, {request_error, make_ref(), 0, timeout}
-    ),
-    ?assertMatch([{set_timer, 1000}], E1),
+    {S2, E1} = fail_then_retry(S1, 0, timeout),
+    ?assertMatch([{set_timer, fault, 1000}], E1),
 
     %% Second timeout — delay doubles.
-    {S3, E2} = rabbitmq_stream_s3_remote_reader_core:step(
-        S2, {request_error, make_ref(), 0, timeout}
-    ),
-    ?assertMatch([{set_timer, 2000}], E2),
+    {S3, E2} = fail(S2, 0, timeout),
+    ?assertMatch([{set_timer, fault, 2000}], E2),
 
     %% Retry fires, new request starts.
-    {S4, E3} = rabbitmq_stream_s3_remote_reader_core:step(S3, retry),
-    ?assertMatch([{start_request, _, _, 0} | _], E3),
+    {S4, E3} = retry(S3, fault),
+    ?assertMatch([{start_request, _, _, _, 0} | _], E3),
 
     %% Data arrives, read is served.
     Data = binary:copy(<<0>>, 1024),
-    {_S5, E4} = rabbitmq_stream_s3_remote_reader_core:step(S4, {data, make_ref(), 0, Data, done}),
-    Replies4 = [E || {reply, _} = E <- E4],
+    {_S5, E4} = deliver(S4, 0, Data, done),
+    Replies4 = replies(E4),
     ?assertMatch([{reply, {ok, _}}], Replies4).
 
 fragment_transition_with_prefetch(_Config) ->
@@ -241,13 +433,11 @@ fragment_transition_with_prefetch(_Config) ->
 
     %% Fill current fragment buffer completely.
     Data = binary:copy(<<0>>, 200),
-    {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {data, make_ref(), 0, Data, done}),
+    {S1, _} = deliver(S0, 0, Data, done),
 
     %% Pre-fetch next fragment data.
     NextData = binary:copy(<<1>>, 300),
-    {S2, _} = rabbitmq_stream_s3_remote_reader_core:step(
-        S1, {data, make_ref(), 100, NextData, done}
-    ),
+    {S2, _} = deliver(S1, 100, NextData, done),
 
     %% Read past end of current fragment (position 64 + 200 = 264 > 64 + 200).
     {_S3, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
@@ -265,7 +455,7 @@ become_local_at_end_of_manifest(_Config) ->
 
     %% Fill buffer to end of fragment.
     Data = binary:copy(<<0>>, 100),
-    {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {data, make_ref(), 0, Data, done}),
+    {S1, _} = deliver(S0, 0, Data, done),
 
     %% Read past end triggers refresh_iterator effect.
     {S2, E1} = rabbitmq_stream_s3_remote_reader_core:step(S1, {read, 164, 50, chunk_boundary}),
@@ -275,7 +465,7 @@ become_local_at_end_of_manifest(_Config) ->
     {_S3, E2} = rabbitmq_stream_s3_remote_reader_core:step(
         S2, {iterator_refreshed, end_of_manifest}
     ),
-    ?assertMatch([{reply, {become_local, 0}}], E2).
+    ?assertMatch([{cancel_timers, all}, {reply, {become_local, 0}}], E2).
 
 not_found_triggers_refresh_iterator(_Config) ->
     %% A 404 on the current fragment triggers a refresh_iterator effect.
@@ -288,16 +478,14 @@ not_found_triggers_refresh_iterator(_Config) ->
     {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {read, 64, 100, chunk_boundary}),
 
     %% Request returns 404.
-    {S2, E1} = rabbitmq_stream_s3_remote_reader_core:step(
-        S1, {request_error, make_ref(), 0, not_found}
-    ),
-    ?assertMatch([{refresh_iterator, 0}], E1),
+    {S2, E1} = fail(S1, 0, not_found),
+    ?assertMatch([{cancel_requests, all}, {refresh_iterator, 0}], E1),
 
     %% Shell reports no more fragments → become_local.
     {_S3, E2} = rabbitmq_stream_s3_remote_reader_core:step(
         S2, {iterator_refreshed, end_of_manifest}
     ),
-    ?assertMatch([{reply, {become_local, 0}}], E2).
+    ?assertMatch([{cancel_timers, all}, {reply, {become_local, 0}}], E2).
 
 %% Regression for #173. When the CURRENT fragment 404s while no read is pending
 %% and the manifest has further live fragments, the refresh must advance past
@@ -314,10 +502,8 @@ current_fragment_404_no_pending_read_keeps_next_live_fragment(_Config) ->
 
     %% The current fragment 404s before any read is pending: no effect yet, the
     %% reader just records current_not_found.
-    {S1, E0} = rabbitmq_stream_s3_remote_reader_core:step(
-        S0, {request_error, make_ref(), 0, not_found}
-    ),
-    ?assertMatch([], E0),
+    {S1, E0} = fail(S0, 0, not_found),
+    ?assertMatch([{cancel_requests, all}], E0),
 
     %% A later read wants bytes past the (empty) buffer, taking the
     %% current_not_found path. The refresh must target the current 404'd offset
@@ -334,7 +520,9 @@ current_fragment_404_no_pending_read_keeps_next_live_fragment(_Config) ->
     {_S3, E2} = rabbitmq_stream_s3_remote_reader_core:step(
         S2, {iterator_refreshed, RefreshedIterator}
     ),
-    ?assertMatch([{reply, {next_fragment, 100}} | _], E2).
+    ?assertMatch(
+        [{cancel_requests, all}, {cancel_timers, all}, {reply, {next_fragment, 100}} | _], E2
+    ).
 
 %% Regression for #173, the subtle interleaving: the current fragment 404s
 %% (current_not_found = true) AND its prefetched next fragment also 404s
@@ -356,19 +544,15 @@ current_and_next_404_read_past_current_keeps_surviving_fragment(_Config) ->
     %% Fill the current fragment's buffer so a read past it transitions rather
     %% than awaiting more data for the current fragment.
     Data = binary:copy(<<0>>, 1_000_000),
-    {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(
-        S0, {data, make_ref(), 0, Data, done}
-    ),
+    {S1, _} = deliver(S0, 0, Data, done),
 
     %% Current fragment (0) 404s with no read pending: records current_not_found.
-    {S2, _} = rabbitmq_stream_s3_remote_reader_core:step(
-        S1, {request_error, make_ref(), 0, not_found}
-    ),
+    %% Its range is already complete, so the 404 is addressed explicitly.
+    {S2, _} = fail(S1, 0, ?SEGMENT_HEADER_B, not_found),
     %% The prefetched next fragment (100) also 404s: sets next = not_found. Now
-    %% both flags are set on the same state.
-    {S3, _} = rabbitmq_stream_s3_remote_reader_core:step(
-        S2, {request_error, make_ref(), 100, not_found}
-    ),
+    %% both flags are set on the same state. The current fragment's 404 already
+    %% dropped every queued range, so this one is addressed explicitly too.
+    {S3, _} = fail(S2, 100, ?SEGMENT_HEADER_B, not_found),
 
     %% Read past the end of the current fragment (>= 64 + 1_000_000). This takes
     %% try_fragment_transition (next = not_found), but current_not_found is also
@@ -384,63 +568,504 @@ current_and_next_404_read_past_current_keeps_surviving_fragment(_Config) ->
     {_S5, E2} = rabbitmq_stream_s3_remote_reader_core:step(
         S4, {iterator_refreshed, RefreshedIterator}
     ),
-    ?assertMatch([{reply, {next_fragment, 200}} | _], E2).
+    ?assertMatch(
+        [{cancel_requests, all}, {cancel_timers, all}, {reply, {next_fragment, 200}} | _], E2
+    ).
 
 %% ------------------------------------------------------------------
-%% AIMD and retry tests
+%% Prefetch window and retry tests
 %% ------------------------------------------------------------------
 
-aimd_growth_after_consecutive_hits(_Config) ->
-    %% 8 consecutive buffer hits grow read_size by one GROW_STEP (1 MiB).
-    FragRef = frag_ref(0, 10_000_000, 42),
-    Iterator = mock_iterator([{0, 10_000_000, 42}]),
-    {S0, _} = init(stream_id(), FragRef, 64, Iterator),
-    %% Fill buffer with plenty of data.
-    Data = binary:copy(<<0>>, 5_000_000),
-    {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {data, make_ref(), 0, Data, done}),
-    %% Issue 8 reads (all buffer hits). Each read at a different position.
+window_grows_on_miss(_Config) ->
+    %% A read that cannot be served means the reader is not fetching far enough
+    %% ahead, so the window doubles. The read size this replaced halved on every
+    %% miss, which drove it to its floor exactly when a consumer fell behind.
+    {S0, _} = window_test_state(#{request_size => 1024, window_max => 65_536}),
+    ?assertEqual(1024, window(S0)),
+    {S1, E1} = read(S0, ?SEGMENT_HEADER_B, 50),
+    ?assertMatch([{observe, miss, _} | _], E1),
+    ?assertEqual(2048, window(S1)),
+    %% Every delivery re-runs the serve attempt while a read waits, but only the
+    %% first counts: one slow read must not run the window to its ceiling, nor
+    %% inflate buffer_miss, which counts reads that waited rather than the
+    %% deliveries they waited through.
+    {S2, E2} = deliver(S1, 0, ?SEGMENT_HEADER_B, <<>>, continue),
+    ?assertEqual([], [E || {observe, miss, _} = E <- E2]),
+    ?assertEqual(2048, window(S2)),
+    %% A new read that also misses does grow it again.
+    {S3, _} = read(S2, ?SEGMENT_HEADER_B, 50),
+    ?assertEqual(4096, window(S3)).
+
+window_capped_at_window_max(_Config) ->
+    {S0, _} = window_test_state(#{request_size => 1024, window_max => 4096}),
     S = lists:foldl(
         fun(I, Acc) ->
-            Pos = 64 + I * 100,
-            {Acc1, _} = rabbitmq_stream_s3_remote_reader_core:step(
-                Acc, {read, Pos, 50, chunk_boundary}
-            ),
+            {Acc1, _} = read(Acc, ?SEGMENT_HEADER_B + I, 50),
             Acc1
         end,
-        S1,
-        lists:seq(0, 7)
+        S0,
+        lists:seq(0, 9)
     ),
-    %% 9th read should trigger the growth. Check via start_request range size.
-    %% Initial read_size = 4 MiB. After 8 hits: 4 MiB + 1 MiB = 5 MiB.
-    %% The next start_request (if triggered) would use the new read_size.
-    %% We verify indirectly: issue one more read that's a hit, then check
-    %% that the state is consistent (no crash, reply produced).
-    {_, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
-        S, {read, 64 + 800, 50, chunk_boundary}
-    ),
-    Replies = [E || {reply, _} = E <- Effects],
-    ?assertMatch([{reply, {ok, _}}], Replies).
+    ?assertEqual(4096, window(S)).
 
-aimd_shrink_on_miss(_Config) ->
-    %% A buffer miss halves read_size. After a timeout clears the request
-    %% and retry fires, the new request uses the halved size.
-    FragRef = frag_ref(0, 10_000_000, 42),
-    Iterator = mock_iterator([{0, 10_000_000, 42}]),
-    {S0, _} = init(stream_id(), FragRef, 64, Iterator),
-    %% Read without data → miss (adjusts read_size).
-    {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {read, 64, 100, chunk_boundary}),
-    %% Timeout clears the in-flight request.
-    {S2, [{set_timer, _}]} = rabbitmq_stream_s3_remote_reader_core:step(
-        S1, {request_error, make_ref(), 0, timeout}
+window_decays_after_sustained_hits(_Config) ->
+    %% A consumer that outruns the reader drives the window to its ceiling; once
+    %% it is being kept up with, each window's worth of bytes served without a
+    %% miss hands one request back.
+    {S0, _} = window_test_state(#{request_size => 1024, window_max => 16_384}),
+    %% Five reads with nothing buffered: 1024 doubled five times, capped.
+    S1 = lists:foldl(
+        fun(I, Acc) ->
+            {Acc1, _} = read(Acc, ?SEGMENT_HEADER_B + I, 50),
+            Acc1
+        end,
+        S0,
+        lists:seq(0, 4)
     ),
-    %% Retry → new request with halved read_size.
-    {_S3, Effects} = rabbitmq_stream_s3_remote_reader_core:step(S2, retry),
-    Requests = [{R, F} || {start_request, _, R, F} <- Effects],
-    ?assertMatch([{{64, _}, 0}], Requests),
-    [{{64, EndPos}, 0}] = Requests,
-    RangeSize = EndPos - 64,
-    %% Initial 4MiB, miss halves to 2MiB.
-    ?assertEqual(2_097_152, RangeSize).
+    ?assertEqual(16_384, window(S1)),
+    %% Now answer everything the reader asks for and read it straight back, so
+    %% every read is a hit.
+    Final = lists:foldl(
+        fun(I, State0) ->
+            State1 = serve_all(State0, 0),
+            {State, _} = read(State1, ?SEGMENT_HEADER_B + I * 512, 512),
+            State
+        end,
+        S1,
+        lists:seq(0, 199)
+    ),
+    ?assert(window(Final) < 16_384).
+
+served_read_frees_its_bytes_from_the_window(_Config) ->
+    %% The window bounds how far ahead of the *consumer* the reader fetches, so
+    %% the bytes a read carries away stop counting against it the moment they
+    %% are served. Measuring from the start of the last read instead held a
+    %% read's worth of the window shut until the next one arrived, and the
+    %% frontier trailed that much behind where the window allows.
+    FragRef = frag_ref(0, 100_000_000, 42),
+    Iterator = mock_iterator([{0, 100_000_000, 42}]),
+    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, #{
+        request_size => 1000, window_max => 1000, max_depth => 32
+    }),
+    ?assertEqual([{8, 1007}], fragment_ranges(S0, 0)),
+    %% One range, a window's worth, answered in full. Nothing follows it: the
+    %% bytes are buffered and nobody has read them yet.
+    {S1, E1} = deliver(S0, 0, pattern(8, 1000), done),
+    ?assertEqual([], starts(E1)),
+    ?assertEqual({1000, 0}, load(S1)),
+    %% Reading half of them frees half the window, which the reader spends at
+    %% once on the next range. Measuring from the start of the last read instead
+    %% freed nothing, so this asked for nothing.
+    {S2, E2} = read(S1, ?SEGMENT_HEADER_B, 500),
+    ?assertEqual([{reply, {ok, pattern(?SEGMENT_HEADER_B, 500)}}], replies(E2)),
+    ?assertEqual([{key(), {1008, 2007}, 0}], starts(E2)),
+    ?assertEqual({1500, 1}, load(S2)).
+
+%% A reader on a fragment far larger than any window it can reach, so the
+%% fragment's size never bounds what these tests observe.
+window_test_state(Opts) ->
+    FragRef = frag_ref(0, 100_000_000, 42),
+    Iterator = mock_iterator([{0, 100_000_000, 42}]),
+    init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts#{max_depth => 32}).
+
+%% ------------------------------------------------------------------
+%% Pipelining: several ranges of one fragment in flight at once
+%% ------------------------------------------------------------------
+
+pipeline_fills_to_window_and_depth(_Config) ->
+    %% The window bounds the bytes outstanding and max_depth bounds the number
+    %% of requests; whichever binds first stops the frontier.
+    {ByWindow, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    ?assertEqual(
+        [{8, 1007}, {1008, 2007}, {2008, 3007}, {3008, 4007}],
+        fragment_ranges(ByWindow, 0)
+    ),
+    {ByDepth, _} = pipelined_state(#{window_max => 1_000_000, max_depth => 3}),
+    ?assertEqual(3, length(fragment_ranges(ByDepth, 0))).
+
+out_of_order_arrival_is_reassembled(_Config) ->
+    %% Responses to concurrent range requests interleave, but the read buffer
+    %% only takes contiguous appends. Bytes for a range whose predecessors are
+    %% unfinished are held back and appended once it reaches the head.
+    {S0, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    %% Answer the third and second ranges; nothing can be served yet.
+    {S1, _} = deliver(S0, 0, 2008, pattern(2008, 1000), done),
+    {S2, E2} = read(S1, 8, 3000),
+    ?assertEqual([], replies(E2)),
+    {S3, _} = deliver(S2, 0, 1008, pattern(1008, 1000), done),
+    {S4, E4} = read(S3, 8, 3000),
+    ?assertEqual([], replies(E4)),
+    %% The first range closes the gap, and all three flush in order.
+    {_S5, E5} = deliver(S4, 0, 8, pattern(8, 1000), done),
+    ?assertEqual([{reply, {ok, pattern(8, 3000)}}], replies(E5)).
+
+mid_pipeline_error_reissues_only_that_range(_Config) ->
+    %% One range failing must not disturb the others, and the retry must re-issue
+    %% exactly the failed range rather than the frontier.
+    {S0, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    Before = fragment_ranges(S0, 0),
+    {S1, E1} = fail(S0, 0, 1008, slow_down),
+    ?assertMatch([{set_timer, fault, 1000}], E1),
+    ?assertEqual(Before, fragment_ranges(S1, 0)),
+    {_S2, E2} = retry(S1, fault),
+    ?assertEqual(
+        [{key(), {1008, 2007}, 0}],
+        starts(E2)
+    ).
+
+failing_batch_arms_one_timer(_Config) ->
+    %% Every range failing at once must arm a single retry timer: one per
+    %% failure would drive a retry pass each and multiply the backoff.
+    {S0, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    {S, Timers} = lists:foldl(
+        fun({Start, _End}, {Acc, TimerAcc}) ->
+            {Acc1, Effects} = fail(Acc, 0, Start, slow_down),
+            {Acc1, TimerAcc ++ [E || {set_timer, _, _} = E <- Effects]}
+        end,
+        {S0, []},
+        fragment_ranges(S0, 0)
+    ),
+    ?assertEqual([{set_timer, fault, 1000}], Timers),
+    %% The one retry puts every failed range back in flight.
+    {S1, E} = retry(S, fault),
+    ?assertEqual(4, length([X || {start_request, _, _, _, _} = X <- E])),
+    %% One fault failed four ranges but cost one doubling, not four. Doubling per
+    %% range would put the next round at 16s (or the 30s cap) after a single
+    %% blip, most of a read deadline spent waiting on nothing.
+    {_S2, E2} = fail(S1, 0, slow_down),
+    ?assertEqual([{set_timer, fault, 2000}], [X || {set_timer, _, _} = X <- E2]).
+
+fully_delivered_range_failing_before_fin_is_dropped(_Config) ->
+    %% A range can deliver every byte it owes and still be in flight, waiting on
+    %% the frame that closes it. If it then fails there is nothing to retry:
+    %% restarting it at the last flushed byte would leave `range_start` one past
+    %% `range_end`, which is both a backwards range to ask S3 for and, because
+    %% ranges are contiguous, a duplicate of its successor's key - so the
+    %% successor's bytes would be routed to the dead request and dropped.
+    {S0, _} = pipelined_state(#{window_max => 8000, max_depth => 4}),
+    ?assertEqual([{8, 1007}, {1008, 2007}, {2008, 3007}, {3008, 4007}], fragment_ranges(S0, 0)),
+    %% The whole first range arrives, but the response does not close.
+    {S1, _} = deliver(S0, 0, 8, pattern(8, 1000), continue),
+    {S2, E2} = fail(S1, 0, 8, connection_error),
+    %% Nothing failed to arrive, so nothing is re-requested and no backoff runs.
+    %% The depth slot it held is freed, which lets the frontier extend.
+    ?assertEqual([], [X || {set_timer, _, _} = X <- E2]),
+    ?assertEqual([{1008, 2007}, {2008, 3007}, {3008, 4007}, {4008, 5007}], fragment_ranges(S2, 0)),
+    %% The successor's bytes still reach the buffer, and the read is served.
+    {S3, _} = deliver(S2, 0, 1008, pattern(1008, 1000), done),
+    {_S4, E4} = read(S3, 8, 2000),
+    ?assertEqual([{reply, {ok, pattern(8, 2000)}}], replies(E4)).
+
+open_range_keeps_flushing_its_successors(_Config) ->
+    %% The same range that owes nothing while its closing frame is outstanding,
+    %% but left in the queue rather than failed. It stays at the head of its
+    %% fragment, and the requests behind it flush past it - which moves the
+    %% buffer's end beyond the byte that range flushed up to. Deciding whether
+    %% the head can flush by comparing those two positions therefore called it
+    %% blocked from that moment on, and since a blocked head skips the rest of
+    %% its fragment's queue, no byte of the fragment could ever reach the buffer
+    %% again. Reads stalled until the deadline, and the closing frame arriving
+    %% did not release them: the head was just as blocked once complete.
+    {S0, _} = pipelined_state(#{window_max => 8000, max_depth => 4}),
+    ?assertEqual([{8, 1007}, {1008, 2007}, {2008, 3007}, {3008, 4007}], fragment_ranges(S0, 0)),
+    %% The head delivers everything it owes without closing, and its successor
+    %% flushes past it.
+    {S1, _} = deliver(S0, 0, 8, pattern(8, 1000), continue),
+    {S2, _} = deliver(S1, 0, 1008, pattern(1008, 1000), done),
+    ?assertEqual([{8, 1007}, {2008, 3007}, {3008, 4007}, {4008, 5007}], fragment_ranges(S2, 0)),
+    %% Everything after it must still flush, on this delivery and on the next.
+    {S3, _} = deliver(S2, 0, 2008, pattern(2008, 1000), done),
+    {S4, E4} = read(S3, 8, 3000),
+    ?assertEqual([{reply, {ok, pattern(8, 3000)}}], replies(E4)),
+    %% Closing the head at last drops it and leaves the queue readable.
+    {S5, _} = deliver(S4, 0, 8, <<>>, done),
+    ?assertEqual([], [R || {_, 8, 1007} = R <- outstanding_ranges(S5)]),
+    {S6, _} = deliver(S5, 0, 3008, pattern(3008, 1000), done),
+    {_S7, E7} = read(S6, 3008, 1000),
+    ?assertEqual([{reply, {ok, pattern(3008, 1000)}}], replies(E7)).
+
+open_range_does_not_pull_the_frontier_back(_Config) ->
+    %% Where the next range starts cannot be read off the queue alone. A range
+    %% that owes nothing stays queued until its closing frame arrives while the
+    %% ranges behind it flush and are dropped, so the highest range end left in
+    %% the queue can sit *below* the buffer's end. Taking the queue's answer
+    %% then walked the frontier backwards and re-requested bytes the buffer
+    %% already held - and that duplicate could never flush (its start is behind
+    %% the buffer's end for good), so it wedged the queue for the rest of the
+    %% fragment on top of wasting the fetch.
+    {S0, _} = pipelined_state(#{window_max => 2000, max_depth => 4}),
+    ?assertEqual([{8, 1007}, {1008, 2007}], fragment_ranges(S0, 0)),
+    %% The head owes nothing but stays open; its successor delivers, flushes
+    %% past it and is dropped. The queue now ends at 1007, the buffer at 2008,
+    %% and the read that flush serves frees the window for the next range. That
+    %% range must start at the buffer's end, not after the stale queue entry -
+    %% asking for 1008 again would re-fetch bytes the buffer already holds.
+    {S1, _} = deliver(S0, 0, 8, pattern(8, 1000), continue),
+    {S2, _} = deliver(S1, 0, 1008, pattern(1008, 1000), done),
+    ?assertEqual([{8, 1007}, {2008, 3007}], fragment_ranges(S2, 0)),
+    %% The consumer walks through the buffered bytes, pulling the frontier along
+    %% behind it - always forwards, never back over what is buffered.
+    {S3, E3} = read(S2, 8, 1000),
+    ?assertEqual([{reply, {ok, pattern(8, 1000)}}], replies(E3)),
+    {S4, E4} = read(S3, 1008, 1000),
+    ?assertEqual([{reply, {ok, pattern(1008, 1000)}}], replies(E4)),
+    {S5, _} = read(S4, 2008, 1000),
+    ?assertEqual([{8, 1007}, {2008, 3007}, {3008, 4007}], fragment_ranges(S5, 0)),
+    %% And it flushes, so the fragment stays readable.
+    {S6, _} = deliver(S5, 0, 2008, pattern(2008, 1000), done),
+    {_S7, E7} = read(S6, 2008, 1000),
+    ?assertEqual([{reply, {ok, pattern(2008, 1000)}}], replies(E7)).
+
+short_completion_refetches_the_gap(_Config) ->
+    %% A response that ends before its range does must not leave a hole: the
+    %% missing bytes are requested again, and the ranges queued behind it keep
+    %% the bytes they have already received.
+    {S0, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    {S1, _} = deliver(S0, 0, 1008, pattern(1008, 1000), done),
+    {S2, _} = deliver(S1, 0, 8, pattern(8, 400), done),
+    %% The delivered prefix is complete and already in the buffer, so what is
+    %% left in the queue is the gap ahead of the untouched successors - including
+    %% the one whose bytes have arrived but cannot flush until the gap closes.
+    %% The prefix also serves the pending read, and the window that read frees
+    %% goes into a new range at the frontier.
+    ?assertEqual(
+        [{408, 1007}, {1008, 2007}, {2008, 3007}, {3008, 4007}, {4008, 5007}],
+        fragment_ranges(S2, 0)
+    ),
+    %% Filling the gap releases the bytes staged behind it too.
+    {S3, _} = deliver(S2, 0, 408, pattern(408, 600), done),
+    {_S4, E4} = read(S3, 8, 2000),
+    ?assertEqual([{reply, {ok, pattern(8, 2000)}}], replies(E4)).
+
+short_completion_at_the_frontier_refetches_the_gap(_Config) ->
+    %% The same hole, but in the last range of a fragment, with the window
+    %% already full of the next fragment's prefetch. Leaving the gap to the
+    %% frontier does not work here: `extend_frontier/1` is window-gated and a
+    %% short completion frees only the bytes that never came, so a response
+    %% short by less than one request leaves no room to ask for them again. The
+    %% hole would then never close - the fragment can never be read to its end,
+    %% so the transition that would free the next fragment's bytes can never
+    %% happen either - and every read behind it would stall until the deadline.
+    FragRef = frag_ref(0, 2000, 42),
+    Iterator = mock_iterator([{0, 2000, 42}, {100, 100_000, 43}]),
+    Opts = #{request_size => 1000, window_max => 2000, max_depth => 8},
+    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
+    %% A miss takes the window to its ceiling, which covers the whole fragment.
+    {S1, _} = read(S0, ?SEGMENT_HEADER_B, 3000),
+    ?assertEqual([{8, 1007}, {1008, 2007}], fragment_ranges(S1, 0)),
+    {S2, _} = deliver(S1, 0, 8, pattern(8, 1000), done),
+    %% Serving a read advances the consumer, which frees window for the spill
+    %% into the next fragment. The window is now full and every byte of the
+    %% current fragment has been asked for.
+    {S3, _} = read(S2, 1000, 8),
+    ?assertEqual([{8, 1007}], fragment_ranges(S3, 100)),
+    %% The fragment's last range comes back one byte short.
+    {S4, E4} = deliver(S3, 0, 1008, pattern(1008, 999), done),
+    ?assertEqual([{2007, 2007}], fragment_ranges(S4, 0)),
+    ?assertEqual(
+        [{key(), {2007, 2007}, 0}],
+        starts(E4)
+    ),
+    %% The byte arrives and the fragment can be read to its end.
+    {S5, _} = deliver(S4, 0, 2007, pattern(2007, 1), done),
+    {_S6, E6} = read(S5, 1008, 1000),
+    ?assertEqual([{reply, {ok, pattern(1008, 1000)}}], replies(E6)).
+
+empty_completion_backs_off(_Config) ->
+    %% A response that closes without a byte would otherwise be re-issued
+    %% immediately, spinning against whatever is answering that way.
+    {S0, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    {S1, E1} = deliver(S0, 0, 8, <<>>, done),
+    ?assertEqual([{set_timer, fault, 1000}], [E || {set_timer, _, _} = E <- E1]),
+    ?assertEqual([], [E || {start_request, _, _, _, _} = E <- E1]),
+    ?assertEqual({8, 1007}, hd(fragment_ranges(S1, 0))).
+
+over_delivery_is_clipped(_Config) ->
+    %% A backend that answers with more than the range asked for must not push
+    %% this request's bytes over its successor's range and have them appended
+    %% twice.
+    {S0, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    {S1, _} = deliver(S0, 0, 8, pattern(8, 2500), done),
+    {S2, _} = deliver(S1, 0, 1008, pattern(1008, 1000), done),
+    {_S3, E3} = read(S2, 8, 2000),
+    ?assertEqual([{reply, {ok, pattern(8, 2000)}}], replies(E3)).
+
+stale_data_for_dropped_range_is_ignored(_Config) ->
+    %% A range cancelled by a read deadline can still have frames in flight.
+    %% Appending those bytes would corrupt the buffer's addressing.
+    {S0, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    {S1, _} = read(S0, 8, 100),
+    {S2, E2} = rabbitmq_stream_s3_remote_reader_core:step(S1, deadline_expired),
+    ?assertMatch(
+        [{cancel_requests, all}, {cancel_timers, all}, {reply, {error, timeout}}], E2
+    ),
+    ?assertEqual([], fragment_ranges(S2, 0)),
+    {S3, E3} = deliver(S2, 0, 1008, pattern(1008, 1000), done),
+    ?assertEqual([], replies(E3)),
+    %% The reader refills from the end of the buffer it kept - here the position
+    %% it started at, since nothing had been delivered - and keeps nothing of the
+    %% stale range, so a read still has to wait.
+    ?assertMatch([{?SEGMENT_HEADER_B, _} | _], fragment_ranges(S3, 0)),
+    {_S4, E4} = read(S3, 8, 100),
+    ?assertEqual([], replies(E4)).
+
+spill_stops_one_fragment_ahead(_Config) ->
+    %% The frontier spills into the next fragment once the current one is fully
+    %% spoken for, but never further: the reader holds one prefetched fragment.
+    FragRef = frag_ref(0, 500, 42),
+    Iterator = mock_iterator([{0, 500, 42}, {100, 500, 43}, {200, 500, 44}]),
+    Opts = #{request_size => 1000, window_max => 1_000_000, max_depth => 32},
+    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
+    %% The placement pass stays inside the current fragment
+    %% (`placement_pass_does_not_look_ahead`); the read that follows spills. The
+    %% miss it takes leaves room for a third fragment, so the queue stopping at
+    %% the second is the memo's doing rather than the window's.
+    {S1, _} = read(S0, ?SEGMENT_HEADER_B, 3000),
+    ?assertEqual([{8, 507}], fragment_ranges(S1, 0)),
+    ?assertEqual([{8, 507}], fragment_ranges(S1, 100)),
+    ?assertEqual([], fragment_ranges(S1, 200)).
+
+become_local_answers_the_pending_read(_Config) ->
+    %% The become_local reply answers the read, so it has to be cleared with it.
+    %% Left pending, a frame still in flight steps `try_serve/1` for a read that
+    %% has already been answered: a second reply the shell drops, and a hit or a
+    %% miss counted - with the window grown on the way out - for a read that no
+    %% longer exists.
+    FragRef = frag_ref(0, 2000, 42),
+    Iterator = mock_iterator([{0, 2000, 42}]),
+    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator),
+    {S1, _} = read(S0, ?SEGMENT_HEADER_B, 1500),
+    {S2, E2} = rabbitmq_stream_s3_remote_reader_core:step(
+        S1, {iterator_refreshed, end_of_manifest}
+    ),
+    ?assertMatch([{become_local, 0}], [R || {reply, R} <- E2]),
+    %% A frame for a range the transition dropped, arriving after the reply. It
+    %% is stale, but the reader is still fetching until the shell stops it, so
+    %% the pass issues a range for the reset buffer.
+    {S3, E3} = deliver(S2, 0, ?SEGMENT_HEADER_B, pattern(8, 100), done),
+    ?assertMatch([_ | _], starts(E3)),
+    %% Which then delivers enough to serve the read. This is where a read left
+    %% pending is answered a second time, and counted as a hit, long after it
+    %% was replied to.
+    {_S4, E4} = deliver(S3, 0, ?SEGMENT_HEADER_B, pattern(8, 2000), done),
+    ?assertEqual([], [E || {reply, _} = E <- E4]),
+    ?assertEqual([], [E || {observe, _, _} = E <- E4]).
+
+become_local_does_not_advance_the_iterator(_Config) ->
+    %% Nothing reads the answer: the reply hands the consumer to the local tier
+    %% and the shell stops the reader. Advancing the iterator to get it can cost
+    %% a synchronous group GET.
+    Fetches = counters:new(1, []),
+    Iterator = mock_iterator_counting_groups([{0, 2000, 42}], [{2000, 1000, 7}], Fetches),
+    {S0, _} = init(stream_id(), frag_ref(0, 2000, 42), ?SEGMENT_HEADER_B, Iterator),
+    ?assertEqual(0, counters:get(Fetches, 1)),
+    {_S1, _} = rabbitmq_stream_s3_remote_reader_core:step(
+        S0, {iterator_refreshed, end_of_manifest}
+    ),
+    ?assertEqual(0, counters:get(Fetches, 1)).
+
+window_ceiling_below_the_request_size_is_clamped(_Config) ->
+    %% `prefetch_window_max` and `prefetch_request_size` are independent
+    %% settings with no schema to reject a ceiling below the floor. Unclamped,
+    %% the window starts at one request and `note_miss/1`'s
+    %% `min(WindowMax, Window * 2)` then *shrinks* it on a miss - the opposite
+    %% of what a miss means - and never admits a second range.
+    FragRef = frag_ref(0, 1_000_000, 42),
+    Iterator = mock_iterator([{0, 1_000_000, 42}]),
+    Opts = #{request_size => 1000, window_max => 100},
+    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
+    ?assertEqual(1000, window(S0)),
+    {S1, _} = read(S0, ?SEGMENT_HEADER_B, 5000),
+    ?assert(window(S1) >= 1000).
+
+next_fragment_404_refresh_reuses_the_peek(_Config) ->
+    %% Deciding which offset to refresh past means naming the fragment that
+    %% 404'd, which is the one the look-ahead already resolved - it is why the
+    %% reader asked for it. Asking the iterator again spends a second group GET
+    %% inside the core, blocking the reader while the caller's deadline burns.
+    Fetches = counters:new(1, []),
+    Iterator = mock_iterator_counting_groups([{0, 500, 42}], [{100, 500, 43}], Fetches),
+    {S0, _} = init(stream_id(), frag_ref(0, 500, 42), ?SEGMENT_HEADER_B, Iterator, #{
+        request_size => 1000
+    }),
+    %% The read spills into the next fragment, which resolves the peek.
+    {S1, _} = read(S0, ?SEGMENT_HEADER_B, 50),
+    ?assertEqual(1, counters:get(Fetches, 1)),
+    %% That prefetch 404s, and the consumer then reads past the current
+    %% fragment, which is what asks for the refresh.
+    {S2, _} = fail(S1, 100, not_found),
+    S3 = serve_all(S2, 0),
+    {_S4, E} = read(S3, ?SEGMENT_HEADER_B + 500, 50),
+    ?assertEqual([{refresh_iterator, 100}], [Eff || {refresh_iterator, _} = Eff <- E]),
+    ?assertEqual(1, counters:get(Fetches, 1)).
+
+placement_pass_does_not_look_ahead(_Config) ->
+    %% `init/5` runs in the consumer process - the shell calls it from
+    %% `gen_server:init/1`, and `gen_server:start/3` holds the consumer until it
+    %% returns - so the placement pass must not resolve the next-fragment peek:
+    %% that descends into a group object, which is a synchronous S3 GET. A
+    %% consumer attaching to a fragment shorter than one request is the case
+    %% that reaches it: the current fragment is fully spoken for by the first
+    %% range, so the frontier is ready to spill.
+    Fetches = counters:new(1, []),
+    Iterator = mock_iterator_counting_groups([{0, 100, 42}], [{2000, 1000, 7}], Fetches),
+    {S0, E0} = init(stream_id(), frag_ref(0, 100, 42), ?SEGMENT_HEADER_B, Iterator),
+    ?assertEqual(0, counters:get(Fetches, 1)),
+    ?assertEqual([0], [F || {start_request, _, _, _, F} <- E0]),
+    %% The first read is what spills, from the reader process.
+    {S1, _} = read(S0, ?SEGMENT_HEADER_B, 50),
+    ?assertEqual(1, counters:get(Fetches, 1)),
+    ?assertMatch([{0, _, _}, {2000, _, _}], outstanding_ranges(S1)).
+
+next_fragment_flushes_while_current_range_streams(_Config) ->
+    %% Each fragment's queue is independent. A current-fragment range that is
+    %% still streaming blocks only the ranges behind it in its own fragment; the
+    %% prefetched next fragment must keep filling its own buffer rather than
+    %% holding its bytes staged until the current fragment closes.
+    FragRef = frag_ref(0, 2000, 42),
+    Iterator = mock_iterator([{0, 2000, 42}, {100, 100_000, 43}]),
+    Opts = #{request_size => 1000, window_max => 4000, max_depth => 8},
+    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
+    %% Two misses grow the window past the current fragment, so the frontier
+    %% spills into the next one.
+    {S1, _} = read(S0, ?SEGMENT_HEADER_B, 3000),
+    {S2, _} = read(S1, ?SEGMENT_HEADER_B, 3000),
+    ?assertEqual([{8, 1007}, {1008, 2007}], fragment_ranges(S2, 0)),
+    ?assertEqual([{8, 1007}, {1008, 2007}], fragment_ranges(S2, 100)),
+    %% The current fragment's head range is still streaming.
+    {S3, _} = deliver(S2, 0, 8, pattern(8, 500), continue),
+    %% The next fragment's head range completes. Its bytes reach the prefetch
+    %% buffer, so the request is done with and leaves the queue.
+    {S4, _} = deliver(S3, 100, 8, pattern(8, 1000), done),
+    ?assertEqual([{1008, 2007}], fragment_ranges(S4, 100)),
+    ?assertEqual([{8, 1007}, {1008, 2007}], fragment_ranges(S4, 0)).
+
+%% A reader with several ranges of one fragment outstanding. The window has to
+%% be grown by misses first, which is what a consumer outrunning the reader
+%% does; ten reads take it to its ceiling for any window_max these tests use.
+%%
+%% The reads are small on purpose. Any unservable read grows the window, and a
+%% large one would additionally raise the fetch ceiling to its own size (see
+%% `fetch_ceiling/1`) - which is correct, but would mean these tests observed a
+%% frontier set by the read rather than by the window they are about.
+pipelined_state(Opts) ->
+    FragRef = frag_ref(0, 100_000_000, 42),
+    Iterator = mock_iterator([{0, 100_000_000, 42}]),
+    {S0, _} = init(
+        stream_id(),
+        FragRef,
+        ?SEGMENT_HEADER_B,
+        Iterator,
+        maps:merge(#{request_size => 1000}, Opts)
+    ),
+    lists:foldl(
+        fun(_, {Acc, _}) -> read(Acc, ?SEGMENT_HEADER_B, 100) end,
+        {S0, []},
+        lists:seq(1, 10)
+    ).
+
+key() ->
+    rabbitmq_stream_s3:fragment_key(stream_id(), 0, 42).
 
 exponential_backoff_caps_at_max(_Config) ->
     %% Repeated errors double the delay up to 30_000ms max.
@@ -448,25 +1073,13 @@ exponential_backoff_caps_at_max(_Config) ->
     Iterator = mock_iterator([{0, 1_000_000, 42}]),
     {S0, _} = init(stream_id(), FragRef, 64, Iterator),
     %% Fire enough errors to exceed 30s cap: 1000, 2000, 4000, 8000, 16000, 32000→30000
-    {S1, [{set_timer, 1000}]} = rabbitmq_stream_s3_remote_reader_core:step(
-        S0, {request_error, make_ref(), 0, slow_down}
-    ),
-    {S2, [{set_timer, 2000}]} = rabbitmq_stream_s3_remote_reader_core:step(
-        S1, {request_error, make_ref(), 0, slow_down}
-    ),
-    {S3, [{set_timer, 4000}]} = rabbitmq_stream_s3_remote_reader_core:step(
-        S2, {request_error, make_ref(), 0, slow_down}
-    ),
-    {S4, [{set_timer, 8000}]} = rabbitmq_stream_s3_remote_reader_core:step(
-        S3, {request_error, make_ref(), 0, slow_down}
-    ),
-    {S5, [{set_timer, 16000}]} = rabbitmq_stream_s3_remote_reader_core:step(
-        S4, {request_error, make_ref(), 0, slow_down}
-    ),
+    {S1, [{set_timer, fault, 1000}]} = fail_then_retry(S0, 0, slow_down),
+    {S2, [{set_timer, fault, 2000}]} = fail_then_retry(S1, 0, slow_down),
+    {S3, [{set_timer, fault, 4000}]} = fail_then_retry(S2, 0, slow_down),
+    {S4, [{set_timer, fault, 8000}]} = fail_then_retry(S3, 0, slow_down),
+    {S5, [{set_timer, fault, 16000}]} = fail_then_retry(S4, 0, slow_down),
     %% Next would be 32000 but capped at 30000.
-    {_S6, [{set_timer, 30000}]} = rabbitmq_stream_s3_remote_reader_core:step(
-        S5, {request_error, make_ref(), 0, slow_down}
-    ),
+    {_S6, [{set_timer, fault, 30000}]} = fail_then_retry(S5, 0, slow_down),
     ok.
 
 fatal_error_emits_stop(_Config) ->
@@ -475,9 +1088,7 @@ fatal_error_emits_stop(_Config) ->
     FragRef = frag_ref(0, 1_000_000, 42),
     Iterator = mock_iterator([{0, 1_000_000, 42}]),
     {S0, _} = init(stream_id(), FragRef, 64, Iterator),
-    {_S1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
-        S0, {request_error, make_ref(), 0, {unexpected, boom}}
-    ),
+    {_S1, Effects} = fail(S0, 0, {unexpected, boom}),
     ?assertEqual([{fatal_error, {unexpected, boom}}, stop], Effects).
 
 fatal_error_reports_reason_before_stop(_Config) ->
@@ -488,9 +1099,7 @@ fatal_error_reports_reason_before_stop(_Config) ->
     FragRef = frag_ref(0, 1_000_000, 42),
     Iterator = mock_iterator([{0, 1_000_000, 42}]),
     {S0, _} = init(stream_id(), FragRef, 64, Iterator),
-    {_S1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
-        S0, {request_error, make_ref(), 0, access_denied}
-    ),
+    {_S1, Effects} = fail(S0, 0, access_denied),
     ?assertEqual([{fatal_error, access_denied}, stop], Effects).
 
 multi_chunk_data_accumulation(_Config) ->
@@ -502,16 +1111,12 @@ multi_chunk_data_accumulation(_Config) ->
     {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {read, 64, 300, chunk_boundary}),
     %% Data arrives in 3 pieces of 100 bytes each.
     Chunk = binary:copy(<<$A>>, 100),
-    {S2, E1} = rabbitmq_stream_s3_remote_reader_core:step(
-        S1, {data, make_ref(), 0, Chunk, continue}
-    ),
-    ?assertEqual([], [E || {reply, _} = E <- E1]),
-    {S3, E2} = rabbitmq_stream_s3_remote_reader_core:step(
-        S2, {data, make_ref(), 0, Chunk, continue}
-    ),
-    ?assertEqual([], [E || {reply, _} = E <- E2]),
-    {_S4, E3} = rabbitmq_stream_s3_remote_reader_core:step(S3, {data, make_ref(), 0, Chunk, done}),
-    Replies = [E || {reply, _} = E <- E3],
+    {S2, E1} = deliver(S1, 0, Chunk, continue),
+    ?assertEqual([], replies(E1)),
+    {S3, E2} = deliver(S2, 0, Chunk, continue),
+    ?assertEqual([], replies(E2)),
+    {_S4, E3} = deliver(S3, 0, Chunk, done),
+    Replies = replies(E3),
     ?assertMatch([{reply, {ok, _}}], Replies),
     [{reply, {ok, ResultData}}] = Replies,
     ?assertEqual(300, byte_size(ResultData)).
@@ -521,44 +1126,40 @@ multi_chunk_data_accumulation(_Config) ->
 %% ------------------------------------------------------------------
 
 retryable_error_preserves_co_pending_request(_Config) ->
-    %% A retryable request error must drop only the failed fragment from the
-    %% in-flight set, not wipe it. Wiping orphaned a co-pending request: the
-    %% retry re-issued it, the shell overwrote the still-live original, and the
-    %% pooled connection leaked. Here fragment 0 (streamed to its end via a
-    %% continue chunk, so its request stays in flight) and fragment 100 (the
-    %% prefetch) are both in flight; an error on 0 must leave 100 untouched, so
-    %% the retry does not re-issue (duplicate) it.
+    %% A retryable request error must put back only the failed range, leaving
+    %% every co-pending request in flight. Wiping them orphaned a live request:
+    %% the core forgot it, the retry re-issued it, the shell overwrote the
+    %% still-live original, and the pooled connection leaked. Here fragment 0's
+    %% range and the prefetch of fragment 100 are both in flight; an error on 0
+    %% must leave 100 untouched, so the retry does not duplicate it.
     FragRef = frag_ref(0, 200, 42),
     Iterator = mock_iterator([{0, 200, 42}, {100, 500, 43}]),
     {S0, _} = init(stream_id(), FragRef, 64, Iterator),
-    Data = binary:copy(<<0>>, 200),
-    {S1, E1} = rabbitmq_stream_s3_remote_reader_core:step(
-        S0, {data, make_ref(), 0, Data, continue}
-    ),
-    %% Filling fragment 0 to its end triggered the prefetch of fragment 100, so
-    %% both are now in flight.
-    ?assertMatch([{_, _, 100}], [{K, R, F} || {start_request, K, R, F} <- E1, F =:= 100]),
-    %% Fragment 0's request errors (retryable); only fragment 0 is dropped.
-    {S2, _} = rabbitmq_stream_s3_remote_reader_core:step(
-        S1, {request_error, make_ref(), 0, slow_down}
-    ),
+    %% The first read spills the frontier into fragment 100, so both are in
+    %% flight when the error arrives.
+    {S1, E1} = read(S0, 64, 50),
+    ?assertMatch([{_, _, 100}], [{K, R, F} || {start_request, _, K, R, F} <- E1, F =:= 100]),
+    %% Fragment 0's request errors (retryable); only its range is put back.
+    {S2, _} = fail(S1, 0, slow_down),
+    ?assertEqual([{?SEGMENT_HEADER_B, ?SEGMENT_HEADER_B + 500 - 1}], fragment_ranges(S2, 100)),
     %% On retry, the surviving prefetch of fragment 100 must NOT be re-issued.
-    {_S3, E3} = rabbitmq_stream_s3_remote_reader_core:step(S2, retry),
-    ?assertEqual([], [F || {start_request, _, _, F} <- E3, F =:= 100]).
+    {_S3, E3} = retry(S2, fault),
+    ?assertEqual([0], [F || {start_request, _, _, _, F} <- E3]).
 
 prefetch_next_fragment_triggered(_Config) ->
-    %% After current fragment buffer is full, core emits start_request for next fragment.
+    %% Once every byte of the current fragment has been asked for, the frontier
+    %% spills into the next fragment rather than waiting for the current one to
+    %% arrive first. Fragment 0 is 200 bytes, so one request covers it and the
+    %% first read's pass issues the prefetch.
     FragRef = frag_ref(0, 200, 42),
     Iterator = mock_iterator([{0, 200, 42}, {100, 500, 43}]),
     {S0, _} = init(stream_id(), FragRef, 64, Iterator),
-    %% Fill current fragment completely (200 bytes from pos 64 to 264).
-    Data = binary:copy(<<0>>, 200),
-    {_S1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
-        S0, {data, make_ref(), 0, Data, done}
-    ),
-    %% Should have a start_request for fragment 100 (the next one).
-    NextRequests = [{K, R, F} || {start_request, K, R, F} <- Effects, F =:= 100],
-    ?assertMatch([{_, _, 100}], NextRequests).
+    {_S1, Effects} = read(S0, 64, 50),
+    NextRequests = [R || {start_request, _, _, R, F} <- Effects, F =:= 100],
+    %% The range is clamped to the next fragment's own data region. Asking past
+    %% it (the old behaviour) would draw a short response that, under the
+    %% re-request rule for short completions, could never be satisfied.
+    ?assertEqual([{?SEGMENT_HEADER_B, ?SEGMENT_HEADER_B + 500 - 1}], NextRequests).
 
 fragment_transition_without_prefetch_awaits(_Config) ->
     %% When next fragment data is not yet available, core awaits (no reply).
@@ -567,13 +1168,13 @@ fragment_transition_without_prefetch_awaits(_Config) ->
     {S0, _} = init(stream_id(), FragRef, 64, Iterator),
     %% Fill current fragment but do NOT provide next fragment data.
     Data = binary:copy(<<0>>, 200),
-    {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {data, make_ref(), 0, Data, done}),
+    {S1, _} = deliver(S0, 0, Data, done),
     %% Read past end of current fragment.
     {_S2, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
         S1, {read, 264, 50, chunk_boundary}
     ),
     %% No reply — awaiting next fragment data.
-    Replies = [E || {reply, _} = E <- Effects],
+    Replies = replies(Effects),
     ?assertEqual([], Replies).
 
 read_at_exact_fragment_boundary(_Config) ->
@@ -583,11 +1184,9 @@ read_at_exact_fragment_boundary(_Config) ->
     {S0, _} = init(stream_id(), FragRef, 64, Iterator),
     %% Fill current + prefetch next.
     Data = binary:copy(<<0>>, 200),
-    {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {data, make_ref(), 0, Data, done}),
+    {S1, _} = deliver(S0, 0, Data, done),
     NextData = binary:copy(<<1>>, 500),
-    {S2, _} = rabbitmq_stream_s3_remote_reader_core:step(
-        S1, {data, make_ref(), 100, NextData, done}
-    ),
+    {S2, _} = deliver(S1, 100, NextData, done),
     %% Read at exactly 64 + 200 = 264 (the boundary).
     {_S3, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
         S2, {read, 264, 50, chunk_boundary}
@@ -600,7 +1199,7 @@ mid_fragment_init_position(_Config) ->
     Iterator = mock_iterator([{0, 1_000_000, 42}]),
     MidPos = 5000,
     {_S0, Effects} = init(stream_id(), FragRef, MidPos, Iterator),
-    ?assertMatch([{start_request, _, {5000, _}, 0}], Effects).
+    ?assertMatch([{start_request, _, _, {5000, _}, 0}], Effects).
 
 fragment_404_advances_to_next_fragment(_Config) ->
     %% 404 on current fragment → refresh_iterator → iterator_refreshed with
@@ -610,9 +1209,7 @@ fragment_404_advances_to_next_fragment(_Config) ->
     {S0, _} = init(stream_id(), FragRef, 64, Iterator),
     %% Issue read, then 404.
     {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {read, 64, 100, chunk_boundary}),
-    {S2, [{refresh_iterator, 0}]} = rabbitmq_stream_s3_remote_reader_core:step(
-        S1, {request_error, make_ref(), 0, not_found}
-    ),
+    {S2, [{cancel_requests, all}, {refresh_iterator, 0}]} = fail(S1, 0, not_found),
     %% Shell refreshes iterator past offset 0. The iterator's next entry
     %% is fragment 500. Build an iterator where next/1 returns fragment 500.
     Manifest500 = build_manifest([{500, 2_000_000, 99}]),
@@ -620,8 +1217,10 @@ fragment_404_advances_to_next_fragment(_Config) ->
     NewIterator = rabbitmq_stream_s3_fragment_iterator:init(Manifest500, 0, GetGroupFun),
     {_S3, E1} = rabbitmq_stream_s3_remote_reader_core:step(S2, {iterator_refreshed, NewIterator}),
     %% Should reply with next_fragment and start a request for the new fragment.
-    ?assertMatch([{reply, {next_fragment, 500}} | _], E1),
-    Requests = [F || {start_request, _, _, F} <- E1],
+    ?assertMatch(
+        [{cancel_requests, all}, {cancel_timers, all}, {reply, {next_fragment, 500}} | _], E1
+    ),
+    Requests = [F || {start_request, _, _, _, F} <- E1],
     ?assertEqual([500], Requests).
 
 retry_resets_delay_on_success(_Config) ->
@@ -630,23 +1229,14 @@ retry_resets_delay_on_success(_Config) ->
     Iterator = mock_iterator([{0, 1_000_000, 42}]),
     {S0, _} = init(stream_id(), FragRef, 64, Iterator),
     %% Escalate: 1s, 2s, 4s.
-    {S1, [{set_timer, 1000}]} = rabbitmq_stream_s3_remote_reader_core:step(
-        S0, {request_error, make_ref(), 0, slow_down}
-    ),
-    {S2, [{set_timer, 2000}]} = rabbitmq_stream_s3_remote_reader_core:step(
-        S1, {request_error, make_ref(), 0, slow_down}
-    ),
-    {S3, [{set_timer, 4000}]} = rabbitmq_stream_s3_remote_reader_core:step(
-        S2, {request_error, make_ref(), 0, slow_down}
-    ),
-    %% Retry, then data arrives successfully.
-    {S4, _} = rabbitmq_stream_s3_remote_reader_core:step(S3, retry),
+    {S1, [{set_timer, fault, 1000}]} = fail_then_retry(S0, 0, slow_down),
+    {S2, [{set_timer, fault, 2000}]} = fail_then_retry(S1, 0, slow_down),
+    {S3, [{set_timer, fault, 4000}]} = fail_then_retry(S2, 0, slow_down),
+    %% Data arrives successfully.
     Data = binary:copy(<<0>>, 1024),
-    {S5, _} = rabbitmq_stream_s3_remote_reader_core:step(S4, {data, make_ref(), 0, Data, done}),
+    {S4, _} = deliver(S3, 0, Data, done),
     %% Next error should start back at 1000ms (reset).
-    {_S6, [{set_timer, 1000}]} = rabbitmq_stream_s3_remote_reader_core:step(
-        S5, {request_error, make_ref(), 0, slow_down}
-    ),
+    {_S5, [{set_timer, fault, 1000}]} = fail(S4, 0, slow_down),
     ok.
 
 read_larger_than_buffer_awaits(_Config) ->
@@ -657,14 +1247,14 @@ read_larger_than_buffer_awaits(_Config) ->
     {S0, _} = init(stream_id(), FragRef, 64, Iterator),
     %% Provide only 100 bytes.
     Data = binary:copy(<<0>>, 100),
-    {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {data, make_ref(), 0, Data, done}),
+    {S1, _} = deliver(S0, 0, Data, done),
     %% Request 5000 bytes at position 64. Only 100 available.
     {_S2, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
         S1, {read, 64, 5000, chunk_boundary}
     ),
     %% No reply — awaiting more data. A new request may or may not be emitted
     %% (depends on whether one was already started when data arrived).
-    Replies = [E || {reply, _} = E <- Effects],
+    Replies = replies(Effects),
     ?assertEqual([], Replies).
 
 header_overread_capped_at_index_boundary(_Config) ->
@@ -678,7 +1268,7 @@ header_overread_capped_at_index_boundary(_Config) ->
     {S0, _} = init(stream_id(), FragRef, 8, Iterator),
     %% Fill buffer to cover the full fragment data region (8 + 500 = 508).
     Data = binary:copy(<<0>>, FragSize),
-    {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {data, make_ref(), 0, Data, done}),
+    {S1, _} = deliver(S0, 0, Data, done),
     %% Read 200 bytes starting at position 400. IdxStartPos = 508.
     %% Requested end = 600 > EndPos = 508. Cap path fires.
     %% Final cap: min(508 - 8 - 400 + 8, 508 - 400) = min(108, 108) = 108.
@@ -687,7 +1277,7 @@ header_overread_capped_at_index_boundary(_Config) ->
     {_S2, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
         S1, {read, 400, 200, chunk_boundary}
     ),
-    Replies = [E || {reply, _} = E <- Effects],
+    Replies = replies(Effects),
     ?assertMatch([{reply, {ok, _}}], Replies),
     [{reply, {ok, ResultData}}] = Replies,
     ?assertEqual(108, byte_size(ResultData)).
@@ -712,11 +1302,11 @@ tail_header_overread_below_guard_serves_remaining(_Config) ->
     Iterator = mock_iterator([{0, FragSize, 42}]),
     {S0, _} = init(stream_id(), FragRef, 8, Iterator),
     Data = binary:copy(<<0>>, FragSize),
-    {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {data, make_ref(), 0, Data, done}),
+    {S1, _} = deliver(S0, 0, Data, done),
     {_S2, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
         S1, {read, 460, 64, chunk_boundary}
     ),
-    Replies = [E || {reply, _} = E <- Effects],
+    Replies = replies(Effects),
     ?assertMatch([{reply, {ok, _}}], Replies),
     [{reply, {ok, ResultData}}] = Replies,
     ?assertEqual(48, byte_size(ResultData)).
@@ -730,16 +1320,38 @@ next_fragment_404_triggers_refresh_iterator(_Config) ->
     {S0, _} = init(stream_id(), FragRef, 8, Iterator),
     %% Fill current fragment.
     Data = binary:copy(<<0>>, 200),
-    {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {data, make_ref(), 0, Data, done}),
+    {S1, _} = deliver(S0, 0, Data, done),
     %% Next fragment prefetch returns 404 (fragment 100, not current fragment 0).
-    {S2, _} = rabbitmq_stream_s3_remote_reader_core:step(
-        S1, {request_error, make_ref(), 100, not_found}
-    ),
+    {S2, _} = fail(S1, 100, not_found),
     %% Read past end of current fragment. Next is not_found → refresh past offset 100.
     {_S3, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
         S2, {read, 208, 50, chunk_boundary}
     ),
     ?assertMatch([{refresh_iterator, 100}], Effects).
+
+stale_404_for_a_left_behind_fragment_keeps_the_prefetch(_Config) ->
+    %% A 404 says something about the prefetch only if it is the prefetched
+    %% fragment that 404'd. Acted on for a fragment the reader has just left
+    %% behind at a transition, it marks the next fragment missing - and the read
+    %% that follows then repositions the consumer past a fragment that is there.
+    FragRef = frag_ref(0, 200, 42),
+    Iterator = mock_iterator([{0, 200, 42}, {100, 300, 43}, {200, 300, 44}]),
+    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator),
+    {S1, _} = deliver(S0, 0, binary:copy(<<0>>, 200), done),
+    {S2, _} = deliver(S1, 100, binary:copy(<<1>>, 300), done),
+    %% The consumer reads past fragment 0, so the reader moves onto 100 and
+    %% leaves 0 behind.
+    {S3, E3} = read(S2, ?SEGMENT_HEADER_B + 200, 50),
+    ?assertMatch([{reply, {next_fragment, 100}} | _], E3),
+    %% A 404 for the fragment left behind, from a range the transition dropped.
+    {S4, _} = fail(S3, 0, ?SEGMENT_HEADER_B, not_found),
+    %% Fragment 200 is still being prefetched, so reading past the current
+    %% fragment awaits its bytes rather than refreshing the iterator past it.
+    {S5, E5} = read(S4, ?SEGMENT_HEADER_B + 300, 50),
+    ?assertEqual([], [E || {refresh_iterator, _} = E <- E5]),
+    ?assertMatch([_ | _], fragment_ranges(S5, 200)),
+    {_S6, E6} = deliver(S5, 200, binary:copy(<<2>>, 300), done),
+    ?assertMatch([{next_fragment, 200} | _], [R || {reply, R} <- E6]).
 
 prefetch_404_full_recovery(_Config) ->
     %% Full cycle: prefetch of next fragment returns 404, consumer reads past
@@ -751,11 +1363,9 @@ prefetch_404_full_recovery(_Config) ->
     {S0, _} = init(stream_id(), FragRef, 8, Iterator),
     %% Fill current fragment.
     Data = binary:copy(<<0>>, 200),
-    {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {data, make_ref(), 0, Data, done}),
+    {S1, _} = deliver(S0, 0, Data, done),
     %% Prefetch of fragment 100 returns 404.
-    {S2, _} = rabbitmq_stream_s3_remote_reader_core:step(
-        S1, {request_error, make_ref(), 100, not_found}
-    ),
+    {S2, _} = fail(S1, 100, not_found),
     %% Consumer reads past current fragment → refresh_iterator.
     {S3, E1} = rabbitmq_stream_s3_remote_reader_core:step(
         S2, {read, 208, 50, chunk_boundary}
@@ -771,14 +1381,14 @@ prefetch_404_full_recovery(_Config) ->
         S3, {iterator_refreshed, RefreshedIterator}
     ),
     %% Core replies with next_fragment pointing to 200 and starts a request.
-    ?assertMatch([{reply, {next_fragment, 200}} | _], E2),
-    Requests = [F || {start_request, _, _, F} <- E2],
+    ?assertMatch(
+        [{cancel_requests, all}, {cancel_timers, all}, {reply, {next_fragment, 200}} | _], E2
+    ),
+    Requests = [F || {start_request, _, _, _, F} <- E2],
     ?assertEqual([200], Requests),
     %% Data arrives for fragment 200. Consumer can read from it.
     NextData = binary:copy(<<1>>, 300),
-    {S5, _} = rabbitmq_stream_s3_remote_reader_core:step(
-        S4, {data, make_ref(), 200, NextData, done}
-    ),
+    {S5, _} = deliver(S4, 200, NextData, done),
     {_S6, E3} = rabbitmq_stream_s3_remote_reader_core:step(
         S5, {read, 8, 50, chunk_boundary}
     ),
@@ -795,33 +1405,206 @@ deadline_expired_replies_error_timeout(_Config) ->
     ?assertMatch({64, 100}, rabbitmq_stream_s3_remote_reader_core:pending(S1)),
     %% Deadline fires.
     {S2, Effects} = rabbitmq_stream_s3_remote_reader_core:step(S1, deadline_expired),
-    ?assertMatch([{reply, {error, timeout}}], Effects),
+    ?assertMatch(
+        [{cancel_requests, all}, {cancel_timers, all}, {reply, {error, timeout}}], Effects
+    ),
     %% Pending is cleared.
     ?assertEqual(undefined, rabbitmq_stream_s3_remote_reader_core:pending(S2)).
 
-deadline_expired_resets_buffer_for_retry(_Config) ->
-    %% After deadline_expired, a subsequent read at any position (including one
-    %% behind the old current_pos) does not crash. It awaits data instead.
+deadline_expired_keeps_the_buffer_for_the_retry(_Config) ->
+    %% The deadline drops what is in flight, not what has already been buffered:
+    %% those bytes are a contiguous run of the current fragment that nothing in
+    %% flight contributed to, so they are as valid after the deadline as before
+    %% it. The log reader's retry restarts at the chunk header it last read,
+    %% which is a read the buffer answers outright, and the frontier resumes at
+    %% the buffer's end rather than at the fragment's first byte.
     FragRef = frag_ref(0, 1_000_000, 42),
     Iterator = mock_iterator([{0, 1_000_000, 42}]),
     {S0, _} = init(stream_id(), FragRef, 64, Iterator),
-    %% Provide data and advance current_pos via a successful read.
-    Data = binary:copy(<<0>>, 5000),
-    {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {data, make_ref(), 0, Data, done}),
-    {S2, E1} = rabbitmq_stream_s3_remote_reader_core:step(S1, {read, 64, 100, chunk_boundary}),
+    {S1, _} = deliver(S0, 0, pattern(64, 5000), continue),
+    {S2, E1} = read(S1, 64, 100),
     ?assertMatch([{reply, {ok, _}} | _], E1),
-    %% Issue another read (pending), then deadline fires.
-    {S3, _} = rabbitmq_stream_s3_remote_reader_core:step(S2, {read, 3000, 100, chunk_boundary}),
+    %% A read past everything buffered is pending when the deadline fires.
+    {S3, _} = read(S2, 5000, 1000),
     {S4, _} = rabbitmq_stream_s3_remote_reader_core:step(S3, deadline_expired),
-    %% Retry at position 64 (behind old current_pos). Must not crash.
-    %% Buffer is empty so it awaits, and a new request is started.
-    {_S5, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
-        S4, {read, 64, 100, chunk_boundary}
+    ?assertEqual([], outstanding_ranges(S4)),
+    %% The retry re-reads the chunk header, behind the read that timed out.
+    {S5, E5} = read(S4, 64, 100),
+    ?assertEqual([{reply, {ok, pattern(64, 100)}}], replies(E5)),
+    %% Nothing the consumer has already read through is fetched again.
+    ?assertMatch([{5064, _} | _], fragment_ranges(S5, 0)),
+    ?assertEqual([], [Range || {start_request, _, _, {Start, _} = Range, _} <- E5, Start < 5064]).
+
+deadline_expired_at_a_fragment_boundary_refetches_nothing(_Config) ->
+    %% The read that timed out was past the current fragment's data region,
+    %% waiting on the next fragment's prefetch. The current fragment is fully
+    %% buffered, so the retry has to ask for the next fragment - not walk the
+    %% frontier back over the fragment the consumer has finished with, which is
+    %% a whole `fragment_target_size` of refetching before the range the read is
+    %% actually waiting on is even requested.
+    FragRef = frag_ref(0, 2000, 42),
+    Iterator = mock_iterator([{0, 2000, 42}, {100, 100_000, 43}]),
+    Opts = #{request_size => 1000, window_max => 4000, max_depth => 8},
+    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
+    %% Buffer the fragment's whole data region: [8, 2008).
+    {S1, _} = deliver(S0, 0, ?SEGMENT_HEADER_B, pattern(8, 1000), done),
+    {S2, _} = read(S1, ?SEGMENT_HEADER_B, 1500),
+    {S3, E3} = deliver(S2, 0, 1008, pattern(1008, 1000), done),
+    ?assertEqual([{reply, {ok, pattern(8, 1500)}}], replies(E3)),
+    %% The consumer reads past the fragment and waits on the transition.
+    {S4, _} = read(S3, ?SEGMENT_HEADER_B + 2000, 100),
+    {S5, _} = rabbitmq_stream_s3_remote_reader_core:step(S4, deadline_expired),
+    {S6, E6} = read(S5, ?SEGMENT_HEADER_B + 2000, 100),
+    ?assertEqual([], [F || {start_request, _, _, _, F} <- E6, F =:= 0]),
+    ?assertEqual([], fragment_ranges(S6, 0)),
+    ?assertMatch([{?SEGMENT_HEADER_B, _} | _], fragment_ranges(S6, 100)).
+
+deadline_expired_disowns_the_retry_timer(_Config) ->
+    %% The deadline drops every outstanding request, so the timer armed for them
+    %% is no longer anyone's. Keeping it marked pending would silence
+    %% `arm_retry/3` for the next read's failures, which would then wait out a
+    %% timer armed for requests that no longer exist - up to `max_retry_delay_ms`
+    %% of a 40s read deadline spent with nothing in flight.
+    FragRef = frag_ref(0, 1_000_000, 42),
+    Iterator = mock_iterator([{0, 1_000_000, 42}]),
+    {S0, _} = init(stream_id(), FragRef, 64, Iterator),
+    {S1, E1} = fail(S0, 0, slow_down),
+    ?assertEqual([{set_timer, fault, 1000}], [E || {set_timer, _, _} = E <- E1]),
+    {S2, _} = rabbitmq_stream_s3_remote_reader_core:step(S1, deadline_expired),
+    %% The next read starts a fresh request; failing it arms a timer again, at
+    %% the reset minimum delay.
+    {S3, _} = read(S2, 64, 100),
+    {_S4, E4} = fail(S3, 0, slow_down),
+    ?assertEqual([{set_timer, fault, 1000}], [E || {set_timer, _, _} = E <- E4]).
+
+deadline_expired_clears_a_failed_look_ahead(_Config) ->
+    %% The `failed` look-ahead memo is cleared by exactly one thing, the fault
+    %% clock (`clear_failed_peek/2`), and the deadline disowns that clock. Left
+    %% behind, the memo is permanent: `arm_peek_retry/4` only arms when the peek
+    %% has just turned `failed`, so an already-`failed` one arms nothing and
+    %% nothing else clears it. The frontier would stop spilling into the next
+    %% fragment for the rest of the current one - the stall `arm_peek_retry/4`
+    %% exists to prevent, reached through the deadline instead.
+    Fetches = counters:new(1, []),
+    Iterator = mock_iterator_counting_failing_group([{0, 1000, 42}], {2000, 0, 7}, Fetches),
+    {S0, _} = init(stream_id(), frag_ref(0, 1000, 42), ?SEGMENT_HEADER_B, Iterator, #{
+        request_size => 4000
+    }),
+    %% The look-ahead fails and arms its round.
+    {S1, E1} = read(S0, ?SEGMENT_HEADER_B, 50),
+    ?assertEqual(1, counters:get(Fetches, 1)),
+    ?assertEqual([{set_timer, fault, 1000}], [E || {set_timer, _, _} = E <- E1]),
+    %% The deadline takes that clock away with everything else it disowns.
+    {S2, _} = rabbitmq_stream_s3_remote_reader_core:step(S1, deadline_expired),
+    %% The retry's read re-attempts the fetch rather than finding the memo stuck,
+    %% and arms a fresh round when it fails again.
+    {_S3, E3} = read(S2, ?SEGMENT_HEADER_B, 50),
+    ?assertEqual(2, counters:get(Fetches, 1)),
+    ?assertEqual([{set_timer, fault, 1000}], [E || {set_timer, _, _} = E <- E3]).
+
+deadline_expired_keeps_an_answered_look_ahead(_Config) ->
+    %% Only a failed peek goes. An answered one is the truth about an iterator
+    %% the deadline does not touch, so re-resolving it would spend a group GET -
+    %% synchronous, inside the core - on an answer already in hand.
+    Fetches = counters:new(1, []),
+    Iterator = mock_iterator_counting_groups([{0, 1000, 42}], [{2000, 1000, 7}], Fetches),
+    {S0, _} = init(stream_id(), frag_ref(0, 1000, 42), ?SEGMENT_HEADER_B, Iterator, #{
+        request_size => 4000
+    }),
+    {S1, _} = read(S0, ?SEGMENT_HEADER_B, 50),
+    ?assertEqual(1, counters:get(Fetches, 1)),
+    {S2, _} = rabbitmq_stream_s3_remote_reader_core:step(S1, deadline_expired),
+    {S3, _} = read(S2, ?SEGMENT_HEADER_B, 50),
+    ?assertEqual(1, counters:get(Fetches, 1)),
+    %% The prefetch the deadline dropped is re-issued from the memo.
+    ?assertMatch([{2000, _, _} | _], [R || {2000, _, _} = R <- outstanding_ranges(S3)]).
+
+deadline_expired_cancels_the_retry_timers(_Config) ->
+    %% Disowning the armed timers is not enough on its own. A stale one carries
+    %% the delay it was armed with - up to `max_retry_delay_ms` - so it can land
+    %% part-way through a *later* backoff round, release that round's ranges
+    %% before the pause S3 asked for has elapsed, and clear the kind from
+    %% `timers` so the round's own timer is then taken for a fresh one. The
+    %% shell is told to cancel them.
+    FragRef = frag_ref(0, 1_000_000, 42),
+    Iterator = mock_iterator([{0, 1_000_000, 42}]),
+    {S0, _} = init(stream_id(), FragRef, 64, Iterator),
+    {S1, _} = read(S0, 64, 100),
+    {S2, E2} = fail(S1, 0, slow_down),
+    ?assertEqual([{set_timer, fault, 1000}], [E || {set_timer, _, _} = E <- E2]),
+    {_S3, E3} = rabbitmq_stream_s3_remote_reader_core:step(S2, deadline_expired),
+    ?assertEqual(
+        [{cancel_requests, all}, {cancel_timers, all}, {reply, {error, timeout}}], E3
+    ).
+
+deadline_expired_drops_the_prefetched_next_fragment(_Config) ->
+    %% The deadline drops every outstanding request, so the bytes prefetched for
+    %% the next fragment go with them: their own ranges are cancelled with the
+    %% rest, but they keep counting against the prefetch window
+    %% (`outstanding/1`). Holding window space that nothing is left to fetch into
+    %% is what wedges the reader - with the window at its ceiling nothing has
+    %% room to be issued however many misses follow, so every later read waits
+    %% out a deadline of its own.
+    FragRef = frag_ref(0, 2000, 42),
+    Iterator = mock_iterator([{0, 2000, 42}, {100, 100_000, 43}]),
+    Opts = #{request_size => 1000, window_max => 4000, max_depth => 8},
+    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
+    %% Two misses grow the window past the current fragment, so the frontier
+    %% spills into the next one, whose head range then completes.
+    {S1, _} = read(S0, ?SEGMENT_HEADER_B, 3000),
+    {S2, _} = read(S1, ?SEGMENT_HEADER_B, 3000),
+    {S3, _} = deliver(S2, 100, 8, pattern(8, 1000), done),
+    ?assertMatch({Outstanding, _} when Outstanding >= 1000, load(S3)),
+    %% The deadline fires: nothing is in flight and nothing is buffered, so
+    %% nothing may be counted against the window either.
+    {S4, _} = rabbitmq_stream_s3_remote_reader_core:step(S3, deadline_expired),
+    ?assertEqual({0, 0}, load(S4)),
+    %% The reader is not wedged: the next read fetches the current fragment
+    %% again.
+    {_S5, E5} = read(S4, ?SEGMENT_HEADER_B, 100),
+    ?assertMatch([0 | _], [F || {start_request, _, _, _, F} <- E5]).
+
+deadline_expired_keeps_a_404_next_fragment(_Config) ->
+    %% A next fragment retention has deleted holds no bytes, so it costs the
+    %% window nothing and is kept across the deadline: a 404 is durable, and
+    %% forgetting it would spend another GET learning the same thing.
+    FragRef = frag_ref(0, 2000, 42),
+    Iterator = mock_iterator([{0, 2000, 42}, {100, 100_000, 43}]),
+    Opts = #{request_size => 1000, window_max => 4000, max_depth => 8},
+    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
+    {S1, _} = read(S0, ?SEGMENT_HEADER_B, 3000),
+    {S2, _} = read(S1, ?SEGMENT_HEADER_B, 3000),
+    {S3, _} = fail(S2, 100, 8, not_found),
+    {S4, _} = rabbitmq_stream_s3_remote_reader_core:step(S3, deadline_expired),
+    %% Reading past the current fragment asks for a manifest refresh rather than
+    %% re-fetching the fragment that is known to be gone.
+    {_S5, E5} = read(S4, ?SEGMENT_HEADER_B + 2000, 100),
+    ?assertEqual([], [F || {start_request, _, _, _, F} <- E5, F =:= 100]),
+    ?assertMatch([{refresh_iterator, 100}], [E || {refresh_iterator, _} = E <- E5]).
+
+iterator_refresh_cancels_the_retry_timers(_Config) ->
+    %% Refreshing the iterator rebuilds the core state from scratch, which
+    %% resets both backoff delays and disowns the timers armed against the old
+    %% fragment - the same reset `deadline_expired` performs, and the same
+    %% hazard if a timer is left running: it would land part-way through a
+    %% later round at the new fragment and release its ranges early.
+    FragRef = frag_ref(0, 200, 42),
+    Iterator = mock_iterator([{0, 200, 42}, {100, 500, 43}]),
+    {S0, _} = init(stream_id(), FragRef, 8, Iterator),
+    %% Arm the fault timer, then 404 the fragment it was armed for.
+    {S1, _} = read(S0, 8, 50),
+    {S2, E2} = fail(S1, 0, slow_down),
+    ?assertEqual([{set_timer, fault, 1000}], [E || {set_timer, _, _} = E <- E2]),
+    {S3, _} = fail(S2, 0, not_found),
+    RefreshedIterator = rabbitmq_stream_s3_fragment_iterator:init(
+        build_manifest([{100, 500, 43}]), 0, fun(_) -> {error, not_found} end
     ),
-    Replies = [E || {reply, _} = E <- Effects],
-    ?assertEqual([], Replies),
-    Requests = [F || {start_request, _, _, F} <- Effects],
-    ?assertMatch([0], Requests).
+    {_S4, E4} = rabbitmq_stream_s3_remote_reader_core:step(
+        S3, {iterator_refreshed, RefreshedIterator}
+    ),
+    ?assertMatch(
+        [{cancel_requests, all}, {cancel_timers, all}, {reply, {next_fragment, 100}} | _], E4
+    ).
 
 fragment_404_emits_refresh_iterator(_Config) ->
     %% When the current fragment returns 404, the core emits
@@ -831,10 +1614,41 @@ fragment_404_emits_refresh_iterator(_Config) ->
     {S0, _} = init(stream_id(), FragRef, 64, Iterator),
     %% Issue read, then 404 on current fragment.
     {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {read, 64, 100, chunk_boundary}),
-    {_S2, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
-        S1, {request_error, make_ref(), 0, not_found}
-    ),
-    ?assertMatch([{refresh_iterator, 0}], Effects).
+    {_S2, Effects} = fail(S1, 0, not_found),
+    ?assertMatch([{cancel_requests, all}, {refresh_iterator, 0}], Effects).
+
+known_404_fragment_is_not_refetched(_Config) ->
+    %% Retention deleting the current fragment mid-read leaves the reader
+    %% holding buffered bytes that still sit below the fragment's index
+    %% boundary, so the fetch frontier still points into an object that is gone.
+    %% The reads those bytes can serve must not restart the pipeline against it:
+    %% each one would fire a whole `max_depth` of range GETs, and every 404 they
+    %% earn wipes the queue and cancels the next fragment's prefetch with it.
+    %% The refresh is driven by the first read that cannot be served.
+    Opts = #{request_size => 1_000, max_depth => 8, window_max => 1_000_000},
+    FragRef = frag_ref(0, 1_000_000, 42),
+    Iterator = mock_iterator([{0, 1_000_000, 42}, {100, 1_000_000, 43}]),
+    {S0, _} = init(stream_id(), FragRef, 64, Iterator, Opts),
+    [{Start, End}] = fragment_ranges(S0, 0),
+    %% A read that misses grows the window, so a second range joins the first.
+    {S1, _} = read(S0, 64, 100),
+    ?assertMatch([_, _], fragment_ranges(S1, 0)),
+    %% The first range is answered in full, which serves the read and leaves
+    %% the reader holding bytes below the fragment's index boundary.
+    {S2, E2} = deliver(S1, 0, Start, pattern(Start, End - Start + 1), done),
+    ?assertMatch([{reply, {ok, _}} | _], E2),
+    %% The fragment is deleted. The range behind it 404s while no read is
+    %% pending, so nothing refreshes the iterator yet.
+    {S3, _} = fail(S2, 0, not_found),
+    ?assertEqual([], outstanding_ranges(S3)),
+    %% A read the buffer can still serve is served, and asks S3 for nothing.
+    {S4, E4} = read(S3, 164, 100),
+    ?assertMatch([{reply, {ok, _}} | _], E4),
+    ?assertEqual([], [E || {start_request, _, _, _, _} = E <- E4]),
+    ?assertEqual([], outstanding_ranges(S4)),
+    %% The first read that cannot be served is what refreshes the iterator.
+    {_S5, E5} = read(S4, End + 1, 100),
+    ?assertEqual([{refresh_iterator, 0}], E5).
 
 last_fragment_404_no_pending_read_refreshes_past_current(_Config) ->
     %% Regression test for issue #193. When the current fragment is the last
@@ -846,14 +1660,12 @@ last_fragment_404_no_pending_read_refreshes_past_current(_Config) ->
     {S0, _} = init(stream_id(), FragRef, 64, Iterator),
     %% Partially fill buffer so the fragment has some data but not all.
     Data = binary:copy(<<0>>, 500),
-    {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {data, make_ref(), 0, Data, done}),
+    {S1, _} = deliver(S0, 0, Data, done),
     %% Read from buffered range succeeds (consuming the pending read slot).
     {S2, E1} = rabbitmq_stream_s3_remote_reader_core:step(S1, {read, 64, 100, chunk_boundary}),
     ?assertMatch([{reply, {ok, _}} | _], E1),
     %% Current fragment 404s while no read is pending.
-    {S3, E2} = rabbitmq_stream_s3_remote_reader_core:step(
-        S2, {request_error, make_ref(), 0, not_found}
-    ),
+    {S3, E2} = fail(S2, 0, not_found),
     %% No refresh_iterator emitted (pending = undefined).
     ?assertEqual([], [Eff || {refresh_iterator, _} = Eff <- E2]),
     %% A new read beyond the buffer triggers not_found_check_range.
@@ -879,9 +1691,7 @@ observe_effects_emitted_for_hit_miss_and_transition(_Config) ->
 
     %% Data arrives, then a read against the buffered range emits a hit.
     Data = binary:copy(<<0>>, 200),
-    {S2, _} = rabbitmq_stream_s3_remote_reader_core:step(
-        S1, {data, make_ref(), 0, Data, done}
-    ),
+    {S2, _} = deliver(S1, 0, Data, done),
     {S3, HitEffects} = rabbitmq_stream_s3_remote_reader_core:step(
         S2, {read, 8, 100, chunk_boundary}
     ),
@@ -891,9 +1701,7 @@ observe_effects_emitted_for_hit_miss_and_transition(_Config) ->
     %% Pre-fetch the next fragment, then read past the current fragment's end
     %% to trigger a fragment transition observation.
     NextData = binary:copy(<<1>>, 200),
-    {S4, _} = rabbitmq_stream_s3_remote_reader_core:step(
-        S3, {data, make_ref(), 100, NextData, done}
-    ),
+    {S4, _} = deliver(S3, 100, NextData, done),
     {_S5, TransEffects} = rabbitmq_stream_s3_remote_reader_core:step(
         S4, {read, 208, 50, chunk_boundary}
     ),
@@ -908,28 +1716,14 @@ pool_busy_backoff_capped_at_500(_Config) ->
     FragRef = frag_ref(0, 1_000_000, 42),
     Iterator = mock_iterator([{0, 1_000_000, 42}]),
     {S0, _} = init(stream_id(), FragRef, 64, Iterator),
-    {S1, [{set_timer, 25}]} = rabbitmq_stream_s3_remote_reader_core:step(
-        S0, {request_error, make_ref(), 0, pool_busy}
-    ),
-    {S2, [{set_timer, 50}]} = rabbitmq_stream_s3_remote_reader_core:step(
-        S1, {request_error, make_ref(), 0, pool_busy}
-    ),
-    {S3, [{set_timer, 100}]} = rabbitmq_stream_s3_remote_reader_core:step(
-        S2, {request_error, make_ref(), 0, pool_busy}
-    ),
-    {S4, [{set_timer, 200}]} = rabbitmq_stream_s3_remote_reader_core:step(
-        S3, {request_error, make_ref(), 0, pool_busy}
-    ),
-    {S5, [{set_timer, 400}]} = rabbitmq_stream_s3_remote_reader_core:step(
-        S4, {request_error, make_ref(), 0, pool_busy}
-    ),
-    {S6, [{set_timer, 500}]} = rabbitmq_stream_s3_remote_reader_core:step(
-        S5, {request_error, make_ref(), 0, pool_busy}
-    ),
+    {S1, [{set_timer, pool_busy, 25}]} = fail_then_retry(S0, 0, pool_busy),
+    {S2, [{set_timer, pool_busy, 50}]} = fail_then_retry(S1, 0, pool_busy),
+    {S3, [{set_timer, pool_busy, 100}]} = fail_then_retry(S2, 0, pool_busy),
+    {S4, [{set_timer, pool_busy, 200}]} = fail_then_retry(S3, 0, pool_busy),
+    {S5, [{set_timer, pool_busy, 400}]} = fail_then_retry(S4, 0, pool_busy),
+    {S6, [{set_timer, pool_busy, 500}]} = fail_then_retry(S5, 0, pool_busy),
     %% Capped: stays at 500.
-    {_S7, [{set_timer, 500}]} = rabbitmq_stream_s3_remote_reader_core:step(
-        S6, {request_error, make_ref(), 0, pool_busy}
-    ),
+    {_S7, [{set_timer, pool_busy, 500}]} = fail_then_retry(S6, 0, pool_busy),
     ok.
 
 pool_busy_delay_resets_on_data(_Config) ->
@@ -938,25 +1732,14 @@ pool_busy_delay_resets_on_data(_Config) ->
     Iterator = mock_iterator([{0, 1_000_000, 42}]),
     {S0, _} = init(stream_id(), FragRef, 64, Iterator),
     %% Escalate the pool_busy delay: 25, 50, 100.
-    {S1, [{set_timer, 25}]} = rabbitmq_stream_s3_remote_reader_core:step(
-        S0, {request_error, make_ref(), 0, pool_busy}
-    ),
-    {S2, [{set_timer, 50}]} = rabbitmq_stream_s3_remote_reader_core:step(
-        S1, {request_error, make_ref(), 0, pool_busy}
-    ),
-    {S3, [{set_timer, 100}]} = rabbitmq_stream_s3_remote_reader_core:step(
-        S2, {request_error, make_ref(), 0, pool_busy}
-    ),
-    %% Retry, then data arrives successfully.
-    {S4, _} = rabbitmq_stream_s3_remote_reader_core:step(S3, retry),
+    {S1, [{set_timer, pool_busy, 25}]} = fail_then_retry(S0, 0, pool_busy),
+    {S2, [{set_timer, pool_busy, 50}]} = fail_then_retry(S1, 0, pool_busy),
+    {S3, [{set_timer, pool_busy, 100}]} = fail_then_retry(S2, 0, pool_busy),
+    %% Data arrives successfully.
     Data = binary:copy(<<0>>, 1024),
-    {S5, _} = rabbitmq_stream_s3_remote_reader_core:step(
-        S4, {data, make_ref(), 0, Data, done}
-    ),
+    {S4, _} = deliver(S3, 0, Data, done),
     %% The next pool_busy starts back at 25ms.
-    {_S6, [{set_timer, 25}]} = rabbitmq_stream_s3_remote_reader_core:step(
-        S5, {request_error, make_ref(), 0, pool_busy}
-    ),
+    {_S5, [{set_timer, pool_busy, 25}]} = fail(S4, 0, pool_busy),
     ok.
 
 pool_busy_backoff_independent_of_network_errors(_Config) ->
@@ -968,22 +1751,79 @@ pool_busy_backoff_independent_of_network_errors(_Config) ->
     Iterator = mock_iterator([{0, 1_000_000, 42}]),
     {S0, _} = init(stream_id(), FragRef, 64, Iterator),
     %% pool_busy uses its own 25ms start.
-    {S1, [{set_timer, 25}]} = rabbitmq_stream_s3_remote_reader_core:step(
-        S0, {request_error, make_ref(), 0, pool_busy}
-    ),
+    {S1, [{set_timer, pool_busy, 25}]} = fail_then_retry(S0, 0, pool_busy),
     %% A network error still starts at the 1000ms minimum, unaffected.
-    {S2, [{set_timer, 1000}]} = rabbitmq_stream_s3_remote_reader_core:step(
-        S1, {request_error, make_ref(), 0, slow_down}
-    ),
+    {S2, [{set_timer, fault, 1000}]} = fail_then_retry(S1, 0, slow_down),
     %% pool_busy continues from 50ms, not reset by the network error.
-    {S3, [{set_timer, 50}]} = rabbitmq_stream_s3_remote_reader_core:step(
-        S2, {request_error, make_ref(), 0, pool_busy}
-    ),
+    {S3, [{set_timer, pool_busy, 50}]} = fail_then_retry(S2, 0, pool_busy),
     %% The network backoff likewise continues from 2000ms.
-    {_S4, [{set_timer, 2000}]} = rabbitmq_stream_s3_remote_reader_core:step(
-        S3, {request_error, make_ref(), 0, slow_down}
-    ),
+    {_S4, [{set_timer, fault, 2000}]} = fail_then_retry(S3, 0, slow_down),
     ok.
+
+pool_busy_delay_resets_once_its_range_waits_on_the_other_clock(_Config) ->
+    %% A range released by a pool_busy retry stops waiting on the pool_busy
+    %% clock the moment it fails again on the network one: it is queued on that
+    %% clock now, and `status` says so. Leaving the pool_busy stamp on it kept
+    %% the pool_busy clock looking busy for the life of the range, so its delay
+    %% was never handed back and the next genuine pool-busy waited as long as
+    %% the last round had grown to - against a pool that had recovered in
+    %% between.
+    {S0, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    {S1, E1} = fail(S0, 0, 8, pool_busy),
+    ?assertEqual([{set_timer, pool_busy, 25}], E1),
+    %% The retry re-issues that range, and this time it fails on the network.
+    {S2, _} = retry(S1, pool_busy),
+    {S3, E3} = fail(S2, 0, 8, slow_down),
+    ?assertEqual([{set_timer, fault, 1000}], E3),
+    %% Any delivery is where idle clocks are handed back. Nothing waits on
+    %% pool_busy now, so the next one starts from the minimum again.
+    {S4, _} = deliver(S3, 0, 1008, pattern(1008, 1000), done),
+    {_S5, E5} = fail(S4, 0, 2008, pool_busy),
+    ?assertEqual([{set_timer, pool_busy, 25}], E5).
+
+pool_busy_delay_resets_once_its_range_completes_empty(_Config) ->
+    %% The same handover as
+    %% `pool_busy_delay_resets_once_its_range_waits_on_the_other_clock`, by the
+    %% other door onto the fault clock: the re-issued range is not failed but
+    %% answered with nothing, which backs it off just the same. Both doors have
+    %% to take the pool_busy stamp off it.
+    {S0, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    {S1, E1} = fail(S0, 0, 8, pool_busy),
+    ?assertEqual([{set_timer, pool_busy, 25}], E1),
+    %% The retry re-issues that range, and this time S3 closes it empty.
+    {S2, _} = retry(S1, pool_busy),
+    {S3, E3} = deliver(S2, 0, 8, <<>>, done),
+    ?assertEqual([{set_timer, fault, 1000}], [E || {set_timer, _, _} = E <- E3]),
+    %% That delivery is also where idle clocks are handed back.
+    {_S4, E4} = fail(S3, 0, 2008, pool_busy),
+    ?assertEqual([{set_timer, pool_busy, 25}], E4).
+
+become_local_cancels_the_retry_timers(_Config) ->
+    %% Becoming local answers the read and the shell stops the reader, but a
+    %% `retry` already in the shell's mailbox is honoured until its timer is
+    %% cancelled. It would drive a pass over a state this event has just
+    %% emptied - the buffer re-based at the start of the fragment - and
+    %% re-request that fragment from its first byte, spending GETs and pooled
+    %% connections on bytes the consumer is already reading locally.
+    FragRef = frag_ref(0, 1_000_000, 42),
+    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, mock_iterator([{0, 1_000_000, 42}])),
+    {S1, E1} = fail(S0, 0, pool_busy),
+    ?assertEqual([{set_timer, pool_busy, 25}], E1),
+    {_S2, E2} = rabbitmq_stream_s3_remote_reader_core:step(
+        S1, {iterator_refreshed, end_of_manifest}
+    ),
+    ?assertEqual(
+        [{cancel_requests, all}, {cancel_timers, all}, {reply, {become_local, 0}}], E2
+    ),
+    %% The same holds when the manifest runs out on a refreshed iterator, which
+    %% reaches the local tier through a clause of its own.
+    {S3, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, mock_iterator([{0, 1_000_000, 42}])),
+    {S4, E4} = fail(S3, 0, pool_busy),
+    ?assertEqual([{set_timer, pool_busy, 25}], E4),
+    {_S5, E5} = rabbitmq_stream_s3_remote_reader_core:step(
+        S4, {iterator_refreshed, mock_iterator([{0, 1_000_000, 42}])}
+    ),
+    ?assertEqual([{cancel_timers, all}, {reply, {become_local, 0}}], E5).
 
 group_fetch_failure_retries_not_become_local(_Config) ->
     %% Advancing past the current fragment, the next entry is a group object
@@ -994,15 +1834,19 @@ group_fetch_failure_retries_not_become_local(_Config) ->
     FragRef = frag_ref(0, 100, 42),
     Iterator = mock_iterator_failing_group([{0, 100, 42}], {100, 0, 99}),
     {S0, _} = init(stream_id(), FragRef, 64, Iterator),
-    %% Fill the current fragment buffer.
+    %% The frontier looks one fragment ahead as soon as the current one is
+    %% spoken for, so the failing group fetch is met on this delivery's pass and
+    %% arms the round's timer (see `failed_group_peek_arms_its_own_retry`).
     Data = binary:copy(<<0>>, 100),
-    {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {data, make_ref(), 0, Data, done}),
-    %% Read past the end → fragment transition → group fetch fails.
+    {S1, E1} = deliver(S0, 0, Data, done),
+    ?assertEqual([{set_timer, fault, 1000}], [E || {set_timer, _, _} = E <- E1]),
+    %% Read past the end → fragment transition → group fetch fails. The round's
+    %% timer is still pending, so this must not arm a second one; what matters
+    %% is that the consumer is not routed to the local tier.
     {_S2, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
         S1, {read, 164, 50, chunk_boundary}
     ),
-    ?assertMatch([{set_timer, _}], Effects),
-    ?assertEqual([], [E || {reply, {become_local, _}} = E <- Effects]).
+    ?assertEqual([], Effects).
 
 group_fetch_failure_on_refreshed_iterator_retries(_Config) ->
     %% After a refresh, advancing the refreshed iterator hits a transient group
@@ -1019,8 +1863,28 @@ group_fetch_failure_on_refreshed_iterator_retries(_Config) ->
     {_S2, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
         S1, {iterator_refreshed, Refreshed}
     ),
-    ?assertMatch([{set_timer, _}], Effects),
+    ?assertMatch([{set_timer, _, _}], Effects),
     ?assertEqual([], [E || {reply, {become_local, _}} = E <- Effects]).
+
+group_fetch_failure_on_refreshed_iterator_drops_cancelled_requests(_Config) ->
+    %% The shell cancels every in-flight request before feeding back a refreshed
+    %% iterator, so a request left in the queue could never be answered: nothing
+    %% re-issues it and `flushable/2` reports it blocked, which wedges its
+    %% fragment until the read deadline. The group-fetch-failed branch is the one
+    %% that keeps its state rather than rebuilding it, so it has to drop them.
+    FragRef = frag_ref(0, 100, 42),
+    Iterator = mock_iterator([{0, 100, 42}]),
+    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator),
+    {S1, _} = read(S0, ?SEGMENT_HEADER_B, 50),
+    ?assertMatch([_ | _], outstanding_ranges(S1)),
+    Refreshed = mock_iterator_failing_group([{0, 100, 42}], {100, 0, 99}),
+    {S2, _} = rabbitmq_stream_s3_remote_reader_core:step(S1, {iterator_refreshed, Refreshed}),
+    ?assertEqual([], outstanding_ranges(S2)),
+    %% The reader is not wedged: the retry puts the current fragment back on the
+    %% wire rather than waiting out the deadline.
+    {S3, E} = retry(S2, fault),
+    ?assertMatch([_ | _], [Eff || {start_request, _, _, _, _} = Eff <- E]),
+    ?assertMatch([_ | _], outstanding_ranges(S3)).
 
 group_fetch_failure_backs_off_and_retries(_Config) ->
     %% A persistently-failing group fetch backs off exponentially and keeps
@@ -1030,13 +1894,342 @@ group_fetch_failure_backs_off_and_retries(_Config) ->
     FragRef = frag_ref(0, 100, 42),
     Iterator = mock_iterator_failing_group([{0, 100, 42}], {100, 0, 99}),
     {S0, _} = init(stream_id(), FragRef, 64, Iterator),
+    %% First failure: the frontier's look-ahead → retry at the minimum delay.
     Data = binary:copy(<<0>>, 100),
-    {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(S0, {data, make_ref(), 0, Data, done}),
-    %% First transition: group fetch fails → retry at the minimum delay.
+    {S1, E0} = deliver(S0, 0, Data, done),
+    [{set_timer, _, D1}] = [E || {set_timer, _, _} = E <- E0],
+    %% The transition meets the same failure while that round is still pending,
+    %% so it neither re-arms nor becomes local.
     {S2, E1} = rabbitmq_stream_s3_remote_reader_core:step(S1, {read, 164, 50, chunk_boundary}),
-    [{set_timer, D1}] = [E || {set_timer, _} = E <- E1],
+    ?assertEqual([], E1),
     %% The retry re-attempts the fetch (still failing) → retry at a larger delay.
-    {_S3, E2} = rabbitmq_stream_s3_remote_reader_core:step(S2, retry),
-    [{set_timer, D2}] = [E || {set_timer, _} = E <- E2],
+    {_S3, E2} = retry(S2, fault),
+    [{set_timer, _, D2}] = [E || {set_timer, _, _} = E <- E2],
     ?assert(D2 > D1),
     ?assertEqual([], [E || {reply, {become_local, _}} = E <- E2]).
+
+next_fragment_peek_is_fetched_once(_Config) ->
+    %% Looking one fragment ahead descends into a group node, which is a
+    %% synchronous S3 GET. The current fragment is fully spoken for from the
+    %% first pass here, so every later pass - one per delivered frame - reaches
+    %% that peek. Fetching the group each time would block the reader on S3 for
+    %% every frame it receives, with the caller's read deadline running.
+    Fetches = counters:new(1, []),
+    Iterator = mock_iterator_counting_groups(
+        [{0, 1000, 42}], [{2000, 1000, 7}, {4000, 1000, 9}], Fetches
+    ),
+    {S0, _} = init(stream_id(), frag_ref(0, 1000, 42), ?SEGMENT_HEADER_B, Iterator, #{
+        request_size => 4000
+    }),
+    %% The first delivery's pass covers the whole current fragment and spills
+    %% into the next, which is where the group is descended into.
+    {S1, _} = deliver(S0, 0, 8, pattern(8, 100), continue),
+    ?assertEqual(1, counters:get(Fetches, 1)),
+    ?assertMatch([{0, _, _}, {2000, _, _}], outstanding_ranges(S1)),
+    %% Ten more passes with both fragments fully spoken for and the window still
+    %% open: every one of them reaches the peek.
+    S2 = lists:foldl(
+        fun(_, Acc) ->
+            {Acc1, _} = deliver(Acc, 0, 8, pattern(8, 100), continue),
+            Acc1
+        end,
+        S1,
+        lists:seq(1, 10)
+    ),
+    ?assertEqual(1, counters:get(Fetches, 1)),
+    %% Moving on replaces the iterator, so the memo is dropped and the fragment
+    %% after the new current one is looked up afresh.
+    {S3, _} = deliver(S2, 2000, 8, pattern(8, 1000), done),
+    {_S4, E} = read(S3, ?SEGMENT_HEADER_B + 1000, 50),
+    ?assertMatch([{next_fragment, 2000}], [R || {reply, R} <- replies(E)]),
+    ?assertEqual(2, counters:get(Fetches, 1)).
+
+failed_group_peek_is_retried_on_the_backoff(_Config) ->
+    %% A group fetch that fails transiently is not an answer worth remembering,
+    %% but it is a reason not to ask again until the retry timer fires: asking
+    %% per pass would put a group GET behind every frame the reader receives
+    %% while S3 is already having trouble.
+    Fetches = counters:new(1, []),
+    Iterator = mock_iterator_counting_failing_group([{0, 1000, 42}], {2000, 0, 7}, Fetches),
+    {S0, _} = init(stream_id(), frag_ref(0, 1000, 42), ?SEGMENT_HEADER_B, Iterator, #{
+        request_size => 4000
+    }),
+    {S1, _} = deliver(S0, 0, 8, pattern(8, 100), continue),
+    ?assertEqual(1, counters:get(Fetches, 1)),
+    S2 = lists:foldl(
+        fun(_, Acc) ->
+            {Acc1, _} = deliver(Acc, 0, 8, pattern(8, 100), continue),
+            Acc1
+        end,
+        S1,
+        lists:seq(1, 5)
+    ),
+    ?assertEqual(1, counters:get(Fetches, 1)),
+    %% A retry round is when it is worth another attempt.
+    {_S3, _} = retry(S2, fault),
+    ?assertEqual(2, counters:get(Fetches, 1)).
+
+failed_group_peek_is_not_retried_on_the_pool_clock(_Config) ->
+    %% The `pool_busy` clock runs 25-500ms and fires for as long as the pool has
+    %% no free connection, which says nothing about whether the group object can
+    %% be fetched. Clearing the memo on it re-attempted the fetch up to 40x more
+    %% often than the fault backoff it is paced by, and `arm_peek_retry/4` could
+    %% not slow it down because the fault timer it arms was already pending.
+    %% Every attempt is a synchronous group GET inside the core, so it blocks
+    %% the reader while the caller's read deadline burns.
+    Fetches = counters:new(1, []),
+    Iterator = mock_iterator_counting_failing_group([{0, 1000, 42}], {2000, 0, 7}, Fetches),
+    {S0, _} = init(stream_id(), frag_ref(0, 1000, 42), ?SEGMENT_HEADER_B, Iterator, #{
+        request_size => 4000
+    }),
+    {S1, _} = deliver(S0, 0, 8, pattern(8, 100), continue),
+    ?assertEqual(1, counters:get(Fetches, 1)),
+    S2 = lists:foldl(
+        fun(_, Acc) ->
+            {Acc1, _} = retry(Acc, pool_busy),
+            Acc1
+        end,
+        S1,
+        lists:seq(1, 5)
+    ),
+    ?assertEqual(1, counters:get(Fetches, 1)),
+    %% The clock the retry is paced by still clears it.
+    {_S3, _} = retry(S2, fault),
+    ?assertEqual(2, counters:get(Fetches, 1)).
+
+failed_group_peek_arms_its_own_retry(_Config) ->
+    %% Nothing else arms a timer on this path: the ranges already queued are
+    %% healthy, so no request error runs, and the `failed` memo is only ever
+    %% cleared by a retry round. Without a timer of its own the memo would be
+    %% permanent for the life of the iterator - the frontier would stop spilling
+    %% into the next fragment, the pipeline would drain as the queued ranges
+    %% completed, and the window would sit idle for the rest of the current
+    %% fragment, the stall ending only when the consumer reached the boundary.
+    Fetches = counters:new(1, []),
+    Iterator = mock_iterator_counting_failing_group([{0, 1000, 42}], {2000, 0, 7}, Fetches),
+    {S0, _} = init(stream_id(), frag_ref(0, 1000, 42), ?SEGMENT_HEADER_B, Iterator, #{
+        request_size => 4000
+    }),
+    %% The peek failed during a frontier pass whose queued range - the current
+    %% fragment's, issued by the placement pass - is perfectly healthy.
+    {S1, E1} = deliver(S0, 0, ?SEGMENT_HEADER_B, pattern(8, 100), continue),
+    ?assertEqual(1, counters:get(Fetches, 1)),
+    ?assertMatch([{0, ?SEGMENT_HEADER_B, _}], outstanding_ranges(S1)),
+    ?assertEqual([{set_timer, fault, 1000}], [E || {set_timer, _, _} = E <- E1]),
+    %% One timer for the round, not one per pass: further passes see the memo
+    %% and must not re-arm (which would also re-grow the backoff).
+    {S2, E2} = deliver(S1, 0, ?SEGMENT_HEADER_B, pattern(8, 100), continue),
+    ?assertEqual([], [E || {set_timer, _, _} = E <- E2]),
+    %% The retry clears the memo, re-attempts the fetch and, since it fails
+    %% again, arms the next round at the grown delay.
+    {_S3, E3} = retry(S2, fault),
+    ?assertEqual(2, counters:get(Fetches, 1)),
+    ?assertEqual([{set_timer, fault, 2000}], [E || {set_timer, _, _} = E <- E3]).
+
+read_larger_than_the_window_is_still_served(_Config) ->
+    %% The prefetch window bounds prefetch; the read in hand is not optional. A
+    %% read of N bytes cannot be served while fewer than N are outstanding, so
+    %% gating fetches on the window alone trapped every read larger than
+    %% `window_max`: at the ceiling `has_room/1` stayed false, `note_miss/1`
+    %% could not widen the window further, and nothing was ever issued again.
+    %% Reads are chunk sized, so one chunk bigger than the window was enough.
+    FragRef = frag_ref(0, 1_000_000, 42),
+    Iterator = mock_iterator([{0, 1_000_000, 42}]),
+    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, #{
+        request_size => 1000, window_max => 2000, max_depth => 8
+    }),
+    %% A read half again the window's ceiling.
+    {S1, _} = read(S0, ?SEGMENT_HEADER_B, 3000),
+    %% Answering everything it asks for must serve the read. Before the fix it
+    %% asked for nothing at all from here on, so no number of rounds served it.
+    {Served, S} = answer_until_served(S1, 20),
+    ?assertEqual(pattern(?SEGMENT_HEADER_B, 3000), Served),
+    %% Exceeding the window is confined to the read that needed it: once served,
+    %% the ceiling governs again, so what the reader fetches from there fits the
+    %% window rather than the 3000 bytes that one read licensed.
+    {Outstanding, _} = load(S),
+    ?assert(Outstanding =< window(S)),
+    %% What it fetched is genuinely ahead of the consumer: the served bytes are
+    %% behind it, so the read that follows them still waits on the wire.
+    {_S2, E} = read(S, ?SEGMENT_HEADER_B + 3000, 10),
+    ?assertEqual([], [R || {reply, {ok, _}} = R <- E]).
+
+%% Answer every outstanding range in full, round after round, until the pending
+%% read is replied to. Returns the served bytes.
+answer_until_served(_State, 0) ->
+    error(never_served);
+answer_until_served(State0, Rounds) ->
+    case outstanding_ranges(State0) of
+        [] ->
+            error({nothing_outstanding_and_no_reply, Rounds});
+        Ranges ->
+            {State, Effects} = lists:foldl(
+                fun({Fragment, Start, End}, {Acc, EffAcc}) ->
+                    {Acc1, Eff} = deliver(
+                        Acc, Fragment, Start, pattern(Start, End - Start + 1), done
+                    ),
+                    {Acc1, EffAcc ++ Eff}
+                end,
+                {State0, []},
+                Ranges
+            ),
+            case [D || {reply, {ok, D}} <- replies(Effects)] of
+                [Served] -> {Served, State};
+                [] -> answer_until_served(State, Rounds - 1)
+            end
+    end.
+
+group_fetch_failure_keeps_the_ranges_in_flight(_Config) ->
+    %% The failure is in advancing the iterator, which says nothing about the
+    %% fragment GETs already on the wire: they may still be delivering the bytes
+    %% the pending read is waiting for. Dropping them also closes their pooled
+    %% connections (`cancel_async/2` must, to stop the response draining), so a
+    %% failed group fetch used to tear down a full depth of healthy connections
+    %% out of a pool shared with the manifest, group and index GETs.
+    Iterator = mock_iterator_failing_group([{0, 100, 42}], {100, 0, 99}),
+    {S0, _} = init(stream_id(), frag_ref(0, 100, 42), ?SEGMENT_HEADER_B, Iterator, #{
+        request_size => 50
+    }),
+    %% A miss widens the window to two requests, so the fragment's second half
+    %% is on the wire as well.
+    {S1, _} = read(S0, ?SEGMENT_HEADER_B, 50),
+    ?assertEqual([{0, 8, 57}, {0, 58, 107}], outstanding_ranges(S1)),
+    %% Answer the first range only, then read past the fragment's end. That is
+    %% the transition, and its look-ahead is the failing group fetch - with the
+    %% second range still streaming.
+    {S2, _} = deliver(S1, 0, 8, pattern(8, 50), done),
+    Before = outstanding_ranges(S2),
+    ?assertEqual([{0, 58, 107}], Before),
+    {S3, E3} = read(S2, ?SEGMENT_HEADER_B + 100, 50),
+    ?assertEqual([], [E || {cancel_requests, _} = E <- E3]),
+    ?assertEqual([], [E || {cancel_request, _} = E <- E3]),
+    ?assertEqual([], [E || {reply, {become_local, _}} = E <- E3]),
+    %% The range is still outstanding and was not re-issued: it never stopped
+    %% streaming, and its pooled connection was not closed under it.
+    ?assertEqual(Before, outstanding_ranges(S3)),
+    ?assertEqual([], [E || {start_request, _, _, _, _} = E <- E3]).
+
+pool_busy_retry_does_not_release_a_throttled_range(_Config) ->
+    %% Each backoff kind arms its own timer. A pool_busy failure must not stand
+    %% in for an S3 fault: with one shared timer the fault's 1s backoff was
+    %% neither armed nor grown, and the pool's 25ms timer put the range S3 had
+    %% just throttled straight back on the wire.
+    {S0, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    [{0, A, _}, {0, B, _} | _] = outstanding_ranges(S0),
+    {S1, E1} = fail(S0, 0, A, pool_busy),
+    ?assertEqual([{set_timer, pool_busy, 25}], E1),
+    %% The S3 fault arms its own timer at its own minimum.
+    {S2, E2} = fail(S1, 0, B, slow_down),
+    ?assertEqual([{set_timer, fault, 1000}], E2),
+    %% The pool's timer releases only the range that waited on the pool.
+    {S3, E3} = retry(S2, pool_busy),
+    ?assertEqual(
+        [{key(), {A, A + 999}, 0}],
+        starts(E3)
+    ),
+    %% The throttled range goes back only on its own timer, and the fault
+    %% backoff has grown in the meantime rather than being lost.
+    {S4, E4} = retry(S3, fault),
+    ?assertEqual(
+        [{key(), {B, B + 999}, 0}],
+        starts(E4)
+    ),
+    {_S5, E5} = fail(S4, 0, B, slow_down),
+    ?assertEqual([{set_timer, fault, 2000}], E5).
+
+partial_throttling_does_not_reset_the_backoff(_Config) ->
+    %% S3 answering some ranges while throttling others is what throttling looks
+    %% like to a pipelined reader. A delivery must not hand back the delay the
+    %% throttled ranges just earned, or the reader retries a throttling S3 at
+    %% the minimum delay for as long as anything at all is getting through.
+    {S0, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    [{0, A, _}, {0, B, _} | _] = outstanding_ranges(S0),
+    {S1, E1} = fail(S0, 0, A, slow_down),
+    ?assertEqual([{set_timer, fault, 1000}], E1),
+    %% A sibling range delivers while A is still queued for retry.
+    {S2, _} = deliver(S1, 0, B, pattern(B, 1000), done),
+    %% A's retry fires and it fails again: the backoff continues from 2s.
+    {S3, _} = retry(S2, fault),
+    {_S4, E2} = fail(S3, 0, A, slow_down),
+    ?assertEqual([{set_timer, fault, 2000}], E2).
+
+retry_round_in_flight_does_not_reset_the_backoff(_Config) ->
+    %% The moment a retry timer fires, no timer is armed and nothing is left in
+    %% backoff - but the round it released has proven nothing yet. A sibling
+    %% delivering in that window must not hand the clock back to its minimum:
+    %% under a throttling S3, some ranges of every round are answered and the
+    %% rest are not, so the delay would oscillate between its first two steps
+    %% for as long as the throttling lasted.
+    {S0, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    [{0, A, _}, {0, B, _} | _] = outstanding_ranges(S0),
+    {S1, [{set_timer, fault, 1000}]} = fail(S0, 0, A, slow_down),
+    {S2, _} = retry(S1, fault),
+    %% A is back on the wire; B answers while it is still outstanding.
+    {S3, _} = deliver(S2, 0, B, pattern(B, 1000), done),
+    %% A is throttled again: the backoff continues from 2s.
+    {_S4, E} = fail(S3, 0, A, slow_down),
+    ?assertEqual([{set_timer, fault, 2000}], E).
+
+backoff_resets_once_the_retried_range_delivers(_Config) ->
+    %% The other side of the same rule: once the round has come back, the clock
+    %% is reset by that very delivery, so a reader that has recovered does not
+    %% carry a grown delay into its next unrelated failure.
+    {S0, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    [{0, A, _}, {0, B, _} | _] = outstanding_ranges(S0),
+    {S1, [{set_timer, fault, 1000}]} = fail(S0, 0, A, slow_down),
+    {S2, _} = retry(S1, fault),
+    {S3, _} = deliver(S2, 0, A, pattern(A, 1000), done),
+    {_S4, E} = fail(S3, 0, B, slow_down),
+    ?assertEqual([{set_timer, fault, 1000}], E).
+
+backoff_resets_when_the_retried_range_delivers_but_stays_queued(_Config) ->
+    %% Delivering is what answers a retry round, not leaving the queue. A range
+    %% that has delivered every byte can sit in the queue for a while yet -
+    %% blocked behind an unfinished predecessor, as here - and while it does,
+    %% counting it as still owing the clock an answer holds the delay wherever
+    %% the burst grew it. A throttling burst that recovers would then pace the
+    %% next unrelated failure from seconds rather than from the minimum.
+    {S0, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    [{0, A, _}, {0, B, _} | _] = outstanding_ranges(S0),
+    {S1, [{set_timer, fault, 1000}]} = fail(S0, 0, B, slow_down),
+    {S2, _} = retry(S1, fault),
+    %% B answers in full, but A is still owed, so B cannot flush and keeps its
+    %% place in the queue.
+    {S3, _} = deliver(S2, 0, B, pattern(B, 1000), done),
+    ?assert(lists:member({B, B + 999}, fragment_ranges(S3, 0))),
+    %% The round has come back all the same: the next failure starts over.
+    {_S4, E} = fail(S3, 0, A, slow_down),
+    ?assertEqual([{set_timer, fault, 1000}], E).
+
+degenerate_prefetch_settings_are_clamped(_Config) ->
+    %% `prefetch_request_size` and `prefetch_max_depth` are plain app-env
+    %% settings with no schema to reject a zero, and either one of them stops
+    %% the reader dead: a zero depth leaves `has_room/1` false however far
+    %% behind the consumer falls, and a zero request size asks S3 for an
+    %% inverted range that it rejects and that counts nothing against the
+    %% window, so the depth fills with them. Both are floored, as the window
+    %% ceiling already is, so a misconfigured reader still makes progress.
+    FragRef = frag_ref(0, 1_000_000, 42),
+    Iterator = mock_iterator([{0, 1_000_000, 42}]),
+    Opts = #{request_size => 0, window_max => 0, max_depth => 0},
+    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
+    ?assertEqual([{8, 8}], fragment_ranges(S0, 0)),
+    %% And it serves what it fetched rather than stalling on it.
+    {S1, _} = deliver(S0, 0, 8, pattern(8, 1), done),
+    {_S2, E2} = read(S1, ?SEGMENT_HEADER_B, 1),
+    ?assertMatch([{reply, {ok, _}} | _], E2).
+
+end_of_manifest_transition_drops_outstanding_requests(_Config) ->
+    %% The transition has nowhere to go, so it stays on the current fragment and
+    %% resets its buffer. Any range still reading that fragment could never
+    %% flush into the reset buffer again - it would wedge the reassembly queue
+    %% and hold its pooled connection - so the requests go with the buffer.
+    FragRef = frag_ref(0, 1_000_000, 42),
+    Iterator = mock_iterator([{0, 1_000_000, 42}]),
+    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator),
+    ?assertMatch([_ | _], outstanding_ranges(S0)),
+    {S1, E} = rabbitmq_stream_s3_remote_reader_core:step(
+        S0, {iterator_refreshed, end_of_manifest}
+    ),
+    ?assertEqual([{cancel_requests, all}, {cancel_timers, all}, {reply, {become_local, 0}}], E),
+    ?assertEqual([], outstanding_ranges(S1)).

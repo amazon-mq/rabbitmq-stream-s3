@@ -6,10 +6,11 @@
 A gen_server process which reads stream data from the remote tier.
 
 This process bridges async S3 responses and the synchronous log reader.
-All decision logic (buffering, retry, fragment transitions, AIMD) lives in
-`rabbitmq_stream_s3_remote_reader_core`. This module translates external events (gun
-messages, timer fires, gen_server calls) into core events, feeds them to the
-core, and executes the resulting effects.
+All decision logic (buffering, reassembly, prefetch sizing and concurrency,
+retry, fragment transitions) lives in `rabbitmq_stream_s3_remote_reader_core`.
+This module translates external events (gun messages, timer fires, gen_server
+calls) into core events, feeds them to the core, and executes the resulting
+effects.
 
 ## Effect execution
 
@@ -27,8 +28,7 @@ synchronous feedback is generated.
 -behaviour(gen_server).
 
 -record(cfg, {
-    request_timeout_ms :: pos_integer(),
-    pending_read_deadline_ms :: pos_integer()
+    request_timeout_ms :: pos_integer()
 }).
 
 -define(C_BUFFER_HIT, 1).
@@ -40,6 +40,7 @@ synchronous feedback is generated.
 -define(C_TOTAL_REQUESTS, 7).
 -define(C_FATAL_ERRORS, 8).
 -define(COUNTER_KEY, {rabbitmq_stream_s3_remote_reader, counter}).
+-define(PREFETCH_SIZING_KEY, {rabbitmq_stream_s3_remote_reader, prefetch_sizing}).
 -define(COUNTERS, [
     {buffer_hit, ?C_BUFFER_HIT, counter, "Number of reads served from the buffer"},
     {buffer_miss, ?C_BUFFER_MISS, counter, "Number of reads that had to await async data"},
@@ -52,27 +53,9 @@ synchronous feedback is generated.
     {remote_reader_fatal_errors, ?C_FATAL_ERRORS, counter,
         "Number of remote readers stopped by a non-retryable S3 error"}
 ]).
-%% Upper bucket boundaries span the AIMD read-size range, whose ceiling is
-%% read_size_max (64 MiB). The 16/32/64 MiB buckets resolve the high end where
-%% the prefetch window spends most of its time under sustained reads; without
-%% them every read above 8 MiB collapses into the +Inf bucket. Reads never
-%% exceed the 64 MiB cap, so in normal operation +Inf stays empty.
--define(READ_SIZE_BUCKETS, [
-    48,
-    128,
-    512,
-    2_048,
-    8_192,
-    32_768,
-    131_072,
-    524_288,
-    2_097_152,
-    8_388_608,
-    16_777_216,
-    33_554_432,
-    67_108_864,
-    infinity
-]).
+%% The most bucket boundaries the prefetch window histogram may have. A window
+%% many requests wide would otherwise get one time series per step it can make.
+-define(PREFETCH_WINDOW_BUCKET_LIMIT, 16).
 
 -type hint() :: chunk_boundary | within_chunk.
 -export_type([hint/0]).
@@ -97,14 +80,32 @@ synchronous feedback is generated.
     %% remove an already-fired message, so a deadline_expired carrying a stale
     %% token (its read was served, or superseded by a newer read) is ignored.
     deadline_token :: reference() | undefined,
-    %% Maps fragment_offset -> {async_req, async_state}
+    %% Maps the backend's request id to the core's. Keyed by the backend id
+    %% because that is what arriving frames carry; the core knows the same
+    %% request by the id it minted for it, which is what its events carry back.
+    %% The fragment travels alongside for the 404 path, which is about the
+    %% object rather than the request.
     requests = #{} :: #{
-        osiris:offset() => {
-            rabbitmq_stream_s3_api:async_req(), rabbitmq_stream_s3_api:async_state()
+        rabbitmq_stream_s3_api:async_req() => {
+            rabbitmq_stream_s3_remote_reader_core:request_id(),
+            osiris:offset(),
+            rabbitmq_stream_s3_api:async_state()
         }
     },
     %% Cancelled request refs (gun may still deliver frames).
     cancelled = #{} :: #{rabbitmq_stream_s3_api:async_req() => ok},
+    %% The timer and token of the retry armed for each backoff kind. The handle
+    %% is what `cancel_timers` cancels; the token is what identifies the round,
+    %% and the kind is not enough on its own. cancel_timer cannot remove an
+    %% already-queued message, so a timer that fired just before it was
+    %% cancelled still arrives - and by then its kind can be armed again for a
+    %% different round, because the batch that cancelled the timers arms it (an
+    %% iterator refresh whose `start_request` effects fail does exactly that).
+    %% Acting on the stale message would release the new round's ranges on a
+    %% delay that round never earned.
+    retry_timers = #{} :: #{
+        rabbitmq_stream_s3_remote_reader_core:backoff() => {reference(), reference()}
+    },
     %% Set to true when the core emits `stop`.
     stopping = false :: boolean()
 }).
@@ -115,8 +116,11 @@ synchronous feedback is generated.
     stop/1,
     read/4,
     read/5,
+    read_iodata/4,
+    read_iodata/5,
     init_counters/0,
-    read_size_prometheus_format/0
+    prefetch_sizing/0,
+    prefetch_window_prometheus_format/0
 ]).
 
 %% gen_server
@@ -137,18 +141,60 @@ synchronous feedback is generated.
 init_counters() ->
     Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?COUNTERS, #{module => ?MODULE}),
     persistent_term:put(?COUNTER_KEY, Cnt),
-    rabbitmq_stream_s3_histogram:new(?MODULE, ?READ_SIZE_BUCKETS),
+    Sizing = read_prefetch_sizing(),
+    persistent_term:put(?PREFETCH_SIZING_KEY, Sizing),
+    rabbitmq_stream_s3_histogram:new(?MODULE, prefetch_window_buckets(Sizing)),
     ok.
 
--spec read_size_prometheus_format() -> map().
-read_size_prometheus_format() ->
+%% The sizing every reader on this node runs with. Published once at boot,
+%% because the histogram boundaries are derived from it and frozen at the same
+%% moment: a reader that read the app env directly would grow its window past
+%% boundaries already fixed against the old ceiling, and every observation above
+%% it would land in +Inf. Reading both from here keeps them the same numbers, so
+%% these two keys are boot-time settings and a change to either needs a restart.
+%%
+%% Falls back to a live read for a reader started without `init_counters/0`
+%% (tests); there is no histogram to disagree with in that case.
+-spec prefetch_sizing() -> {pos_integer(), pos_integer()}.
+prefetch_sizing() ->
+    persistent_term:get(?PREFETCH_SIZING_KEY, read_prefetch_sizing()).
+
+%% Clamped here rather than at each use so the boundaries and the readers cannot
+%% disagree about a ceiling configured below the floor either.
+read_prefetch_sizing() ->
+    RequestSize = rabbitmq_stream_s3_config:prefetch_request_size(),
+    {RequestSize, max(RequestSize, rabbitmq_stream_s3_config:prefetch_window_max())}.
+
+%% Upper bucket boundaries follow the values the window can actually take: it
+%% starts at `prefetch_request_size`, doubles on a miss up to
+%% `prefetch_window_max` and gives a request back at a time, so it is always in
+%% `[RequestSize, WindowMax]` and moves in whole requests. Boundaries spaced by
+%% the request size therefore resolve every step it can make, and the top one
+%% is the window's ceiling, so in normal operation +Inf stays empty.
+%%
+%% They are derived from the configured sizes rather than fixed because both are
+%% settings: a fixed list would put every observation of a raised
+%% `prefetch_window_max` into +Inf, and collapse the steps of a raised
+%% `prefetch_request_size` into a handful of buckets. Where the window spans
+%% more than `?PREFETCH_WINDOW_BUCKET_LIMIT` requests the spacing is widened to
+%% keep the series count bounded; the ceiling stays a boundary either way.
+%%
+%% Takes the sizing rather than reading it, so the boundaries are derived from
+%% the same numbers the readers run with. See `prefetch_sizing/0`.
+prefetch_window_buckets({RequestSize, WindowMax}) ->
+    Steps = ceil(WindowMax / RequestSize),
+    Stride = RequestSize * ceil(Steps / ?PREFETCH_WINDOW_BUCKET_LIMIT),
+    lists:usort(lists:seq(Stride, WindowMax, Stride) ++ [WindowMax]) ++ [infinity].
+
+-spec prefetch_window_prometheus_format() -> map().
+prefetch_window_prometheus_format() ->
     {Buckets, Count, Sum} = rabbitmq_stream_s3_histogram:prometheus_format(
-        ?MODULE, fun(X) -> X end, ?READ_SIZE_BUCKETS
+        ?MODULE, fun(X) -> X end
     ),
     #{
-        read_size_bytes => #{
+        prefetch_window_bytes => #{
             type => histogram,
-            help => <<"Distribution of remote tier read sizes in bytes">>,
+            help => <<"Distribution of the remote reader's prefetch window in bytes">>,
             values => [{[], Buckets, Count, Sum}]
         }
     }.
@@ -162,17 +208,68 @@ start(Config) ->
 stop(Pid) ->
     gen_server:cast(Pid, stop).
 
-%% The gen_server:call timeout must exceed PENDING_READ_DEADLINE_MS so the
-%% internal deadline always fires first and replies {error, timeout} to the
-%% caller. This avoids overlapping reads (caller times out, new read arrives
-%% while from is still set) which require unsafe buffer resets.
+%% The deadline a pending read is given before it is answered `{error, timeout}`.
+%% Fixed, it silently caps how large a chunk the remote tier can serve: a read
+%% cannot complete faster than the tier can deliver the bytes it asked for, so
+%% past that cap every attempt expires. The log reader's retries do not rescue
+%% it either - a retry resumes from what the core still has buffered, but the
+%% bytes the read is waiting for are by definition the ones that did not arrive
+%% in time, so each attempt meets the same wall and after
+%% `?READ_RETRY_ATTEMPTS` the read fails for good. Chunks are one writer batch
+%% and are bounded by message count rather than by bytes, and a chunk larger
+%% than `fragment_target_size` simply becomes an oversized single-chunk
+%% fragment, so the cap is reachable by ordinary publishing.
+%%
+%% So the budget scales with what the read needs fetched. `Offset` counts too,
+%% as an upper bound on that rather than a tight one: a consumer that attaches
+%% mid-fragment starts with nothing buffered, and a read is served as soon as
+%% its bytes arrive, so an over-estimate costs headroom and nothing else.
 -define(PENDING_READ_DEADLINE_MS, 40_000).
--define(SEND_FILE_READ_TIMEOUT_MS, 45_000).
+%% A deliberately pessimistic floor on tier throughput: 10 kB/ms is 10 MB/s,
+%% against ~40 MB/s for a single connection and several pipelined. The margin
+%% is for a slow tier; it still bounds how long a genuinely stuck read holds
+%% its caller, since the term is linear in bytes actually asked for.
+-define(DEADLINE_BYTES_PER_MS, 10_000).
+%% The gen_server:call timeout must exceed the internal deadline so the deadline
+%% always fires first and replies {error, timeout} to the caller. This avoids
+%% overlapping reads (caller times out, new read arrives while from is still
+%% set) which require unsafe buffer resets. `read/4` runs in the caller and has
+%% no access to the server's config, so the base is a constant on both sides
+%% rather than an option: a configurable base could be raised past the caller's
+%% timeout and invert the ordering.
+-define(READ_TIMEOUT_MARGIN_MS, 5_000).
 
+%% Reads come back as iodata: the reader holds its window as the blocks S3
+%% delivered, and a range spanning two of them is a list of two rather than a
+%% copy of the range. `read/4,5` flattens that for callers that need a single
+%% binary to slice - which is what the chunk-iterator path does, record by
+%% record - and `read_iodata/4,5` is for the callers that do not: the
+%% high-throughput send path puts the result straight into an iolist for the
+%% socket, so flattening it first is a copy of every byte for nothing.
+%%
+%% The flattening happens here, in the caller, rather than in the reader: the
+%% blocks cross the process boundary as refc binaries either way, so this only
+%% moves the copy off the reader, which is a data pipe shared by nothing else.
 read(Server, Offset, Bytes, Hint) ->
-    read(Server, Offset, Bytes, Hint, ?SEND_FILE_READ_TIMEOUT_MS).
+    flatten(read_iodata(Server, Offset, Bytes, Hint)).
+
+read_iodata(Server, Offset, Bytes, Hint) ->
+    Timeout = read_deadline_ms(Offset, Bytes, ?PENDING_READ_DEADLINE_MS) + ?READ_TIMEOUT_MARGIN_MS,
+    read_iodata(Server, Offset, Bytes, Hint, Timeout).
+
+flatten({ok, IoData}) -> {ok, iolist_to_binary(IoData)};
+flatten(Other) -> Other.
+
+%% The deadline for a read, and the basis for its caller's call timeout. Both
+%% derive from this so the ordering between them holds at every read size.
+read_deadline_ms(Offset, Bytes, BaseMs) ->
+    ToFetch = max(0, Offset + Bytes - ?SEGMENT_HEADER_B),
+    BaseMs + ToFetch div ?DEADLINE_BYTES_PER_MS.
 
 read(Server, Offset, Bytes, Hint, Timeout) ->
+    flatten(read_iodata(Server, Offset, Bytes, Hint, Timeout)).
+
+read_iodata(Server, Offset, Bytes, Hint, Timeout) ->
     T0 = erlang:monotonic_time(),
     Result =
         try
@@ -225,13 +322,14 @@ init(
 handle_call(
     #read{offset = Offset, bytes = Bytes, hint = Hint},
     From,
-    #state{cfg = #cfg{pending_read_deadline_ms = Deadline}, core = Core0} = State0
+    #state{core = Core0} = State0
 ) ->
     ?assertEqual(undefined, State0#state.from),
     {Core1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
         Core0, {read, Offset, Bytes, Hint}
     ),
     Token = make_ref(),
+    Deadline = read_deadline_ms(Offset, Bytes, ?PENDING_READ_DEADLINE_MS),
     Timer = erlang:send_after(Deadline, self(), {deadline_expired, Token}),
     State1 = State0#state{
         core = Core1,
@@ -251,14 +349,32 @@ handle_cast(_Msg, State) ->
 
 handle_info({'DOWN', MRef, process, _Pid, _Reason}, #state{reader_ref = MRef} = State) ->
     {stop, normal, State};
-handle_info(retry_requests, #state{stream = StreamId, core = Core0} = State0) ->
-    ?LOG_DEBUG(
-        "remote_reader retry_requests firing for stream ~ts",
-        [StreamId]
-    ),
-    {Core1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(Core0, retry),
-    State = execute_effects(Effects, State0#state{core = Core1}),
-    maybe_stop(State);
+handle_info(
+    {retry_requests, Kind, Token},
+    #state{stream = StreamId, core = Core0, retry_timers = Timers} = State0
+) ->
+    case Timers of
+        #{Kind := {_Timer, Token}} ->
+            ?LOG_DEBUG(
+                "remote_reader ~ts retry_requests firing for stream ~ts",
+                [Kind, StreamId]
+            ),
+            {Core1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(Core0, {retry, Kind}),
+            State = execute_effects(
+                Effects, State0#state{core = Core1, retry_timers = maps:remove(Kind, Timers)}
+            ),
+            maybe_stop(State);
+        _ ->
+            %% A retry timer that was cancelled after it had already fired (a
+            %% read deadline expired, or the iterator was refreshed - both
+            %% disown either backoff). cancel_timer cannot remove a queued
+            %% message, so it is dropped here instead. The token is what makes
+            %% that decidable: the same batch that cancels the timers can arm a
+            %% fresh one for the same kind, so a guard on the kind alone would
+            %% mistake the stale message for the new round's own and release
+            %% that round's ranges before their delay had elapsed.
+            {noreply, State0}
+    end;
 handle_info(
     {deadline_expired, Token},
     #state{deadline_token = Token, stream = StreamId, core = Core0} = State0
@@ -283,7 +399,7 @@ handle_info({deadline_expired, _StaleToken}, State) ->
     %% newer read's buffer and cancel its in-flight requests.
     {noreply, State};
 handle_info(Msg, #state{requests = Requests0, cancelled = Cancelled0} = State0) ->
-    AsyncStates = #{Req => AsyncState || _ := {Req, AsyncState} <- Requests0},
+    AsyncStates = #{Req => AsyncState || Req := {_, _, AsyncState} <- Requests0},
     case rabbitmq_stream_s3_api:match_async(Msg, AsyncStates, Cancelled0) of
         {ok, RequestId} ->
             handle_async_response(Msg, RequestId, State0);
@@ -317,84 +433,83 @@ format_status(#{state := #state{stream = StreamId, core = Core, from = From}} = 
 %%----------------------------------------------------------------------------
 
 handle_async_response(
-    Msg, RequestId, #state{requests = Requests0, cancelled = Cancelled0, core = Core0} = State0
+    Msg, RequestId, #state{requests = Requests0, cancelled = Cancelled0} = State0
 ) ->
-    %% Find which fragment this request belongs to.
-    {FragOffset, {_, AsyncState0}} = find_request_by_id(RequestId, Requests0),
+    %% Find the range this request was issued for.
+    #{RequestId := {Id, FragOffset, AsyncState0}} = Requests0,
     case rabbitmq_stream_s3_api:handle_async(Msg, RequestId, AsyncState0) of
         ignore ->
             {noreply, State0};
         {continue, AsyncState} ->
-            Requests = Requests0#{FragOffset := {RequestId, AsyncState}},
+            Requests = Requests0#{RequestId := {Id, FragOffset, AsyncState}},
             {noreply, State0#state{requests = Requests}};
         {data, Data, Result} ->
             {Requests, DoneOrContinue} =
                 case Result of
                     done ->
                         counters:sub(counter(), ?C_REQUESTS_IN_FLIGHT, 1),
-                        {maps:remove(FragOffset, Requests0), done};
+                        {maps:remove(RequestId, Requests0), done};
                     AsyncState ->
-                        {Requests0#{FragOffset := {RequestId, AsyncState}}, continue}
+                        {Requests0#{RequestId := {Id, FragOffset, AsyncState}}, continue}
                 end,
-            {Core1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
-                Core0, {data, RequestId, FragOffset, Data, DoneOrContinue}
-            ),
-            State = execute_effects(Effects, State0#state{core = Core1, requests = Requests}),
-            maybe_stop(State);
+            step_and_execute(
+                {data, Id, Data, DoneOrContinue},
+                State0#state{requests = Requests}
+            );
         {done, ok} ->
             %% Empty 200 on range GET. Treat as transient error.
             counters:sub(counter(), ?C_REQUESTS_IN_FLIGHT, 1),
-            Requests = maps:remove(FragOffset, Requests0),
-            {Core1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
-                Core0, {request_error, RequestId, FragOffset, timeout}
-            ),
-            State = execute_effects(Effects, State0#state{core = Core1, requests = Requests}),
-            maybe_stop(State);
+            Requests = maps:remove(RequestId, Requests0),
+            step_and_execute(
+                {request_error, Id, FragOffset, timeout},
+                State0#state{requests = Requests}
+            );
         {done, {error, Reason}} ->
             counters:sub(counter(), ?C_REQUESTS_IN_FLIGHT, 1),
-            Requests = maps:remove(FragOffset, Requests0),
-            {Core1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
-                Core0, {request_error, RequestId, FragOffset, Reason}
-            ),
-            State = execute_effects(Effects, State0#state{core = Core1, requests = Requests}),
-            maybe_stop(State);
+            Requests = maps:remove(RequestId, Requests0),
+            step_and_execute(
+                {request_error, Id, FragOffset, Reason},
+                State0#state{requests = Requests}
+            );
         {done_cancel, {error, Reason}} ->
             counters:sub(counter(), ?C_REQUESTS_IN_FLIGHT, 1),
-            Requests = maps:remove(FragOffset, Requests0),
+            Requests = maps:remove(RequestId, Requests0),
             Cancelled = Cancelled0#{RequestId => ok},
-            {Core1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
-                Core0, {request_error, RequestId, FragOffset, Reason}
-            ),
-            State = execute_effects(Effects, State0#state{
-                core = Core1, requests = Requests, cancelled = Cancelled
-            }),
-            maybe_stop(State)
+            step_and_execute(
+                {request_error, Id, FragOffset, Reason},
+                State0#state{requests = Requests, cancelled = Cancelled}
+            )
     end.
 
-find_request_by_id(RequestId, Requests) ->
-    maps:fold(
-        fun
-            (FragOff, {ReqId, _} = Val, undefined) when ReqId =:= RequestId ->
-                {FragOff, Val};
-            (_, _, Acc) ->
-                Acc
-        end,
-        undefined,
-        Requests
-    ).
+step_and_execute(Event, #state{core = Core0} = State0) ->
+    {Core, Effects} = rabbitmq_stream_s3_remote_reader_core:step(Core0, Event),
+    State = execute_effects(Effects, State0#state{core = Core}),
+    maybe_stop(State).
 
 %%----------------------------------------------------------------------------
 %% Internal: effect execution loop
 %%----------------------------------------------------------------------------
 
-execute_effects([], State) ->
-    State;
-execute_effects([Effect | Rest], State0) ->
-    State = execute_effect(Effect, State0),
-    execute_effects(Rest, State).
+%% The connection pool hands out connections with a 100ms checkout timeout, so
+%% executing a batch of start_request effects against a saturated pool would
+%% block this process for 100ms per request while the caller's read deadline
+%% burns. Once one checkout has come back `pool_busy` the rest of the batch is
+%% reported to the core as busy without being attempted, capping the cost of a
+%% saturated pool at one checkout timeout per batch.
+execute_effects(Effects, State) ->
+    {State1, _PoolBusy} = execute_effects(Effects, false, State),
+    State1.
+
+execute_effects([], PoolBusy, State) ->
+    {State, PoolBusy};
+execute_effects([Effect | Rest], PoolBusy0, State0) ->
+    {State, PoolBusy} = execute_effect(Effect, PoolBusy0, State0),
+    execute_effects(Rest, PoolBusy, State).
 
 execute_effect(
-    {reply, Result}, #state{stream = StreamId, from = From, deadline_timer = Timer} = State
+    {reply, Result},
+    PoolBusy,
+    #state{stream = StreamId, from = From, deadline_timer = Timer} = State
 ) when
     From =/= undefined
 ->
@@ -414,50 +529,82 @@ execute_effect(
     end,
     cancel_deadline_timer(Timer),
     gen_server:reply(From, Result),
-    State#state{from = undefined, deadline_timer = undefined, deadline_token = undefined};
-execute_effect({reply, _Result}, State) ->
-    State;
-execute_effect({observe, hit, ReadSize}, State) ->
+    {
+        State#state{from = undefined, deadline_timer = undefined, deadline_token = undefined},
+        PoolBusy
+    };
+execute_effect({reply, _Result}, PoolBusy, State) ->
+    {State, PoolBusy};
+execute_effect({observe, hit, Window}, PoolBusy, State) ->
     counters:add(counter(), ?C_BUFFER_HIT, 1),
-    rabbitmq_stream_s3_histogram:observe(?MODULE, ReadSize),
-    State;
-execute_effect({observe, miss, ReadSize}, State) ->
+    rabbitmq_stream_s3_histogram:observe(?MODULE, Window),
+    {State, PoolBusy};
+execute_effect({observe, miss, Window}, PoolBusy, State) ->
     counters:add(counter(), ?C_BUFFER_MISS, 1),
-    rabbitmq_stream_s3_histogram:observe(?MODULE, ReadSize),
-    State;
-execute_effect({observe, fragment_transition, ReadSize}, State) ->
+    rabbitmq_stream_s3_histogram:observe(?MODULE, Window),
+    {State, PoolBusy};
+execute_effect({observe, fragment_transition, Window}, PoolBusy, State) ->
     counters:add(counter(), ?C_FRAGMENT_TRANSITION, 1),
-    rabbitmq_stream_s3_histogram:observe(?MODULE, ReadSize),
-    State;
+    rabbitmq_stream_s3_histogram:observe(?MODULE, Window),
+    {State, PoolBusy};
 execute_effect(
-    {start_request, Key, Range, FragOffset},
-    #state{cfg = #cfg{request_timeout_ms = Timeout}, core = Core0, requests = Requests0} = State
+    {start_request, Id, Key, {RangeStart, _} = Range, FragOffset},
+    false,
+    #state{
+        stream = StreamId, cfg = #cfg{request_timeout_ms = Timeout}, requests = Requests0
+    } = State
 ) ->
     case rabbitmq_stream_s3_api:get_range_async(Key, Range, #{timeout => Timeout}) of
         {ok, RequestId, AsyncState} ->
             counters:add(counter(), ?C_REQUESTS_IN_FLIGHT, 1),
             counters:add(counter(), ?C_TOTAL_REQUESTS, 1),
-            Requests = Requests0#{FragOffset => {RequestId, AsyncState}},
-            State#state{requests = Requests};
+            Requests = Requests0#{RequestId => {Id, FragOffset, AsyncState}},
+            {State#state{requests = Requests}, false};
         {error, pool_busy} ->
             ?LOG_DEBUG(
-                "remote_reader start_request: pool_busy key=~ts frag=~b",
-                [Key, FragOffset]
+                "remote_reader start_request: pool_busy key=~ts frag=~b pos=~b",
+                [Key, FragOffset, RangeStart]
             ),
-            {Core1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
-                Core0, {request_error, make_ref(), FragOffset, pool_busy}
+            report_pool_busy(Id, FragOffset, State);
+        {error, Reason} ->
+            %% The request never reached the pool: credentials could not be
+            %% obtained or the region could not be resolved, so signing failed.
+            %% Both are transient and node-local, and neither says anything
+            %% about the object, so report it as a connection error and let the
+            %% core put the range back with its usual backoff. Crashing here
+            %% instead (this clause used to be absent) took the reader down on
+            %% an IMDS blip and failed the consumer's read outright.
+            ?LOG_WARNING(
+                "remote_reader could not start a request for stream ~ts "
+                "(key=~ts frag=~b pos=~b): ~0p",
+                [StreamId, Key, FragOffset, RangeStart, Reason]
             ),
-            execute_effects(Effects, State#state{core = Core1})
+            report_request_error(Id, FragOffset, connection_error, false, State)
     end;
-execute_effect({set_timer, DelayMs}, #state{stream = StreamId} = State) ->
+execute_effect({start_request, Id, _Key, _Range, FragOffset}, true, State) ->
+    %% A checkout in this batch has already timed out; do not spend another
+    %% timeout finding out the pool is still saturated.
+    report_pool_busy(Id, FragOffset, State);
+execute_effect({cancel_request, Id}, PoolBusy, State) ->
+    {cancel_request(Id, State), PoolBusy};
+execute_effect({cancel_requests, all}, PoolBusy, State) ->
+    {cancel_all_requests(State), PoolBusy};
+execute_effect(
+    {set_timer, Kind, DelayMs}, PoolBusy, #state{stream = StreamId, retry_timers = Timers} = State
+) ->
     ?LOG_DEBUG(
-        "remote_reader scheduling retry in ~bms for stream ~ts",
-        [DelayMs, StreamId]
+        "remote_reader scheduling ~ts retry in ~bms for stream ~ts",
+        [Kind, DelayMs, StreamId]
     ),
-    erlang:send_after(DelayMs, self(), retry_requests),
-    State;
+    Token = make_ref(),
+    Timer = erlang:send_after(DelayMs, self(), {retry_requests, Kind, Token}),
+    {State#state{retry_timers = Timers#{Kind => {Timer, Token}}}, PoolBusy};
+execute_effect({cancel_timers, all}, PoolBusy, #state{retry_timers = Timers} = State) ->
+    maps:foreach(fun(_Kind, {Timer, _Token}) -> cancel_retry_timer(Timer) end, Timers),
+    {State#state{retry_timers = #{}}, PoolBusy};
 execute_effect(
     {refresh_iterator, NotFoundOffset},
+    PoolBusy,
     #state{stream = StreamId, core = Core0} = State0
 ) ->
     %% Cancel in-flight requests. The core will reinitialize at a new fragment.
@@ -467,16 +614,46 @@ execute_effect(
     {Core1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
         Core0, {iterator_refreshed, Result}
     ),
-    execute_effects(Effects, State1#state{core = Core1});
-execute_effect({fatal_error, Reason}, #state{stream = StreamId} = State) ->
+    execute_effects(Effects, PoolBusy, State1#state{core = Core1});
+execute_effect({fatal_error, Reason}, PoolBusy, #state{stream = StreamId} = State) ->
     counters:add(counter(), ?C_FATAL_ERRORS, 1),
     ?LOG_WARNING(
         "remote_reader for stream ~ts stopping on non-retryable S3 error: ~tp",
         [StreamId, Reason]
     ),
-    State;
-execute_effect(stop, State) ->
-    State#state{stopping = true}.
+    {State, PoolBusy};
+execute_effect(stop, PoolBusy, State) ->
+    {State#state{stopping = true}, PoolBusy}.
+
+report_pool_busy(Id, FragOffset, State) ->
+    report_request_error(Id, FragOffset, pool_busy, true, State).
+
+%% Tell the core that a range the shell was asked to start never got off the
+%% ground. An error step can ask for requests to be started (a range that owed
+%% nothing frees a depth slot for the next one), so the nested effects run with
+%% the batch's busy flag carried through: a saturated pool passes `true`, which
+%% turns any nested start into another report rather than another checkout.
+%%
+%% `PoolBusy` has to be what the shell actually saw. A start that failed before
+%% the pool was reached (credentials, region) is not evidence the pool is busy,
+%% and reporting a nested range as `pool_busy` on that path would grow
+%% `pool_busy_delay` and park the range on a clock measuring something else.
+%%
+%% Recursion is bounded at one level either way. The nested range is in flight
+%% by the time it is reported, so the core requeues it - `fail_range/3` takes the
+%% `{ok, _}` branch, which only arms a timer - rather than freeing another slot.
+%%
+%% The flag the nested effects end on is what this returns, so it reaches the
+%% rest of the outer batch. Only the nested run can raise it: a start that
+%% failed before the pool was reached enters with `false`, and if one of the
+%% requests it went on to start then found the pool saturated, discarding that
+%% would leave the outer batch spending a 100ms checkout on each of its
+%% remaining ranges - the cost the short-circuit exists to cap.
+report_request_error(Id, FragOffset, Reason, PoolBusy, #state{core = Core0} = State) ->
+    {Core, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
+        Core0, {request_error, Id, FragOffset, Reason}
+    ),
+    execute_effects(Effects, PoolBusy, State#state{core = Core}).
 
 %% Rebuild the fragment iterator from the manifest cache, advancing past
 %% the given offset (the fragment known to be 404).
@@ -533,23 +710,38 @@ maybe_stop(State) ->
     {noreply, State}.
 
 build_cfg(Opts) ->
-    #cfg{
-        request_timeout_ms = maps:get(request_timeout_ms, Opts, 15_000),
-        pending_read_deadline_ms = maps:get(
-            pending_read_deadline_ms, Opts, ?PENDING_READ_DEADLINE_MS
-        )
-    }.
+    #cfg{request_timeout_ms = maps:get(request_timeout_ms, Opts, 15_000)}.
 
 cancel_all_requests(#state{requests = Requests, cancelled = Cancelled0} = State) ->
     maps:foreach(
-        fun(_FragOff, {ReqId, AsyncState}) ->
+        fun(ReqId, {_CoreRequestId, _FragOffset, AsyncState}) ->
             rabbitmq_stream_s3_api:cancel_async(ReqId, AsyncState)
         end,
         Requests
     ),
     counters:sub(counter(), ?C_REQUESTS_IN_FLIGHT, map_size(Requests)),
-    NewCancelled = maps:merge(Cancelled0, #{ReqId => ok || _ := {ReqId, _} <- Requests}),
+    NewCancelled = maps:merge(Cancelled0, #{ReqId => ok || ReqId := _ <- Requests}),
     State#state{requests = #{}, cancelled = NewCancelled}.
+
+%% Abandon one range. The core drops requests individually when a fragment it
+%% no longer reads still has ranges outstanding; frames for them may still
+%% arrive, so the id is remembered as cancelled and matched away.
+cancel_request(Id, #state{requests = Requests} = State) ->
+    Matching = [ReqId || ReqId := {ReqCoreId, _, _} <- Requests, ReqCoreId =:= Id],
+    lists:foldl(fun cancel_request_id/2, State, Matching).
+
+cancel_request_id(ReqId, #state{requests = Requests, cancelled = Cancelled} = State) ->
+    #{ReqId := {_, _, AsyncState}} = Requests,
+    rabbitmq_stream_s3_api:cancel_async(ReqId, AsyncState),
+    counters:sub(counter(), ?C_REQUESTS_IN_FLIGHT, 1),
+    State#state{
+        requests = maps:remove(ReqId, Requests),
+        cancelled = Cancelled#{ReqId => ok}
+    }.
+
+cancel_retry_timer(Timer) ->
+    _ = erlang:cancel_timer(Timer, [{async, true}, {info, false}]),
+    ok.
 
 cancel_deadline_timer(undefined) ->
     ok;
@@ -574,5 +766,214 @@ stale_deadline_token_is_ignored_test() ->
     %% Also ignored when no read is pending (token undefined).
     State2 = #state{deadline_token = undefined},
     ?assertEqual({noreply, State2}, handle_info({deadline_expired, Stale}, State2)).
+
+%% `cancel_timers` must leave no way for a cancelled retry to be acted on.
+%% cancel_timer cannot remove a message that is already queued, so the timer map
+%% is both the handle used to cancel and the record of which rounds may still
+%% retry: a `retry_requests` whose token is not in it is stale.
+cancel_timers_disarms_every_retry_timer_test() ->
+    Token = make_ref(),
+    Timer = erlang:send_after(60_000, self(), {retry_requests, fault, Token}),
+    State = #state{retry_timers = #{fault => {Timer, Token}}},
+    {State1, false} = execute_effect({cancel_timers, all}, false, State),
+    ?assertEqual(#{}, State1#state.retry_timers),
+    %% Even the message of a timer that had already fired is dropped. Acting on
+    %% it would release the ranges of whatever backoff round is current, on a
+    %% delay that round never earned.
+    ?assertEqual({noreply, State1}, handle_info({retry_requests, fault, Token}, State1)).
+
+%% Cancelling a kind's timer and arming a fresh one for it can happen in the
+%% same effect batch: an iterator refresh emits `cancel_timers` followed by the
+%% new fragment's `start_request` effects, and one of those failing arms the
+%% kind again. A message from the cancelled timer then arrives with its kind
+%% back in the map, so the kind alone cannot say whether it is stale - the token
+%% can, and must, or the new round's ranges go back on the wire immediately.
+stale_retry_token_is_ignored_while_the_kind_is_rearmed_test() ->
+    Cancelled = make_ref(),
+    State = #state{
+        retry_timers = #{fault => {erlang:send_after(60_000, self(), ignored), make_ref()}}
+    },
+    ?assertEqual({noreply, State}, handle_info({retry_requests, fault, Cancelled}, State)),
+    ?assert(is_map_key(fault, State#state.retry_timers)).
+
+%% One kind's timer must not stand in for the other's: cancelling `fault` leaves
+%% a live `pool_busy` timer that is still honoured.
+stale_retry_is_ignored_per_kind_test() ->
+    PoolBusy = {erlang:send_after(60_000, self(), ignored), make_ref()},
+    State = #state{retry_timers = #{pool_busy => PoolBusy}},
+    ?assertEqual({noreply, State}, handle_info({retry_requests, fault, make_ref()}, State)),
+    ?assert(is_map_key(pool_busy, State#state.retry_timers)).
+
+%% The histogram's boundaries have to follow the values the window can take, or
+%% it reports resolution it cannot deliver. The window moves in whole requests
+%% between `prefetch_request_size` and `prefetch_window_max`, so every step it
+%% can make needs its own bucket - and none of them may land in +Inf, which is
+%% for a window that has escaped its ceiling.
+prefetch_window_buckets_resolve_every_window_step_test() ->
+    {RequestSize, WindowMax} = Sizing = read_prefetch_sizing(),
+    Buckets = prefetch_window_buckets(Sizing),
+    Windows = lists:seq(RequestSize, WindowMax, RequestSize),
+    Observed = [bucket_of(W, Buckets) || W <- Windows],
+    ?assertEqual(length(Windows), length(lists:usort(Observed))),
+    ?assertNot(lists:member(infinity, Observed)).
+
+%% The boundaries are derived, so sizings other than the default have to hold
+%% up too: the ceiling is always the top finite boundary (nothing the window can
+%% take falls into +Inf), and a window many requests wide is spaced out rather
+%% than given a boundary per step.
+prefetch_window_buckets_follow_the_configured_sizes_test_() ->
+    Sizings = [
+        %% Default.
+        {4_194_304, 33_554_432},
+        %% A raised ceiling: fixed boundaries would have put all of it in +Inf.
+        {4_194_304, 268_435_456},
+        %% A raised request size, which is also the floor the window sits at.
+        {33_554_432, 134_217_728},
+        %% A ceiling that is not a whole number of requests.
+        {4_194_304, 30_000_000},
+        %% Degenerate: no room to grow at all.
+        {4_194_304, 4_194_304},
+        %% Degenerate: a ceiling below the floor, which the core clamps away.
+        {4_194_304, 1_048_576}
+    ],
+    [
+        {
+            lists:flatten(io_lib:format("~b/~b", [RequestSize, WindowMax])),
+            fun() ->
+                with_prefetch_config(RequestSize, WindowMax, fun() ->
+                    {_, Ceiling} = Sizing = read_prefetch_sizing(),
+                    ?assertEqual(max(RequestSize, WindowMax), Ceiling),
+                    Buckets = prefetch_window_buckets(Sizing),
+                    ?assertEqual(infinity, lists:last(Buckets)),
+                    ?assertEqual(Ceiling, lists:last(lists:droplast(Buckets))),
+                    ?assertNotEqual(infinity, bucket_of(Ceiling, Buckets)),
+                    ?assert(length(Buckets) =< ?PREFETCH_WINDOW_BUCKET_LIMIT + 1)
+                end)
+            end
+        }
+     || {RequestSize, WindowMax} <- Sizings
+    ].
+
+with_prefetch_config(RequestSize, WindowMax, Fun) ->
+    Set = fun(Key, Value) ->
+        Prev = application:get_env(rabbitmq_stream_s3, Key),
+        application:set_env(rabbitmq_stream_s3, Key, Value),
+        Prev
+    end,
+    Reset = fun
+        (Key, {ok, Value}) -> application:set_env(rabbitmq_stream_s3, Key, Value);
+        (Key, undefined) -> application:unset_env(rabbitmq_stream_s3, Key)
+    end,
+    PrevSize = Set(prefetch_request_size, RequestSize),
+    PrevMax = Set(prefetch_window_max, WindowMax),
+    try
+        Fun()
+    after
+        Reset(prefetch_request_size, PrevSize),
+        Reset(prefetch_window_max, PrevMax)
+    end.
+
+bucket_of(Value, Buckets) ->
+    hd([UB || UB <- Buckets, UB =:= infinity orelse Value =< UB]).
+
+%% Checking a connection out of a saturated pool costs a 100ms timeout, so once
+%% one request in a batch has come back pool_busy the rest must be reported to
+%% the core as busy without being attempted. Otherwise a reader pipelining N
+%% requests blocks for N x 100ms with its caller's read deadline burning.
+pool_busy_short_circuits_the_rest_of_a_batch_test() ->
+    StreamId = <<"pool-busy-test">>,
+    FragRef = #fragment_ref{offset = 0, uid = 1, size = 100_000},
+    Manifest = #manifest{
+        first_offset = 0,
+        next_offset = 1,
+        entries = ?ENTRY(0, 0, 0, ?MANIFEST_KIND_FRAGMENT, 100_000, 1)
+    },
+    Iterator = rabbitmq_stream_s3_fragment_iterator:init(
+        Manifest, 0, fun(_) -> {error, not_found} end
+    ),
+    {Core0, _} = rabbitmq_stream_s3_remote_reader_core:init(
+        StreamId, FragRef, ?SEGMENT_HEADER_B, Iterator, #{request_size => 1000, max_depth => 4}
+    ),
+    %% Reads that cannot be served grow the prefetch window until the reader
+    %% pipelines; failing every range then leaves a batch for the retry to
+    %% re-issue, which is when a saturated pool costs the most.
+    Core1 = lists:foldl(
+        fun(_, Acc) ->
+            {Acc1, _} = rabbitmq_stream_s3_remote_reader_core:step(
+                Acc, {read, ?SEGMENT_HEADER_B, 50_000, chunk_boundary}
+            ),
+            Acc1
+        end,
+        Core0,
+        lists:seq(1, 3)
+    ),
+    Core2 = lists:foldl(
+        fun({Fragment, Start, _End}, Acc) ->
+            {ok, Id} = rabbitmq_stream_s3_remote_reader_core:request_id(Acc, Fragment, Start),
+            {Acc1, _} = rabbitmq_stream_s3_remote_reader_core:step(
+                Acc, {request_error, Id, Fragment, slow_down}
+            ),
+            Acc1
+        end,
+        Core1,
+        rabbitmq_stream_s3_remote_reader_core:outstanding_ranges(Core1)
+    ),
+    {Core, Effects} = rabbitmq_stream_s3_remote_reader_core:step(Core2, {retry, fault}),
+    Starts = [E || {start_request, _, _, _, _} = E <- Effects],
+    ?assert(length(Starts) > 1),
+    State = #state{stream = StreamId, cfg = build_cfg(#{}), core = Core},
+    %% Enter the batch as if a checkout had already timed out.
+    {State1, true} = execute_effects(Starts, true, State),
+    %% No request was issued, and the core has every range queued for retry.
+    ?assertEqual(#{}, State1#state.requests),
+    ?assertEqual(
+        [{0, Start, End} || {start_request, _, _, {Start, End}, 0} <- Starts],
+        rabbitmq_stream_s3_remote_reader_core:outstanding_ranges(State1#state.core)
+    ).
+
+%% A read cannot complete faster than the tier can deliver what it asked for, so
+%% a fixed deadline caps the chunk size the remote tier can serve: past the cap
+%% every attempt expires, and the log reader's retries do not rescue it - the
+%% bytes a retry waits for are by definition the ones that did not arrive in
+%% time, so each attempt meets the same wall.
+read_deadline_scales_with_the_bytes_asked_for_test() ->
+    Base = ?PENDING_READ_DEADLINE_MS,
+    %% A chunk-header over-read is answered on the base budget.
+    ?assertEqual(Base, read_deadline_ms(?SEGMENT_HEADER_B, 0, Base)),
+    ?assert(read_deadline_ms(?SEGMENT_HEADER_B, 303, Base) < Base + 1_000),
+    %% A 512 MiB chunk gets a budget it can actually be delivered in. At the
+    %% pessimistic 10 MB/s floor that is ~51s of transfer on top of the base.
+    Big = read_deadline_ms(?SEGMENT_HEADER_B, 512 * 1024 * 1024, Base),
+    ?assert(Big > Base + 50_000),
+    %% The offset counts too, as an upper bound on what the read needs fetched
+    %% rather than a tight one: a consumer that attaches mid-fragment starts with
+    %% nothing buffered, and an over-estimate costs headroom and nothing else.
+    ?assert(
+        read_deadline_ms(?SEGMENT_HEADER_B + 100_000_000, 1_000, Base) >
+            read_deadline_ms(?SEGMENT_HEADER_B, 1_000, Base)
+    ),
+    %% Monotonic, so a larger read never gets a smaller budget.
+    ?assert(read_deadline_ms(?SEGMENT_HEADER_B, 4_000_000, Base) >= Base).
+
+%% The caller's call timeout must stay above the internal deadline at every read
+%% size, or the caller times out first and leaves `from` set for an overlapping
+%% read - which needs a buffer reset that is not safe to do underneath one.
+call_timeout_exceeds_the_deadline_at_every_size_test() ->
+    Base = ?PENDING_READ_DEADLINE_MS,
+    lists:foreach(
+        fun({Offset, Bytes}) ->
+            Deadline = read_deadline_ms(Offset, Bytes, Base),
+            CallTimeout = Deadline + ?READ_TIMEOUT_MARGIN_MS,
+            ?assert(CallTimeout > Deadline)
+        end,
+        [
+            {?SEGMENT_HEADER_B, 1},
+            {?SEGMENT_HEADER_B, 303},
+            {?SEGMENT_HEADER_B, 4 * 1024 * 1024},
+            {?SEGMENT_HEADER_B, 512 * 1024 * 1024},
+            {?SEGMENT_HEADER_B + 64 * 1024 * 1024, 512 * 1024 * 1024},
+            {0, 0}
+        ]
+    ).
 
 -endif.

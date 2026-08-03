@@ -58,6 +58,7 @@ groups() ->
     [
         {single_node, [], [
             read_from_remote_first,
+            send_file_from_remote_tier,
             read_from_remote_first_large_filter,
             read_across_fragment_boundaries,
             read_from_remote_offset,
@@ -69,6 +70,8 @@ groups() ->
             remote_reader_restart_self_heals,
             become_local_stops_remote_reader,
             read_retries_transient_remote_error,
+            read_with_out_of_order_remote_responses,
+            read_with_out_of_order_responses_and_a_failure,
             read_tolerates_slow_remote,
             read_group_fetch_error_is_surfaced
         ]},
@@ -122,6 +125,12 @@ end_per_testcase(_TestCase, Config) ->
         rabbitmq_stream_s3, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_fs
     ),
     catch rabbitmq_stream_s3_api_fault:reset(),
+    %% Restore the default prefetch sizing if a test shrank it, including the
+    %% copy published at boot; see `pipeline_within_fragments/0`.
+    application:unset_env(rabbitmq_stream_s3, prefetch_request_size),
+    application:unset_env(rabbitmq_stream_s3, prefetch_window_max),
+    application:unset_env(rabbitmq_stream_s3, prefetch_max_depth),
+    ok = rabbitmq_stream_s3_remote_reader:init_counters(),
     Config.
 
 %% ------------------------------------------------------------------
@@ -144,6 +153,89 @@ read_from_remote_first(Config) ->
 
     Records = read_all(Reader0),
     assert_sequential(Records, N).
+
+send_file_from_remote_tier(Config) ->
+    %% `send_file/3` is the high-throughput delivery path: the stream protocol
+    %% hands it a socket and it writes chunk headers and data straight out,
+    %% never assembling a chunk into one binary. Nothing else in this suite
+    %% drives it - every other remote read here goes through the chunk-iterator
+    %% path, which the messaging protocols use - so this is the only coverage
+    %% for reading the remote tier as iodata.
+    %%
+    %% CRC validation is on, which is what gives the test teeth: the check runs
+    %% over the bytes as they came out of the reader's blocks, so a range
+    %% assembled in the wrong order, short, or with the wrong prefix taken for
+    %% the check exits here rather than being written to the socket unnoticed.
+    Writer = start_writer(Config, #{fragment_target_size => 1000}),
+    N = 200,
+    write_sequential(Writer, N, 5),
+
+    ReaderCfg0 = reader_config(Writer, Config),
+    ReaderCfg = ReaderCfg0#{verify_crc_on_read => true},
+    #{shared := Shared} = ReaderCfg,
+    ?awaitMatch([S] when S > 0, list_segment_offsets(Config), 1000),
+    ?awaitMatch(F when F > 0, osiris_log_shared:first_chunk_id(Shared), 1000),
+
+    %% What the chunk-iterator path says is there, chunk by chunk: the header
+    %% plus the bytes `send_file` is asked to send for it.
+    {ok, Counting} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg),
+    ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Counting)),
+    Expected = expected_send_bytes(Counting, 0),
+
+    {ok, Reader} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg),
+    {Server, Client} = tcp_pair(),
+    try
+        Sent = send_all(Server, Reader),
+        Received = recv_exactly(Client, Sent),
+        ?assert(Sent > 0),
+        ?assertEqual(Expected, Sent),
+        ?assertEqual(Sent, byte_size(Received))
+    after
+        gen_tcp:close(Server),
+        gen_tcp:close(Client)
+    end.
+
+%% The chunk header is sent whole and the data region is sent as the chunk
+%% selector asks for it, which for user data is `data_size` bytes after the
+%% filter.
+expected_send_bytes(Reader0, Acc) ->
+    case rabbitmq_stream_s3_log_reader:chunk_iterator(Reader0, 1, undefined) of
+        {ok, #{filter_size := FilterSize, data_size := DataSize}, _Iter, Reader} ->
+            expected_send_bytes(Reader, Acc + ?CHUNK_HEADER_B + FilterSize + DataSize);
+        {end_of_stream, _Reader} ->
+            Acc
+    end.
+
+send_all(Socket, Reader0) ->
+    send_all(Socket, Reader0, 0).
+
+send_all(Socket, Reader0, Acc) ->
+    %% The callback's return is prepended to every chunk on the wire; an empty
+    %% one keeps the byte count to what the reader itself sent.
+    Callback = fun(_Header, _Size) -> <<>> end,
+    case rabbitmq_stream_s3_log_reader:send_file(Socket, Reader0, Callback) of
+        {ok, Reader} ->
+            {ok, Sent} = sent_bytes(Socket),
+            send_all(Socket, Reader, Sent);
+        {end_of_stream, _Reader} ->
+            Acc
+    end.
+
+sent_bytes(Socket) ->
+    {ok, [{send_oct, Sent}]} = inet:getstat(Socket, [send_oct]),
+    {ok, Sent}.
+
+tcp_pair() ->
+    {ok, Listen} = gen_tcp:listen(0, [binary, {active, false}, {reuseaddr, true}]),
+    {ok, Port} = inet:port(Listen),
+    {ok, Client} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}]),
+    {ok, Server} = gen_tcp:accept(Listen, 5000),
+    ok = gen_tcp:close(Listen),
+    {Server, Client}.
+
+recv_exactly(Socket, Bytes) ->
+    {ok, Data} = gen_tcp:recv(Socket, Bytes, 5000),
+    Data.
 
 read_retries_transient_remote_error(Config) ->
     %% A transient S3 error on a remote fragment GET must be retried, not
@@ -171,6 +263,78 @@ read_retries_transient_remote_error(Config) ->
     ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),
     Records = read_all(Reader0),
     assert_sequential(Records, N).
+
+%% Shrink the prefetch sizing so each fragment takes several range requests and
+%% more than one is in flight at a time. At the production request size a
+%% fragment these tests write is a single request, which never interleaves.
+pipeline_within_fragments() ->
+    ok = application:set_env(rabbitmq_stream_s3, prefetch_request_size, 256),
+    ok = application:set_env(rabbitmq_stream_s3, prefetch_window_max, 8192),
+    ok = application:set_env(rabbitmq_stream_s3, prefetch_max_depth, 8),
+    %% The request size and window ceiling are read once at boot, so republish
+    %% them the way a restart would - otherwise readers keep running with the
+    %% sizing frozen when the suite started and never interleave.
+    ok = rabbitmq_stream_s3_remote_reader:init_counters().
+
+read_with_out_of_order_remote_responses(Config) ->
+    %% Several ranges of a fragment are fetched at once, so their responses
+    %% interleave. The reader stages bytes for a range whose predecessors are
+    %% unfinished and appends them only once it heads the queue; if that
+    %% reassembly were wrong the consumer would see corrupt or missing records
+    %% rather than an error. The fault backend delivers every range response
+    %% from a courier after a random delay, so they land out of issue order.
+    StreamId = ?config(stream_id, Config),
+    ok = application:set_env(
+        rabbitmq_stream_s3, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_fault
+    ),
+    ok = rabbitmq_stream_s3_api_fault:setup(),
+    ok = pipeline_within_fragments(),
+
+    Writer = start_writer(Config, #{fragment_target_size => 1000}),
+    N = 200,
+    write_sequential(Writer, N, 5),
+    ReaderCfg = reader_config(Writer, Config),
+    #{shared := Shared} = ReaderCfg,
+    ?awaitMatch([S] when S > 0, list_segment_offsets(Config), 1000),
+    ?awaitMatch(F when F > 0, osiris_log_shared:first_chunk_id(Shared), 1000),
+
+    ok = rabbitmq_stream_s3_api_fault:reorder(StreamId, 20),
+
+    {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg),
+    ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),
+    Records = read_all(Reader0),
+    assert_sequential(Records, N),
+    %% Guard against the test going vacuous: the reorder path must have
+    %% answered several requests, or nothing was interleaved.
+    ?assert(rabbitmq_stream_s3_api_fault:reorder_count() > 1).
+
+read_with_out_of_order_responses_and_a_failure(Config) ->
+    %% The same, with one range failing mid-pipeline: only that range may be
+    %% re-requested, and the ranges queued behind it must keep the bytes they
+    %% have already received rather than leaving a hole.
+    StreamId = ?config(stream_id, Config),
+    ok = application:set_env(
+        rabbitmq_stream_s3, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_fault
+    ),
+    ok = rabbitmq_stream_s3_api_fault:setup(),
+    ok = pipeline_within_fragments(),
+
+    Writer = start_writer(Config, #{fragment_target_size => 1000}),
+    N = 200,
+    write_sequential(Writer, N, 5),
+    ReaderCfg = reader_config(Writer, Config),
+    #{shared := Shared} = ReaderCfg,
+    ?awaitMatch([S] when S > 0, list_segment_offsets(Config), 1000),
+    ?awaitMatch(F when F > 0, osiris_log_shared:first_chunk_id(Shared), 1000),
+
+    ok = rabbitmq_stream_s3_api_fault:reorder(StreamId, 20),
+    ok = rabbitmq_stream_s3_api_fault:fail_next(get_range_async, StreamId, slow_down),
+
+    {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg),
+    ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),
+    Records = read_all(Reader0),
+    assert_sequential(Records, N),
+    ?assert(rabbitmq_stream_s3_api_fault:reorder_count() > 1).
 
 read_tolerates_slow_remote(Config) ->
     %% A slow remote tier (latency on every fragment GET) must still deliver the

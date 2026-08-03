@@ -52,7 +52,7 @@ Subsequent reads (`send_file/3`, `chunk_iterator/3`) are forwarded to the remote
 
 The remote reader is split into a functional core and a gen_server shell, following the same pattern as the upload path (`replica_reader` / `replica_reader_core`).
 
-**`rabbitmq_stream_s3_remote_reader_core`** is a pure module containing all decision logic: buffer management, AIMD prefetch sizing, fragment transitions, retry/timeout decisions, and error classification. It receives events and returns a new state plus a list of effects. It never performs I/O.
+**`rabbitmq_stream_s3_remote_reader_core`** is a pure module containing all decision logic: buffer management and reassembly, prefetch sizing and concurrency, fragment transitions, retry/timeout decisions, and error classification. It receives events and returns a new state plus a list of effects. It never performs I/O.
 
 **`rabbitmq_stream_s3_remote_reader`** is the gen_server shell. It translates external events (gun HTTP messages, timer fires, gen_server calls from the log reader) into core events, feeds them to the core, and executes the resulting effects (start S3 requests, set timers, reply to callers, look up the manifest cache).
 
@@ -66,22 +66,57 @@ This design complements the Erlang VM binary implementation. A naive approach, g
 
 - Blocks are contiguous and immutable: `end_pos - start_pos` equals the sum of block sizes, and a delivery is never copied into place (append is O(1)).
 - Consumed data is freed block-by-block: reads are non-decreasing, so when a read is served every block entirely below its start offset is dropped. `start_pos` advances block-granularly, never past the last read's start.
-- A read pins at most the blocks it overlaps: reads ≤ 512 bytes (chunk-header over-reads are 303 bytes) are copied and pin nothing; larger single-block reads share a sub-binary of one block; reads spanning blocks are assembled into a fresh binary.
+- A read pins at most the blocks it overlaps: reads ≤ 512 bytes (chunk-header over-reads are 303 bytes) are copied and pin nothing, however they are taken; larger reads share the blocks they cover, as a sub-binary at each edge.
 
-Reads spanning blocks concatenate only the requested bytes (chunk-sized, not window-sized), which is rare and cheap once the AIMD window is large relative to chunks.
+Reads come back as those blocks. The send path puts them straight into the socket's iolist, so a read spanning blocks costs no copy at all; callers that need one binary to slice — the chunk iterator, record by record — flatten it themselves, concatenating only the requested bytes (chunk-sized, not window-sized), which is rare and cheap once the prefetch window is large relative to chunks.
+
+Because several ranges of a fragment are in flight at once, their responses interleave, but the buffer only accepts contiguous appends. Outstanding ranges are therefore held in an ordered queue that doubles as a reassembly queue: bytes for a range whose predecessors have not finished are staged against that range and appended once it reaches the head. Staged bytes count against the prefetch window, so reassembly cannot grow memory beyond the window bound.
+
+A range that fails, or that is answered with fewer bytes than it asked for, goes back in the queue restarted at the last byte that reached the buffer. Only that range is re-requested: co-pending ranges keep streaming, no bytes are fetched twice, and a hole in the middle of the pipeline cannot be papered over. A range that fails having already delivered every byte it owed — only its closing frame was outstanding — is dropped rather than restarted, since there is nothing left to fetch.
+
+A range in that state that has *not* failed stays queued until its closing frame arrives, and it must not be mistaken for one that is still owed bytes. Whether a queued range can flush is decided from what it still owes, never from where the buffer's end happens to be: the ranges behind it flush past it in the meantime, so the buffer's end moves beyond it and the two positions stop agreeing. For the same reason, where the next range starts is the later of the buffer's end and one past the last range queued — the queue alone can point backwards, since the ranges that flushed past the open one have been dropped from it.
 
 ### Prefetch
 
 The starting byte position within a fragment is determined once, at offset-spec resolution time, by the log reader (see [Index lookup within a fragment](#index-lookup-within-a-fragment)), not by the remote reader. Once reading begins, the remote reader issues forward range requests only for the chunk-data region `[8 + start, 8 + Size)` (it never re-fetches the index), reading ahead of the consumer's position and walking chunk headers sequentially within the buffered data.
 
-Read size grows using AIMD (additive increase, multiplicative decrease). The window starts at `initial_read_size` (4 MiB). After a run of consecutive buffer hits it grows additively (by 1 MiB, capped at `read_size_max`, 64 MiB); a buffer miss (the consumer outrunning the prefetch) halves it (floored at `read_size_min`, 1 MiB). The decrease is driven by buffer misses, not by S3 errors, which instead drive a separate exponential retry-delay backoff. This avoids wasting bandwidth on consumers that read a few records and disconnect, while allowing sustained sequential readers to approach local-tier throughput.
+Several ranges are fetched at once. A single S3 connection transfers at roughly 40 MB/s whatever range size is asked of it, so delivered bandwidth is `W / (TTFB + W/BW)`, which asymptotes to one connection's rate as the range size `W` grows. Only concurrency moves that ceiling, so the request size is fixed (`prefetch_request_size`, 4 MiB) and what adapts is the *prefetch window*: the bytes the reader holds or has asked for ahead of the consumer's read position. New ranges are issued at the fetch frontier while the window has room and fewer than `prefetch_max_depth` (8) requests are in flight.
+
+The window starts at one request and:
+
+- doubles on a buffer miss, capped at `prefetch_window_max` (32 MiB) — a miss means the reader is not fetching far enough ahead, so it is a signal to fetch more, not to back off
+- gives one request back after a window's worth of bytes has been served without a miss
+
+Only the first miss for a given read counts: the serve attempt re-runs on every delivery while a read waits, and counting each of those would run the window to its ceiling on one slow read. Growing once per missed read also bounds what a consumer that reads a few records and disconnects can pull, since it only ever misses once or twice.
+
+The window is also the reader's memory bound: it holds or has outstanding at most `prefetch_window_max` plus one request. A consumer that stops reading needs no separate throttle — the buffer fills to the window and no further requests are issued.
+
+The pending-read deadline scales with the read for the same reason. A read cannot complete faster than the tier can deliver the bytes it asked for, so a fixed deadline would cap the chunk size the remote tier can serve — past the cap every attempt expires, and the log reader's retries do not rescue it, since the bytes a retry waits for are the ones that did not arrive in time. The budget is therefore a base plus the bytes to fetch over a pessimistic floor on tier throughput; the read's offset counts towards that as an upper bound rather than a tight one, since a consumer that attaches mid-fragment starts with nothing buffered. The caller's timeout is derived from the same figure so it always exceeds the deadline, which is what keeps a caller from timing out first and leaving a read pending underneath the next one.
+
+The one thing that lifts that bound is the read in hand. The window governs *prefetch*, but a read of N bytes cannot be served while fewer than N are outstanding, so the fetch ceiling rises to whatever the pending read needs and the bound becomes the larger of `prefetch_window_max` and that read, plus one request. Reads are chunk sized, so this only bites when a chunk is larger than the window. Refusing to fetch instead would not bound anything — it would simply never serve the read: at the ceiling the window cannot grow, so nothing further is ever requested, and the read deadline only refetches to the same ceiling and stalls again.
+
+S3 errors do not move the window. They drive a separate exponential retry-delay backoff, and `pool_busy` (the connection pool saturated) drives a third, milder one. Both grow once per retry round rather than once per failed range: a reset connection fails every pipelined range at once, and one fault must cost one doubling.
+
+The two backoffs are independent down to their timers, and a failed range is released only by the timer of the kind that failed it. They measure unrelated conditions three orders of magnitude apart, so sharing either would let the pool's 25 ms clock re-issue a range S3 has just asked the reader to slow down. For the same reason a delivery resets only a backoff nothing is waiting on: with several ranges in flight, S3 answering some while throttling others is what throttling looks like from here, and resetting on every delivered frame would hand back the delay the throttled ranges just earned. A round the clock's timer has just released counts as waiting on it too, until the ranges it put back on the wire have answered — otherwise the first of them S3 answers resets the clock and the ones it throttles in the same breath start a fresh minimum round, and the delay never grows however long the throttling lasts.
+
+A read deadline expiring drops every outstanding range, so both timers are cancelled with them, and a message either had already left is dropped on arrival — by its token, since the batch that cancels a kind's timer can arm a fresh one for that same kind. What has already been buffered is kept: those bytes are a contiguous run of the current fragment that nothing in flight contributed to, so the retry is usually a read the buffer answers outright, and the fetch frontier — which is read off the buffer's end — resumes where the reader had got to rather than at the fragment's first byte. A timer carries the delay it was armed with — up to `max_retry_delay_ms` — so one left running would land part-way through a later backoff round and release that round's ranges before the pause they earned had elapsed.
+
+The bytes prefetched for the next fragment are dropped as well. They count against the window like any other, and the ranges that were filling them have just been cancelled, so keeping them would hold window space nothing is left to fetch into: with the window at its ceiling no range would ever be issued again and every later read would wait out a deadline of its own.
 
 ### Fragment transitions
 
-When the consumer reads past the end of the current fragment:
+Once every byte of the current fragment has been asked for, the fetch frontier spills into the next one rather than waiting for the current fragment to arrive first, so the window stays full across a boundary instead of draining at every fragment. The reader looks one fragment ahead and no further: it holds the current fragment's buffer and one prefetched next-fragment buffer.
 
-1. The remote reader calls `next/1` on the fragment iterator to get the next fragment as a `#fragment_ref{}` (its `offset`, `uid`, and `size`).
-2. It constructs the S3 key and begins prefetching the next fragment.
+Looking ahead means advancing the fragment iterator, which downloads a group object when the next entry sits behind a group node. That answer is memoised, along with the advanced iterator, until the iterator is replaced at the next transition, so a fragment behind a group node costs one GET rather than one per frame the reader receives while sitting on its predecessor.
+
+The pass that places the reader on a fragment is the one exception: it issues that fragment's ranges but never looks ahead, and the first read or delivery spills. The reader is started with `gen_server:start/3`, so its `init` runs while the *consumer* process waits, and the look-ahead's GET would block the consumer rather than the reader. It is reachable there whenever the fragment has less than one request left in it — a consumer attaching near a fragment's end, or to a short one.
+
+A group fetch that fails transiently is memoised too, as *failed* rather than as an answer, and the look-ahead arms the retry backoff itself. Nothing else on that path would: the ranges already queued are healthy, so no request error runs. That memo records only that the last attempt failed — whether to attempt again is read off the fault clock rather than stored beside it, so the memo is honoured while that clock is armed and re-attempted once it is not. Something has to pace the attempts, since each is a synchronous GET that blocks the reader, and that clock is what paces every other retry here. The pool's much shorter clock cannot stand in: it fires for as long as the pool has no free connection, which says nothing about whether the group object can be fetched. The ranges in flight are left alone when this happens: the failure is in advancing the iterator, which says nothing about the fragment GETs already on the wire, and cancelling one closes its pooled connection.
+
+When the consumer then reads past the end of the current fragment:
+
+1. The prefetched next fragment's buffer is moved into place whole, and its `#fragment_ref{}` (its `offset`, `uid`, and `size`) becomes the current one.
+2. Any range still outstanding against the fragment being left behind is cancelled, so it cannot block reassembly of the new one.
 3. Reading continues seamlessly from the new fragment.
 
 If the iterator returns `end_of_manifest`, the remote reader requests a fresh iterator from the manifest cache. If the fresh iterator has entries (new fragments uploaded since the previous iterator was created), reading continues from remote. If not, the remaining data is in the local tier.
@@ -96,8 +131,8 @@ This transition is transparent to the consumer. The stream of chunks is continuo
 
 If a GET returns 404 (fragment deleted by retention between iterator creation and fetch):
 
-1. The remote reader marks the current fragment as not found.
-2. On the next read attempt, it checks the manifest cache for the current range.
+1. The remote reader marks the current fragment as not found and stops fetching: every range it still holds is dropped and no new one is issued, since the fetch frontier points into an object that is gone. Reads that the bytes already buffered can serve are still served from them.
+2. On the first read attempt those bytes cannot serve, it checks the manifest cache for the current range.
 3. It repositions at the oldest available offset (`first_offset` from the manifest).
 4. Reading continues from the new position.
 

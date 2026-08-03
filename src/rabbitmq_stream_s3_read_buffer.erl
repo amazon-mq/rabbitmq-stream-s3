@@ -15,10 +15,10 @@ with the runtime once reads are served from it:
   underlying writable binary (the runtime pins it when the sub-binary is
   copied into a message), so the next append copies the entire window rather
   than appending in place. In steady state nearly every delivery re-copies
-  the whole prefetch window (up to `read_size_max`, 64 MiB).
+  the whole prefetch window (up to `prefetch_window_max`, 32 MiB).
 - A reply sub-binary keeps the entire window generation alive in the
-  consumer's heap: a ~300-byte chunk-header read can pin 64 MiB until the
-  consumer process happens to collect garbage.
+  consumer's heap: a ~300-byte chunk-header read can pin the whole window
+  until the consumer process happens to collect garbage.
 
 This module avoids both by never appending into a binary. Deliveries are
 retained as-is, in order, as sealed blocks; consumed blocks are dropped
@@ -32,8 +32,9 @@ object, the same coordinates the remote reader core uses. The buffer covers
 contiguous: `end_pos - start_pos` always equals the sum of the block sizes.
 
 Reads of at most 512 bytes are returned as fresh copies rather than
-sub-binaries, so the frequent small chunk-header over-reads
-(`?CHUNK_HEADER_B + ?MAX_FILTER_SIZE` = 303 bytes) pin nothing at all.
+sub-binaries - as iodata too, not only through `read/3` - so the frequent
+small chunk-header over-reads (`?CHUNK_HEADER_B + ?MAX_FILTER_SIZE` = 303
+bytes) pin nothing at all.
 """.
 
 -include("include/rabbitmq_stream_s3.hrl").
@@ -130,8 +131,6 @@ assembled into a fresh binary.
 -spec read(byte_offset(), non_neg_integer(), buffer()) -> binary().
 read(Pos, Len, Buffer) ->
     case read_iodata(Pos, Len, Buffer) of
-        [Bin] when Len =< ?COPY_MAX_B ->
-            binary:copy(Bin);
         [Bin] ->
             Bin;
         IoData ->
@@ -139,11 +138,13 @@ read(Pos, Len, Buffer) ->
     end.
 
 -doc """
-Reads `Len` bytes at `Pos` as a list of binaries, copying nothing.
+Reads `Len` bytes at `Pos` as a list of binaries.
 
-The range must lie within `[start_pos, end_pos)`. Each element is either a
-whole block or a sub-binary of the block at the range's edge, so the result
-shares (and pins) only the blocks the range overlaps.
+The range must lie within `[start_pos, end_pos)`. Nothing is copied beyond the
+`?COPY_MAX_B` cutoff `read/3` documents: each element is then either a whole
+block or a sub-binary of the block at the range's edge, so the result shares
+(and pins) only the blocks the range overlaps. A read at or below the cutoff is
+copied out and comes back as a single fresh binary.
 """.
 -spec read_iodata(byte_offset(), non_neg_integer(), buffer()) -> [binary()].
 read_iodata(_Pos, 0, _Buffer) ->
@@ -153,9 +154,20 @@ read_iodata(Pos, Len, #buffer{start_pos = StartPos, end_pos = EndPos} = Buffer) 
         Pos >= StartPos andalso Pos + Len =< EndPos
 ->
     #buffer{front = Front, rear = Rear} = Buffer,
-    take(Pos - StartPos, Len, Front, Rear);
+    copy_short(Len, take(Pos - StartPos, Len, Front, Rear));
 read_iodata(Pos, Len, #buffer{start_pos = StartPos, end_pos = EndPos}) ->
     error({out_of_range, {Pos, Len}, {StartPos, EndPos}}).
+
+%% The cutoff is applied here rather than in `read/3` so that every caller
+%% inherits it. Flattening does not restore it: `iolist_to_binary/1` of a
+%% one-element list returns that element unchanged, so a short read left as a
+%% sub-binary pins its block just as hard after the caller has flattened it.
+copy_short(Len, [Bin]) when Len =< ?COPY_MAX_B ->
+    [binary:copy(Bin)];
+copy_short(Len, IoData) when Len =< ?COPY_MAX_B ->
+    [iolist_to_binary(IoData)];
+copy_short(_Len, IoData) ->
+    IoData.
 
 %% Walks `front` and reverses `rear` only if the requested range extends
 %% into it, so a read near start_pos never pays for the whole block list.

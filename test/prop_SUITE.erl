@@ -70,6 +70,11 @@ all() ->
         remote_reader_core_no_crash,
         remote_reader_core_reply_size_bounded,
         remote_reader_core_reply_bytes_exact,
+        remote_reader_core_survives_failure_interleavings,
+        remote_reader_core_load_bounded,
+        remote_reader_core_look_ahead_recovers,
+        %% Read pipeline (reassembly queue over the block buffer)
+        read_pipeline_matches_model,
         %% Read buffer (block queue)
         read_buffer_matches_model,
         %% Garbage collection reap decision
@@ -1692,14 +1697,14 @@ prop_remote_reader_core_reply_size_bounded() ->
             %% Provide data.
             Data = binary:copy(<<0>>, DataSize),
             {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(
-                S0, {data, make_ref(), 0, Data, done}
+                S0, {data, rrc_id(S0, 0, 8), Data, done}
             ),
             %% Issue a read.
             {_S2, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
                 S1, {read, ReadOffset, ReadBytes, chunk_boundary}
             ),
             %% If a reply was produced, its data must be <= ReadBytes.
-            case [D || {reply, {ok, D}} <- Effects] of
+            case [iolist_to_binary(D) || {reply, {ok, D}} <- Effects] of
                 [] -> true;
                 [ReplyData] -> byte_size(ReplyData) =< ReadBytes
             end
@@ -1727,7 +1732,7 @@ gen_rrc_event(NextReadPos) ->
         {3, gen_rrc_read_event(NextReadPos)},
         {3, ?LET(E, gen_rrc_data_event(), {E, NextReadPos})},
         {2, ?LET(E, gen_rrc_error_event(), {E, NextReadPos})},
-        {1, {{retry}, NextReadPos}},
+        {1, ?LET(Kind, oneof([fault, pool_busy]), {{retry, Kind}, NextReadPos})},
         {1, ?LET(E, gen_rrc_iterator_refreshed_event(), {E, NextReadPos})},
         {1, {deadline_expired, NextReadPos}}
     ]).
@@ -1739,18 +1744,25 @@ gen_rrc_read_event(NextReadPos) ->
         {{read, NextReadPos, Bytes, chunk_boundary}, NextReadPos + Bytes}
     ).
 
+%% Requests are addressed by the range they were issued for, which the
+%% generator cannot know, so deliveries and failures are emitted as markers and
+%% bound to an actual outstanding range when the sequence runs. `Which` picks
+%% among the outstanding ranges, so responses arrive out of issue order.
 gen_rrc_data_event() ->
     ?LET(
-        Size,
-        range(1, 10000),
-        {data, make_ref(), 0, binary:copy(<<0>>, Size), oneof([done, continue])}
+        {Size, Which},
+        {range(1, 10000), range(0, 7)},
+        {deliver, Which, binary:copy(<<0>>, Size), oneof([done, continue])}
     ).
 
 gen_rrc_error_event() ->
     ?LET(
-        Reason,
-        oneof([timeout, slow_down, connection_error, stream_error, internal_error, pool_busy]),
-        {request_error, make_ref(), 0, Reason}
+        {Reason, Which},
+        {
+            oneof([timeout, slow_down, connection_error, stream_error, internal_error, pool_busy]),
+            range(0, 7)
+        },
+        {fail, Which, Reason}
     ).
 
 gen_rrc_iterator_refreshed_event() ->
@@ -1781,26 +1793,71 @@ gen_rrc_iterator_refreshed_event() ->
 
 run_rrc_events([], State) ->
     State;
-run_rrc_events([{retry} | Rest], State0) ->
-    {State1, _} = rabbitmq_stream_s3_remote_reader_core:step(State0, retry),
-    run_rrc_events(Rest, State1);
+run_rrc_events([{deliver, Which, Data, DoneOrContinue} | Rest], State0) ->
+    State =
+        case pick_rrc_range(Which, State0) of
+            none ->
+                State0;
+            {Fragment, Start} ->
+                {State1, _} = rabbitmq_stream_s3_remote_reader_core:step(
+                    State0, {data, rrc_id(State0, Fragment, Start), Data, DoneOrContinue}
+                ),
+                State1
+        end,
+    run_rrc_events(Rest, State);
+run_rrc_events([{fail, Which, Reason} | Rest], State0) ->
+    State =
+        case pick_rrc_range(Which, State0) of
+            none ->
+                State0;
+            {Fragment, Start} ->
+                {State1, _} = rabbitmq_stream_s3_remote_reader_core:step(
+                    State0, {request_error, rrc_id(State0, Fragment, Start), Fragment, Reason}
+                ),
+                State1
+        end,
+    run_rrc_events(Rest, State);
 run_rrc_events([Event | Rest], State0) ->
     {State1, _} = rabbitmq_stream_s3_remote_reader_core:step(State0, Event),
     run_rrc_events(Rest, State1).
 
-%% Every reply carries exactly the bytes of the stream at the read offset.
-%% Data content is a function of absolute position, so any bookkeeping error in
-%% the buffer (a block dropped too eagerly, an off-by-one in block slicing, a
-%% stale block surviving a drop) surfaces as a content mismatch, not just a
-%% size mismatch. Steps interleave a delivery with a forward (non-decreasing)
-%% read, the log reader's access pattern.
+%% Fire both retry timers. Each backoff kind releases only the ranges queued
+%% against it, so a run that mixes S3 faults with pool_busy has to fire both to
+%% put every failed range back in flight.
+rrc_retry_all(State0) ->
+    lists:foldl(
+        fun(Kind, Acc) ->
+            {Acc1, _} = rabbitmq_stream_s3_remote_reader_core:step(Acc, {retry, Kind}),
+            Acc1
+        end,
+        State0,
+        [fault, pool_busy]
+    ).
+
+pick_rrc_range(Which, State) ->
+    case rabbitmq_stream_s3_remote_reader_core:outstanding_ranges(State) of
+        [] ->
+            none;
+        Ranges ->
+            {Fragment, Start, _End} = lists:nth(Which rem length(Ranges) + 1, Ranges),
+            {Fragment, Start}
+    end.
+
+%% Every reply carries exactly the bytes of the stream at the read offset,
+%% whatever order the concurrent range requests are answered in. Data content is
+%% a function of absolute position, so any bookkeeping error - a block dropped
+%% too eagerly, an off-by-one in block slicing, a staged block flushed at the
+%% wrong offset, a hole papered over after a short response - surfaces as a
+%% content mismatch rather than only a size mismatch. This is the property that
+%% covers reassembly: with several ranges of a fragment in flight, responses
+%% interleave, and the buffer only ever accepts contiguous appends.
 remote_reader_core_reply_bytes_exact(_Config) ->
     rabbit_ct_proper_helpers:run_proper(fun prop_remote_reader_core_reply_bytes_exact/0, [], 500).
 
 prop_remote_reader_core_reply_bytes_exact() ->
     ?FORALL(
-        Steps,
-        list({range(1, 5000), range(0, 99), range(1, 4000)}),
+        {Steps, RequestSize, MaxDepth},
+        {list({range(0, 7), range(1, 4000), range(0, 99)}), range(64, 4000), range(1, 8)},
         begin
             FragSize = 100_000_000,
             FragRef = #fragment_ref{offset = 0, uid = 1, size = FragSize},
@@ -1816,8 +1873,13 @@ prop_remote_reader_core_reply_bytes_exact() ->
                     {ok, _, It} -> It;
                     _ -> Iterator0
                 end,
+            Opts = #{
+                request_size => RequestSize,
+                window_max => RequestSize * 8,
+                max_depth => MaxDepth
+            },
             {S0, _} = rabbitmq_stream_s3_remote_reader_core:init(
-                <<"prop-stream">>, FragRef, 8, Iterator, #{}
+                <<"prop-stream">>, FragRef, 8, Iterator, Opts
             ),
             run_rrc_exact_steps(Steps, S0, 8, 8)
         end
@@ -1825,27 +1887,540 @@ prop_remote_reader_core_reply_bytes_exact() ->
 
 run_rrc_exact_steps([], _State, _DataEnd, _ReadFloor) ->
     true;
-run_rrc_exact_steps([{DataLen, PosFrac, LenWant} | Steps], S0, DataEnd0, ReadFloor) ->
-    %% Deliver DataLen bytes of position-patterned data.
-    Data = rb_pattern(DataEnd0, DataLen),
-    {S1, _} = rabbitmq_stream_s3_remote_reader_core:step(
-        S0, {data, make_ref(), 0, Data, done}
-    ),
-    DataEnd = DataEnd0 + DataLen,
-    %% Read at a position at or past the previous read (reads are
-    %% non-decreasing) and within delivered data, so a reply is guaranteed.
-    ReadPos = ReadFloor + ((DataEnd - 1 - ReadFloor) * PosFrac) div 100,
-    ReadLen = min(LenWant, DataEnd - ReadPos),
-    {S2, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
-        S1, {read, ReadPos, ReadLen, chunk_boundary}
-    ),
-    case [D || {reply, {ok, D}} <- Effects] of
-        [Reply] ->
-            Reply =:= rb_pattern(ReadPos, ReadLen) andalso
-                run_rrc_exact_steps(Steps, S2, DataEnd, ReadPos);
-        _ ->
-            false
+run_rrc_exact_steps([{Rot, LenWant, PosFrac} | Steps], S0, DataEnd0, ReadFloor) ->
+    %% Answer every outstanding range, rotated so the responses land in a
+    %% different order from the one they were issued in.
+    Outstanding = [{Start, End} || {0, Start, End} <- outstanding_rrc_ranges(S0)],
+    {S1, DataEnd} = answer_rrc_ranges(rotate(Rot, Outstanding), S0, DataEnd0),
+    case DataEnd > ReadFloor of
+        false ->
+            run_rrc_exact_steps(Steps, S1, DataEnd, ReadFloor);
+        true ->
+            %% Read at or past the previous read (reads are non-decreasing) and
+            %% within what has been delivered, so a reply is guaranteed.
+            ReadPos = ReadFloor + ((DataEnd - 1 - ReadFloor) * PosFrac) div 100,
+            ReadLen = max(1, min(LenWant, DataEnd - ReadPos)),
+            {S2, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
+                S1, {read, ReadPos, ReadLen, chunk_boundary}
+            ),
+            case [iolist_to_binary(D) || {reply, {ok, D}} <- Effects] of
+                [Reply] ->
+                    Reply =:= rb_pattern(ReadPos, ReadLen) andalso
+                        run_rrc_exact_steps(Steps, S2, DataEnd, ReadPos);
+                _ ->
+                    false
+            end
     end.
+
+%% Answer each range in full, alternating the closing frame: every other range
+%% is delivered with `continue`, so it has handed over every byte it owes while
+%% its response stays open. Those bytes must still reach the buffer, and the
+%% requests behind such a range must still be able to flush - on the next step
+%% and every step after it, not just the one it was delivered on. Answering
+%% only with `done` never builds that state, and it is the state in which the
+%% reassembly queue can wedge: the caller's read then goes unserved, which this
+%% property's `_ -> false` turns into a counterexample.
+answer_rrc_ranges(Ranges, State, DataEnd) ->
+    {Acc, MaxEnd, _} = lists:foldl(
+        fun({Start, End}, {StateAcc, MaxEnd0, N}) ->
+            Data = rb_pattern(Start, End - Start + 1),
+            DoneOrContinue =
+                case N rem 2 of
+                    0 -> done;
+                    1 -> continue
+                end,
+            {StateAcc1, _} = rabbitmq_stream_s3_remote_reader_core:step(
+                StateAcc, {data, rrc_id(StateAcc, 0, Start), Data, DoneOrContinue}
+            ),
+            {StateAcc1, max(MaxEnd0, End + 1), N + 1}
+        end,
+        {State, DataEnd, 0},
+        Ranges
+    ),
+    {Acc, MaxEnd}.
+
+%% The core addresses a request by the id the pipeline minted for it; a property
+%% knows which range S3 is answering. An id it cannot match is dropped as stale,
+%% which is the right outcome for a range that has left the queue.
+rrc_id(State, Fragment, Start) ->
+    case rabbitmq_stream_s3_remote_reader_core:request_id(State, Fragment, Start) of
+        {ok, Id} -> Id;
+        error -> 0
+    end.
+
+outstanding_rrc_ranges(State) ->
+    rabbitmq_stream_s3_remote_reader_core:outstanding_ranges(State).
+
+rotate(_N, []) ->
+    [];
+rotate(N, List) ->
+    {Head, Tail} = lists:split(N rem length(List), List),
+    Tail ++ Head.
+
+%% The same exactness guarantee as `remote_reader_core_reply_bytes_exact`, but
+%% where every outstanding range may also fail, close early, or close without
+%% closing its range - and where those outcomes interleave with successes across
+%% a full pipeline. Failure and success are not independent: a range that fails
+%% is put back at the byte its bytes reached, which rewrites its key, and its
+%% neighbours keep streaming into the queue it re-enters. That is what makes the
+%% combination worth generating rather than each outcome on its own.
+%%
+%% Two things are asserted after every event:
+%%
+%%  1. The request queue is well formed - no range runs backwards, no two
+%%     requests share a key, and each fragment's ranges stay sorted and
+%%     disjoint. A key collision is not a local error: requests are addressed by
+%%     `{fragment, range_start}`, so two requests sharing one means deliveries
+%%     are routed to the wrong request and silently dropped.
+%%  2. Any bytes replied to a read are the stream's bytes at that position.
+%%
+%% and one thing at the end of the run: the core is still alive, in the sense
+%% that answering everything it is waiting on drains its queue and gets the
+%% pending read served. See `rrc_drains/2` for why a liveness oracle is needed
+%% on top of the two above.
+remote_reader_core_survives_failure_interleavings(_Config) ->
+    rabbit_ct_proper_helpers:run_proper(
+        fun prop_remote_reader_core_survives_failure_interleavings/0, [], 500
+    ).
+
+prop_remote_reader_core_survives_failure_interleavings() ->
+    ?FORALL(
+        {Steps, RequestSize, MaxDepth, ProbeLen},
+        {list(gen_rrc_failure_step()), range(64, 4000), range(1, 8), range(1, 5000)},
+        begin
+            FragSize = 100_000_000,
+            FragRef = #fragment_ref{offset = 0, uid = 1, size = FragSize},
+            Manifest = #manifest{
+                first_offset = 0,
+                next_offset = 200,
+                entries = ?ENTRY(0, 0, 0, ?MANIFEST_KIND_FRAGMENT, FragSize, 1)
+            },
+            GetGroupFun = fun(_) -> {error, not_found} end,
+            Iterator0 = rabbitmq_stream_s3_fragment_iterator:init(Manifest, 0, GetGroupFun),
+            Iterator =
+                case rabbitmq_stream_s3_fragment_iterator:next(Iterator0) of
+                    {ok, _, It} -> It;
+                    _ -> Iterator0
+                end,
+            Opts = #{
+                request_size => RequestSize,
+                window_max => RequestSize * 8,
+                max_depth => MaxDepth
+            },
+            {S0, _} = rabbitmq_stream_s3_remote_reader_core:init(
+                <<"prop-stream">>, FragRef, 8, Iterator, Opts
+            ),
+            rrc_queue_well_formed(S0) andalso
+                run_rrc_failure_steps(Steps, S0, 8, {ProbeLen, RequestSize})
+        end
+    ).
+
+%% One step answers every range outstanding at its start, rotated so responses
+%% land out of issue order, then reads. `Outcomes` is cycled over the ranges, so
+%% a step mixes successes and failures rather than doing one thing to all of
+%% them.
+gen_rrc_failure_step() ->
+    {range(0, 7), non_empty(list(gen_rrc_outcome())), range(1, 4000)}.
+
+gen_rrc_outcome() ->
+    frequency([
+        %% The whole range, properly closed.
+        {5, done},
+        %% The whole range, but the closing frame never arrives. The request
+        %% stays in flight owing nothing, which is the state a failure has to
+        %% handle without rewriting the range backwards.
+        {2, continue},
+        %% A response that ends before its range does.
+        {2, ?LET(Frac, range(0, 100), {short, Frac})},
+        {3, ?LET(R, oneof([timeout, slow_down, connection_error, pool_busy]), {fail, R})},
+        {2, skip}
+    ]).
+
+run_rrc_failure_steps([], State, ReadFloor, Probe) ->
+    rrc_drains(State, ReadFloor, Probe);
+run_rrc_failure_steps([{Rot, Outcomes, LenWant} | Steps], S0, ReadFloor, Probe) ->
+    %% Release anything queued for retry so failed ranges are re-issued rather
+    %% than accumulating in `backoff` for the rest of the run.
+    S1 = rrc_retry_all(S0),
+    Ranges = rotate(Rot, [{Start, End} || {0, Start, End} <- outstanding_rrc_ranges(S1)]),
+    case apply_rrc_outcomes(Ranges, Outcomes, S1) of
+        false ->
+            false;
+        {ok, S2} ->
+            {S3, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
+                S2, {read, ReadFloor, LenWant, chunk_boundary}
+            ),
+            case rrc_queue_well_formed(S3) of
+                false ->
+                    false;
+                true ->
+                    case [iolist_to_binary(D) || {reply, {ok, D}} <- Effects] of
+                        [] ->
+                            run_rrc_failure_steps(Steps, S3, ReadFloor, Probe);
+                        [Reply] ->
+                            Reply =:= rb_pattern(ReadFloor, byte_size(Reply)) andalso
+                                run_rrc_failure_steps(
+                                    Steps, S3, ReadFloor + byte_size(Reply), Probe
+                                )
+                    end
+            end
+    end.
+
+%% Liveness. Everything above this point is a safety property: it says what the
+%% core must not do, and a core that has stopped doing anything at all passes
+%% every one of them. A wedged reassembly queue is exactly that shape - the
+%% ranges stay well formed, the load stays inside the window, no reply is ever
+%% wrong because no reply is ever produced - so it needs an oracle that asks for
+%% progress rather than for the absence of a mistake.
+%%
+%% The oracle: stop injecting faults and answer, in full and properly closed,
+%% every range the core is waiting on, round after round. That is the friendliest
+%% environment a reader can be in, and S3 has now told it everything it asked to
+%% know, so two things must follow. The queue must drain to empty - a request
+%% that no longer waits on any byte must leave it - and the consumer's next read
+%% must be served. Neither holds if some request at the head of the queue can no
+%% longer flush: the rounds then answer the same ranges forever and the read is
+%% never served.
+%%
+%% The rounds are capped so a wedge fails the property instead of hanging the
+%% suite. The cap is generous: with no reads to advance the consumer, the buffer
+%% fills to the prefetch window within a few rounds and the core stops issuing,
+%% so a healthy queue empties in about `window_max / request_size` of them.
+-define(RRC_DRAIN_ROUNDS, 64).
+
+rrc_drains(State0, ReadFloor, {ProbeLen, RequestSize}) ->
+    case rrc_drain(State0, ?RRC_DRAIN_ROUNDS) of
+        false ->
+            false;
+        {ok, State0b} ->
+            {State, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
+                State0b, {read, ReadFloor, ProbeLen, chunk_boundary}
+            ),
+            rrc_await_reply(
+                State, ReadFloor, ProbeLen, Effects, await_rounds(ProbeLen, RequestSize)
+            )
+    end.
+
+%% How many rounds the post-drain read is allowed. A round answers every range
+%% outstanding at its start, so with `max_depth` at 1 it moves one request size,
+%% and a read is served only once every byte below it has been fetched: the
+%% rounds needed are the read's own length in requests, plus the window the
+%% reader fills ahead of it. A fixed cap cannot cover that - at the smallest
+%% request size the generator produces, a long read needs more rounds than a
+%% short one is anywhere near, and the property failed a core that was serving
+%% the read correctly, one round at a time.
+await_rounds(ProbeLen, RequestSize) ->
+    %% `window_max` is 8 requests in this fixture; the slack is for the miss
+    %% that widens the window and the round the reply itself lands in.
+    ProbeLen div RequestSize + 8 + 8.
+
+%% The post-drain read has to be served eventually, not within the one step that
+%% issues it. Draining leaves no read pending, so the core has no reason to have
+%% fetched past its prefetch window; a read the buffer cannot satisfy then costs
+%% a fetch round-trip, and the miss it takes is exactly what widens the window
+%% and issues the range that will serve it. Demanding the reply in the first
+%% step called that legitimate warm-up a wedge.
+%%
+%% The teeth are kept. The read stays pending across the rounds, so the reply
+%% arrives with whichever delivery completes it; a core that is genuinely stuck
+%% either asks for nothing while still owing a reply - which is the wedge, and
+%% is failed on the spot - or keeps asking forever and runs out of rounds.
+rrc_await_reply(_State, _ReadFloor, _ProbeLen, _Effects, 0) ->
+    false;
+rrc_await_reply(State0, ReadFloor, ProbeLen, Effects, Rounds) ->
+    case [iolist_to_binary(D) || {reply, {ok, D}} <- Effects] of
+        [Reply] ->
+            Reply =:= rb_pattern(ReadFloor, ProbeLen);
+        [] ->
+            State1 = rrc_retry_all(State0),
+            case outstanding_rrc_ranges(State1) of
+                [] ->
+                    %% A read it cannot serve and nothing left to answer: the
+                    %% core has stopped.
+                    false;
+                Ranges ->
+                    {State, Emitted} = lists:foldl(
+                        fun({Fragment, Start, End}, {Acc, EffAcc}) ->
+                            Data = rb_pattern(Start, End - Start + 1),
+                            {Acc1, Eff} = rabbitmq_stream_s3_remote_reader_core:step(
+                                Acc, {data, rrc_id(Acc, Fragment, Start), Data, done}
+                            ),
+                            {Acc1, EffAcc ++ Eff}
+                        end,
+                        {State1, []},
+                        Ranges
+                    ),
+                    rrc_queue_well_formed(State) andalso
+                        rrc_await_reply(State, ReadFloor, ProbeLen, Emitted, Rounds - 1)
+            end
+    end.
+
+rrc_drain(_State, 0) ->
+    %% Still waiting on ranges after every one of them has been answered
+    %% repeatedly: the queue cannot drain.
+    false;
+rrc_drain(State0, Rounds) ->
+    State1 = rrc_retry_all(State0),
+    case outstanding_rrc_ranges(State1) of
+        [] ->
+            {ok, State1};
+        Ranges ->
+            State = lists:foldl(
+                fun({Fragment, Start, End}, Acc) ->
+                    Data = rb_pattern(Start, End - Start + 1),
+                    {Acc1, _} = rabbitmq_stream_s3_remote_reader_core:step(
+                        Acc, {data, rrc_id(Acc, Fragment, Start), Data, done}
+                    ),
+                    Acc1
+                end,
+                State1,
+                Ranges
+            ),
+            case rrc_queue_well_formed(State) of
+                true -> rrc_drain(State, Rounds - 1);
+                false -> false
+            end
+    end.
+
+apply_rrc_outcomes([], _Outcomes, State) ->
+    {ok, State};
+apply_rrc_outcomes([{Start, End} | Ranges], [Outcome | Rest], State0) ->
+    State = apply_rrc_outcome(Outcome, Start, End, State0),
+    case rrc_queue_well_formed(State) of
+        true -> apply_rrc_outcomes(Ranges, Rest ++ [Outcome], State);
+        false -> false
+    end.
+
+apply_rrc_outcome(skip, _Start, _End, State) ->
+    State;
+apply_rrc_outcome({fail, Reason}, Start, _End, State0) ->
+    {State, _} = rabbitmq_stream_s3_remote_reader_core:step(
+        State0, {request_error, rrc_id(State0, 0, Start), 0, Reason}
+    ),
+    State;
+apply_rrc_outcome({short, Frac}, Start, End, State0) ->
+    Len = ((End - Start + 1) * Frac) div 100,
+    {State, _} = rabbitmq_stream_s3_remote_reader_core:step(
+        State0, {data, rrc_id(State0, 0, Start), rb_pattern(Start, Len), done}
+    ),
+    State;
+apply_rrc_outcome(DoneOrContinue, Start, End, State0) ->
+    Data = rb_pattern(Start, End - Start + 1),
+    {State, _} = rabbitmq_stream_s3_remote_reader_core:step(
+        State0, {data, rrc_id(State0, 0, Start), Data, DoneOrContinue}
+    ),
+    State.
+
+%% Ranges run forwards, keys are unique, and each fragment's ranges are sorted
+%% and disjoint - the ordering the request queue documents, and what addressing
+%% requests by `{fragment, range_start}` depends on.
+%%
+%% Sorted and disjoint, not contiguous: a request that has delivered every byte
+%% it owes but whose closing frame has not arrived stays in the queue while the
+%% requests behind it are dropped, so a gap the buffer already holds can open up
+%% between two queued ranges.
+rrc_queue_well_formed(State) ->
+    Ranges = outstanding_rrc_ranges(State),
+    Keys = [{F, S} || {F, S, _} <- Ranges],
+    lists:all(fun({_, S, E}) -> S =< E end, Ranges) andalso
+        length(lists:usort(Keys)) =:= length(Keys) andalso
+        rrc_ranges_disjoint(Ranges).
+
+rrc_ranges_disjoint([{F, _, End}, {F, Start, _} = Next | Rest]) ->
+    Start > End andalso rrc_ranges_disjoint([Next | Rest]);
+rrc_ranges_disjoint([_ | Rest]) ->
+    rrc_ranges_disjoint(Rest);
+rrc_ranges_disjoint([]) ->
+    true.
+
+%% The prefetch window and the depth cap are the reader's memory bound. Neither
+%% may be exceeded by any sequence of events: a range that is put back after a
+%% failure is already accounted for, so re-issuing it must not double-count, and
+%% a short response must not leave bytes outstanding that nothing tracks.
+%%
+%% The one thing that may lift the window is the read in hand. A read of N bytes
+%% cannot be served while fewer than N are outstanding, so the ceiling rises to
+%% whatever the pending read needs (see `fetch_ceiling/1` in the core) - the
+%% alternative is refusing to fetch and never serving it. That is bounded by the
+%% largest read in the sequence, so the property still has teeth: nothing else
+%% may push the reader past its window.
+%% Every property above this one drives a single-fragment manifest whose group
+%% fun returns `{error, not_found}`, so the look-ahead can only ever answer
+%% `end_of_manifest`: `next_peek = failed` - the state a transient group fetch
+%% leaves behind, and the state the reader has to climb back out of - was
+%% unreachable in all 500 iterations of each of them. That is why a stranded
+%% memo survived several reviews. This fixture puts every fragment after the
+%% first behind a group node and lets the generator decide how many of those
+%% fetches fail, so the region is reachable and the invariants checked inside
+%% `step/2` apply to it like anywhere else.
+%%
+%% The oracle is the recovery, because the failure is not a crash: a reader
+%% carrying a stranded memo keeps serving the fragment it is on and stops only
+%% prefetching, which every safety property here is happy with. So the second
+%% phase turns S3 healthy, expires the read - the event that used to disown the
+%% clock and strand the memo with it - and then only answers and reads. No retry
+%% event is injected, deliberately: with no clock armed and none coming, a
+%% reader that cannot re-attempt the fetch on its own never asks for the next
+%% fragment again, and the rounds run out.
+remote_reader_core_look_ahead_recovers(_Config) ->
+    rabbit_ct_proper_helpers:run_proper(fun prop_remote_reader_core_look_ahead_recovers/0, [], 500).
+
+prop_remote_reader_core_look_ahead_recovers() ->
+    ?FORALL(
+        {Events, GroupFailures},
+        {gen_rrc_event_sequence(), range(0, 8)},
+        begin
+            Failures = counters:new(1, []),
+            counters:add(Failures, 1, GroupFailures),
+            FragSize = 2000,
+            Fragments = [{Offset, FragSize, Offset + 1} || Offset <- lists:seq(0, 700, 100)],
+            Iterator = rrc_grouped_iterator(Fragments, Failures),
+            [{Offset, _, Uid} | _] = Fragments,
+            FragRef = #fragment_ref{offset = Offset, uid = Uid, size = FragSize},
+            Opts = #{request_size => 1000, window_max => 8000, max_depth => 4},
+            {S0, _} = rabbitmq_stream_s3_remote_reader_core:init(
+                <<"prop-stream">>, FragRef, ?SEGMENT_HEADER_B, Iterator, Opts
+            ),
+            %% Phase 1: chaos, with group fetches failing while the budget
+            %% lasts. Iterator refreshes are dropped: the generator builds them
+            %% around a single-fragment manifest of its own, which would replace
+            %% this fixture with one that has nothing to look ahead to.
+            S1 = run_rrc_events([E || E <- Events, not is_rrc_refresh(E)], S0),
+            %% Phase 2: S3 is healthy and the read the shell was waiting on has
+            %% expired.
+            counters:put(Failures, 1, 0),
+            {S2, _} = rabbitmq_stream_s3_remote_reader_core:step(S1, deadline_expired),
+            ReadFloor = rabbitmq_stream_s3_remote_reader_core:read_position(S2),
+            rrc_looks_ahead_again(S2, ReadFloor, ?RRC_DRAIN_ROUNDS)
+        end
+    ).
+
+is_rrc_refresh({iterator_refreshed, _}) -> true;
+is_rrc_refresh(_Event) -> false.
+
+%% A round answers everything outstanding and reads, which is what walks the
+%% consumer to the end of the fragment and puts the frontier where it has to
+%% look ahead. The reader has recovered as soon as it asks for a fragment other
+%% than the one it is on, or reaches the end of the manifest.
+rrc_looks_ahead_again(_State, _ReadFloor, 0) ->
+    false;
+rrc_looks_ahead_again(State0, ReadFloor, Rounds) ->
+    Current = rabbitmq_stream_s3_remote_reader_core:current_fragment_offset(State0),
+    case [F || {F, _, _} <- outstanding_rrc_ranges(State0), F =/= Current] of
+        [_ | _] ->
+            true;
+        [] ->
+            State1 = lists:foldl(
+                fun({Fragment, Start, End}, Acc) ->
+                    {Acc1, _} = rabbitmq_stream_s3_remote_reader_core:step(
+                        Acc,
+                        {data, rrc_id(Acc, Fragment, Start), rb_pattern(Start, End - Start + 1),
+                            done}
+                    ),
+                    Acc1
+                end,
+                State0,
+                outstanding_rrc_ranges(State0)
+            ),
+            {State, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
+                State1, {read, ReadFloor, 500, chunk_boundary}
+            ),
+            case [R || {reply, R} <- Effects] of
+                [{become_local, _}] ->
+                    %% The manifest ended: there is no next fragment to ask for.
+                    true;
+                [{next_fragment, _}] ->
+                    rrc_looks_ahead_again(
+                        State,
+                        rabbitmq_stream_s3_remote_reader_core:read_position(State),
+                        Rounds - 1
+                    );
+                [{ok, Data}] ->
+                    rrc_looks_ahead_again(State, ReadFloor + iolist_size(Data), Rounds - 1);
+                _ ->
+                    rrc_looks_ahead_again(State, ReadFloor, Rounds - 1)
+            end
+    end.
+
+%% A manifest whose first fragment is a direct entry and whose every later one
+%% sits behind a group node, so looking one fragment ahead always costs a group
+%% fetch - the synchronous S3 GET the look-ahead memo exists to avoid repeating.
+%% The first `Failures` of those fetches fail transiently; the counter is the
+%% side channel because the fun is called from inside the core, not by the test.
+rrc_grouped_iterator([{FirstOffset, FirstSize, FirstUid} | Rest], Failures) ->
+    Groups = <<
+        <<(?ENTRY(Offset, 0, 0, ?MANIFEST_KIND_GROUP, 0, Uid))/binary>>
+     || {Offset, _, Uid} <- Rest
+    >>,
+    Manifest = #manifest{
+        first_offset = FirstOffset,
+        next_offset = element(1, lists:last(Rest)) + 100,
+        entries =
+            <<
+                (?ENTRY(FirstOffset, 0, 0, ?MANIFEST_KIND_FRAGMENT, FirstSize, FirstUid))/binary,
+                Groups/binary
+            >>
+    },
+    GetGroupFun = fun(#group_ref{offset = Offset}) ->
+        case counters:get(Failures, 1) of
+            0 ->
+                [{_, Size, Uid}] = [E || {O, _, _} = E <- Rest, O =:= Offset],
+                {ok, ?ENTRY(Offset, 0, 0, ?MANIFEST_KIND_FRAGMENT, Size, Uid)};
+            _ ->
+                counters:sub(Failures, 1, 1),
+                {error, slow_down}
+        end
+    end,
+    Iterator = rabbitmq_stream_s3_fragment_iterator:init(Manifest, FirstOffset, GetGroupFun),
+    case rabbitmq_stream_s3_fragment_iterator:next(Iterator) of
+        {ok, _, Advanced} -> Advanced;
+        _ -> Iterator
+    end.
+
+remote_reader_core_load_bounded(_Config) ->
+    rabbit_ct_proper_helpers:run_proper(fun prop_remote_reader_core_load_bounded/0, [], 500).
+
+prop_remote_reader_core_load_bounded() ->
+    ?FORALL(
+        {Events, RequestSize, MaxDepth},
+        {gen_rrc_event_sequence(), range(64, 4000), range(1, 8)},
+        begin
+            FragSize = 1_000_000,
+            FragRef = #fragment_ref{offset = 0, uid = 1, size = FragSize},
+            Manifest = #manifest{
+                first_offset = 0,
+                next_offset = 200,
+                entries = ?ENTRY(0, 0, 0, ?MANIFEST_KIND_FRAGMENT, FragSize, 1)
+            },
+            GetGroupFun = fun(_) -> {error, not_found} end,
+            Iterator0 = rabbitmq_stream_s3_fragment_iterator:init(Manifest, 0, GetGroupFun),
+            Iterator =
+                case rabbitmq_stream_s3_fragment_iterator:next(Iterator0) of
+                    {ok, _, It} -> It;
+                    _ -> Iterator0
+                end,
+            WindowMax = RequestSize * 8,
+            Opts = #{
+                request_size => RequestSize, window_max => WindowMax, max_depth => MaxDepth
+            },
+            {S0, _} = rabbitmq_stream_s3_remote_reader_core:init(
+                <<"prop-stream">>, FragRef, 8, Iterator, Opts
+            ),
+            %% `read_pos` is never negative, so the most any pending read can
+            %% ask for is the furthest byte any read in the sequence reaches.
+            MaxReadEnd = lists:max([0 | [O + B || {read, O, B, _} <- Events]]),
+            MaxOutstanding = max(WindowMax, MaxReadEnd) + RequestSize,
+            check_rrc_load(Events, S0, MaxOutstanding, MaxDepth)
+        end
+    ).
+
+check_rrc_load([], _State, _MaxOutstanding, _MaxDepth) ->
+    true;
+check_rrc_load([Event | Rest], State0, MaxOutstanding, MaxDepth) ->
+    State = run_rrc_events([Event], State0),
+    {Outstanding, InFlight} = rabbitmq_stream_s3_remote_reader_core:load(State),
+    Outstanding =< MaxOutstanding andalso InFlight =< MaxDepth andalso
+        check_rrc_load(Rest, State, MaxOutstanding, MaxDepth).
 
 %% =========================================================================
 %% Read buffer (block queue) properties
@@ -1855,6 +2430,205 @@ run_rrc_exact_steps([{DataLen, PosFrac, LenWant} | Steps], S0, DataEnd0, ReadFlo
 %% block-granular drops occurs, the retained window and every in-range read
 %% must be byte-identical to the corresponding slice of that history.
 %% =========================================================================
+
+%% =========================================================================
+%% Read pipeline properties
+%% =========================================================================
+
+%% The reassembly queue's whole job is to turn range responses that interleave,
+%% arrive short, arrive empty or fail into a contiguous buffer without ever
+%% papering over a hole. The oracle for that does not need to model the queue:
+%% a byte is in the buffer exactly when every byte below it in the fragment has
+%% been received, whatever order the ranges were answered in. So the model is
+%% just the bytes S3 has said, by position, and everything observable is
+%% recomputed from them.
+%%
+%% Two things are asserted after every command, and they are the two halves of
+%% one statement. A read is served if and only if the model says every byte
+%% below its end has arrived - serving one it cannot is a hole papered over,
+%% refusing one it can is a stall - and a served read carries exactly the bytes
+%% of the positions it claims.
+%%
+%% Single fragment on purpose: the prefetched next fragment's own queue is
+%% driven by the core's properties above. What is exercised here is the
+%% reassembly, which is per fragment.
+read_pipeline_matches_model(_Config) ->
+    rabbit_ct_proper_helpers:run_proper(fun prop_read_pipeline_matches_model/0, [], 500).
+
+prop_read_pipeline_matches_model() ->
+    ?FORALL(
+        Ops,
+        non_empty(list(gen_rp_op())),
+        begin
+            FragSize = 20_000,
+            FragRef = #fragment_ref{offset = 0, uid = 1, size = FragSize},
+            P = rabbitmq_stream_s3_read_pipeline:new(<<"prop-stream">>, FragRef, ?SEGMENT_HEADER_B),
+            check_rp_ops(Ops, P, #{}, FragSize)
+        end
+    ).
+
+gen_rp_op() ->
+    frequency([
+        {4, {push, range(1, 3000)}},
+        %% `Which` picks among the outstanding ranges, so responses land out of
+        %% issue order.
+        {5, {deliver, range(0, 7), gen_rp_delivery()}},
+        {2, {fail, range(0, 7)}},
+        {1, release},
+        {1, ready},
+        {3, {read, range(1, 4000)}}
+    ]).
+
+gen_rp_delivery() ->
+    frequency([
+        %% Exactly the range, properly closed.
+        {5, full},
+        %% Ends before the range does, which queues the rest as a gap request.
+        {3, ?LET(Frac, range(0, 100), {short, Frac})},
+        %% Closes without a byte.
+        {1, empty},
+        %% More bytes than the range asked for: must be clipped, never spill
+        %% into the successor's range.
+        {1, over},
+        %% Not closed, so the range stays in flight owing the rest.
+        {2, partial}
+    ]).
+
+check_rp_ops([], _P, _Got, _FragSize) ->
+    true;
+check_rp_ops([Op | Ops], P0, Got0, FragSize) ->
+    {P, Got} = apply_rp_op(Op, P0, Got0, FragSize),
+    case check_rp_read(P, Got, FragSize) of
+        true -> check_rp_ops(Ops, P, Got, FragSize);
+        false -> false
+    end.
+
+apply_rp_op({push, Len}, P0, Got, FragSize) ->
+    Frontier = rabbitmq_stream_s3_read_pipeline:frontier(0, P0),
+    IdxStart = ?SEGMENT_HEADER_B + FragSize,
+    case Frontier < IdxStart of
+        true ->
+            End = min(Frontier + Len - 1, IdxStart - 1),
+            FragRef = rabbitmq_stream_s3_read_pipeline:current_fragment(P0),
+            {_Spec, P} = rabbitmq_stream_s3_read_pipeline:push(FragRef, {Frontier, End}, P0),
+            {P, Got};
+        false ->
+            {P0, Got}
+    end;
+apply_rp_op({deliver, Which, How}, P0, Got, _FragSize) ->
+    case pick_rp_inflight(Which, P0) of
+        none ->
+            {P0, Got};
+        {Id, Start, End} ->
+            %% S3 continues a range from where it left off, not from its start:
+            %% a response that was left open owes only the bytes after the ones
+            %% it has already sent.
+            Pos = rp_range_pos(Start, End, Got),
+            Remaining = End - Pos + 1,
+            {Bytes, Close} = rp_delivery(How, Remaining),
+            Data = rb_pattern(Pos, Bytes),
+            {_Signals, P} = rabbitmq_stream_s3_read_pipeline:data(Id, Data, Close, P0),
+            %% The pipeline clips an over-delivery to the range, so the model
+            %% records only what the range owns.
+            {P, rp_received(Pos, min(Bytes, Remaining), Got)}
+    end;
+apply_rp_op({fail, Which}, P0, Got, _FragSize) ->
+    case pick_rp_inflight(Which, P0) of
+        none ->
+            {P0, Got};
+        {Id, Start, End} ->
+            case rabbitmq_stream_s3_read_pipeline:fail(Id, fault, P0) of
+                {ok, P} -> {P, rp_drop_staged(Start, End, Got)};
+                {dropped, P} -> {P, Got};
+                stale -> {P0, Got}
+            end
+    end;
+apply_rp_op(release, P0, Got, _FragSize) ->
+    {rabbitmq_stream_s3_read_pipeline:release(fault, P0), Got};
+apply_rp_op(ready, P0, Got, _FragSize) ->
+    {_Specs, P} = rabbitmq_stream_s3_read_pipeline:ready(8, P0),
+    {P, Got};
+apply_rp_op({read, Len}, P0, Got, _FragSize) ->
+    ReadPos = rabbitmq_stream_s3_read_pipeline:read_position(P0),
+    case rabbitmq_stream_s3_read_pipeline:read(ReadPos, Len, P0) of
+        {ok, _Data, P} -> {P, Got};
+        _ -> {P0, Got}
+    end.
+
+rp_delivery(full, Len) -> {Len, done};
+rp_delivery(empty, _Len) -> {0, done};
+rp_delivery(over, Len) -> {Len + 64, done};
+rp_delivery(partial, Len) -> {max(1, Len div 2), continue};
+rp_delivery({short, Frac}, Len) -> {max(1, Len * Frac div 100), done}.
+
+%% A failure drops what *that range* had received but not yet appended, which is
+%% everything of its own above the contiguous run: the buffer keeps what it has
+%% already taken and the range restarts there. Other ranges' staged bytes are
+%% untouched - they are held on their own request.
+rp_drop_staged(Start, End, Got) ->
+    Contiguous = rp_contiguous(Got),
+    maps:filter(
+        fun(Pos, _Byte) -> Pos < Contiguous orelse Pos < Start orelse Pos > End end,
+        Got
+    ).
+
+rp_received(_Start, Len, Got) when Len =< 0 ->
+    Got;
+rp_received(Start, Len, Got) ->
+    Data = rb_pattern(Start, Len),
+    lists:foldl(
+        fun(I, Acc) -> Acc#{Start + I => binary:at(Data, I)} end,
+        Got,
+        lists:seq(0, Len - 1)
+    ).
+
+%% Where a range's next delivery starts: past its own contiguous prefix. A
+%% range's received bytes are contiguous from its start, since a failure puts it
+%% back at the last byte that reached a buffer and drops the rest.
+rp_range_pos(Start, End, _Got) when Start > End ->
+    Start;
+rp_range_pos(Start, End, Got) ->
+    case is_map_key(Start, Got) of
+        true -> rp_range_pos(Start + 1, End, Got);
+        false -> Start
+    end.
+
+%% One past the last byte of the contiguous run from the start of the data
+%% region: exactly what the buffer can hold, whatever order the ranges arrived.
+rp_contiguous(Got) ->
+    rp_contiguous(Got, ?SEGMENT_HEADER_B).
+
+rp_contiguous(Got, Pos) ->
+    case is_map_key(Pos, Got) of
+        true -> rp_contiguous(Got, Pos + 1);
+        false -> Pos
+    end.
+
+%% Both halves of the statement: a read is served exactly when the model says
+%% the bytes are there, and a served read carries exactly those bytes.
+check_rp_read(P, Got, FragSize) ->
+    ReadPos = rabbitmq_stream_s3_read_pipeline:read_position(P),
+    Len = 64,
+    Contiguous = rp_contiguous(Got),
+    Servable = ReadPos + Len =< Contiguous,
+    case rabbitmq_stream_s3_read_pipeline:read(ReadPos, Len, P) of
+        {ok, Data, _P} ->
+            Servable andalso iolist_to_binary(Data) =:= rb_pattern(ReadPos, Len);
+        await ->
+            not Servable;
+        past_end ->
+            ReadPos >= ?SEGMENT_HEADER_B + FragSize
+    end.
+
+pick_rp_inflight(Which, P) ->
+    case rabbitmq_stream_s3_read_pipeline:inflight_ranges(P) of
+        [] ->
+            none;
+        Ranges ->
+            {F, Start, End} = lists:nth(Which rem length(Ranges) + 1, Ranges),
+            {ok, Id} = rabbitmq_stream_s3_read_pipeline:find_request(F, Start, P),
+            {Id, Start, End}
+    end.
 
 read_buffer_matches_model(_Config) ->
     rabbit_ct_proper_helpers:run_proper(fun prop_read_buffer_matches_model/0, [], 500).

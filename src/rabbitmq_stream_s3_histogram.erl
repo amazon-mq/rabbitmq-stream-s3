@@ -7,7 +7,7 @@ Generic histogram backed by a counters array.
 One slot per bucket plus a sum slot at the end.
 """.
 
--export([new/2, observe/2, prometheus_format/3]).
+-export([new/2, observe/2, prometheus_format/2]).
 
 -type bucket() :: number() | infinity.
 -type key() :: term().
@@ -30,11 +30,16 @@ observe(Key, Value) ->
 Returns `{CumulativeBuckets, Count, Sum}` where `CumulativeBuckets` is
 `[{UpperBound, CumulativeCount}]` suitable for Prometheus histogram format.
 SumTransform is applied to the raw sum (e.g. `fun(X) -> X / 1000 end`).
+
+The boundaries are the ones the histogram was created with rather than a
+parameter. They index the counters array, so a caller that computes them (from
+configuration, say) and computes them differently here would read the wrong
+slots, or read past the end.
 """.
--spec prometheus_format(key(), fun((number()) -> number()), [bucket()]) ->
+-spec prometheus_format(key(), fun((number()) -> number())) ->
     {[{bucket(), non_neg_integer()}], non_neg_integer(), number()}.
-prometheus_format(Key, SumTransform, Buckets) ->
-    {Counters, _} = persistent_term:get(Key),
+prometheus_format(Key, SumTransform) ->
+    {Counters, Buckets} = persistent_term:get(Key),
     SumPos = length(Buckets) + 1,
     Indexed = lists:enumerate(Buckets),
     {Cumulative, Count} = lists:mapfoldl(

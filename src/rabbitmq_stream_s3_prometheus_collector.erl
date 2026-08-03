@@ -86,7 +86,7 @@ collect_mf(Registry, Callback) ->
                 )
             )
         end,
-        rabbitmq_stream_s3_remote_reader:read_size_prometheus_format()
+        rabbitmq_stream_s3_remote_reader:prefetch_window_prometheus_format()
     ).
 
 %% ------------------------------------------------------------------

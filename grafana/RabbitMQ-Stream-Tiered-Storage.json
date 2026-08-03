@@ -6545,13 +6545,13 @@
       },
       "targets": [
         {
-          "expr": "sum by(le) (rate(rabbitmq_stream_s3_read_size_bytes_bucket[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "expr": "sum by(le) (rate(rabbitmq_stream_s3_prefetch_window_bytes_bucket[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
           "format": "heatmap",
           "legendFormat": "{{le}}",
           "refId": "A"
         }
       ],
-      "title": "Read size distribution",
+      "title": "Prefetch window distribution",
       "type": "heatmap"
     },
     {

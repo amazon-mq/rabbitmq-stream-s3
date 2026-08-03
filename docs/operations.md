@@ -449,13 +449,19 @@ Owned by `rabbitmq_stream_s3_remote_reader`. One counter set per node, summed ac
 | `rabbitmq_stream_s3_remote_reader_total_requests`      | counter | S3 requests initiated                                             |
 | `rabbitmq_stream_s3_remote_reader_fatal_errors`        | counter | Remote readers stopped by a non-retryable S3 error                |
 
-### Read size histogram
+### Prefetch window histogram
 
 | Metric                              | Description                                                       |
 |-------------------------------------|-------------------------------------------------------------------|
-| `rabbitmq_stream_s3_read_size_bytes_bucket`            | Distribution of read sizes from S3                                |
+| `rabbitmq_stream_s3_prefetch_window_bytes_bucket`      | Distribution of the remote reader's prefetch window                |
 
-Buckets: 48 B, 128 B, 512 B, 2 KiB, 8 KiB, 32 KiB, 128 KiB, 512 KiB, 2 MiB, 8 MiB, 16 MiB, 32 MiB, 64 MiB, +Inf. The top finite boundary matches the remote reader's 64 MiB AIMD read-size cap, so `+Inf` stays empty in normal operation.
+The boundaries are derived from the configured sizes at boot: the window moves in whole requests between `prefetch_request_size` and `prefetch_window_max`, so they are spaced by the request size up to the window cap. At the default sizing that is 4, 8, 12, 16, 20, 24, 28, 32 MiB and `+Inf`. The top finite boundary is always the window cap, so `+Inf` stays empty in normal operation. A window that spans more than 16 requests is spaced out rather than given a boundary per step, which bounds the number of series.
+
+Because the boundaries are fixed at boot, both settings are read at boot too, and readers started later keep running with the sizing the node booted with. Changing either one takes effect on restart.
+
+This metric replaces `rabbitmq_stream_s3_read_size_bytes_bucket`, which no longer exists. Panels and alerts that name the old metric go blank rather than error, so they have to be repointed by hand; the bundled Grafana dashboard already is.
+
+The window grows on a miss and shrinks on sustained hits, so it reads as a load signal rather than a health one. A window pinned at its ceiling while `rabbitmq_stream_s3_buffer_miss` still climbs means consumers are outrunning the remote tier: prefetch has grown as far as it is allowed to and reads are still waiting on S3. A window sitting at its floor means the reader is staying ahead of its consumers and has given back every request it took.
 
 ## Dashboards
 
@@ -486,7 +492,7 @@ The pipeline gauges (`rabbitmq_stream_s3_bytes_in_assembly`, `rabbitmq_stream_s3
 
 S3 supports at least 3,500 PUT/POST/DELETE and 5,500 GET requests per second per partitioned prefix and scales automatically under sustained load. Each fragment is one PUT, so even very high stream throughput produces few PUTs per second. The realistic concern is GETs from many consumers reading old data on the same stream simultaneously. S3's automatic scaling handles sustained load but a sudden burst on a previously idle stream may see brief throttling.
 
-The AIMD prefetch in the remote reader naturally grows toward larger reads for fast consumers, which reduces request rate per consumer.
+Each remote reader issues fixed-size range GETs (`prefetch_request_size`, 4 MiB) and runs up to `prefetch_max_depth` (8) of them concurrently, so a lagging consumer's request rate is bounded by its depth rather than by its throughput. Lowering the depth trades a consumer's catch-up rate for a lower request rate and fewer pooled connections.
 
 ### Local disk and page cache
 
