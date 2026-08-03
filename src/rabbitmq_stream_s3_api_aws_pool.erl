@@ -313,14 +313,15 @@ handle_gun_up(Conn, #?MODULE{close_fun = CloseFun} = State) ->
 %% arrives; a request fired onto a down connection is silently lost until it
 %% times out. `monitors` is left intact so the `DOWN` handler still runs the
 %% final cleanup and grows a replacement.
-%%
-%% Log abnormal closes with the connection's age and checkout status.
-%% Clean idle closes are not logged: reason=normal is gun's own clean
-%% shutdown; reason=closed is the remote side (S3) closing an idle
-%% keep-alive connection.
-handle_gun_down(Conn, Reason, _KilledStreams = [], State) when
-    Reason =:= normal orelse Reason =:= closed
-->
+handle_gun_down(Conn, normal, _KilledStreams, State) ->
+    %% Avoid a warning log even if `KilledStreams` is not empty. The current
+    %% version of gun in use today (2.4.0) does not clean up the HTTP/1 request
+    %% stream when the request's response has the header `connection: close`
+    %% and does not have a body, so the `gun_down` message reports a reason of
+    %% `normal` and a `KilledStreams` list of length one.
+    {noreply, remove_available(Conn, State)};
+handle_gun_down(Conn, closed, _KilledStreams = [], State) ->
+    %% Avoid a warning log if the remote closed an idle connection.
     {noreply, remove_available(Conn, State)};
 handle_gun_down(Conn, Reason, KilledStreams, #?MODULE{checkouts = Checkouts} = State) ->
     ConnAge = get_conn_age(Conn, State),
