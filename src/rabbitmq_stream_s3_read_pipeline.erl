@@ -264,10 +264,13 @@ clear_requests(#pipeline{} = P) ->
 %% Give up the bytes prefetched for the next fragment. A `not_found` next is
 %% kept: it holds no bytes, so it costs the window nothing, and a fragment
 %% retention has deleted does not come back - forgetting it would spend another
-%% GET learning the same 404.
+%% GET learning the same 404. That clause changes nothing, so it needs no
+%% `checked/1`. Clearing `next` cannot break an invariant on its own - only
+%% `not_found` constrains the queue - but it goes through `checked/1` anyway so
+%% that every mutator does; see `checked/1`.
 -spec drop_prefetch(pipeline()) -> pipeline().
 drop_prefetch(#pipeline{next = not_found} = P) -> P;
-drop_prefetch(#pipeline{} = P) -> P#pipeline{next = undefined}.
+drop_prefetch(#pipeline{} = P) -> checked(P#pipeline{next = undefined}).
 
 -doc """
 Moves to the fragment `next` was prefetching, or resets the current one when
@@ -806,6 +809,14 @@ read(Offset, Bytes, #pipeline{frag_ref = #fragment_ref{size = FragSize}, buffer 
 %% to contiguously; a duplicate key means a delivery routed to the wrong
 %% request. Checked after every operation that mutates the queue, so no caller
 %% can construct a queue that breaks them.
+%%
+%% Every mutator routes through here rather than the ones that look risky,
+%% because these are whole-queue properties: an operation that touches one
+%% request can break an invariant that spans two, and the resulting queue is
+%% still well-formed enough to keep working - a read stalls or a range is
+%% fetched twice, far from the edit that caused it. Routing all of them through
+%% one place is what makes the check a net rather than a spot assertion, and it
+%% costs nothing in production (`checked/1` is a no-op outside TEST).
 checked(#pipeline{reqs = Reqs, next = Next, frag_ref = #fragment_ref{offset = Current}} = P) ->
     %% Nothing is prefetched once the next fragment is known to be missing, so a
     %% range above the current fragment cannot coexist with a `not_found` next.

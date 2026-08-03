@@ -968,13 +968,17 @@ init_remote_reader(
             _ ->
                 undefined
         end,
+    %% The sizing comes from the reader module, not the config, because the
+    %% prefetch histogram's boundaries are derived from it and frozen at boot;
+    %% see `rabbitmq_stream_s3_remote_reader:prefetch_sizing/0`.
+    {RequestSize, WindowMax} = rabbitmq_stream_s3_remote_reader:prefetch_sizing(),
     Conf = #{
         reader => self(),
         stream => StreamId,
         location => Location,
         opts => #{
-            request_size => rabbitmq_stream_s3_config:prefetch_request_size(),
-            window_max => rabbitmq_stream_s3_config:prefetch_window_max(),
+            request_size => RequestSize,
+            window_max => WindowMax,
             max_depth => rabbitmq_stream_s3_config:prefetch_max_depth()
         }
     },

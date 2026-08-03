@@ -457,6 +457,8 @@ Owned by `rabbitmq_stream_s3_remote_reader`. One counter set per node, summed ac
 
 The boundaries are derived from the configured sizes at boot: the window moves in whole requests between `prefetch_request_size` and `prefetch_window_max`, so they are spaced by the request size up to the window cap. At the default sizing that is 4, 8, 12, 16, 20, 24, 28, 32 MiB and `+Inf`. The top finite boundary is always the window cap, so `+Inf` stays empty in normal operation. A window that spans more than 16 requests is spaced out rather than given a boundary per step, which bounds the number of series.
 
+Because the boundaries are fixed at boot, both settings are read at boot too, and readers started later keep running with the sizing the node booted with. Changing either one takes effect on restart.
+
 This metric replaces `rabbitmq_stream_s3_read_size_bytes_bucket`, which no longer exists. Panels and alerts that name the old metric go blank rather than error, so they have to be repointed by hand; the bundled Grafana dashboard already is.
 
 The window grows on a miss and shrinks on sustained hits, so it reads as a load signal rather than a health one. A window pinned at its ceiling while `rabbitmq_stream_s3_buffer_miss` still climbs means consumers are outrunning the remote tier: prefetch has grown as far as it is allowed to and reads are still waiting on S3. A window sitting at its floor means the reader is staying ahead of its consumers and has given back every request it took.

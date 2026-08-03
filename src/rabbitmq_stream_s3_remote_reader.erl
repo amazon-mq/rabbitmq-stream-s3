@@ -40,6 +40,7 @@ synchronous feedback is generated.
 -define(C_TOTAL_REQUESTS, 7).
 -define(C_FATAL_ERRORS, 8).
 -define(COUNTER_KEY, {rabbitmq_stream_s3_remote_reader, counter}).
+-define(PREFETCH_SIZING_KEY, {rabbitmq_stream_s3_remote_reader, prefetch_sizing}).
 -define(COUNTERS, [
     {buffer_hit, ?C_BUFFER_HIT, counter, "Number of reads served from the buffer"},
     {buffer_miss, ?C_BUFFER_MISS, counter, "Number of reads that had to await async data"},
@@ -118,6 +119,7 @@ synchronous feedback is generated.
     read_iodata/4,
     read_iodata/5,
     init_counters/0,
+    prefetch_sizing/0,
     prefetch_window_prometheus_format/0
 ]).
 
@@ -139,8 +141,29 @@ synchronous feedback is generated.
 init_counters() ->
     Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?COUNTERS, #{module => ?MODULE}),
     persistent_term:put(?COUNTER_KEY, Cnt),
-    rabbitmq_stream_s3_histogram:new(?MODULE, prefetch_window_buckets()),
+    Sizing = read_prefetch_sizing(),
+    persistent_term:put(?PREFETCH_SIZING_KEY, Sizing),
+    rabbitmq_stream_s3_histogram:new(?MODULE, prefetch_window_buckets(Sizing)),
     ok.
+
+%% The sizing every reader on this node runs with. Published once at boot,
+%% because the histogram boundaries are derived from it and frozen at the same
+%% moment: a reader that read the app env directly would grow its window past
+%% boundaries already fixed against the old ceiling, and every observation above
+%% it would land in +Inf. Reading both from here keeps them the same numbers, so
+%% these two keys are boot-time settings and a change to either needs a restart.
+%%
+%% Falls back to a live read for a reader started without `init_counters/0`
+%% (tests); there is no histogram to disagree with in that case.
+-spec prefetch_sizing() -> {pos_integer(), pos_integer()}.
+prefetch_sizing() ->
+    persistent_term:get(?PREFETCH_SIZING_KEY, read_prefetch_sizing()).
+
+%% Clamped here rather than at each use so the boundaries and the readers cannot
+%% disagree about a ceiling configured below the floor either.
+read_prefetch_sizing() ->
+    RequestSize = rabbitmq_stream_s3_config:prefetch_request_size(),
+    {RequestSize, max(RequestSize, rabbitmq_stream_s3_config:prefetch_window_max())}.
 
 %% Upper bucket boundaries follow the values the window can actually take: it
 %% starts at `prefetch_request_size`, doubles on a miss up to
@@ -155,9 +178,10 @@ init_counters() ->
 %% `prefetch_request_size` into a handful of buckets. Where the window spans
 %% more than `?PREFETCH_WINDOW_BUCKET_LIMIT` requests the spacing is widened to
 %% keep the series count bounded; the ceiling stays a boundary either way.
-prefetch_window_buckets() ->
-    RequestSize = rabbitmq_stream_s3_config:prefetch_request_size(),
-    WindowMax = max(RequestSize, rabbitmq_stream_s3_config:prefetch_window_max()),
+%%
+%% Takes the sizing rather than reading it, so the boundaries are derived from
+%% the same numbers the readers run with. See `prefetch_sizing/0`.
+prefetch_window_buckets({RequestSize, WindowMax}) ->
     Steps = ceil(WindowMax / RequestSize),
     Stride = RequestSize * ceil(Steps / ?PREFETCH_WINDOW_BUCKET_LIMIT),
     lists:usort(lists:seq(Stride, WindowMax, Stride) ++ [WindowMax]) ++ [infinity].
@@ -616,7 +640,7 @@ report_pool_busy(Id, FragOffset, State) ->
 %% `pool_busy_delay` and park the range on a clock measuring something else.
 %%
 %% Recursion is bounded at one level either way. The nested range is in flight
-%% by the time it is reported, so the core requeues it - `fail_req/4` takes the
+%% by the time it is reported, so the core requeues it - `fail_range/3` takes the
 %% `{ok, _}` branch, which only arms a timer - rather than freeing another slot.
 %%
 %% The flag the nested effects end on is what this returns, so it reaches the
@@ -786,9 +810,8 @@ stale_retry_is_ignored_per_kind_test() ->
 %% can make needs its own bucket - and none of them may land in +Inf, which is
 %% for a window that has escaped its ceiling.
 prefetch_window_buckets_resolve_every_window_step_test() ->
-    RequestSize = rabbitmq_stream_s3_config:prefetch_request_size(),
-    WindowMax = rabbitmq_stream_s3_config:prefetch_window_max(),
-    Buckets = prefetch_window_buckets(),
+    {RequestSize, WindowMax} = Sizing = read_prefetch_sizing(),
+    Buckets = prefetch_window_buckets(Sizing),
     Windows = lists:seq(RequestSize, WindowMax, RequestSize),
     Observed = [bucket_of(W, Buckets) || W <- Windows],
     ?assertEqual(length(Windows), length(lists:usort(Observed))),
@@ -818,8 +841,9 @@ prefetch_window_buckets_follow_the_configured_sizes_test_() ->
             lists:flatten(io_lib:format("~b/~b", [RequestSize, WindowMax])),
             fun() ->
                 with_prefetch_config(RequestSize, WindowMax, fun() ->
-                    Ceiling = max(RequestSize, WindowMax),
-                    Buckets = prefetch_window_buckets(),
+                    {_, Ceiling} = Sizing = read_prefetch_sizing(),
+                    ?assertEqual(max(RequestSize, WindowMax), Ceiling),
+                    Buckets = prefetch_window_buckets(Sizing),
                     ?assertEqual(infinity, lists:last(Buckets)),
                     ?assertEqual(Ceiling, lists:last(lists:droplast(Buckets))),
                     ?assertNotEqual(infinity, bucket_of(Ceiling, Buckets)),
