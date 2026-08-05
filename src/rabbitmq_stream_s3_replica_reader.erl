@@ -1593,6 +1593,13 @@ restart_at_local_floor(
         State#state.core, Core0
     ),
     ok = rabbitmq_stream_s3_manifest_replica:put_manifest(StreamId, FreshManifest, Epoch),
+    %% Publish the reset range. Without this the manifest_first_offset and
+    %% manifest_next_offset gauges keep reporting the range of the manifest that
+    %% was just discarded, so Prometheus and Grafana advertise a remote tier that
+    %% no longer exists and contradict both the cache row written above and
+    %% get_range/1. Observed after a leader restart: the gauges read
+    %% [129554, 194331) while every node's cache row read [257045, 257045).
+    update_manifest_gauges(FreshManifest, State),
     %% Propagate the reset to replicas. The fresh manifest carries the discarded
     %% manifest's revision (the broadcast sequence number), so the sync is not
     %% rejected as stale and subsequent broadcasts continue in sequence. Replicas

@@ -1626,7 +1626,8 @@ await_first_nonzero(Config, Name, Timeout, Start) ->
         _ ->
             Elapsed = erlang:monotonic_time(millisecond) - Start,
             case Elapsed > Timeout of
-                true -> ct:fail({counter_stayed_zero, Name, Timeout});
+                true ->
+                    ct:fail({counter_stayed_zero, Name, Timeout});
                 false ->
                     timer:sleep(5),
                     await_first_nonzero(Config, Name, Timeout, Start)
