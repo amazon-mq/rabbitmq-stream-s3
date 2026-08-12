@@ -57,7 +57,7 @@ Both profiles apply equal jitter (the delay is uniformly distributed in `[delay/
 
 **Mitigation.** None. The system handles this automatically.
 
-**Resolution.** The new replica reader resolves the manifest from S3, determines where to resume, and begins uploading. Normal operation resumes within seconds. Any orphaned fragment is cleaned up by orphan detection (planned; see "Orphaned S3 objects" below).
+**Resolution.** The new replica reader resolves the manifest from S3, determines where to resume, and begins uploading. Normal operation resumes within seconds. Any orphaned fragment is reclaimed by garbage collection (see "Orphaned S3 objects" below).
 
 ---
 
