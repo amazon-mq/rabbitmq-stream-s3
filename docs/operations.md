@@ -579,6 +579,10 @@ Shows the current state of the tiered storage replica reader for a stream: manif
 rabbitmq-streams stream_s3_status my-stream --vhost /
 # Status of tiered storage for stream my-stream in vhost / ...
 #
+# Remote tier bucket
+#
+# Accessible: yes
+#
 # Stream
 #
 # Stream ID: __my-stream_1781016420026141262
@@ -616,7 +620,11 @@ rabbitmq-streams stream_s3_status my-stream --vhost /
 # Cut: no
 ```
 
-The report is grouped into four sections.
+The report is grouped into five sections.
+
+**Remote tier bucket** reports whether the node can reach the configured S3 bucket.
+
+- `Accessible`: `yes` when the node last reached the bucket, `no (does not exist)` or `no (access denied)` when a probe failed with a known reason (any other failure is shown verbatim), and `unknown` before the node has probed the bucket.
 
 **Stream** identifies the stream and where this report comes from.
 
