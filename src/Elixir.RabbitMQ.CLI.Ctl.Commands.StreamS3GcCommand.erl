@@ -7,6 +7,8 @@
 
 -export([
     scopes/0,
+    switches/0,
+    aliases/0,
     usage/0,
     usage_additional/0,
     banner/2,
@@ -21,18 +23,36 @@
 scopes() ->
     [streams].
 
+switches() ->
+    [{mode, string}].
+
+aliases() ->
+    [].
+
 description() ->
     <<"Identifies (or deletes) dangling objects in the remote tier">>.
 
 help_section() ->
     {plugin, stream}.
 
-validate([], _Opts) ->
-    ok;
-validate([_Stream], _Opts) ->
-    ok;
-validate(_, _Opts) ->
-    {validation_failure, too_many_args}.
+validate(Args, _Opts) when length(Args) > 1 ->
+    {validation_failure, too_many_args};
+validate(_Args, Opts) ->
+    case maps:get(mode, Opts, <<"dry_run">>) of
+        <<"dry_run">> ->
+            ok;
+        <<"delete">> ->
+            ok;
+        Other ->
+            {validation_failure,
+                {bad_argument,
+                    erlang:iolist_to_binary(
+                        io_lib:format(
+                            "Unsupported --mode value: ~ts. Supported values are: dry_run, delete.",
+                            [Other]
+                        )
+                    )}}
+    end.
 
 merge_defaults(Args, Opts) ->
     {Args, maps:merge(#{mode => <<"dry_run">>, vhost => <<"/">>}, Opts)}.
@@ -100,9 +120,9 @@ output({error, Reason}, _Opts) ->
 %% Internal
 %% ------------------------------------------------------------------
 
+%% Only the values accepted by validate/2 reach this function.
 parse_mode(<<"dry_run">>) -> dry_run;
-parse_mode(<<"delete">>) -> delete;
-parse_mode(_) -> dry_run.
+parse_mode(<<"delete">>) -> delete.
 
 format_finding(#{stream_id := StreamId, key := Key, reason := Reason}) ->
     io_lib:format("~ts\t~ts\t~p", [StreamId, Key, Reason]).
