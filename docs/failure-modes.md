@@ -31,7 +31,7 @@ For the concepts behind these scenarios, see [concepts.md](./concepts.md). For t
 
 A failed fragment upload is always retried; the fragment is never abandoned, because dropping it would advance the manifest over a range that is not durable in S3 and leave a silent hole (issue #206). How the retry is paced depends on the error class.
 
-**Transient errors** (throttling, 5xx, timeouts, connection errors) are expected to clear quickly. The first retry is immediate, preserving responsiveness for a one-off blip. Successive consecutive failures of the same fragment back off exponentially from `stream_s3.task_retry_delay_constant` (10ms) by a factor of `stream_s3.task_retry_delay_exponent` (2), capped at `stream_s3.task_retry_delay_max_ms` (5s).
+**Transient errors** (throttling, 5xx, timeouts, connection errors) are expected to clear quickly. The first retry is immediate, preserving responsiveness for a one-off blip. Successive consecutive failures of the same fragment back off exponentially from `task_retry_delay_constant` (10ms) by a factor of `task_retry_delay_exponent` (2), capped at `task_retry_delay_max_ms` (5s).
 
 **Non-transient errors** (a confirmed checksum mismatch, an unexpected 4xx) are unlikely to clear on a tight retry, so the pipeline stalls at the failed offset and retries with a backoff starting at `upload_retry_delay_ms` (1000ms), growing to `upload_retry_delay_max_ms` (30s). Local-tier cleanup also stalls at that offset, so the only durable copy is retained until the upload succeeds.
 
@@ -164,7 +164,7 @@ Discarding remote manifest and restarting from the local log.
 
 **Mitigation.** None required: recovery is automatic.
 
-**Resolution.** Each submitted transfer arms a reader-side deadline (`stream_s3.transfer_deadline_ms`, default four times `segment_upload_timeout`). On expiry the reader resubmits the transfer under the same reference through the normal retry path, recovering from a dropped `pending` item, an externally killed task, or a lost message with one mechanism. The deadline is generous so a healthy but slow upload (including time queued behind the token bucket) is not resubmitted spuriously; a spurious resubmit is harmless because the reference is reused, the first result to arrive is accounted and the duplicate is discarded, and the losing upload's object becomes an orphan that GC reclaims. If local retention has already trimmed past the stalled offset by the time the deadline fires, the reader instead takes the local-log-ahead recovery path (see "Segment deleted before upload").
+**Resolution.** Each submitted transfer arms a reader-side deadline (`transfer_deadline_ms`, default four times `segment_upload_timeout`). On expiry the reader resubmits the transfer under the same reference through the normal retry path, recovering from a dropped `pending` item, an externally killed task, or a lost message with one mechanism. The deadline is generous so a healthy but slow upload (including time queued behind the token bucket) is not resubmitted spuriously; a spurious resubmit is harmless because the reference is reused, the first result to arrive is accounted and the duplicate is discarded, and the losing upload's object becomes an orphan that GC reclaims. If local retention has already trimmed past the stalled offset by the time the deadline fires, the reader instead takes the local-log-ahead recovery path (see "Segment deleted before upload").
 
 ---
 
