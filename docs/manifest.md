@@ -260,7 +260,7 @@ rabbitmq/
 │   │       ├── 00000000000012345678.79425118.group
 │   │       ├── 00000000000091234567.edabc41f.group
 │   │       ├── ...
-│   │       └── root.db868505.manifest     // the root
+│   │       └── root.5.db868505.manifest   // the root, at epoch 5
 ```
 
 The UID of the manifest root is stored in [Khepri](https://github.com/rabbitmq/khepri) (RabbitMQ's metadata store) associated with the stream name. The Khepri tree looks like this:
