@@ -107,7 +107,7 @@ To add one, create `test/<name>_bench.erl` exporting `run/0` that calls `rabbitm
 
 Wall time is the primary signal. In particular, do not trust `tprof`'s `call_memory` view for binary-heavy paths: it counts heap words and cannot see refc binary payloads, which is precisely what the plugin's hot paths move.
 
-For memory questions the harness provides `sample_binary_memory/1` (peak VM binary memory over a run, baselined after garbage-collecting every process). Peak readings are GC-timing dependent and jitter run to run; for a deterministic number, measure what live references pin after a forced GC — see the memory phase of `read_buffer_bench` for the pattern (a sink retains the last N replies, GCs itself, and reports its deduplicated `process_info(_, binary)` total).
+For memory questions the harness provides `sample_binary_memory/1` (peak VM binary memory over a run, baselined after garbage-collecting every process). Peak readings are GC-timing dependent and jitter run to run; for a deterministic number, measure what live references pin after a forced GC - see the memory phase of `read_buffer_bench` for the pattern (a sink retains the last N replies, GCs itself, and reports its deduplicated `process_info(_, binary)` total).
 
 ## Formatting
 

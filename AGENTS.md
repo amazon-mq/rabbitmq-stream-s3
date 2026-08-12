@@ -6,20 +6,20 @@ This file covers the `rabbitmq_stream_s3` plugin specifically. For general Rabbi
 
 Read the relevant documentation before modifying any module:
 
-- `docs/README.md` — overview and reading guide
-- `docs/DEVELOPMENT.md` — building, testing, formatting
-- `docs/GLOSSARY.md` — terminology used throughout the plugin and its docs
-- `docs/concepts.md` — streaming primitives and how the plugin extends them
-- `docs/architecture.md` — how the pieces fit together
-- `docs/conventions.md` — patterns and conventions for writing code here
+- `docs/README.md` - overview and reading guide
+- `docs/DEVELOPMENT.md` - building, testing, formatting
+- `docs/GLOSSARY.md` - terminology used throughout the plugin and its docs
+- `docs/concepts.md` - streaming primitives and how the plugin extends them
+- `docs/architecture.md` - how the pieces fit together
+- `docs/conventions.md` - patterns and conventions for writing code here
 
 When working on a specific subsystem, also read its dedicated document first:
 
-- `docs/read-path.md` — the consumer read path, including the remote-to-local tier transition (`become_local`)
-- `docs/upload-path.md` — how local segments are uploaded to the remote tier
-- `docs/manifest.md` — the manifest tree, fragments, and how the remote tier is indexed
-- `docs/failure-modes.md` — known failure modes and how the plugin handles them
-- `docs/investigations/` — write-ups of prior investigations; check here before debugging a hard problem, it may already be documented
+- `docs/read-path.md` - the consumer read path, including the remote-to-local tier transition (`become_local`)
+- `docs/upload-path.md` - how local segments are uploaded to the remote tier
+- `docs/manifest.md` - the manifest tree, fragments, and how the remote tier is indexed
+- `docs/failure-modes.md` - known failure modes and how the plugin handles them
+- `docs/investigations/` - write-ups of prior investigations; check here before debugging a hard problem, it may already be documented
 
 The Java end-to-end integration tests live in `test/integration/`; see `test/integration/README.md` before writing or changing a replay test.
 

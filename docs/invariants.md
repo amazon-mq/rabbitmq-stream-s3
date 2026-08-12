@@ -81,7 +81,7 @@ GC reaps an S3 object only when it can prove the object is not live. For an obje
 
 ## Cached state
 
-The invariants above are stated over the manifest `M`, but no reader consults `M` directly: every consumer reads a node-local cache of it (`rabbitmq_stream_s3_manifest_replica`'s ETS table). The cache is volatile state with its own lifecycle, and the read-path invariants only follow from the durable-state invariants if the cache's relationship to `M` is itself pinned down. `Cache(node, S)` denotes the cache row for stream `S` on a node, with two states: a resolved manifest (possibly empty) and `pending` (attached but not yet resolved or synced, or no row at all yet — a missing row defaults to pending, it is never a distinct third state).
+The invariants above are stated over the manifest `M`, but no reader consults `M` directly: every consumer reads a node-local cache of it (`rabbitmq_stream_s3_manifest_replica`'s ETS table). The cache is volatile state with its own lifecycle, and the read-path invariants only follow from the durable-state invariants if the cache's relationship to `M` is itself pinned down. `Cache(node, S)` denotes the cache row for stream `S` on a node, with two states: a resolved manifest (possibly empty) and `pending` (attached but not yet resolved or synced, or no row at all yet - a missing row defaults to pending, it is never a distinct third state).
 
 | Invariant | Statement | Where |
 |---|---|---|

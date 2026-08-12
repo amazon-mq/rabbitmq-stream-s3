@@ -465,10 +465,7 @@ The window grows on a miss and shrinks on sustained hits, so it reads as a load 
 
 ## Dashboards
 
-A reference Grafana dashboard ships with the plugin at
-[`grafana/RabbitMQ-Stream-Tiered-Storage.json`](../grafana/RabbitMQ-Stream-Tiered-Storage.json).
-The dashboard scrapes the default `/metrics` endpoint and uses the
-folded aggregate values so it works regardless of stream count.
+A reference Grafana dashboard ships with the plugin at [`grafana/RabbitMQ-Stream-Tiered-Storage.json`](../grafana/RabbitMQ-Stream-Tiered-Storage.json). The dashboard scrapes the default `/metrics` endpoint and uses the folded aggregate values so it works regardless of stream count.
 
 ### Recommended alerting
 
