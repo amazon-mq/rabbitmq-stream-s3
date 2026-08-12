@@ -14,8 +14,9 @@ This plugin lives inside the RabbitMQ server tree as a dependency. You do not cl
 ```bash
 git clone https://github.com/amazon-mq/upstream-to-rabbitmq-server.git
 cd upstream-to-rabbitmq-server
-git checkout streams-tiered-storage
 ```
+
+The plugin is on the default branch, `main`, which is what the clone checks out.
 
 The plugin source is at `deps/rabbitmq_stream_s3/`. All build and test commands run from that directory:
 
