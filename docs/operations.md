@@ -19,9 +19,14 @@ If `stream_s3.region` is not set, the plugin attempts to determine the region au
 
 Useful for S3-compatible storage or VPC endpoints.
 
+The value is a *top-level domain*, not a full hostname. The plugin builds the connection host as `s3.<region>.<tld>` and addresses buckets virtual-hosted style, so requests go to `<bucket>.s3.<region>.<tld>` over TLS on port 443. Passing a full hostname yields a doubled host such as `s3.us-east-1.stream_s3.us-east-1.amazonaws.com`.
+
 ```ini
-stream_s3.region_endpoints.us-east-1 = stream_s3.us-east-1.amazonaws.com
+stream_s3.region = us-east-1
+stream_s3.region_endpoints.us-east-1 = amazonaws.com
 ```
+
+The default is `amazonaws.com`, and the China, US intelligence community, and European Sovereign Cloud partitions are already mapped, so an override is only needed for a domain you resolve yourself. To reach S3-compatible storage, pick such a domain and point `<bucket>.s3.<region>.<tld>` at your endpoint: `stream_s3.region = jepsen` with `stream_s3.region_endpoints.jepsen = local` gives the host `s3.jepsen.local`. See [`jepsen/jepsen.streams3/src/jepsen/streams3/db.clj`](../jepsen/jepsen.streams3/src/jepsen/streams3/db.clj) for a working MinIO configuration.
 
 ### Credentials
 
