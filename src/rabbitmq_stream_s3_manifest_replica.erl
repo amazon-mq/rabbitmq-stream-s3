@@ -86,6 +86,7 @@ manifest row.
     sync/5,
     register_replica_context/5,
     is_context_registered/1,
+    is_awaiting_sync/1,
     evaluate_local_retention/1,
     forget/1
 ]).
@@ -323,6 +324,18 @@ register_replica_context(StreamId, MemberPid, Dir, Shared, Counter) ->
 is_context_registered(StreamId) ->
     gen_server:call(?MODULE, {is_context_registered, StreamId}).
 
+-doc """
+Whether a stream on this node has a registered context whose cache row is still
+`pending`. This is the wedged shape from rabbitmq_stream_s3#362 -- a context
+exists (so readers fail closed on the pending row) but no manifest ever arrived
+to resolve it. The reconciler uses this to re-request a sync, since a
+registered-but-pending row is otherwise never healed once gap-detection goes
+quiet.
+""".
+-spec is_awaiting_sync(stream_id()) -> boolean().
+is_awaiting_sync(StreamId) ->
+    gen_server:call(?MODULE, {is_awaiting_sync, StreamId}).
+
 -doc "Evaluate local-tier retention for a stream on this node.".
 -spec evaluate_local_retention(stream_id()) -> ok | {error, term()}.
 evaluate_local_retention(StreamId) ->
@@ -472,6 +485,18 @@ handle_call(
     }};
 handle_call({is_context_registered, StreamId}, _From, #state{contexts = Ctxs} = State) ->
     {reply, maps:is_key(StreamId, Ctxs), State};
+handle_call(
+    {is_awaiting_sync, StreamId}, _From, #state{contexts = Ctxs} = State
+) ->
+    %% Wedged shape: a context is registered but the cache row is still pending,
+    %% so a reader on this node fails closed. The row state, not the seqs map, is
+    %% the authoritative check: put_manifest/2,3 (GC, the read path, writer
+    %% reseed) resolves the row without recording a sequence, so an absent seqs
+    %% entry does not imply pending. get_manifest/1 reads the ETS row directly.
+    Awaiting =
+        maps:is_key(StreamId, Ctxs) andalso
+            get_manifest(StreamId) =:= pending,
+    {reply, Awaiting, State};
 handle_call({evaluate_local_retention, StreamId}, _From, #state{contexts = Ctxs} = State) ->
     Reply =
         case maps:get(StreamId, Ctxs, undefined) of
@@ -911,6 +936,63 @@ is_stale_sync_test() ->
     %% A delayed sync from a deposed lower-epoch writer is stale, even with a
     %% higher sequence than the new writer has reached.
     ?assert(is_stale_sync(5, 10, {1, 6, Node})),
+    ok.
+
+%% is_awaiting_sync/1 must report the wedged shape (a registered context whose
+%% cache row is still pending) and must NOT false-positive on a row resolved via
+%% put_manifest, which writes the row without recording a sequence. Regression
+%% test for rabbitmq_stream_s3#362. Runs against a live singleton because the
+%% predicate reads the ETS row (get_manifest/1), not just gen_server state.
+is_awaiting_sync_test_() ->
+    {setup,
+        fun() ->
+            {ok, Pid} = start_link(),
+            Pid
+        end,
+        fun(Pid) ->
+            gen_server:stop(Pid)
+        end,
+        fun(_Pid) ->
+            S = <<"awaiting_sync_stream">>,
+            Shared = osiris_log_shared:new(),
+            Counter = counters:new(1, []),
+            [
+                %% No context at all: not awaiting.
+                ?_assertNot(is_awaiting_sync(S)),
+                %% Register a context. mark_pending is applied by register, so the
+                %% row is pending with a context: this is the wedged shape.
+                ?_test(begin
+                    ok = register_replica_context(S, self(), "/tmp/nx", Shared, Counter),
+                    ?assert(is_awaiting_sync(S))
+                end),
+                %% A sync resolves the row and records a sequence: no longer awaiting.
+                ?_test(begin
+                    M = #manifest{first_offset = 0, next_offset = 10, revision = 1},
+                    ok = sync(S, 1, 1, M),
+                    ?assertNot(is_awaiting_sync(S))
+                end),
+                %% Re-mark pending (as a member restart's re-register does) and confirm
+                %% it reports awaiting again even though a sequence was once recorded:
+                %% the row state, not the seqs map, is authoritative.
+                ?_test(begin
+                    ok = mark_pending_for_test(S),
+                    ?assert(is_awaiting_sync(S))
+                end),
+                %% put_manifest resolves the row WITHOUT recording a sequence (the GC
+                %% and read-path resolve). This must NOT read as awaiting: the earlier
+                %% seqs-based predicate false-positived here.
+                ?_test(begin
+                    M2 = #manifest{first_offset = 0, next_offset = 20, revision = 2},
+                    ok = put_manifest(S, M2, 1),
+                    ?assertNot(is_awaiting_sync(S))
+                end)
+            ]
+        end}.
+
+%% mark_pending inserts only if absent (insert_new), so a test that needs to
+%% force an already-resolved row back to pending overwrites it directly.
+mark_pending_for_test(StreamId) ->
+    true = ets:insert(?TABLE, {StreamId, pending, undefined}),
     ok.
 
 -endif.

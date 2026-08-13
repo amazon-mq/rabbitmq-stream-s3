@@ -471,23 +471,36 @@ handle_cast(
         cfg = #cfg{stream = StreamId, epoch = Epoch}
     } = State
 ) ->
-    case maps:is_key(Node, Replicas) of
-        true ->
-            {noreply, State};
-        false ->
-            MonRef = monitor(process, {rabbitmq_stream_s3_manifest_replica, Node}),
-            %% Sync the *persisted* manifest, not the live one: sync_manifest/4
-            %% tags the sync with the manifest's revision as the sequence number
-            %% (see the {broadcast, _} effect), and that revision only advances
-            %% when a persist commits. Pairing the live manifest with the
-            %% persisted revision would cache an edit the replica was never told
-            %% about, which the next broadcast then re-delivers in-sequence so
-            %% the replica double-applies it (silent, unhealable divergence: no
-            %% gap is ever observed). Do not change this back to manifest/1.
-            Manifest = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(Core),
-            sync_manifest(StreamId, Epoch, Manifest, Node),
-            {noreply, State#state{replicas = Replicas#{Node => MonRef}}}
-    end;
+    %% Sync the *persisted* manifest, not the live one: sync_manifest/4
+    %% tags the sync with the manifest's revision as the sequence number
+    %% (see the {broadcast, _} effect), and that revision only advances
+    %% when a persist commits. Pairing the live manifest with the
+    %% persisted revision would cache an edit the replica was never told
+    %% about, which the next broadcast then re-delivers in-sequence so
+    %% the replica double-applies it (silent, unhealable divergence: no
+    %% gap is ever observed). Do not change this back to manifest/1.
+    Manifest = rabbitmq_stream_s3_replica_reader_core:persisted_manifest(Core),
+    %% Always re-sync, even when the node is already in the replicas map. A
+    %% replica's osiris member restarts on every "fell behind retention"
+    %% resync, and each restart's on_init(acceptor) hook re-sends
+    %% register_acceptor and re-marks the node's cache row pending, while this
+    %% writer's monitor is on the replica's manifest_replica process (which does
+    %% not restart), so the node never leaves the replicas map. Early-returning
+    %% here on the already-registered path left the row wedged in pending with
+    %% no sync to resolve it once publishing stopped and gap-detection went
+    %% quiet. The re-sync is idempotent: the replica's is_stale_sync/3 drops it
+    %% if the replica is already current, and applies it (resolving a pending
+    %% row with no recorded sequence) otherwise. See rabbitmq_stream_s3#362.
+    Replicas1 =
+        case maps:is_key(Node, Replicas) of
+            true ->
+                Replicas;
+            false ->
+                MonRef = monitor(process, {rabbitmq_stream_s3_manifest_replica, Node}),
+                Replicas#{Node => MonRef}
+        end,
+    sync_manifest(StreamId, Epoch, Manifest, Node),
+    {noreply, State#state{replicas = Replicas1}};
 handle_cast(
     {retention_updated, Retention}, #state{core = Core, cfg = #cfg{stream = StreamId}} = State
 ) ->
