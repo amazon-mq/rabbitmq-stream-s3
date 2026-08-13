@@ -1,5 +1,7 @@
 # Remote reader memory behavior
 
+> Status update (2026-08-13). The prefetch ceiling this doc cites, `read_size_max` at 64 MiB with a further next-fragment prefetch at the full window size, has been retired. The pipelined prefetch of [#349](https://github.com/amazon-mq/rabbitmq-stream-s3/issues/349) replaced it with a single window spanning both fragments, capped by `prefetch_window_max` (32 MiB), so the per-consumer ceiling is that plus one in-flight request rather than the ~128 MiB quoted below. The block-queue findings and every measurement below are unaffected and remain valid.
+
 This doc is an investigation into the memory impact of remote tier reads.
 
 Measurements were taken on a single development machine (Linux, Erlang/OTP 27, ERTS 15.2.7.6).
@@ -8,7 +10,7 @@ Measurements were taken on a single development machine (Linux, Erlang/OTP 27, E
 
 The upload path never accumulates: `stream_put/stream_data` (`rabbitmq_stream_s3_api_aws.erl`) batches outgoing data to 1 MiB chunks and hands each to gun immediately, so a replica reader in steady state holds roughly one chunk of in-flight data per stream.
 
-The read path must accumulate by design. The remote reader prefetches an AIMD-sized window ahead of the consumer (up to `read_size_max`, 64 MiB) and additionally prefetches the next fragment at the full window size, so tens of MiB of *intentional* buffer per remote consumer is the baseline. The waste investigated here was on top of that: the same bytes being copied repeatedly, and dead buffer memory surviving long after it was consumed.
+The read path must accumulate by design. When this investigation was made, the remote reader prefetched an AIMD-sized window ahead of the consumer (up to `read_size_max`, 64 MiB) and additionally prefetched the next fragment at the full window size, so tens of MiB of *intentional* buffer per remote consumer was the baseline. The waste investigated here was on top of that: the same bytes being copied repeatedly, and dead buffer memory surviving long after it was consumed.
 
 ## Mechanism: appending and slicing the same binary
 
