@@ -4,7 +4,7 @@ Models the integer-offset branch of `log_reader:resolve_remote_location/2`: the 
 
 ## The bugs
 
-Three defects, both shipped and retired, all INV#4 silent remote skips, all gated on below.
+Three defects, all shipped and since retired, all INV#4 silent remote skips, all gated on below.
 
 The floor-guard bug. The local-tier check is:
 
@@ -40,12 +40,12 @@ The three failing runs are the validation gate: each proves the spec reproduces 
 
 ```bash
 p compile
-p check -tc tcTierRoutingGuardedWarm      -s 2000   # 0 bugs
-p check -tc tcTierRoutingGuardedColdStart -s 2000   # 0 bugs
-p check -tc tcTierRoutingBuggyNoMinusOneGuard -s 500   # 1 bug: INV#4 misrouting
-p check -tc tcTierRoutingBuggyMissFallsLocal  -s 500   # 1 bug: INV#4 misrouting
+p check -tc tcTierRoutingGuardedWarm      -i 2000   # 0 bugs
+p check -tc tcTierRoutingGuardedColdStart -i 2000   # 0 bugs
+p check -tc tcTierRoutingBuggyNoMinusOneGuard -i 500   # 1 bug: INV#4 misrouting
+p check -tc tcTierRoutingBuggyMissFallsLocal  -i 500   # 1 bug: INV#4 misrouting
 p check -tc tcTierRoutingBuggyNoMarker        -i 2000   # 0 bugs
-p check -tc tcTierRoutingBuggyColdAbsent      -s 500   # 1 bug: INV#4 misrouting
+p check -tc tcTierRoutingBuggyColdAbsent      -i 500   # 1 bug: INV#4 misrouting
 ```
 
 ## Scope note
