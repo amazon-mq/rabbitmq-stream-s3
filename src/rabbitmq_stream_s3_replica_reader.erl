@@ -1593,6 +1593,13 @@ restart_at_local_floor(
         State#state.core, Core0
     ),
     ok = rabbitmq_stream_s3_manifest_replica:put_manifest(StreamId, FreshManifest, Epoch),
+    %% Publish the reset range. Without this the manifest_first_offset and
+    %% manifest_next_offset gauges keep reporting the range of the manifest that
+    %% was just discarded, so Prometheus and Grafana advertise a remote tier that
+    %% no longer exists and contradict both the cache row written above and
+    %% get_range/1. Observed after a leader restart: the gauges read
+    %% [129554, 194331) while every node's cache row read [257045, 257045).
+    update_manifest_gauges(FreshManifest, State),
     %% Propagate the reset to replicas. The fresh manifest carries the discarded
     %% manifest's revision (the broadcast sequence number), so the sync is not
     %% rejected as stale and subsequent broadcasts continue in sequence. Replicas
@@ -1647,10 +1654,13 @@ handle_local_log_ahead(
         "remote tier.",
         [StreamId, NextOffset, Reason, LocalFirst, NextOffset]
     ),
-    %% Count the mid-stream (upload-path) recovery too, not just the reader-init
-    %% path (start_reading0/1), so the #225 trimmed-segment recovery is visible
-    %% in the local_log_ahead_recoveries metric and not only in the logs.
-    inc(State0, ?C_LOCAL_LOG_AHEAD_RECOVERIES, 1),
+    %% Do NOT count the recovery here. This path restarts through
+    %% resolve_and_start/1 -> start_reading/1 -> start_reading0/1, whose
+    %% local-ahead clause opens the data reader at the same stale next_offset,
+    %% takes the same {offset_out_of_range, {LocalFirst, _}} error and counts it.
+    %% Incrementing here as well reported one event as two, inflating every
+    %% measurement taken from the counter (the documented signal for telling a
+    %% benign recovery from the sustained #356 loop) by 2x on the upload path.
     resolve_and_start(reset_for_recovery(State0)).
 
 -spec drain(#state{}) -> #state{}.

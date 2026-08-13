@@ -792,6 +792,21 @@ upload_path_recovers_from_trimmed_segment(Config) ->
     %% stalling the manifest at NextA forever.
     ok = rabbitmq_stream_s3_api_fault:release(TaskPid, Ref),
 
+    %% This recovery counts exactly once. The upload path recovers by restarting
+    %% through resolve_and_start/1 -> start_reading0/1, whose local-ahead clause
+    %% re-opens at the same stale next_offset and does the counting; incrementing
+    %% on the upload path as well would report this single event as two. The count
+    %% is the documented signal for telling a benign one-shot recovery from a
+    %% sustained retention-outruns-upload loop (#356), so inflating it is not
+    %% cosmetic.
+    %%
+    %% Assert on the first nonzero reading rather than a final total: continued
+    %% writing under this test's tight max_bytes retention can legitimately drive
+    %% a second recovery, so the total is not deterministic. The first nonzero
+    %% reading is: a double increment happens entirely within one reader callback,
+    %% so no external observer can ever see 1 when both fire.
+    ?assertEqual(1, await_first_nonzero(Config, local_log_ahead_recoveries, 5_000)),
+
     %% Keep writing so the reset reader is driven by osiris offset notifications
     %% to drain and re-upload (in #225 writes are continuous). No permanent
     %% stall: the manifest leaves NextA and advances past it.
@@ -801,7 +816,7 @@ upload_path_recovers_from_trimmed_segment(Config) ->
             Write(5),
             get_range(Config)
         end,
-        30_000
+        5_000
     ).
 
 remote_tier_ahead_discards_manifest(Config) ->
@@ -1586,3 +1601,35 @@ reconcile_recovers_replica_after_cache_restart(Config) ->
         end,
         5000
     ).
+
+%% Read one per-stream replica reader counter by name. This suite starts writers
+%% with `reference => StreamId` rather than a queue resource, so the reader
+%% registers under init_metrics/2's labelless fallback id.
+stream_counter(Config, Name) ->
+    StreamId = ?config(stream_id, Config),
+    Id = {rabbitmq_stream_s3_replica_reader, StreamId},
+    case seshat:counters(rabbitmq_stream_s3, Id, [Name]) of
+        #{Name := Value} -> Value;
+        undefined -> undefined
+    end.
+
+%% Poll a per-stream counter and return the first nonzero value observed. Used to
+%% assert the increment size of a single event, which a final total cannot pin
+%% down when the event can legitimately recur.
+await_first_nonzero(Config, Name, Timeout) ->
+    await_first_nonzero(Config, Name, Timeout, erlang:monotonic_time(millisecond)).
+
+await_first_nonzero(Config, Name, Timeout, Start) ->
+    case stream_counter(Config, Name) of
+        V when is_integer(V) andalso V > 0 ->
+            V;
+        _ ->
+            Elapsed = erlang:monotonic_time(millisecond) - Start,
+            case Elapsed > Timeout of
+                true ->
+                    ct:fail({counter_stayed_zero, Name, Timeout});
+                false ->
+                    timer:sleep(5),
+                    await_first_nonzero(Config, Name, Timeout, Start)
+            end
+    end.
