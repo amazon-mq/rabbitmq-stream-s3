@@ -6,7 +6,7 @@ Log access mode used by replicas to accept chunks replicated from the writer.
 
 ## Chunk
 
-A batch of serialized entries written to the log as a single unit. Chunks are the unit of replication in Osiris. Each chunk has a 48-byte header containing the chunk type, offset, epoch, timestamp, checksum, and bloom filter.
+A batch of serialized entries written to the log as a single unit. Chunks are the unit of replication in Osiris. Each chunk has a 48-byte header containing the chunk type, offset, epoch, timestamp, checksum, and the size of the bloom filter, followed by the filter itself when the chunk carries one.
 
 ## Commit offset
 
@@ -94,7 +94,7 @@ Stream data stored in S3 as fragment objects. Provides bottomless retention at l
 
 ## Replica
 
-A follower node that copies chunks from the writer. The median offset across writer and replicas determines the commit offset.
+A follower node that copies chunks from the writer. The commit offset is the highest offset a majority of writer and replicas have acknowledged.
 
 ## Replica reader
 
