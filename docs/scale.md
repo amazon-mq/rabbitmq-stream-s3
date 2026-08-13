@@ -51,9 +51,9 @@ With a full set of 1024 mega-groups, the root covers 64 EiB. Beyond that, the ro
 
 | Throughput | Time to 1 PiB | Time to 1 EiB |
 |------------|----------------|----------------|
-| 100 MB/s | 4 months | 340 years |
-| 1 GB/s | 12 days | 34 years |
-| 10 GB/s | 29 hours | 3.4 years |
+| 100 MiB/s | 4 months | 349 years |
+| 1 GiB/s | 12 days | 34 years |
+| 10 GiB/s | 29 hours | 3.4 years |
 
 Even at very high sustained throughput, producing enough data to matter takes years.
 

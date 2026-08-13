@@ -4,7 +4,7 @@
 
 This investigation looks at optimizing the approach which Osiris uses to search through index files.
 
-The Osiris index file has one 29-byte record per chunk. Each record contains the chunk's first offset, timestamp, epoch, file position, and type. The file has an 8-byte header followed by records in append order. At the default chunk limit of 256,000 per segment, the index is at most ~7.3 MiB.
+The Osiris index file has one 29-byte record per chunk. Each record contains the chunk's first offset, timestamp, epoch, file position, and type. The file has an 8-byte header followed by records in append order. At the default chunk limit of 256,000 per segment, the index is at most ~7.08 MiB.
 
 Consumers resolve offset specs (a specific offset, a timestamp, `first`, `last`) by searching the index file for the relevant chunk. This happens once per consumer attach.
 
