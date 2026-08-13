@@ -53,6 +53,9 @@ gmake eunit
 
 # Dialyzer type check
 gmake dialyze
+
+# Cross-reference check for calls to undefined or deprecated functions
+gmake xref
 ```
 
 ### CT logs
