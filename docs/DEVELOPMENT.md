@@ -54,7 +54,7 @@ gmake eunit
 # Dialyzer type check
 gmake dialyze
 
-# Cross-reference check for calls to undefined or deprecated functions
+# Cross-reference check for calls to undefined functions
 gmake xref
 ```
 
@@ -107,7 +107,7 @@ gmake bench-read_buffer_bench
 
 Benchmarks are for humans comparing before/after numbers on a quiet machine. They are deliberately not CI-gated and assert nothing: relative performance assertions are flaky on shared runners, and a benchmark that must pass gets tuned until it does. When a change touches a hot path (the read or upload path), run the relevant benchmark before and after and put both numbers in the commit message or PR.
 
-To add one, create `test/<name>_bench.erl` exporting `run/0` that calls `rabbitmq_stream_s3_bench:run/1,2` with named scenario funs; `make bench` picks it up by filename. Keep a scenario's iteration meaningful (one window of work, not one tiny operation) and keep the default runtime in seconds, not minutes.
+To add one, create `test/<name>_bench.erl` exporting `run/0` that calls `rabbitmq_stream_s3_bench:run/1,2` with named scenario funs; `gmake bench` picks it up by filename. Keep a scenario's iteration meaningful (one window of work, not one tiny operation) and keep the default runtime in seconds, not minutes.
 
 Wall time is the primary signal. In particular, do not trust `tprof`'s `call_memory` view for binary-heavy paths: it counts heap words and cannot see refc binary payloads, which is precisely what the plugin's hot paths move.
 
