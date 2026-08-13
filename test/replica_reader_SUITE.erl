@@ -805,7 +805,7 @@ upload_path_recovers_from_trimmed_segment(Config) ->
     %% a second recovery, so the total is not deterministic. The first nonzero
     %% reading is: a double increment happens entirely within one reader callback,
     %% so no external observer can ever see 1 when both fire.
-    ?assertEqual(1, await_first_nonzero(Config, local_log_ahead_recoveries, 30_000)),
+    ?assertEqual(1, await_first_nonzero(Config, local_log_ahead_recoveries, 5_000)),
 
     %% Keep writing so the reset reader is driven by osiris offset notifications
     %% to drain and re-upload (in #225 writes are continuous). No permanent
@@ -816,7 +816,7 @@ upload_path_recovers_from_trimmed_segment(Config) ->
             Write(5),
             get_range(Config)
         end,
-        30_000
+        5_000
     ).
 
 remote_tier_ahead_discards_manifest(Config) ->
