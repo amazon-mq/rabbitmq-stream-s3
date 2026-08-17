@@ -2407,19 +2407,25 @@ prop_remote_reader_core_load_bounded() ->
             ),
             %% `read_pos` is never negative, so the most any pending read can
             %% ask for is the furthest byte any read in the sequence reaches.
+            %%
+            %% The two budgets are bounded separately, which is what the reader
+            %% now enforces: `has_room/1` admits a range while a budget has room,
+            %% so each may cross its ceiling by the one range that pass queues.
+            %% `buffer_max` defaults to `window_max`, so they share a bound here
+            %% without sharing a budget - the reader's memory is their sum.
             MaxReadEnd = lists:max([0 | [O + B || {read, O, B, _} <- Events]]),
-            MaxOutstanding = max(WindowMax, MaxReadEnd) + RequestSize,
-            check_rrc_load(Events, S0, MaxOutstanding, MaxDepth)
+            Bound = max(WindowMax, MaxReadEnd) + RequestSize,
+            check_rrc_load(Events, S0, Bound, MaxDepth)
         end
     ).
 
-check_rrc_load([], _State, _MaxOutstanding, _MaxDepth) ->
+check_rrc_load([], _State, _Bound, _MaxDepth) ->
     true;
-check_rrc_load([Event | Rest], State0, MaxOutstanding, MaxDepth) ->
+check_rrc_load([Event | Rest], State0, Bound, MaxDepth) ->
     State = run_rrc_events([Event], State0),
-    {Outstanding, InFlight} = rabbitmq_stream_s3_remote_reader_core:load(State),
-    Outstanding =< MaxOutstanding andalso InFlight =< MaxDepth andalso
-        check_rrc_load(Rest, State, MaxOutstanding, MaxDepth).
+    {Committed, Buffered, InFlight} = rabbitmq_stream_s3_remote_reader_core:load(State),
+    Committed =< Bound andalso Buffered =< Bound andalso InFlight =< MaxDepth andalso
+        check_rrc_load(Rest, State, Bound, MaxDepth).
 
 %% =========================================================================
 %% Read buffer (block queue) properties

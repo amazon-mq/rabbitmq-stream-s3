@@ -88,9 +88,14 @@ and transitions immediately if available, or signals that more data is needed.
     %% Bytes per range request. Fixed: concurrency, not size, is what scales a
     %% remote reader's bandwidth past one connection's transfer rate.
     request_size :: pos_integer(),
-    %% Ceiling on the prefetch window, and so on this reader's memory: it can
-    %% hold or have outstanding at most `window_max + request_size` bytes.
+    %% Ceiling on the prefetch window: the most the reader may have on the wire
+    %% at once, over and above what the read in hand needs.
     window_max :: pos_integer(),
+    %% Ceiling on the bytes the reader may hold that the consumer has not read.
+    %% Together with `window_max` this bounds its memory at
+    %% `window_max + buffer_max + request_size` - the two are separate budgets
+    %% (see `has_room/1`), so they add rather than share.
+    buffer_max :: pos_integer(),
     %% Most requests that may be in flight at once, across every fragment.
     max_depth :: pos_integer(),
     %% Most fragments the reader may look ahead to beyond the one it is reading.
@@ -416,13 +421,13 @@ step_(#state{cfg = #cfg{min_retry_delay_ms = MinDelay}} = State0, deadline_expir
     %%
     %% The prefetched next fragment is dropped along with them. Its own ranges
     %% are cancelled with the rest, but its bytes keep counting against the
-    %% prefetch window (see `outstanding/1`), so keeping it would hold window
-    %% space that nothing is left to fetch into. With the window at its ceiling
-    %% that is permanent: `has_room/1` stays false however many misses the reader
-    %% takes, `extend_frontier/1` issues nothing, and no range is ever requested
-    %% for the current fragment again - every subsequent read waits out its own
-    %% deadline. Below the ceiling it costs at least one more of them before the
-    %% window doubles past what the stale prefetch holds.
+    %% buffer budget (see `buffered/1`), so keeping it would hold budget that
+    %% nothing is left to fetch into. With the window at its ceiling that is
+    %% permanent: `has_room/1` stays false however many misses the reader takes,
+    %% `extend_frontier/1` issues nothing, and no range is ever requested for the
+    %% current fragment again - every subsequent read waits out its own deadline.
+    %% Below the ceiling it costs at least one more of them before the window
+    %% doubles past what the stale prefetch holds.
     %% The look-ahead memo is left alone. An answered one is the truth about an
     %% iterator this event does not touch, and re-resolving it would spend a
     %% group GET on an answer already in hand; a `failed` one needs no clearing,
@@ -463,6 +468,7 @@ step_(State0, {iterator_refreshed, end_of_manifest}) ->
         pipeline = Pipeline,
         pending = undefined,
         peeks = [],
+        peek_tail = unknown,
         current_not_found = false,
         timers = #{}
     },
@@ -592,11 +598,11 @@ window_bytes(#state{window = Window}) ->
 read_position(State) ->
     rabbitmq_stream_s3_read_pipeline:read_position(pipeline(State)).
 
-%% Bytes held or asked for ahead of the consumer, and how many requests are in
-%% flight: the two quantities the prefetch window and depth cap bound.
--spec load(state()) -> {non_neg_integer(), non_neg_integer()}.
+%% What the two budgets and the depth cap bound, split the way `has_room/1`
+%% bounds them: bytes on the wire, bytes held unread, and requests in flight.
+-spec load(state()) -> {non_neg_integer(), non_neg_integer(), non_neg_integer()}.
 load(State) ->
-    {outstanding(State), inflight_count(State)}.
+    {committed(State), buffered(State), inflight_count(State)}.
 
 -endif.
 
@@ -760,6 +766,10 @@ not_found_refresh(#state{peeks = Peeks0, peek_tail = Tail0} = State0) ->
 %% Moves to the fragment being prefetched, resetting what this module tracks
 %% about the fragment left behind. The pipeline decides what that costs in
 %% cancelled requests (see its `advance/1`).
+%%
+%% `peek_tail` is left where it is. It says what follows the *last* of the
+%% peeks, and popping the head does not move the last one, so the marker means
+%% the same thing after the transition as before it.
 goto_next_fragment(State0) ->
     {_NewOffset, Cancels, Pipeline} = rabbitmq_stream_s3_read_pipeline:advance(pipeline(State0)),
     {Iterator, Peeks} = advance_iterator(State0),
@@ -876,8 +886,14 @@ idle(Kind, #state{timers = Timers} = State) ->
 inflight_count(State) ->
     rabbitmq_stream_s3_read_pipeline:inflight(pipeline(State)).
 
-outstanding(State) ->
-    rabbitmq_stream_s3_read_pipeline:outstanding(pipeline(State)).
+%% Bytes on the wire or queued for it, not yet in a buffer. Bounded for
+%% throughput; see `has_room/1`.
+committed(State) ->
+    rabbitmq_stream_s3_read_pipeline:committed(pipeline(State)).
+
+%% Bytes in a buffer the consumer has not read. Bounded for memory.
+buffered(State) ->
+    rabbitmq_stream_s3_read_pipeline:buffered(pipeline(State)).
 
 %% ------------------------------------------------------------------
 %% Internal: request issuance
@@ -917,7 +933,7 @@ start_current_request(State) ->
     {State1, Effects}.
 
 %% (Re-)issue ranges that are queued and not in flight. Their bytes are already
-%% counted in `outstanding/1`, so they are not window-gated - a range the reader
+%% counted in `committed/1`, so they are not budget-gated - a range the reader
 %% has committed to must be fetched, or the buffer never becomes contiguous
 %% again and every read behind it stalls until the deadline. They do take a
 %% slot, so the depth cap still applies; running before `extend_frontier/1`
@@ -1000,33 +1016,51 @@ extend_frontier(State, Peeks0, Tail0, Attempted0, Acc) ->
 start_request_effect({Id, Key, Range, Fragment}) ->
     {start_request, Id, Key, Range, Fragment}.
 
-has_room(#state{cfg = #cfg{max_depth = MaxDepth}} = State) ->
-    inflight_count(State) < MaxDepth andalso outstanding(State) < fetch_ceiling(State).
-
-%% How far ahead the reader may fetch. That is the prefetch window, except that
-%% the window bounds *prefetch* and the read in hand is not optional: a read of
-%% N bytes cannot be served while fewer than N are outstanding. Gating on the
-%% window alone therefore trapped any read larger than `window_max`. Once
-%% `outstanding` reached the ceiling `has_room/1` stayed false, `note_miss/1`
-%% could not grow the window past `min(WindowMax, _)`, and `extend_frontier/1`
-%% issued nothing - forever. The read deadline was no escape either: it clears
-%% the buffer, the reader refetches to the same ceiling, and wedges again, so
-%% the consumer loops on deadlines instead of making progress. Reads are chunk
-%% sized (`data_size` from the chunk header), so a chunk larger than the
-%% window - or a smaller one while a next-fragment prefetch is held, since that
-%% counts against `outstanding/1` too - was enough.
+%% Two budgets, not one. How hard to fetch and how much to hold ahead of the
+%% consumer are different quantities answering different questions, so
+%% `committed` is bounded for throughput and `buffered` for memory. Summing them
+%% against a single ceiling would make a full buffer subtract directly from
+%% concurrency: a consumer draining slower than the reader fetches would slow
+%% the reader down, when a consumer that cannot keep up is a reason to stop
+%% fetching *more*, once, at a memory bound, not a reason to fetch each range it
+%% already owes less concurrently.
 %%
-%% Flooring at what the pending read needs is the whole fix. The other terms in
-%% `outstanding/1` cannot starve it: the next-fragment buffer only holds bytes
-%% once the current fragment is entirely buffered or in flight, and a pending
-%% read that `try_read/3` left awaiting is below that fragment's index
-%% boundary, so what is already on the wire completes it.
-fetch_ceiling(#state{window = Window, pending = #pending{} = Pending} = State) ->
-    #pending{offset = Offset, bytes = Bytes} = Pending,
+%% Measured: at one configuration a drain-capped consumer held 18.0 requests in
+%% flight where the same reader uncapped held 25.7.
+%%
+%% So `committed` is bounded for throughput and `buffered` for memory. The
+%% reader keeps its full concurrency until the buffer is genuinely full and then
+%% stops, rather than degrading in proportion to how far behind the consumer is.
+%% The cost is that the two no longer share: worst-case memory is the sum of the
+%% ceilings rather than one of them.
+has_room(#state{cfg = #cfg{max_depth = MaxDepth}} = State) ->
+    inflight_count(State) < MaxDepth andalso
+        committed(State) < fetch_ceiling(State) andalso
+        buffered(State) < buffer_ceiling(State).
+
+%% How much the reader may have on the wire: what the concurrency target is
+%% worth in bytes, floored at what the pending read needs.
+%%
+%% Flooring at what the pending read needs is the whole fix, and it is why both
+%% ceilings carry the same floor: either one held below the pending read is the
+%% same wedge, reached by a different route.
+fetch_ceiling(#state{window = Window} = State) ->
+    max(Window, pending_need(State)).
+
+%% How much the reader may hold that the consumer has not read. Bounds memory
+%% and nothing else: reaching it says the consumer is behind, which is a reason
+%% to stop fetching ahead but not a reason to fetch what is already owed any
+%% less concurrently.
+buffer_ceiling(#state{cfg = #cfg{buffer_max = BufferMax}} = State) ->
+    max(BufferMax, pending_need(State)).
+
+%% What the pending read still needs from beyond the read position. Zero with no
+%% read in hand, which cannot floor anything.
+pending_need(#state{pending = #pending{offset = Offset, bytes = Bytes}} = State) ->
     ReadPos = rabbitmq_stream_s3_read_pipeline:read_position(pipeline(State)),
-    max(Window, Offset + Bytes - ReadPos);
-fetch_ceiling(#state{window = Window}) ->
-    Window.
+    Offset + Bytes - ReadPos;
+pending_need(#state{}) ->
+    0.
 
 %% The next range to request: the tail of the current fragment's data region,
 %% or the head of the prefetched next fragment once the current one is fully
@@ -1205,6 +1239,15 @@ build_cfg(Opts) ->
         %% window in the bottom bucket of a histogram whose boundaries are
         %% derived from these same two numbers.
         window_max = max(RequestSize, maps:get(window_max, Opts, 33_554_432)),
+        %% Defaulted to the window so that the bytes a reader may hold unread are
+        %% bounded where they were before the budgets were split - what changes
+        %% is that holding them no longer costs concurrency, not how many it may
+        %% hold. Below one request it would stall a reader that has fetched a
+        %% range the consumer has not reached yet.
+        buffer_max = max(
+            RequestSize,
+            maps:get(buffer_max, Opts, max(RequestSize, maps:get(window_max, Opts, 33_554_432)))
+        ),
         %% At least one request in flight. Zero leaves `has_room/1` false
         %% however far behind the consumer falls, so nothing is ever requested
         %% and every read waits out its whole deadline - three times over, with
