@@ -26,6 +26,9 @@ all() ->
         become_local_at_end_of_manifest,
         not_found_triggers_refresh_iterator,
         %% New tests
+        fetch_rate_is_measured_over_the_sample_the_shell_stamps,
+        sample_survives_an_iterator_refresh,
+        tick_with_no_elapsed_time_keeps_the_sample_open,
         window_grows_on_miss,
         window_capped_at_window_max,
         window_decays_after_sustained_hits,
@@ -330,6 +333,14 @@ window(State) ->
 load(State) ->
     rabbitmq_stream_s3_remote_reader_core:load(State).
 
+fetch_rate(State) ->
+    rabbitmq_stream_s3_remote_reader_core:fetch_rate(State).
+
+%% Close a measurement sample of `ElapsedUs`, which the shell would have measured
+%% off a real clock and this drives directly.
+tick(State, ElapsedUs) ->
+    rabbitmq_stream_s3_remote_reader_core:step(State, {tune_tick, ElapsedUs}).
+
 %% Answer every outstanding range of a fragment, in queue order, with the
 %% fragment's byte pattern.
 serve_all(State0, Fragment) ->
@@ -577,6 +588,63 @@ current_and_next_404_read_past_current_keeps_surviving_fragment(_Config) ->
 %% ------------------------------------------------------------------
 %% Prefetch window and retry tests
 %% ------------------------------------------------------------------
+
+sample_survives_an_iterator_refresh(_Config) ->
+    %% The refresh rebuilds the state part-way through a measurement sample, but
+    %% the sample's other term is the shell's: `sample_at` moves on the tick and
+    %% nothing here can move it. Dropping the bytes while the elapsed time stays
+    %% whole would report a reader that had just delivered a megabyte as one
+    %% that had delivered a fraction of it, and the search would act on the
+    %% difference.
+    Entries = [{0, 500, 42}, {100, 500, 43}],
+    {S0, _} = init(
+        stream_id(),
+        frag_ref(0, 500, 42),
+        ?SEGMENT_HEADER_B,
+        mock_iterator(Entries),
+        #{request_size => 1000, window_max => 100_000, max_depth => 8, auto_tune => true}
+    ),
+    {S1, _} = deliver(S0, 0, ?SEGMENT_HEADER_B, pattern(?SEGMENT_HEADER_B, 500), done),
+    {S2, _} = rabbitmq_stream_s3_remote_reader_core:step(
+        S1, {iterator_refreshed, mock_iterator(Entries)}
+    ),
+    %% A tenth of a second for 500 bytes is 5 kB/s, whatever happened to the
+    %% state in between.
+    {S3, _} = tick(S2, 100_000),
+    ?assertEqual(5000, fetch_rate(S3)).
+
+fetch_rate_is_measured_over_the_sample_the_shell_stamps(_Config) ->
+    %% The core has no clock: elapsed time arrives as an input on the tick, so a
+    %% rate can be measured without `step/2` ever depending on when it was
+    %% called - and a test can drive a sample of any length in no time at all.
+    {S0, _} = pipelined_state(#{window_max => 100_000, max_depth => 32}),
+    ?assertEqual(undefined, fetch_rate(S0)),
+    %% 2000 bytes delivered over a tenth of a second is 20 kB/s.
+    {S1, _} = deliver(S0, 0, 8, pattern(8, 1000), done),
+    {S2, _} = deliver(S1, 0, 1008, pattern(1008, 1000), done),
+    {S3, _} = tick(S2, 100_000),
+    ?assertEqual(20_000, fetch_rate(S3)),
+    %% The sample closes with it: the next one counts only what arrives after,
+    %% so a burst is not credited to every sample that follows it.
+    {S4, _} = tick(S3, 100_000),
+    ?assertEqual(0, fetch_rate(S4)),
+    %% Same bytes, ten times the sample, a tenth of the rate. Nothing here reads
+    %% a clock, so the two differ only by what the shell stamped.
+    {S5, _} = deliver(S4, 0, 2008, pattern(2008, 1000), done),
+    {S6, _} = tick(S5, 1_000_000),
+    ?assertEqual(1000, fetch_rate(S6)).
+
+tick_with_no_elapsed_time_keeps_the_sample_open(_Config) ->
+    %% A tick delivered twice, or early enough that the clock has not moved,
+    %% carries no measurement. Dividing by it would fail; crediting the bytes to
+    %% a zero-length sample would read as an unbounded rate. They stay in the
+    %% sample instead, so the next tick to carry real elapsed time counts them.
+    {S0, _} = pipelined_state(#{window_max => 100_000, max_depth => 32}),
+    {S1, _} = deliver(S0, 0, 8, pattern(8, 1000), done),
+    {S2, _} = tick(S1, 0),
+    ?assertEqual(undefined, fetch_rate(S2)),
+    {S3, _} = tick(S2, 100_000),
+    ?assertEqual(10_000, fetch_rate(S3)).
 
 window_grows_on_miss(_Config) ->
     %% A read that cannot be served means the reader is not fetching far enough
