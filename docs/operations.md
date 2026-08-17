@@ -19,9 +19,14 @@ If `stream_s3.region` is not set, the plugin attempts to determine the region au
 
 Useful for S3-compatible storage or VPC endpoints.
 
+The value is a *top-level domain*, not a full hostname. The plugin builds the connection host as `s3.<region>.<tld>` and addresses buckets virtual-hosted style, so requests go to `<bucket>.s3.<region>.<tld>` over TLS on port 443. Passing a full hostname yields a doubled host such as `s3.us-east-1.stream_s3.us-east-1.amazonaws.com`.
+
 ```ini
-stream_s3.region_endpoints.us-east-1 = stream_s3.us-east-1.amazonaws.com
+stream_s3.region = us-east-1
+stream_s3.region_endpoints.us-east-1 = amazonaws.com
 ```
+
+The default is `amazonaws.com`, and the China, US intelligence community, and European Sovereign Cloud partitions are already mapped, so an override is only needed for a domain you resolve yourself. To reach S3-compatible storage, pick such a domain and point `<bucket>.s3.<region>.<tld>` at your endpoint: `stream_s3.region = jepsen` with `stream_s3.region_endpoints.jepsen = local` gives the host `s3.jepsen.local`. See [`jepsen/jepsen.streams3/src/jepsen/streams3/db.clj`](../jepsen/jepsen.streams3/src/jepsen/streams3/db.clj) for a working MinIO configuration.
 
 ### Credentials
 
@@ -465,10 +470,7 @@ The window grows on a miss and shrinks on sustained hits, so it reads as a load 
 
 ## Dashboards
 
-A reference Grafana dashboard ships with the plugin at
-[`grafana/RabbitMQ-Stream-Tiered-Storage.json`](../grafana/RabbitMQ-Stream-Tiered-Storage.json).
-The dashboard scrapes the default `/metrics` endpoint and uses the
-folded aggregate values so it works regardless of stream count.
+A reference Grafana dashboard ships with the plugin at [`grafana/RabbitMQ-Stream-Tiered-Storage.json`](../grafana/RabbitMQ-Stream-Tiered-Storage.json). The dashboard scrapes the default `/metrics` endpoint and uses the folded aggregate values so it works regardless of stream count.
 
 ### Recommended alerting
 
@@ -577,6 +579,10 @@ Shows the current state of the tiered storage replica reader for a stream: manif
 rabbitmq-streams stream_s3_status my-stream --vhost /
 # Status of tiered storage for stream my-stream in vhost / ...
 #
+# Remote tier bucket
+#
+# Accessible: yes
+#
 # Stream
 #
 # Stream ID: __my-stream_1781016420026141262
@@ -614,7 +620,11 @@ rabbitmq-streams stream_s3_status my-stream --vhost /
 # Cut: no
 ```
 
-The report is grouped into four sections.
+The report is grouped into five sections.
+
+**Remote tier bucket** reports whether the node can reach the configured S3 bucket.
+
+- `Accessible`: `yes` when the node last reached the bucket, `no (does not exist)` or `no (access denied)` when a probe failed with a known reason (any other failure is shown verbatim), and `unknown` before the node has probed the bucket.
 
 **Stream** identifies the stream and where this report comes from.
 

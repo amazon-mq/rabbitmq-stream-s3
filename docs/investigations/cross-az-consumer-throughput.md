@@ -69,6 +69,8 @@ The stream protocol's consumer flow control is credit-based. The Java client's d
 
 This was confirmed independently by sweeping `--initial-credits` across 10, 50, 200, and 1000 on the same broker. Coefficient of variation collapsed as the window grew: 0.182 at window 10, 0.182 at window 50, 0.068 at window 200, 0.031 at window 1000. A small credit window is far more sensitive to RTT noise than a large one, which is exactly the signature of an RTT-bound in-flight window rather than a throughput-bound one. Working backward from measured throughput and the confirmed 10-credit, 1-message-per-chunk workload gives an implied per-hop RTT increase in the sub-millisecond range, which is plausible for an added AZ hop.
 
+> Figure to re-verify (2026-08-13). The coefficient of variation is recorded as 0.182 at both window 10 and window 50, which does not fit the collapse the sentence describes. One of the two is likely a transcription error. Re-check both against the raw runs before citing them.
+
 Because this is a latency-bound mechanism, it is specific to the credit-gated consumer path. A long-lived bulk transfer, such as the broker's own connection to S3 for uploads or remote reads, is not gated the same way and would not be expected to show the same sensitivity to a single AZ hop. That path was not part of this workload (no producers were active) and remains untested.
 
 ### Confirming the mechanism by controlling AZ and credit window together
@@ -81,6 +83,8 @@ The credit sweep above did not control AZ placement, so it could only show that 
 | 50 | 7111.5 | 6963.3 | 148.2 | 5.0% | p = 0.58 |
 | 200 | 7408.2 | 7445.3 | -37.1 | -1.3% | p = 0.90 |
 | 1000 | 7782.1 | 7782.1 | 0.0 | 0.0% | p = 1.00 |
+
+> Figure to re-verify (2026-08-13). The window 1000 row reports identical means to one decimal place, an exactly zero gap and `p = 1.00`. Across 5 runs per cell of a measurement this noisy that is implausible, so the row is probably a copy-paste of one cell into both columns. Re-check it against the raw runs before citing it. The conclusion below rests on the window 50 and 200 rows as well, so it does not stand or fall on this row.
 
 The gap converges to near-zero by window 50 and stays there through window 1000. AZ placement stops mattering once the credit window is large enough to absorb the added RTT, which is exactly what the mechanism predicts and is the strongest evidence that credit-window size, not the AZ hop itself, is the actual lever.
 

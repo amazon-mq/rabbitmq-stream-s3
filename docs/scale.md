@@ -45,15 +45,15 @@ At 64 MiB per fragment:
 | Kilo-groups | 64 PiB |
 | Mega-groups | 64 EiB |
 
-With a full set of 1024 mega-groups, the root covers ~70 EiB. Beyond that, the root continues to grow linearly (additional mega-group entries). The tree does not stop working, but the root object grows larger, using more memory and bandwidth per manifest upload. In practice, remote retention keeps the manifest bounded long before this matters.
+With a full set of 1024 mega-groups, the root covers 64 EiB. Beyond that, the root continues to grow linearly (additional mega-group entries). The tree does not stop working, but the root object grows larger, using more memory and bandwidth per manifest upload. In practice, remote retention keeps the manifest bounded long before this matters.
 
 ### What it takes to produce that much data
 
 | Throughput | Time to 1 PiB | Time to 1 EiB |
 |------------|----------------|----------------|
-| 100 MB/s | 4 months | 340 years |
-| 1 GB/s | 12 days | 34 years |
-| 10 GB/s | 29 hours | 3.4 years |
+| 100 MiB/s | 4 months | 349 years |
+| 1 GiB/s | 12 days | 34 years |
+| 10 GiB/s | 29 hours | 3.4 years |
 
 Even at very high sustained throughput, producing enough data to matter takes years.
 
@@ -99,7 +99,7 @@ A stream with no remote retention grows the manifest linearly: one entry per fra
 |----------|-------------------|-------------------|
 | Offset space | 2⁶⁴ records (~584 years at 1B/sec) | No |
 | Timestamp space | Year 292 million | No |
-| Manifest tree depth | 70 EiB at 64 MiB fragments | No |
+| Manifest tree depth | 64 EiB at 64 MiB fragments | No |
 | S3 storage | No documented limit | No |
 | S3 PUT rate | 3,500/sec/prefix | No (uploads are infrequent) |
 | S3 GET rate | 5,500/sec/prefix (scales automatically) | Possible, at high consumer fan-out on a cold stream |

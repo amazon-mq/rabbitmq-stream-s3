@@ -26,7 +26,7 @@ Segment framing: each segment starts with a magic (4 bytes) and version (4 bytes
 0000025
 ```
 
-Each chunk has a header of at least 48 bytes. It can be larger if you use a larger-than-default bloom filter. Then each message is stored in AMQP 1.0 framing.
+Each chunk has a 48-byte header, which records in a single byte the size of the bloom filter that follows it. A chunk with no filter values carries no filter bytes at all, as in the dump below (`filter_size => 0`), so its entries begin 48 bytes in; a chunk that does carry a filter adds `filter_size` bytes, 16 by default. Each message is then stored in AMQP 1.0 framing.
 
 ```erlang
 > Fd = osiris_log:dump_init("/path/to/00000000000000000000.segment").

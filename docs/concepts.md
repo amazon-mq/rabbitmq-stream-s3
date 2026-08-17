@@ -211,10 +211,10 @@ Each stream has an internal identifier that is distinct from the user-visible qu
 ```
   base64uri(VHost + "_" + QueueName + "_" + Timestamp)
 
-  Example: ___my-stream_1745252105682952932
-           ^   ^          ^
-           |   |          creation timestamp (erlang:system_time())
-           |   queue name
+  Example: __my-stream_1745252105682952932
+           ^ ^         ^
+           | |         creation timestamp (erlang:system_time())
+           | queue name
            vhost "/" encoded as "_"
 ```
 

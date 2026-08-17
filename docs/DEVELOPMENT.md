@@ -14,8 +14,9 @@ This plugin lives inside the RabbitMQ server tree as a dependency. You do not cl
 ```bash
 git clone https://github.com/amazon-mq/upstream-to-rabbitmq-server.git
 cd upstream-to-rabbitmq-server
-git checkout streams-tiered-storage
 ```
+
+The plugin is on the default branch, `main`, which is what the clone checks out.
 
 The plugin source is at `deps/rabbitmq_stream_s3/`. All build and test commands run from that directory:
 
@@ -52,6 +53,9 @@ gmake eunit
 
 # Dialyzer type check
 gmake dialyze
+
+# Cross-reference check for calls to undefined functions
+gmake xref
 ```
 
 ### CT logs
@@ -103,11 +107,11 @@ gmake bench-read_buffer_bench
 
 Benchmarks are for humans comparing before/after numbers on a quiet machine. They are deliberately not CI-gated and assert nothing: relative performance assertions are flaky on shared runners, and a benchmark that must pass gets tuned until it does. When a change touches a hot path (the read or upload path), run the relevant benchmark before and after and put both numbers in the commit message or PR.
 
-To add one, create `test/<name>_bench.erl` exporting `run/0` that calls `rabbitmq_stream_s3_bench:run/1,2` with named scenario funs; `make bench` picks it up by filename. Keep a scenario's iteration meaningful (one window of work, not one tiny operation) and keep the default runtime in seconds, not minutes.
+To add one, create `test/<name>_bench.erl` exporting `run/0` that calls `rabbitmq_stream_s3_bench:run/1,2` with named scenario funs; `gmake bench` picks it up by filename. Keep a scenario's iteration meaningful (one window of work, not one tiny operation) and keep the default runtime in seconds, not minutes.
 
 Wall time is the primary signal. In particular, do not trust `tprof`'s `call_memory` view for binary-heavy paths: it counts heap words and cannot see refc binary payloads, which is precisely what the plugin's hot paths move.
 
-For memory questions the harness provides `sample_binary_memory/1` (peak VM binary memory over a run, baselined after garbage-collecting every process). Peak readings are GC-timing dependent and jitter run to run; for a deterministic number, measure what live references pin after a forced GC — see the memory phase of `read_buffer_bench` for the pattern (a sink retains the last N replies, GCs itself, and reports its deduplicated `process_info(_, binary)` total).
+For memory questions the harness provides `sample_binary_memory/1` (peak VM binary memory over a run, baselined after garbage-collecting every process). Peak readings are GC-timing dependent and jitter run to run; for a deterministic number, measure what live references pin after a forced GC - see the memory phase of `read_buffer_bench` for the pattern (a sink retains the last N replies, GCs itself, and reports its deduplicated `process_info(_, binary)` total).
 
 ## Formatting
 

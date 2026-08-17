@@ -20,9 +20,9 @@ MaxSegSize = maps:get(max_segment_size_bytes, Config, ?DEFAULT_MAX_SEGMENT_SIZE_
 
 The `log_hooks` key follows this pattern. Passing `log_hooks => undefined` in the config map suppresses hooks regardless of what the application environment says. This is how test helpers like `seed_log/2` write to the log without triggering replica reader spawns.
 
-### Chunk header is variable-size
+### Offset to a chunk's data is variable
 
-The chunk header is not a fixed 48 bytes. It includes a bloom filter whose size depends on `filter_size` configuration. Do not hardcode chunk header sizes. Use `data_size` and `position`/`next_position` from the header map to reason about byte offsets.
+The chunk header itself is a fixed 48 bytes, but the distance from a chunk's start to its data is not. A bloom filter sits between the two, and its size is not simply the configured `filter_size`: the filter is built only from filter values on user entries, so a chunk that carries none is written with no filter bytes at all, whatever `filter_size` is set to. Do not hardcode the offset to a chunk's data. Use `data_size` and `position`/`next_position` from the header map to reason about byte offsets.
 
 ## Derived state has no catch-alls
 

@@ -81,7 +81,7 @@ GC reaps an S3 object only when it can prove the object is not live. For an obje
 
 ## Cached state
 
-The invariants above are stated over the manifest `M`, but no reader consults `M` directly: every consumer reads a node-local cache of it (`rabbitmq_stream_s3_manifest_replica`'s ETS table). The cache is volatile state with its own lifecycle, and the read-path invariants only follow from the durable-state invariants if the cache's relationship to `M` is itself pinned down. `Cache(node, S)` denotes the cache row for stream `S` on a node, with two states: a resolved manifest (possibly empty) and `pending` (attached but not yet resolved or synced, or no row at all yet — a missing row defaults to pending, it is never a distinct third state).
+The invariants above are stated over the manifest `M`, but no reader consults `M` directly: every consumer reads a node-local cache of it (`rabbitmq_stream_s3_manifest_replica`'s ETS table). The cache is volatile state with its own lifecycle, and the read-path invariants only follow from the durable-state invariants if the cache's relationship to `M` is itself pinned down. `Cache(node, S)` denotes the cache row for stream `S` on a node, with two states: a resolved manifest (possibly empty) and `pending` (attached but not yet resolved or synced, or no row at all yet - a missing row defaults to pending, it is never a distinct third state).
 
 | Invariant | Statement | Where |
 |---|---|---|
@@ -94,4 +94,4 @@ The invariants above are stated over the manifest `M`, but no reader consults `M
 | Invariant | Statement | Where |
 |---|---|---|
 | Exactly-once | A read started at spec `s` delivers each offset of `[max(s, f), T)` exactly once, in strictly increasing order, across both tiers. A seek into a group resolves to the unique fragment containing the target (Ordering), not the group's first child. A fail-closed attach (Miss semantics) is not a violation: it delivers nothing and the consumer retries; only a delivery that skips an offset of `[max(s, f), T)` violates this invariant. | [read-path.md](./read-path.md) |
-| Tier overlap | The local segments cover `[n, T)` while the remote tier covers `[f, n)`; the ranges overlap and the reader hands off at a shared offset, so no offset is skipped or repeated at the seam. | [read-path.md](./read-path.md) |
+| Tier overlap | The local segments cover `[f_local, T)` while the remote tier covers `[f, n)`, with `f_local ≤ n` in steady state, so the tiers overlap on `[f_local, n)`. The reader routes every offset at or above `f_local` to the local tier and the rest of `[f, n)` to the remote tier, handing off at the shared offset `f_local`, so no offset is skipped or repeated at the seam. | [read-path.md](./read-path.md) |

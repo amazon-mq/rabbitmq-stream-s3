@@ -68,7 +68,7 @@ To support practically infinitely long streams, we can factor out `m` groups int
 
 ### Choosing `m`
 
-An `m` which is too small increases the number of requests to the remote tier during factoring and search, but reduces memory footprint. And vice versa for an `m` which is too large. We're using `1024` as a nice round power of two, though this could be tuned in the future. With `m=1024` and 34 bytes for each array entry, each (kilo-/mega-)group object only takes ~34 kiB, which is small enough to fit into memory comfortably even when there are many streams. The root can grow beyond this, but remains small anyways. Small streams (less than 1024 fragments) do not need any groups at all and can store all metadata in the root. If `m=1024` and mega-groups are the largest kind of group, a 'fully loaded' root of 1024 mega-groups points to 1024^4 fragments. At an average fragment size of 64 MiB this covers 70 EiB of data in a single stream, which is a large enough amount that publishing it is very difficult in the first place.
+An `m` which is too small increases the number of requests to the remote tier during factoring and search, but reduces memory footprint. And vice versa for an `m` which is too large. We're using `1024` as a nice round power of two, though this could be tuned in the future. With `m=1024` and 34 bytes for each array entry, each (kilo-/mega-)group object only takes ~34 KiB, which is small enough to fit into memory comfortably even when there are many streams. The root can grow beyond this, but remains small anyways. Small streams (less than 1024 fragments) do not need any groups at all and can store all metadata in the root. If `m=1024` and mega-groups are the largest kind of group, a 'fully loaded' root of 1024 mega-groups points to 1024^4 fragments. At an average fragment size of 64 MiB this covers 64 EiB of data in a single stream, which is a large enough amount that publishing it is very difficult in the first place.
 
 A large `m` makes lookup fast. With mega-groups being the largest kind of group, lookup within even EiB of data would make 3 round-trips to the remote tier to determine the fragment for a given offset or timestamp. The root is cached, then one round trip gets the mega-group, another gets the right kilo-group, another gets the right group and then search within that group finds the right fragment. If the remote tier has reasonably low latency (10-100ms) then lookup is always sub-second.
 
@@ -260,7 +260,7 @@ rabbitmq/
 │   │       ├── 00000000000012345678.79425118.group
 │   │       ├── 00000000000091234567.edabc41f.group
 │   │       ├── ...
-│   │       └── root.db868505.manifest     // the root
+│   │       └── root.5.db868505.manifest   // the root, at epoch 5
 ```
 
 The UID of the manifest root is stored in [Khepri](https://github.com/rabbitmq/khepri) (RabbitMQ's metadata store) associated with the stream name. The Khepri tree looks like this:

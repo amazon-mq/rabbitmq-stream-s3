@@ -223,4 +223,4 @@ $PERF --uris "$URI" --load-balancer --streams demo --producers 0 --consumers 0 -
 
 ## Further reading
 
-See the [main documentation](/docs/README.md) for full guides through the plugin's behavior, operations and implementation details.
+See the [main documentation](../README.md) for full guides through the plugin's behavior, operations and implementation details.

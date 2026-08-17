@@ -28,6 +28,11 @@ rabbitmq_stream_s3_sup (one_for_one, intensity 3 / period 5)
 │     AWS credential server. Fetches and refreshes credentials (instance
 │     role or static) and serves them to the API backend. Returns `ignore`
 │     when the backend is not AWS.
+├── rabbitmq_stream_s3_bucket_monitor (worker, permanent)
+│     Bucket accessibility probe. Issues a HeadBucket at startup and on a
+│     slow interval (default 5 min; `bucket_check_enabled`), surfacing the
+│     result through logs, the `bucket_accessible` gauge, and the status
+│     CLI. Never blocks publishers.
 ├── rabbitmq_stream_s3_manifest_replica (worker, permanent)
 │     Per-node manifest cache. Owns the ETS table of cached manifests.
 │     Receives sequenced edits from writer-node replica readers. Detects
@@ -66,12 +71,18 @@ rabbitmq_stream_s3_sup (one_for_one, intensity 3 / period 5)
 │                 committed chunks, assemble fragments, submit to governor,
 │                 apply completions in order, persist manifest, broadcast
 │                 edits, evaluate retention.
-└── rabbitmq_stream_s3_reconciler (worker, permanent)
-      Periodic reconciliation. On a timer (default 60s) re-attaches local
-      osiris writers that have no registered replica reader (a parked
-      reader, a writer-restart race, or a reader that never started), so a
-      parked stream is picked back up rather than staying un-tiered.
-      Started last so its dependencies are already up.
+├── rabbitmq_stream_s3_reconciler (worker, permanent)
+│     Periodic reconciliation. On a timer (default 60s) re-attaches local
+│     osiris writers that have no registered replica reader (a parked
+│     reader, a writer-restart race, or a reader that never started), so a
+│     parked stream is picked back up rather than staying un-tiered.
+│     Started after its dependencies (the registry, the replica reader
+│     factory, the manifest cache) so they are already up.
+└── rabbitmq_stream_s3_gc_scheduler (worker, permanent)
+      Periodic cross-stream garbage collection. On a timer (default 24h;
+      off unless `gc_enabled`) triggers a bucket-wide sweep that reclaims
+      orphaned objects and stale tombstones, holding a non-blocking
+      cluster-wide lock so only one node sweeps at a time. Started last.
 ```
 
 The supervisor init also performs one-time setup: creates the seshat counter group, initializes the API backend, sets the osiris hooks (`log_hooks` and `log_reader`), registers the Khepri deletion trigger, and creates the process registry ETS table.
