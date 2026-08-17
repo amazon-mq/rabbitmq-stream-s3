@@ -169,7 +169,8 @@ arms it.
     current_fragment_offset/1,
     read_position/1,
     frontier/2,
-    outstanding/1,
+    committed/1,
+    buffered/1,
     inflight/1,
     waits_on/2,
     push/3,
@@ -489,7 +490,7 @@ replace_next(Fragment, _Buffer, []) ->
     error({unseated_fragment, Fragment}).
 
 %% (Re-)issue ranges that are queued and not in flight. Their bytes are already
-%% counted in `outstanding/1`, so the caller does not window-gate them - a range
+%% counted in `committed/1`, so the caller does not budget-gate them - a range
 %% the reader has committed to must be fetched, or the buffer never becomes
 %% contiguous again and every read behind it stalls until the deadline. They do
 %% take a slot, so the depth cap still applies.
@@ -553,17 +554,10 @@ buffered_end(Fragment, #pipeline{nexts = Nexts}) ->
         error -> ?SEGMENT_HEADER_B
     end.
 
-%% How far ahead of the consumer the reader has got: the buffered bytes it has
-%% not read yet, plus the part of every outstanding range that is not in a
-%% buffer. This is what the prefetch window bounds.
-%%
-%% Split into its two terms because they answer different questions - how much
-%% memory the reader is holding, against how hard it is currently fetching - and
-%% the sum is what couples them: a full buffer subtracts directly from the room
-%% `has_room/1` will admit for new ranges.
--spec outstanding(pipeline()) -> non_neg_integer().
-outstanding(#pipeline{} = P) ->
-    buffered(P) + committed(P).
+%% How far ahead of the consumer the reader has got, in two terms rather than
+%% one. They answer different questions - how much memory the reader is holding,
+%% against how hard it is currently fetching - and the core bounds each on its
+%% own. See its `has_room/1`.
 
 %% Bytes held in a buffer that the consumer has not read: the current
 %% fragment's unread run, plus everything prefetched for the fragments after it

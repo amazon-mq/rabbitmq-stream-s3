@@ -654,14 +654,14 @@ served_read_frees_its_bytes_from_the_window(_Config) ->
     %% bytes are buffered and nobody has read them yet.
     {S1, E1} = deliver(S0, 0, pattern(8, 1000), done),
     ?assertEqual([], starts(E1)),
-    ?assertEqual({1000, 0}, load(S1)),
-    %% Reading half of them frees half the window, which the reader spends at
-    %% once on the next range. Measuring from the start of the last read instead
-    %% freed nothing, so this asked for nothing.
+    ?assertEqual({0, 1000, 0}, load(S1)),
+    %% Reading half of them frees half the buffer budget, which the reader
+    %% spends at once on the next range. Measuring from the start of the last
+    %% read instead freed nothing, so this asked for nothing.
     {S2, E2} = read(S1, ?SEGMENT_HEADER_B, 500),
     ?assertEqual([{reply, {ok, pattern(?SEGMENT_HEADER_B, 500)}}], replies(E2)),
     ?assertEqual([{key(), {1008, 2007}, 0}], starts(E2)),
-    ?assertEqual({1500, 1}, load(S2)).
+    ?assertEqual({1000, 500, 1}, load(S2)).
 
 %% A reader on a fragment far larger than any window it can reach, so the
 %% fragment's size never bounds what these tests observe.
@@ -804,7 +804,10 @@ open_range_does_not_pull_the_frontier_back(_Config) ->
     %% asking for 1008 again would re-fetch bytes the buffer already holds.
     {S1, _} = deliver(S0, 0, 8, pattern(8, 1000), continue),
     {S2, _} = deliver(S1, 0, 1008, pattern(1008, 1000), done),
-    ?assertEqual([{8, 1007}, {2008, 3007}], fragment_ranges(S2, 0)),
+    %% What matters is where the new ranges start, not how many the budgets
+    %% admit: the frontier is at the buffer's end, so nothing asks for 1008
+    %% again. How far past it the reader gets to run is the window's business.
+    ?assertEqual([{8, 1007}, {2008, 3007}, {3008, 4007}], fragment_ranges(S2, 0)),
     %% The consumer walks through the buffered bytes, pulling the frontier along
     %% behind it - always forwards, never back over what is buffered.
     {S3, E3} = read(S2, 8, 1000),
@@ -860,7 +863,7 @@ short_completion_at_the_frontier_refetches_the_gap(_Config) ->
     %% into the next fragment. The window is now full and every byte of the
     %% current fragment has been asked for.
     {S3, _} = read(S2, 1000, 8),
-    ?assertEqual([{8, 1007}], fragment_ranges(S3, 100)),
+    ?assertEqual([{8, 1007}, {1008, 2007}], fragment_ranges(S3, 100)),
     %% The fragment's last range comes back one byte short.
     {S4, E4} = deliver(S3, 0, 1008, pattern(1008, 999), done),
     ?assertEqual([{2007, 2007}], fragment_ranges(S4, 0)),
@@ -1054,7 +1057,7 @@ next_fragment_flushes_while_current_range_streams(_Config) ->
     %% The next fragment's head range completes. Its bytes reach the prefetch
     %% buffer, so the request is done with and leaves the queue.
     {S4, _} = deliver(S3, 100, 8, pattern(8, 1000), done),
-    ?assertEqual([{1008, 2007}], fragment_ranges(S4, 100)),
+    ?assertEqual([{1008, 2007}, {2008, 3007}, {3008, 4007}], fragment_ranges(S4, 100)),
     ?assertEqual([{8, 1007}, {1008, 2007}], fragment_ranges(S4, 0)).
 
 %% A reader with several ranges of one fragment outstanding. The window has to
@@ -1590,11 +1593,11 @@ deadline_expired_cancels_the_retry_timers(_Config) ->
 deadline_expired_drops_the_prefetched_next_fragment(_Config) ->
     %% The deadline drops every outstanding request, so the bytes prefetched for
     %% the next fragment go with them: their own ranges are cancelled with the
-    %% rest, but they keep counting against the prefetch window
-    %% (`outstanding/1`). Holding window space that nothing is left to fetch into
-    %% is what wedges the reader - with the window at its ceiling nothing has
-    %% room to be issued however many misses follow, so every later read waits
-    %% out a deadline of its own.
+    %% rest, but they keep counting against the buffer budget (`buffered/1`).
+    %% Holding budget that nothing is left to fetch into is what wedges the
+    %% reader - with the window at its ceiling nothing has room to be issued
+    %% however many misses follow, so every later read waits out a deadline of
+    %% its own.
     FragRef = frag_ref(0, 2000, 42),
     Iterator = mock_iterator([{0, 2000, 42}, {100, 100_000, 43}]),
     Opts = #{request_size => 1000, window_max => 4000, max_depth => 8},
@@ -1604,11 +1607,11 @@ deadline_expired_drops_the_prefetched_next_fragment(_Config) ->
     {S1, _} = read(S0, ?SEGMENT_HEADER_B, 3000),
     {S2, _} = read(S1, ?SEGMENT_HEADER_B, 3000),
     {S3, _} = deliver(S2, 100, 8, pattern(8, 1000), done),
-    ?assertMatch({Outstanding, _} when Outstanding >= 1000, load(S3)),
+    ?assertMatch({_, Buffered, _} when Buffered >= 1000, load(S3)),
     %% The deadline fires: nothing is in flight and nothing is buffered, so
     %% nothing may be counted against the window either.
     {S4, _} = rabbitmq_stream_s3_remote_reader_core:step(S3, deadline_expired),
-    ?assertEqual({0, 0}, load(S4)),
+    ?assertEqual({0, 0, 0}, load(S4)),
     %% The reader is not wedged: the next read fetches the current fragment
     %% again.
     {_S5, E5} = read(S4, ?SEGMENT_HEADER_B, 100),
@@ -1686,14 +1689,16 @@ known_404_fragment_is_not_refetched(_Config) ->
     %% The first range is answered in full, which serves the read and leaves
     %% the reader holding bytes below the fragment's index boundary.
     {S2, E2} = deliver(S1, 0, Start, pattern(Start, End - Start + 1), done),
-    ?assertMatch([{reply, {ok, _}} | _], E2),
+    %% Whether the pass also queues more ranges is the budgets' business; what
+    %% this cares about is that the read was answered.
+    ?assertMatch([_ | _], [R || {reply, {ok, _}} = R <- E2]),
     %% The fragment is deleted. The range behind it 404s while no read is
     %% pending, so nothing refreshes the iterator yet.
     {S3, _} = fail(S2, 0, not_found),
     ?assertEqual([], outstanding_ranges(S3)),
     %% A read the buffer can still serve is served, and asks S3 for nothing.
     {S4, E4} = read(S3, 164, 100),
-    ?assertMatch([{reply, {ok, _}} | _], E4),
+    ?assertMatch([_ | _], [R || {reply, {ok, _}} = R <- E4]),
     ?assertEqual([], [E || {start_request, _, _, _, _} = E <- E4]),
     ?assertEqual([], outstanding_ranges(S4)),
     %% The first read that cannot be served is what refreshes the iterator.
@@ -2097,10 +2102,13 @@ read_larger_than_the_window_is_still_served(_Config) ->
     {Served, S} = answer_until_served(S1, 20),
     ?assertEqual(pattern(?SEGMENT_HEADER_B, 3000), Served),
     %% Exceeding the window is confined to the read that needed it: once served,
-    %% the ceiling governs again, so what the reader fetches from there fits the
-    %% window rather than the 3000 bytes that one read licensed.
-    {Outstanding, _} = load(S),
-    ?assert(Outstanding =< window(S)),
+    %% the ceiling governs again, so what the reader fetches from there is back
+    %% within a request of the window rather than the 3000 bytes that one read
+    %% licensed. The slack is one range: `has_room/1` admits a range while the
+    %% budget has room and the range it then queues may cross the ceiling.
+    {Committed, _Buffered, _} = load(S),
+    ?assert(Committed =< window(S) + 1000),
+    ?assert(Committed < 3000),
     %% What it fetched is genuinely ahead of the consumer: the served bytes are
     %% behind it, so the read that follows them still waits on the wire.
     {_S2, E} = read(S, ?SEGMENT_HEADER_B + 3000, 10),
