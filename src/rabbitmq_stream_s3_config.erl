@@ -30,6 +30,7 @@ lives here. Callers use these functions instead of calling
     prefetch_request_size/0,
     prefetch_window_max/0,
     prefetch_max_depth/0,
+    prefetch_max_lookahead/0,
     fragment_target_size/0,
     persist_threshold/0,
     persist_interval_ms/0,
@@ -174,6 +175,18 @@ prefetch_window_max() ->
 -spec prefetch_max_depth() -> pos_integer().
 prefetch_max_depth() ->
     application:get_env(?APP, prefetch_max_depth, 8).
+
+%% Most fragments a reader may look ahead to beyond the one it is reading.
+%%
+%% A backstop rather than the working limit: what governs how far ahead a reader
+%% fetches is `prefetch_window_max` and `prefetch_max_depth`, and a fragment is
+%% only ever looked ahead to in order to put a range in it - so at the depth cap
+%% this cannot bind first. It bounds the walk for the cases those do not. At 1 a
+%% reader holds exactly one prefetched fragment, which is the way back if
+%% looking further ahead ever proves to be the wrong call.
+-spec prefetch_max_lookahead() -> pos_integer().
+prefetch_max_lookahead() ->
+    application:get_env(?APP, prefetch_max_lookahead, prefetch_max_depth()).
 
 %% Target byte size at which the replica reader cuts a fragment for upload.
 -spec fragment_target_size() -> pos_integer().
@@ -376,6 +389,7 @@ defaults_test_() ->
         ?_assertEqual(4_194_304, prefetch_request_size()),
         ?_assertEqual(33_554_432, prefetch_window_max()),
         ?_assertEqual(8, prefetch_max_depth()),
+        ?_assertEqual(8, prefetch_max_lookahead()),
         ?_assertEqual(?MAX_FRAGMENT_SIZE_B, fragment_target_size()),
         ?_assertEqual(5, persist_threshold()),
         ?_assertEqual(2000, persist_interval_ms()),

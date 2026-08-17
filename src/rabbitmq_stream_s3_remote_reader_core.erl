@@ -91,8 +91,16 @@ and transitions immediately if available, or signals that more data is needed.
     %% Ceiling on the prefetch window, and so on this reader's memory: it can
     %% hold or have outstanding at most `window_max + request_size` bytes.
     window_max :: pos_integer(),
-    %% Most requests that may be in flight at once, across both fragments.
+    %% Most requests that may be in flight at once, across every fragment.
     max_depth :: pos_integer(),
+    %% Most fragments the reader may look ahead to beyond the one it is reading.
+    %%
+    %% A backstop, not the working limit: what governs reach is the window and
+    %% the depth cap in `has_room/1`, and the look-ahead only ever extends when
+    %% every fragment it already holds is spoken for. This bounds the walk for
+    %% the cases those do not - a run of fragments with empty data regions
+    %% consumes no request, so nothing else would stop it.
+    max_lookahead :: pos_integer(),
     min_retry_delay_ms :: pos_integer(),
     max_retry_delay_ms :: pos_integer()
 }).
@@ -130,19 +138,27 @@ and transitions immediately if available, or signals that more data is needed.
     %% Fragment iterator
     iterator :: rabbitmq_stream_s3_fragment_iterator:iterator(),
 
-    %% The entry the iterator points at, and the iterator advanced past it,
-    %% memoised. `next/1` is a synchronous S3 GET whenever that entry sits
-    %% behind a group node, so the answer is kept for as long as the iterator is
-    %% the same one (it is only ever replaced wholesale, never advanced in
-    %% place), and the fragment transition reuses it rather than fetching the
-    %% group a second time. `unknown` means "not looked up yet"; `failed` means
-    %% the group fetch failed transiently, which is not an answer to keep but is
-    %% a reason not to ask again until a retry timer fires.
-    next_peek = unknown ::
-        unknown
-        | failed
-        | none
-        | {ok, #fragment_ref{}, rabbitmq_stream_s3_fragment_iterator:iterator()},
+    %% The entries the iterator has been walked forward onto, nearest first,
+    %% each paired with the iterator advanced past it. `next/1` is a synchronous
+    %% S3 GET whenever an entry sits behind a group node, so every answer is kept
+    %% for as long as the iterator is the same one (it is only ever replaced
+    %% wholesale, never advanced in place), and a fragment transition promotes
+    %% the head rather than fetching the group a second time.
+    %%
+    %% Walking more than one fragment ahead is what lets the window exceed the
+    %% reach of a single fragment: at a fragment's tail one entry reaches `F`
+    %% bytes, so a window above `F` would otherwise have nowhere to go. Each
+    %% entry memoises its own advanced iterator, so walking N ahead costs at
+    %% most N descents in total, and normally far fewer - a run of leaf entries
+    %% behind one group node is walked in memory once the first of them has been
+    %% descended to.
+    peeks = [] :: [{#fragment_ref{}, rabbitmq_stream_s3_fragment_iterator:iterator()}],
+
+    %% What the iterator said when it was last walked past the end of `peeks`.
+    %% `unknown` means it has not been asked; `none` that the manifest ends
+    %% there; `failed` that the group fetch failed transiently, which is not an
+    %% answer to keep but is a reason not to ask again until a retry timer fires.
+    peek_tail = unknown :: unknown | none | failed,
 
     %% The backoff kinds whose retry timer is armed and has not fired yet.
     %% Without this a batch of N failing requests would arm N timers and drive N
@@ -446,7 +462,7 @@ step_(State0, {iterator_refreshed, end_of_manifest}) ->
     State = State0#state{
         pipeline = Pipeline,
         pending = undefined,
-        next_peek = unknown,
+        peeks = [],
         current_not_found = false,
         timers = #{}
     },
@@ -521,20 +537,19 @@ other_fragment_not_found(Fragment, State0) ->
     {Dropped, Pipeline0} = rabbitmq_stream_s3_read_pipeline:drop_fragment(
         Fragment, pipeline(State0)
     ),
-    Pipeline =
+    {DroppedPast, Pipeline} =
         case Prefetched of
             true ->
-                {[], P} = rabbitmq_stream_s3_read_pipeline:drop_fragment(
-                    next_not_found, Pipeline0
-                ),
-                P;
+                rabbitmq_stream_s3_read_pipeline:drop_fragment(
+                    {not_found, Fragment}, Pipeline0
+                );
             false ->
-                Pipeline0
+                {[], Pipeline0}
         end,
     %% Try to serve: a recorded 404 may trigger a refresh when the consumer
     %% reads past the current fragment.
     {State, Effects} = try_serve(State0#state{pipeline = Pipeline}),
-    {State, [{cancel_request, Id} || Id <- Dropped] ++ Effects}.
+    {State, [{cancel_request, Id} || Id <- Dropped ++ DroppedPast] ++ Effects}.
 
 %% Whether `Fragment` is the fragment the reader is prefetching. The pipeline
 %% knows it once bytes have arrived for it; before that the look-ahead memo is
@@ -546,12 +561,9 @@ other_fragment_not_found(Fragment, State0) ->
 %% synchronous group GET (see `peek_next_fragment/2`). A memo that has not been
 %% answered costs nothing to be strict about, since a prefetch is only ever
 %% started for a peek that resolved.
-is_prefetched_fragment(Fragment, #state{next_peek = Peek} = State) ->
+is_prefetched_fragment(Fragment, #state{peeks = Peeks} = State) ->
     rabbitmq_stream_s3_read_pipeline:prefetching(Fragment, pipeline(State)) orelse
-        case Peek of
-            {ok, #fragment_ref{offset = Fragment}, _Advanced} -> true;
-            _ -> false
-        end.
+        lists:any(fun({#fragment_ref{offset = Offset}, _}) -> Offset =:= Fragment end, Peeks).
 
 %% @doc Returns the pending read, if any.
 -spec pending(state()) -> undefined | {byte_offset(), pos_integer()}.
@@ -662,10 +674,10 @@ try_fragment_transition(State0) ->
             try_peeked_transition(State0)
     end.
 
-try_peeked_transition(#state{next_peek = Peek0} = State0) ->
-    {Peek, _Attempted} = peek_next_fragment(State0, Peek0),
-    State = State0#state{next_peek = Peek},
-    case State#state.next_peek of
+try_peeked_transition(#state{peeks = Peeks0, peek_tail = Tail0} = State0) ->
+    {Peeks, Tail, _Attempted} = peek_next_fragment(State0, Peeks0, Tail0),
+    State = State0#state{peeks = Peeks, peek_tail = Tail},
+    case peek_head(Peeks, Tail) of
         {ok, _FragRef, _Advanced} ->
             {await, State};
         none ->
@@ -723,7 +735,7 @@ retry_group_fetch(State) ->
 not_found_refresh(#state{current_not_found = true} = State) ->
     %% Path 2: the current fragment 404'd. Refresh past its own offset.
     {State, [{refresh_iterator, current_fragment_offset(State)}]};
-not_found_refresh(#state{next_peek = Peek0} = State0) ->
+not_found_refresh(#state{peeks = Peeks0, peek_tail = Tail0} = State0) ->
     %% Path 1: the prefetched next fragment 404'd. Refresh past it, falling
     %% back to the current offset if the iterator is exhausted (the 404'd
     %% next was the last entry in the manifest).
@@ -732,9 +744,9 @@ not_found_refresh(#state{next_peek = Peek0} = State0) ->
     %% directly here spent a synchronous group GET on an answer this reader has
     %% usually already paid for - and it is the answer that told it to prefetch
     %% the fragment that has just 404'd, so it is memoised by definition.
-    {Peek, _Attempted} = peek_next_fragment(State0, Peek0),
-    State = State0#state{next_peek = Peek},
-    case Peek of
+    {Peeks, Tail, _Attempted} = peek_next_fragment(State0, Peeks0, Tail0),
+    State = State0#state{peeks = Peeks, peek_tail = Tail},
+    case peek_head(Peeks, Tail) of
         {ok, #fragment_ref{offset = NotFoundOffset}, _Advanced} ->
             {State, [{refresh_iterator, NotFoundOffset}]};
         none ->
@@ -750,11 +762,11 @@ not_found_refresh(#state{next_peek = Peek0} = State0) ->
 %% cancelled requests (see its `advance/1`).
 goto_next_fragment(State0) ->
     {_NewOffset, Cancels, Pipeline} = rabbitmq_stream_s3_read_pipeline:advance(pipeline(State0)),
-    Iterator = advance_iterator(State0),
+    {Iterator, Peeks} = advance_iterator(State0),
     State = State0#state{
         pipeline = Pipeline,
         iterator = Iterator,
-        next_peek = unknown,
+        peeks = Peeks,
         current_not_found = false
     },
     {State, cancel_effects(Cancels)}.
@@ -762,15 +774,20 @@ goto_next_fragment(State0) ->
 cancel_effects(all) -> [{cancel_requests, all}];
 cancel_effects(Ids) -> [{cancel_request, Id} || Id <- Ids].
 
-%% The peek already advanced the iterator past the entry being moved to, and
-%% paid for the group fetch that took, so take its answer rather than descending
-%% into the same group again.
-advance_iterator(#state{next_peek = {ok, _FragRef, Advanced}}) ->
-    Advanced;
+%% The look-ahead already advanced the iterator past the entry being moved to,
+%% and paid for the group fetch that took, so take its answer rather than
+%% descending into the same group again.
+%%
+%% Only the head is consumed. The entries behind it were walked from the same
+%% iterator and are still the fragments after the new current one, so keeping
+%% them is what stops a transition costing back the reach the look-ahead just
+%% bought - and what stops the descents being paid for twice.
+advance_iterator(#state{peeks = [{_FragRef, Advanced} | Rest]}) ->
+    {Advanced, Rest};
 advance_iterator(#state{iterator = Iterator}) ->
     case rabbitmq_stream_s3_fragment_iterator:next(Iterator) of
-        {ok, _, It} -> It;
-        _ -> Iterator
+        {ok, _, It} -> {It, []};
+        _ -> {Iterator, []}
     end.
 
 %% A response that closed without delivering a byte is queued against the fault
@@ -875,7 +892,7 @@ maybe_start_requests(State0) ->
 %% `init/5` or from an iterator refresh. It differs from
 %% `maybe_start_requests/1` in that it does not resolve the next-fragment peek:
 %% passing `none` for it holds the frontier inside the current fragment without
-%% touching the iterator, and `#state.next_peek` is left `unknown` so the first
+%% touching the iterator, and `#state.peek_tail` is left `unknown` so the first
 %% delivery resolves it instead.
 %%
 %% That matters because `init/5` runs inside the shell's `gen_server:init/1`,
@@ -892,7 +909,11 @@ maybe_start_requests(State0) ->
 %% `issue_ready/1` is skipped rather than reordered: the queue is empty at both
 %% call sites.
 start_current_request(State) ->
-    {State1, _Peek, _Attempted, Effects} = extend_frontier(State, none, []),
+    %% `none` for the look-ahead's tail is what defers it: it reads as "the
+    %% manifest ends here", so the frontier fills the current fragment and stops
+    %% without walking the iterator. It is passed rather than stored, so the
+    %% state's own look-ahead is untouched.
+    {State1, _Peeks, _Tail, _Attempted, Effects} = extend_frontier(State, [], none, []),
     {State1, Effects}.
 
 %% (Re-)issue ranges that are queued and not in flight. Their bytes are already
@@ -919,9 +940,11 @@ issue_ready(#state{cfg = #cfg{max_depth = MaxDepth}} = State) ->
 %% (see `not_found_refresh/1`), so the only thing to do until then is wait.
 extend_frontier(#state{current_not_found = true} = State) ->
     {State, []};
-extend_frontier(#state{next_peek = Peek0} = State) ->
-    {State1, Peek, Attempted, Effects} = extend_frontier(State, Peek0, []),
-    arm_peek_retry(Peek, Attempted, State1#state{next_peek = Peek}, Effects).
+extend_frontier(#state{peeks = Peeks0, peek_tail = Tail0} = State) ->
+    {State1, Peeks, Tail, Attempted, Effects} = extend_frontier(State, Peeks0, Tail0, []),
+    arm_peek_retry(
+        Tail, Attempted, State1#state{peeks = Peeks, peek_tail = Tail}, Effects
+    ).
 
 %% A group fetch that failed while looking ahead has to arm the retry itself.
 %% Nothing else in this pass will: the ranges already queued are healthy, so no
@@ -949,27 +972,28 @@ arm_peek_retry(failed, true, State, Effects) ->
 arm_peek_retry(_Peek, _Attempted, State, Effects) ->
     {State, Effects}.
 
-extend_frontier(State, Peek0, Acc) ->
-    extend_frontier(State, Peek0, false, Acc).
+extend_frontier(State, Peeks0, Tail0, Acc) ->
+    extend_frontier(State, Peeks0, Tail0, false, Acc).
 
-extend_frontier(State, Peek0, Attempted0, Acc) ->
+extend_frontier(State, Peeks0, Tail0, Attempted0, Acc) ->
     case has_room(State) of
         false ->
-            {State, Peek0, Attempted0, lists:reverse(Acc)};
+            {State, Peeks0, Tail0, Attempted0, lists:reverse(Acc)};
         true ->
-            case next_range(State, Peek0) of
-                {Peek, Attempted, {FragRef, Range}} ->
+            case next_range(State, Peeks0, Tail0) of
+                {Peeks, Tail, Attempted, {FragRef, Range}} ->
                     {Spec, Pipeline} = rabbitmq_stream_s3_read_pipeline:push(
                         FragRef, Range, pipeline(State)
                     ),
                     extend_frontier(
                         State#state{pipeline = Pipeline},
-                        Peek,
+                        Peeks,
+                        Tail,
                         Attempted0 orelse Attempted,
                         [start_request_effect(Spec) | Acc]
                     );
-                {Peek, Attempted, none} ->
-                    {State, Peek, Attempted0 orelse Attempted, lists:reverse(Acc)}
+                {Peeks, Tail, Attempted, none} ->
+                    {State, Peeks, Tail, Attempted0 orelse Attempted, lists:reverse(Acc)}
             end
     end.
 
@@ -1019,76 +1043,138 @@ fetch_ceiling(#state{window = Window}) ->
 %% one per delivered frame, since a current fragment that is fully spoken for
 %% reaches this on every pass until the transition. Either blocks the reader
 %% while the caller's read deadline burns.
-next_range(State, Peek) ->
+next_range(State, Peeks, Tail) ->
     FragRef = rabbitmq_stream_s3_read_pipeline:current_fragment(pipeline(State)),
     #fragment_ref{offset = Fragment, size = FragSize} = FragRef,
     Frontier = rabbitmq_stream_s3_read_pipeline:frontier(Fragment, pipeline(State)),
     case range_in_fragment(Frontier, FragSize, State) of
-        {Start, End} -> {Peek, false, {FragRef, {Start, End}}};
-        none -> next_fragment_range(State, Peek)
+        {Start, End} -> {Peeks, Tail, false, {FragRef, {Start, End}}};
+        none -> next_fragment_range(State, Peeks, Tail)
     end.
 
 %% A next fragment known to be 404 is not looked ahead to: there is nothing to
 %% prefetch and the transition decides what to do about it.
-next_fragment_range(State, Peek0) ->
+next_fragment_range(State, Peeks0, Tail0) ->
     case rabbitmq_stream_s3_read_pipeline:prefetch(pipeline(State)) of
         not_found ->
-            {Peek0, false, none};
+            {Peeks0, Tail0, false, none};
         _ ->
-            {Peek, Attempted} = peek_next_fragment(State, Peek0),
-            {Peek, Attempted, peeked_range(Peek, State)}
+            spill(State, Peeks0, Tail0, Peeks0, false)
     end.
 
-peeked_range(none, _State) ->
-    none;
-peeked_range(failed, _State) ->
-    %% The peek could not be resolved (a transient group fetch failure). Nothing
-    %% to prefetch for the next fragment until the retry clears it.
-    none;
-peeked_range({ok, #fragment_ref{offset = Offset, size = Size} = FragRef, _Advanced}, State) ->
-    Frontier = rabbitmq_stream_s3_read_pipeline:frontier(Offset, pipeline(State)),
-    case range_in_fragment(Frontier, Size, State) of
-        {Start, End} -> {FragRef, {Start, End}};
-        none -> none
-    end.
-
-%% What the iterator points at. The iterator is only ever replaced, never
-%% advanced in place, so the answer holds until it is - which is where the memo
-%% in `#state.next_peek` is dropped. A group fetch that failed transiently is
-%% recorded as `failed` rather than as `none`: `none` is what says the manifest
-%% ends here, and remembering that of a fetch that merely failed would leave the
-%% reader awaiting a next fragment it has stopped asking for.
+%% Walk the fragments already looked ahead to for one with room left, extending
+%% the look-ahead by one when every one of them is spoken for.
 %%
-%% `failed` says only that the last attempt failed. Whether to attempt again is
-%% not stored alongside it but read off the fault clock: the memo is honoured
-%% while that clock is armed and re-attempted once it is not. Each attempt is a
-%% synchronous group GET inside the core, so something has to pace them, and the
-%% clock is what paces every other retry here - `min_retry_delay_ms` to
-%% `max_retry_delay_ms`, one round at a time. The `pool_busy` clock cannot
-%% stand in: it runs 25-500ms and fires for as long as the pool has no free
-%% connection, which says nothing about whether the group object is fetchable.
-%%
-%% Deriving it rather than storing it is what keeps the two from drifting apart.
-%% A memo that recorded "waiting on the fault clock" as a fact of its own had to
-%% be reset by hand at every site that disowns that clock, and a site that forgot
-%% - `deadline_expired` did - stranded it: nothing re-attempted the fetch and
-%% nothing armed a clock to pace one, so the frontier stopped spilling into the
-%% next fragment for the rest of the current one. Read off the clock, that state
-%% cannot be reached: dropping the clock is what licenses the next attempt.
-%% Returns `{Peek, Attempted}`. Whether a fetch was actually attempted is what
-%% decides the retry clock: a pass that never reached the look-ahead owes
-%% nothing, and arming for it would keep the clock alive - and an armed clock is
-%% exactly what suppresses the next attempt.
-peek_next_fragment(#state{timers = Timers}, failed) when is_map_key(fault, Timers) ->
-    {failed, false};
-peek_next_fragment(#state{iterator = Iterator}, Peek) when Peek =:= unknown; Peek =:= failed ->
-    case rabbitmq_stream_s3_fragment_iterator:next(Iterator) of
-        {ok, FragRef, Advanced} -> {{ok, FragRef, Advanced}, true};
-        end_of_manifest -> {none, true};
-        {error, {group_fetch_failed, _}} -> {failed, true}
+%% Walking past a full fragment rather than stopping at it is what lets the
+%% window exceed one fragment: stopping would put the end of the frontier at the
+%% first fully-spoken-for fragment, so reach at a fragment tail would be one
+%% fragment however large the window is.
+spill(State, Peeks, Tail, [], Attempted) ->
+    %% Any fragment a further walk turns up is past the last one prefetched, so
+    %% a horizon at all is a horizon this side of it: there is nothing to find.
+    case rabbitmq_stream_s3_read_pipeline:prefetch_horizon(pipeline(State)) of
+        unlimited ->
+            case extend_peeks(State, Peeks, Tail) of
+                {Peeks1, Tail1, true} when length(Peeks1) > length(Peeks) ->
+                    spill(State, Peeks1, Tail1, lists:nthtail(length(Peeks), Peeks1), true);
+                {Peeks1, Tail1, Attempted1} ->
+                    {Peeks1, Tail1, Attempted orelse Attempted1, none}
+            end;
+        _Horizon ->
+            {Peeks, Tail, Attempted, none}
     end;
-peek_next_fragment(_State, Peek) ->
-    {Peek, false}.
+spill(State, Peeks, Tail, [{FragRef, _Advanced} | Rest], Attempted) ->
+    #fragment_ref{offset = Offset, size = Size} = FragRef,
+    %% The look-ahead can be deeper than the horizon: a 404 arrives for a
+    %% fragment the iterator was walked past long before, and the peeks on the
+    %% far side of it are kept - `not_found_refresh/1` reads the 404'd offset off
+    %% the head of them. They are not fetchable, so the walk stops here.
+    case beyond_horizon(Offset, State) of
+        true ->
+            {Peeks, Tail, Attempted, none};
+        false ->
+            Frontier = rabbitmq_stream_s3_read_pipeline:frontier(Offset, pipeline(State)),
+            case range_in_fragment(Frontier, Size, State) of
+                {Start, End} -> {Peeks, Tail, Attempted, {FragRef, {Start, End}}};
+                %% Walking past this fragment without issuing into it leaves it
+                %% unseated in the pipeline's `nexts`, which is what would put
+                %% the heads of `peeks` and `nexts` on different fragments -
+                %% and `not_found_refresh/1` reads the 404'd offset off the
+                %% first of them. It cannot happen here: `range_in_fragment/3`
+                %% answers `none` for an unseated fragment only when its data
+                %% region is empty, and `fragment_iterator:next/1` yields only
+                %% fragment entries, descending into the group entries that are
+                %% the size-0 case. An already-seated fragment answers `none`
+                %% once it is fully spoken for, which is the case this walk is
+                %% for.
+                none -> spill(State, Peeks, Tail, Rest, Attempted)
+            end
+    end.
+
+beyond_horizon(Offset, State) ->
+    case rabbitmq_stream_s3_read_pipeline:prefetch_horizon(pipeline(State)) of
+        unlimited -> false;
+        Horizon -> Offset > Horizon
+    end.
+
+%% Walk the iterator one fragment further forward, memoising the entry and the
+%% iterator advanced past it. Returns `{Peeks, Tail, Attempted}`.
+%%
+%% Nothing is walked past the lookahead cap, past the end of the manifest, or
+%% while the fault clock is armed over a failed descent. Each attempt is a
+%% synchronous group GET inside the core, so something has to pace them, and the
+%% fault clock is what paces every other retry here. The `pool_busy` clock
+%% cannot stand in: it fires for as long as the pool has no free connection,
+%% which says nothing about whether the group object is fetchable.
+%%
+%% Whether to re-attempt is read off that clock rather than stored beside the
+%% `failed` marker, so the two cannot drift apart: dropping the clock is what
+%% licenses the next attempt, which means every site that disowns the clock
+%% licenses one without having to remember to.
+%%
+%% `Attempted` says whether a fetch was actually made, which is what decides the
+%% retry clock: a pass that never reached the look-ahead owes nothing, and arming
+%% for it would keep alive the very clock that suppresses the next attempt.
+extend_peeks(State, Peeks, Tail) ->
+    case length(Peeks) >= max_lookahead(State) of
+        true -> {Peeks, Tail, false};
+        false -> extend_peeks_(State, Peeks, Tail)
+    end.
+
+extend_peeks_(#state{timers = Timers}, Peeks, failed) when is_map_key(fault, Timers) ->
+    {Peeks, failed, false};
+extend_peeks_(State, Peeks, Tail) when Tail =:= unknown; Tail =:= failed ->
+    case rabbitmq_stream_s3_fragment_iterator:next(peek_iterator(State, Peeks)) of
+        {ok, FragRef, Advanced} -> {Peeks ++ [{FragRef, Advanced}], unknown, true};
+        end_of_manifest -> {Peeks, none, true};
+        {error, {group_fetch_failed, _}} -> {Peeks, failed, true}
+    end;
+extend_peeks_(_State, Peeks, none) ->
+    {Peeks, none, false}.
+
+%% The iterator to walk forward from: the one advanced past the last fragment
+%% already looked ahead to, or the reader's own when none has been.
+peek_iterator(#state{iterator = Iterator}, []) ->
+    Iterator;
+peek_iterator(_State, Peeks) ->
+    {_FragRef, Advanced} = lists:last(Peeks),
+    Advanced.
+
+%% Ensure at least one fragment has been looked ahead to, for the callers that
+%% only ever need the nearest one. Returns `{Peeks, Tail, Attempted}`.
+peek_next_fragment(_State, [_ | _] = Peeks, Tail) ->
+    {Peeks, Tail, false};
+peek_next_fragment(State, [], Tail) ->
+    extend_peeks(State, [], Tail).
+
+%% What the nearest look-ahead resolved to. Callers that ask about "the next
+%% fragment" want the head, and the terminal marker only speaks for them when
+%% there is no head.
+peek_head([{FragRef, Advanced} | _], _Tail) -> {ok, FragRef, Advanced};
+peek_head([], Tail) -> Tail.
+
+max_lookahead(#state{cfg = #cfg{max_lookahead = MaxLookahead}}) ->
+    MaxLookahead.
 
 range_in_fragment(Frontier, FragSize, State) ->
     IdxStartPos = ?SEGMENT_HEADER_B + FragSize,
@@ -1124,6 +1210,11 @@ build_cfg(Opts) ->
         %% and every read waits out its whole deadline - three times over, with
         %% nothing in the log to say why.
         max_depth = max(1, maps:get(max_depth, Opts, 8)),
+        %% Defaulted to the depth cap because a fragment is only ever looked
+        %% ahead to in order to put a range in it, and no more ranges can be in
+        %% flight than the depth allows - so at this value the backstop cannot
+        %% bind before `has_room/1` does, which is the intent.
+        max_lookahead = max(1, maps:get(max_lookahead, Opts, maps:get(max_depth, Opts, 8))),
         min_retry_delay_ms = maps:get(min_retry_delay_ms, Opts, 1_000),
         max_retry_delay_ms = maps:get(max_retry_delay_ms, Opts, 30_000)
     }.

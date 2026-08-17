@@ -42,7 +42,8 @@ all() ->
         empty_completion_backs_off,
         over_delivery_is_clipped,
         stale_data_for_dropped_range_is_ignored,
-        spill_stops_one_fragment_ahead,
+        spill_reaches_past_one_fragment,
+        spill_stops_at_the_lookahead_cap,
         placement_pass_does_not_look_ahead,
         window_ceiling_below_the_request_size_is_clamped,
         become_local_answers_the_pending_read,
@@ -64,6 +65,7 @@ all() ->
         tail_header_overread_below_guard_serves_remaining,
         next_fragment_404_triggers_refresh_iterator,
         stale_404_for_a_left_behind_fragment_keeps_the_prefetch,
+        not_found_beyond_the_nearest_prefetch_truncates_there,
         prefetch_404_full_recovery,
         deadline_expired_replies_error_timeout,
         deadline_expired_keeps_the_buffer_for_the_retry,
@@ -909,17 +911,32 @@ stale_data_for_dropped_range_is_ignored(_Config) ->
     {_S4, E4} = read(S3, 8, 100),
     ?assertEqual([], replies(E4)).
 
-spill_stops_one_fragment_ahead(_Config) ->
-    %% The frontier spills into the next fragment once the current one is fully
-    %% spoken for, but never further: the reader holds one prefetched fragment.
+spill_reaches_past_one_fragment(_Config) ->
+    %% The frontier spills into each next fragment as the one before it is fully
+    %% spoken for, and keeps going while the window and the depth cap allow.
+    %% Without this, reach at a fragment's tail would be one fragment and a
+    %% window larger than a fragment would have nowhere to go.
     FragRef = frag_ref(0, 500, 42),
     Iterator = mock_iterator([{0, 500, 42}, {100, 500, 43}, {200, 500, 44}]),
     Opts = #{request_size => 1000, window_max => 1_000_000, max_depth => 32},
     {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
     %% The placement pass stays inside the current fragment
-    %% (`placement_pass_does_not_look_ahead`); the read that follows spills. The
-    %% miss it takes leaves room for a third fragment, so the queue stopping at
-    %% the second is the memo's doing rather than the window's.
+    %% (`placement_pass_does_not_look_ahead`); the read that follows spills.
+    {S1, _} = read(S0, ?SEGMENT_HEADER_B, 3000),
+    ?assertEqual([{8, 507}], fragment_ranges(S1, 0)),
+    ?assertEqual([{8, 507}], fragment_ranges(S1, 100)),
+    ?assertEqual([{8, 507}], fragment_ranges(S1, 200)).
+
+spill_stops_at_the_lookahead_cap(_Config) ->
+    %% `max_lookahead` bounds the walk. At 1 the reader holds exactly one
+    %% prefetched fragment. The window here leaves room for a third, so the queue
+    %% stopping at the second is the cap's doing rather than the window's.
+    FragRef = frag_ref(0, 500, 42),
+    Iterator = mock_iterator([{0, 500, 42}, {100, 500, 43}, {200, 500, 44}]),
+    Opts = #{
+        request_size => 1000, window_max => 1_000_000, max_depth => 32, max_lookahead => 1
+    },
+    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
     {S1, _} = read(S0, ?SEGMENT_HEADER_B, 3000),
     ?assertEqual([{8, 507}], fragment_ranges(S1, 0)),
     ?assertEqual([{8, 507}], fragment_ranges(S1, 100)),
@@ -1352,6 +1369,39 @@ stale_404_for_a_left_behind_fragment_keeps_the_prefetch(_Config) ->
     ?assertMatch([_ | _], fragment_ranges(S5, 200)),
     {_S6, E6} = deliver(S5, 200, binary:copy(<<2>>, 300), done),
     ?assertMatch([{next_fragment, 200} | _], [R || {reply, R} <- E6]).
+
+not_found_beyond_the_nearest_prefetch_truncates_there(_Config) ->
+    %% The look-ahead reaches past one fragment, so a 404 can land on one that is
+    %% not the nearest. Everything at or past the hole goes - a fragment is
+    %% reached only by walking the ones before it, so a range or a buffer beyond
+    %% one that is gone is work nothing will ever collect - while the prefetch
+    %% between the hole and the current fragment is left alone, and the consumer
+    %% still moves onto it without a refresh.
+    FragRef = frag_ref(0, 200, 42),
+    Iterator = mock_iterator([{0, 200, 42}, {100, 200, 43}, {200, 200, 44}, {300, 200, 45}]),
+    Opts = #{request_size => 1000, window_max => 1_000_000, max_depth => 32},
+    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
+    %% One request covers a whole fragment here, so one pass reaches all four.
+    {S1, _} = read(S0, ?SEGMENT_HEADER_B, 3000),
+    ?assertMatch([_ | _], fragment_ranges(S1, 100)),
+    ?assertMatch([_ | _], fragment_ranges(S1, 200)),
+    ?assertMatch([_ | _], fragment_ranges(S1, 300)),
+    %% Retention deleted fragment 200, two ahead of the one being read.
+    {S2, _} = fail(S1, 200, not_found),
+    ?assertMatch([_ | _], fragment_ranges(S2, 100)),
+    ?assertEqual([], fragment_ranges(S2, 200)),
+    ?assertEqual([], fragment_ranges(S2, 300)),
+    %% Reading past the current fragment still moves onto 100 rather than
+    %% refreshing: the hole is behind it, not at it.
+    {S3, _} = deliver(S2, 0, binary:copy(<<0>>, 200), done),
+    {S4, _} = deliver(S3, 100, binary:copy(<<1>>, 200), done),
+    {S5, E5} = read(S4, ?SEGMENT_HEADER_B + 200, 50),
+    ?assertEqual([], [E || {refresh_iterator, _} = E <- E5]),
+    ?assertMatch([{next_fragment, 100}], [R || {reply, R} <- replies(E5)]),
+    %% Reading past 100 is where the hole is met, and the iterator is refreshed
+    %% past the fragment that actually 404'd.
+    {_S6, E6} = read(S5, ?SEGMENT_HEADER_B + 200, 50),
+    ?assertEqual([{refresh_iterator, 200}], [E || {refresh_iterator, _} = E <- E6]).
 
 prefetch_404_full_recovery(_Config) ->
     %% Full cycle: prefetch of next fragment returns 404, consumer reads past
@@ -1909,11 +1959,11 @@ group_fetch_failure_backs_off_and_retries(_Config) ->
     ?assertEqual([], [E || {reply, {become_local, _}} = E <- E2]).
 
 next_fragment_peek_is_fetched_once(_Config) ->
-    %% Looking one fragment ahead descends into a group node, which is a
-    %% synchronous S3 GET. The current fragment is fully spoken for from the
-    %% first pass here, so every later pass - one per delivered frame - reaches
-    %% that peek. Fetching the group each time would block the reader on S3 for
-    %% every frame it receives, with the caller's read deadline running.
+    %% Looking a fragment ahead descends into a group node, which is a
+    %% synchronous S3 GET. Every fragment here is fully spoken for by one range,
+    %% so every later pass - one per delivered frame - reaches the look-ahead.
+    %% Fetching a group each time would block the reader on S3 for every frame
+    %% it receives, with the caller's read deadline running.
     Fetches = counters:new(1, []),
     Iterator = mock_iterator_counting_groups(
         [{0, 1000, 42}], [{2000, 1000, 7}, {4000, 1000, 9}], Fetches
@@ -1922,10 +1972,10 @@ next_fragment_peek_is_fetched_once(_Config) ->
         request_size => 4000
     }),
     %% The first delivery's pass covers the whole current fragment and spills
-    %% into the next, which is where the group is descended into.
+    %% through both fragments behind it, descending into each one's group once.
     {S1, _} = deliver(S0, 0, 8, pattern(8, 100), continue),
-    ?assertEqual(1, counters:get(Fetches, 1)),
-    ?assertMatch([{0, _, _}, {2000, _, _}], outstanding_ranges(S1)),
+    ?assertEqual(2, counters:get(Fetches, 1)),
+    ?assertMatch([{0, _, _}, {2000, _, _}, {4000, _, _}], outstanding_ranges(S1)),
     %% Ten more passes with both fragments fully spoken for and the window still
     %% open: every one of them reaches the peek.
     S2 = lists:foldl(
@@ -1936,9 +1986,11 @@ next_fragment_peek_is_fetched_once(_Config) ->
         S1,
         lists:seq(1, 10)
     ),
-    ?assertEqual(1, counters:get(Fetches, 1)),
-    %% Moving on replaces the iterator, so the memo is dropped and the fragment
-    %% after the new current one is looked up afresh.
+    ?assertEqual(2, counters:get(Fetches, 1)),
+    %% Moving on consumes only the head of the look-ahead. The entries behind it
+    %% were walked from the same iterator and still name the fragments after the
+    %% new current one, so the transition costs no descent - the reader keeps
+    %% both the reach it had bought and the group fetches it had paid for.
     {S3, _} = deliver(S2, 2000, 8, pattern(8, 1000), done),
     {_S4, E} = read(S3, ?SEGMENT_HEADER_B + 1000, 50),
     ?assertMatch([{next_fragment, 2000}], [R || {reply, R} <- replies(E)]),
