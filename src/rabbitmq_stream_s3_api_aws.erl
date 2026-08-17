@@ -463,7 +463,9 @@ stream_put(Key, ContentLength, Opts0) when is_binary(Key) andalso is_map(Opts0) 
                                 timeout => maps:get(timeout, Opts0, 60_000)
                             },
                             {ok, State};
-                        {error, pool_busy} = Err ->
+                        {error, Saturation} = Err when
+                            Saturation =:= pool_busy; Saturation =:= pool_exhausted
+                        ->
                             Err
                     end;
                 {error, _} = Err ->
@@ -1263,7 +1265,9 @@ start_async_request(Pool, Method, Path, Headers, Body, Opts) ->
                 bytes_received => 0
             },
             {ok, StreamRef, maybe_set_timer(Opts, StreamRef, State)};
-        {error, pool_busy} = Err ->
+        {error, Saturation} = Err when
+            Saturation =:= pool_busy; Saturation =:= pool_exhausted
+        ->
             Err
     end.
 

@@ -980,7 +980,9 @@ init_remote_reader(
             request_size => RequestSize,
             window_max => WindowMax,
             max_depth => rabbitmq_stream_s3_config:prefetch_max_depth(),
-            max_lookahead => rabbitmq_stream_s3_config:prefetch_max_lookahead()
+            max_lookahead => rabbitmq_stream_s3_config:prefetch_max_lookahead(),
+            auto_tune => rabbitmq_stream_s3_config:prefetch_auto_tune(),
+            inflight_initial => rabbitmq_stream_s3_config:prefetch_inflight_initial()
         }
     },
     %% The remote reader is a data pipe for large refc binaries with a small
