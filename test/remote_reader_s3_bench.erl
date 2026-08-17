@@ -179,7 +179,12 @@ run_one() ->
                     opts => #{
                         max_depth => Depth,
                         window_max => WindowMiB * 1_048_576,
-                        request_size => RequestMiB * 1_048_576
+                        request_size => RequestMiB * 1_048_576,
+                        %% At 1 the reader holds exactly one prefetched
+                        %% fragment, so sweeping this measures multi-fragment
+                        %% look-ahead against single-fragment reach rather than
+                        %% against a differently-configured reader.
+                        max_lookahead => env_int("S3B_LOOKAHEAD", Depth)
                     }
                 }),
                 %% One machine-readable line; the sweep script tabulates.

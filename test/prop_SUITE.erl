@@ -2246,13 +2246,12 @@ rrc_ranges_disjoint([]) ->
 %% may push the reader past its window.
 %% Every property above this one drives a single-fragment manifest whose group
 %% fun returns `{error, not_found}`, so the look-ahead can only ever answer
-%% `end_of_manifest`: `next_peek = failed` - the state a transient group fetch
-%% leaves behind, and the state the reader has to climb back out of - was
-%% unreachable in all 500 iterations of each of them. That is why a stranded
-%% memo survived several reviews. This fixture puts every fragment after the
-%% first behind a group node and lets the generator decide how many of those
-%% fetches fail, so the region is reachable and the invariants checked inside
-%% `step/2` apply to it like anywhere else.
+%% `end_of_manifest`, leaving `peek_tail = failed` unreachable in all 500
+%% iterations of each of them. That is the state a transient group fetch leaves
+%% behind and the one the reader has to climb back out of. This fixture puts
+%% every fragment after the first behind a group node and lets the generator
+%% decide how many of those fetches fail, so the region is reachable and the
+%% invariants checked inside `step/2` apply to it like anywhere else.
 %%
 %% The oracle is the recovery, because the failure is not a crash: a reader
 %% carrying a stranded memo keeps serving the fragment it is on and stops only
