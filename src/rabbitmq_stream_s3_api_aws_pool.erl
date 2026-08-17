@@ -22,6 +22,11 @@ the reader pool avoids reader starvation.
 %% Reap proactively before S3 closes an idle connection from under us.
 -define(IDLE_TIMEOUT_MS, 10_000).
 
+%% How long to spend asking the pool which kind of saturation a timed-out
+%% checkout hit. Short: the answer only picks between two backoffs, and the
+%% caller has already waited out its own timeout to get here.
+-define(SATURATION_TIMEOUT_MS, 50).
+
 -define(C_CHECKOUTS, 1).
 -define(C_CHECKINS, 2).
 -define(C_CHECKOUT_QUEUED, 3).
@@ -125,7 +130,7 @@ the reader pool avoids reader starvation.
 
 %%---------------------------------------------------------------------------
 
--spec checkout(pool(), timeout()) -> {ok, conn()} | {error, pool_busy}.
+-spec checkout(pool(), timeout()) -> {ok, conn()} | {error, pool_busy | pool_exhausted}.
 checkout(Pool, Timeout) ->
     %% NOTE: the server monitors the caller, but we also send a cancellation
     %% message. The cancellation message ensures the checkout attempt is
@@ -142,7 +147,7 @@ checkout(Pool, Timeout) ->
         %% escapes the pool boundary and callers classify pool_busy by name.
         exit:{timeout, _} ->
             gen_server:cast(Pool, {cancel_checkout, Checkout}),
-            {error, pool_busy};
+            {error, saturation(Pool)};
         %% Any other exit (e.g. the pool is down) is not a saturation signal.
         %% Send the cancellation and re-raise, preserving the caller's view of
         %% a genuinely broken pool.
@@ -155,7 +160,8 @@ checkout(Pool, Timeout) ->
 checkin(Pool, Conn) ->
     gen_server:cast(Pool, {checkin, Conn}).
 
--spec with(pool(), timeout(), fun((conn()) -> term())) -> term() | {error, pool_busy}.
+-spec with(pool(), timeout(), fun((conn()) -> term())) ->
+    term() | {error, pool_busy | pool_exhausted}.
 with(Pool, Timeout, Fun) ->
     case checkout(Pool, Timeout) of
         {ok, Conn} ->
@@ -164,8 +170,26 @@ with(Pool, Timeout, Fun) ->
             after
                 ok = checkin(Pool, Conn)
             end;
-        {error, pool_busy} = Err ->
+        {error, _} = Err ->
             Err
+    end.
+
+%% Which kind of saturation the caller just hit. The two are the same wait and
+%% different conditions: below `max_size` a checkout that finds nothing free is
+%% what growing looks like while the connections open, and it resolves on its
+%% own; at `max_size` there is nothing left to open, so every checkout waits out
+%% its timeout until demand falls. Only the pool can tell them apart, which is
+%% why it is asked rather than inferred.
+%%
+%% Asked after the caller has already spent its checkout timeout, so one more
+%% short call costs nothing next to it, and anything other than a clean answer
+%% falls back to the reading that assumes the pool is still growing.
+saturation(Pool) ->
+    try gen_server:call(Pool, at_capacity, ?SATURATION_TIMEOUT_MS) of
+        true -> pool_exhausted;
+        false -> pool_busy
+    catch
+        _:_ -> pool_busy
     end.
 
 %%---------------------------------------------------------------------------
@@ -211,6 +235,11 @@ handle_call(
             State2 = State1#?MODULE{pending = queue:in(P, Pending0)},
             {noreply, grow(State2)}
     end;
+handle_call(at_capacity, _From, #?MODULE{max_size = MaxSize, monitors = Monitors} = State) ->
+    %% Every open connection is monitored, so the map is the count. Answered
+    %% from the current state rather than from what `grow/1` last decided: a
+    %% connection may have died since, and the caller is asking about now.
+    {reply, map_size(Monitors) >= MaxSize, State};
 handle_call(Request, From, State) ->
     ?LOG_INFO(?MODULE_STRING " received unexpected call from ~p: ~W", [From, Request, 10]),
     {noreply, State}.
@@ -721,8 +750,10 @@ test_inspect(Pool) ->
         idle_timers => IdleTimers
     }.
 
-%% A saturated pool must surface as {error, pool_busy}, not a raw
-%% gen_server:call exit escaping the pool boundary (issue #332).
+%% A saturated pool must surface as a named error, not a raw gen_server:call
+%% exit escaping the pool boundary (issue #332). At `max_size` with everything
+%% checked out the name is `pool_exhausted`: there is nothing left to open, so
+%% waiting longer cannot help.
 checkout_timeout_returns_pool_busy_test() ->
     {ok, _} = application:ensure_all_started(seshat),
     ok = application:set_env(
@@ -742,7 +773,7 @@ checkout_timeout_returns_pool_busy_test() ->
         %% Take the pool's only connection and hold it, so the next checkout
         %% cannot be served and must time out.
         {ok, Conn} = checkout(busy_pool, 1000),
-        ?assertEqual({error, pool_busy}, checkout(busy_pool, 100)),
+        ?assertEqual({error, pool_exhausted}, checkout(busy_pool, 100)),
         %% The connection held above is still valid and checks back in cleanly.
         ok = checkin(busy_pool, Conn)
     after

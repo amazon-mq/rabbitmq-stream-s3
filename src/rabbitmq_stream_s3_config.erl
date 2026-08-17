@@ -31,6 +31,8 @@ lives here. Callers use these functions instead of calling
     prefetch_window_max/0,
     prefetch_max_depth/0,
     prefetch_max_lookahead/0,
+    prefetch_auto_tune/0,
+    prefetch_inflight_initial/0,
     fragment_target_size/0,
     persist_threshold/0,
     persist_interval_ms/0,
@@ -170,11 +172,54 @@ prefetch_request_size() ->
 prefetch_window_max() ->
     application:get_env(?APP, prefetch_window_max, 33_554_432).
 
-%% Most range GETs one reader may have in flight. Also its share of the general
-%% connection pool.
+%% The most range GETs one reader may ever have in flight - a ceiling, not the
+%% operating point. What a reader runs at is searched for from measured
+%% throughput, or `prefetch_inflight_initial` when `prefetch_auto_tune` is off.
+%%
+%% Set generously for that reason. It bounds a reader's share of the general
+%% pool, and exhausting the pool surfaces as `pool_busy`, so a ceiling above
+%% what the pool can serve costs a backoff, not a stall.
 -spec prefetch_max_depth() -> pos_integer().
 prefetch_max_depth() ->
-    application:get_env(?APP, prefetch_max_depth, 8).
+    application:get_env(?APP, prefetch_max_depth, 64).
+
+%% Whether a reader searches for its concurrency or runs at a fixed one.
+%%
+%% On, because the right concurrency is not a property of the configuration. The
+%% same reader wants materially different concurrency against a store that has a
+%% round trip to hide behind and one that does not, and against a cold
+%% connection pool and a warm one, so no static setting is right for all of them.
+%%
+%% The failure mode to know about is drift. The search hill-climbs on a rate it
+%% measures over one sample, so variance between samples can let a target past the
+%% peak record a new best by chance, which ratchets the anchor it holds upward.
+%% Past the peak the throughput curve is shallow, so drifting along it costs
+%% little next to running at a fixed setting that is wrong for the store the
+%% reader actually has.
+%%
+%% On also keeps a reader's attach cost proportional to what its consumer asks
+%% for: the search starts at one request, so a client that reads a message and
+%% stops never pays for concurrency it did not use.
+%%
+%% Off, a reader runs at `prefetch_inflight_initial` for its whole life, from the
+%% first pass inside `init/1`. That is the way back if the search is ever the
+%% wrong call for a workload, and it is what to set before reporting a throughput
+%% number that has to be reproducible.
+-spec prefetch_auto_tune() -> boolean().
+prefetch_auto_tune() ->
+    application:get_env(?APP, prefetch_auto_tune, true).
+
+%% How many range GETs a reader keeps in flight when `prefetch_auto_tune` is
+%% off, which it is not by default.
+%%
+%% With the search on this is not consulted at all: a reader starts at one
+%% request and the ramp doubles it into an operating point within a few epochs,
+%% so what a reader runs at is measured rather than configured, and
+%% `prefetch_max_depth` is the only bound on it. What this sets is the fixed
+%% concurrency a reader runs at with the search turned off.
+-spec prefetch_inflight_initial() -> pos_integer().
+prefetch_inflight_initial() ->
+    application:get_env(?APP, prefetch_inflight_initial, 8).
 
 %% Most fragments a reader may look ahead to beyond the one it is reading.
 %%
@@ -388,8 +433,10 @@ defaults_test_() ->
         ?_assertEqual(200, general_pool_max_size()),
         ?_assertEqual(4_194_304, prefetch_request_size()),
         ?_assertEqual(33_554_432, prefetch_window_max()),
-        ?_assertEqual(8, prefetch_max_depth()),
-        ?_assertEqual(8, prefetch_max_lookahead()),
+        ?_assertEqual(64, prefetch_max_depth()),
+        ?_assertEqual(64, prefetch_max_lookahead()),
+        ?_assertEqual(true, prefetch_auto_tune()),
+        ?_assertEqual(8, prefetch_inflight_initial()),
         ?_assertEqual(?MAX_FRAGMENT_SIZE_B, fragment_target_size()),
         ?_assertEqual(5, persist_threshold()),
         ?_assertEqual(2000, persist_interval_ms()),

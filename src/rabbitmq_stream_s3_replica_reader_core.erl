@@ -906,10 +906,15 @@ is_retriable(#{status := Status}) ->
     %% transients; everything else (e.g. 403, 404) is fatal.
     Status =:= 408 orelse Status =:= 429 orelse (Status >= 500 andalso Status =< 599);
 %% A saturated upload pool. rabbitmq_stream_s3_api_aws_pool:checkout/2 converts
-%% the checkout timeout into this named atom at the pool boundary, so the real
-%% cause (capacity, not a fatal 403/404) is classified transient and takes the
-%% fast retry path.
+%% the checkout timeout into one of these named atoms at the pool boundary, so
+%% the real cause (capacity, not a fatal 403/404) is classified transient and
+%% takes the fast retry path. Both belong here: they differ in whether the pool
+%% has room left to grow into, which is a question for the remote reader's
+%% concurrency search and not for an upload, and the clause below this one makes
+%% anything it does not name fatal.
 is_retriable(pool_busy) ->
+    true;
+is_retriable(pool_exhausted) ->
     true;
 %% Any other reason (including a governor-wrapped {Class, Reason} from an
 %% unexpected upload-task crash) is fatal: the delayed-retry path keeps the

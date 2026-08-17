@@ -172,6 +172,7 @@ arms it.
     committed/1,
     buffered/1,
     inflight/1,
+    inflight_owing/1,
     waits_on/2,
     push/3,
     ready/2,
@@ -493,12 +494,13 @@ replace_next(Fragment, _Buffer, []) ->
 %% counted in `committed/1`, so the caller does not budget-gate them - a range
 %% the reader has committed to must be fetched, or the buffer never becomes
 %% contiguous again and every read behind it stalls until the deadline. They do
-%% take a slot, so the depth cap still applies.
+%% take a slot, so `Cap` still applies: the caller's concurrency bound, which is
+%% the depth cap and the search's target together (see its `issue_ready/1`).
 -spec ready(pos_integer(), pipeline()) -> {[start_spec()], pipeline()}.
-ready(MaxDepth, #pipeline{reqs = Reqs} = P) ->
+ready(Cap, #pipeline{reqs = Reqs} = P) ->
     {Reqs1, {_, Specs}} = lists:mapfoldl(
         fun
-            (#req{status = ready} = Req, {InFlight, Acc}) when InFlight < MaxDepth ->
+            (#req{status = ready} = Req, {InFlight, Acc}) when InFlight < Cap ->
                 {Req#req{status = inflight}, {InFlight + 1, [start_spec(Req) | Acc]}};
             (Req, Acc) ->
                 {Req, Acc}
@@ -585,6 +587,25 @@ committed(#pipeline{reqs = Reqs}) ->
 -spec inflight(pipeline()) -> non_neg_integer().
 inflight(#pipeline{reqs = Reqs}) ->
     length([Req || #req{status = inflight} = Req <- Reqs]).
+
+-doc """
+In flight and still owing bytes: what is actually occupying the wire.
+
+A request that has delivered every byte it owes stays in the queue until its
+closing frame arrives, and until then it is a request doing nothing. Counting it
+against the concurrency target would spend a slot on a response that is over,
+which at a target sized for throughput is throughput given away. What it is
+still holding is a pooled connection, and that is accounted for separately: the
+core's `has_room/1` counts every in-flight request, owing bytes or not, against
+`max_depth`, which is what bounds a reader's share of the pool.
+""".
+-spec inflight_owing(pipeline()) -> non_neg_integer().
+inflight_owing(#pipeline{reqs = Reqs}) ->
+    length([
+        Req
+     || #req{status = inflight, range_end = RangeEnd, flushed = Flushed} = Req <- Reqs,
+        Flushed =< RangeEnd
+    ]).
 
 -doc """
 Whether anything is waiting on a backoff clock: a range queued against it, or
