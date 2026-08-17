@@ -39,6 +39,7 @@ synchronous feedback is generated.
 -define(C_READ, 6).
 -define(C_TOTAL_REQUESTS, 7).
 -define(C_FATAL_ERRORS, 8).
+-define(C_INFLIGHT_TARGET, 9).
 -define(COUNTER_KEY, {rabbitmq_stream_s3_remote_reader, counter}).
 -define(PREFETCH_SIZING_KEY, {rabbitmq_stream_s3_remote_reader, prefetch_sizing}).
 -define(COUNTERS, [
@@ -51,7 +52,13 @@ synchronous feedback is generated.
     {read, ?C_READ, counter, "Number of read/4,5 calls"},
     {remote_reader_total_requests, ?C_TOTAL_REQUESTS, counter, "Number of S3 requests initiated"},
     {remote_reader_fatal_errors, ?C_FATAL_ERRORS, counter,
-        "Number of remote readers stopped by a non-retryable S3 error"}
+        "Number of remote readers stopped by a non-retryable S3 error"},
+    %% What the reader is aiming for, against `requests_in_flight` for what it
+    %% is achieving. Without both, the two questions an operator has about a slow
+    %% remote read - is the reader aiming low, or aiming high and not getting
+    %% there - are indistinguishable from outside the process.
+    {remote_reader_inflight_target, ?C_INFLIGHT_TARGET, gauge,
+        "Requests the remote reader is currently aiming to keep in flight"}
 ]).
 %% The most bucket boundaries the prefetch window histogram may have. A window
 %% many requests wide would otherwise get one time series per step it can make.
@@ -120,7 +127,13 @@ synchronous feedback is generated.
     %% measured here rather than assumed from `?TUNE_INTERVAL_MS`: a busy reader
     %% is exactly the one whose timers land late, and it is also the one whose
     %% rate the tuner is trying to read.
-    sample_at :: integer() | undefined
+    sample_at :: integer() | undefined,
+    %% What this reader last published to the `inflight_target` gauge. The gauge
+    %% is node-wide, so it is kept by adding this reader's delta the way
+    %% `requests_in_flight` is - writing the target outright would make the
+    %% gauge mean "whichever reader ticked last", which on a node with several
+    %% consumers is not a number about anything.
+    published_target = 0 :: non_neg_integer()
 }).
 
 %% API
@@ -330,8 +343,22 @@ init(
         reader_ref = erlang:monitor(process, Reader),
         sample_at = erlang:monotonic_time(microsecond)
     },
-    _ = erlang:send_after(?TUNE_INTERVAL_MS, self(), tune_tick),
-    State = execute_effects(Effects, State0),
+    %% With the search off the target never moves, so there is nothing for a
+    %% tick to measure: arming it anyway would wake every reader five times a
+    %% second for its whole life to compute a rate nothing reads. The gauge is
+    %% published once here instead of on the first tick, so a pinned reader
+    %% still reports the target it is running at.
+    State1 =
+        case rabbitmq_stream_s3_remote_reader_core:searching(Core0) of
+            true ->
+                _ = erlang:send_after(?TUNE_INTERVAL_MS, self(), tune_tick),
+                State0;
+            false ->
+                Target = rabbitmq_stream_s3_remote_reader_core:inflight_target(Core0),
+                counters:add(counter(), ?C_INFLIGHT_TARGET, Target),
+                State0#state{published_target = Target}
+        end,
+    State = execute_effects(Effects, State1),
     {ok, State}.
 
 handle_call(
@@ -424,7 +451,11 @@ handle_info(tune_tick, #state{core = Core0, sample_at = SampleAt} = State0) ->
         Core0, {tune_tick, Now - SampleAt}
     ),
     _ = erlang:send_after(?TUNE_INTERVAL_MS, self(), tune_tick),
-    State = execute_effects(Effects, State0#state{core = Core1, sample_at = Now}),
+    Target = rabbitmq_stream_s3_remote_reader_core:inflight_target(Core1),
+    counters:add(counter(), ?C_INFLIGHT_TARGET, Target - State0#state.published_target),
+    State = execute_effects(
+        Effects, State0#state{core = Core1, sample_at = Now, published_target = Target}
+    ),
     maybe_stop(State);
 handle_info(Msg, #state{requests = Requests0, cancelled = Cancelled0} = State0) ->
     AsyncStates = #{Req => AsyncState || Req := {_, _, AsyncState} <- Requests0},
@@ -443,8 +474,12 @@ handle_info(Msg, #state{requests = Requests0, cancelled = Cancelled0} = State0) 
             {noreply, State0}
     end.
 
-terminate(_Reason, State) ->
+terminate(_Reason, #state{published_target = Target} = State) ->
     _ = cancel_all_requests(State),
+    %% Give the node-wide gauge back what this reader was holding, or a node
+    %% that has churned through consumers reads as aiming for a concurrency no
+    %% reader is asking for.
+    counters:sub(counter(), ?C_INFLIGHT_TARGET, Target),
     ok.
 
 format_status(#{state := #state{stream = StreamId, core = Core, from = From}} = Status) ->
@@ -521,9 +556,12 @@ step_and_execute(Event, #state{core = Core0} = State0) ->
 %% The connection pool hands out connections with a 100ms checkout timeout, so
 %% executing a batch of start_request effects against a saturated pool would
 %% block this process for 100ms per request while the caller's read deadline
-%% burns. Once one checkout has come back `pool_busy` the rest of the batch is
-%% reported to the core as busy without being attempted, capping the cost of a
-%% saturated pool at one checkout timeout per batch.
+%% burns. Once one checkout has come back saturated the rest of the batch is
+%% reported to the core without being attempted, capping the cost of a
+%% saturated pool at one checkout timeout per batch. The kind the first
+%% checkout came back with is what the rest are reported as: the two differ in
+%% what the core makes of them, and a batch that ends on an exhausted pool did
+%% not stop being exhausted for the ranges behind the first one.
 execute_effects(Effects, State) ->
     {State1, _PoolBusy} = execute_effects(Effects, false, State),
     State1.
@@ -588,12 +626,12 @@ execute_effect(
             counters:add(counter(), ?C_TOTAL_REQUESTS, 1),
             Requests = Requests0#{RequestId => {Id, FragOffset, AsyncState}},
             {State#state{requests = Requests}, false};
-        {error, pool_busy} ->
+        {error, Saturation} when Saturation =:= pool_busy; Saturation =:= pool_exhausted ->
             ?LOG_DEBUG(
-                "remote_reader start_request: pool_busy key=~ts frag=~b pos=~b",
-                [Key, FragOffset, RangeStart]
+                "remote_reader start_request: ~s key=~ts frag=~b pos=~b",
+                [Saturation, Key, FragOffset, RangeStart]
             ),
-            report_pool_busy(Id, FragOffset, State);
+            report_saturation(Id, FragOffset, Saturation, State);
         {error, Reason} ->
             %% The request never reached the pool: credentials could not be
             %% obtained or the region could not be resolved, so signing failed.
@@ -609,10 +647,12 @@ execute_effect(
             ),
             report_request_error(Id, FragOffset, connection_error, false, State)
     end;
-execute_effect({start_request, Id, _Key, _Range, FragOffset}, true, State) ->
+execute_effect({start_request, Id, _Key, _Range, FragOffset}, Saturation, State) when
+    Saturation =/= false
+->
     %% A checkout in this batch has already timed out; do not spend another
     %% timeout finding out the pool is still saturated.
-    report_pool_busy(Id, FragOffset, State);
+    report_saturation(Id, FragOffset, Saturation, State);
 execute_effect({cancel_request, Id}, PoolBusy, State) ->
     {cancel_request(Id, State), PoolBusy};
 execute_effect({cancel_requests, all}, PoolBusy, State) ->
@@ -653,18 +693,22 @@ execute_effect({fatal_error, Reason}, PoolBusy, #state{stream = StreamId} = Stat
 execute_effect(stop, PoolBusy, State) ->
     {State#state{stopping = true}, PoolBusy}.
 
-report_pool_busy(Id, FragOffset, State) ->
-    report_request_error(Id, FragOffset, pool_busy, true, State).
+%% Both kinds wait on the pool clock; they differ in what the core makes of
+%% them. See the core's `note_contention/2`. The kind is also what the rest of
+%% the batch is reported as, so it is carried rather than flattened to a flag.
+report_saturation(Id, FragOffset, Saturation, State) ->
+    report_request_error(Id, FragOffset, Saturation, Saturation, State).
 
 %% Tell the core that a range the shell was asked to start never got off the
 %% ground. An error step can ask for requests to be started (a range that owed
 %% nothing frees a depth slot for the next one), so the nested effects run with
-%% the batch's busy flag carried through: a saturated pool passes `true`, which
-%% turns any nested start into another report rather than another checkout.
+%% the batch's saturation carried through: a saturated pool passes the kind it
+%% saw, which turns any nested start into another report rather than another
+%% checkout.
 %%
-%% `PoolBusy` has to be what the shell actually saw. A start that failed before
-%% the pool was reached (credentials, region) is not evidence the pool is busy,
-%% and reporting a nested range as `pool_busy` on that path would grow
+%% `Saturation` has to be what the shell actually saw. A start that failed
+%% before the pool was reached (credentials, region) is not evidence the pool is
+%% busy, and reporting a nested range as saturated on that path would grow
 %% `pool_busy_delay` and park the range on a clock measuring something else.
 %%
 %% Recursion is bounded at one level either way. The nested range is in flight
@@ -677,11 +721,11 @@ report_pool_busy(Id, FragOffset, State) ->
 %% requests it went on to start then found the pool saturated, discarding that
 %% would leave the outer batch spending a 100ms checkout on each of its
 %% remaining ranges - the cost the short-circuit exists to cap.
-report_request_error(Id, FragOffset, Reason, PoolBusy, #state{core = Core0} = State) ->
+report_request_error(Id, FragOffset, Reason, Saturation, #state{core = Core0} = State) ->
     {Core, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
         Core0, {request_error, Id, FragOffset, Reason}
     ),
-    execute_effects(Effects, PoolBusy, State#state{core = Core}).
+    execute_effects(Effects, Saturation, State#state{core = Core}).
 
 %% Rebuild the fragment iterator from the manifest cache, advancing past
 %% the given offset (the fragment known to be 404).
@@ -905,8 +949,8 @@ bucket_of(Value, Buckets) ->
     hd([UB || UB <- Buckets, UB =:= infinity orelse Value =< UB]).
 
 %% Checking a connection out of a saturated pool costs a 100ms timeout, so once
-%% one request in a batch has come back pool_busy the rest must be reported to
-%% the core as busy without being attempted. Otherwise a reader pipelining N
+%% one request in a batch has come back saturated the rest must be reported to
+%% the core without being attempted. Otherwise a reader pipelining N
 %% requests blocks for N x 100ms with its caller's read deadline burning.
 pool_busy_short_circuits_the_rest_of_a_batch_test() ->
     StreamId = <<"pool-busy-test">>,
@@ -919,8 +963,15 @@ pool_busy_short_circuits_the_rest_of_a_batch_test() ->
     Iterator = rabbitmq_stream_s3_fragment_iterator:init(
         Manifest, 0, fun(_) -> {error, not_found} end
     ),
+    %% A fixed concurrency, because the subject is a batch of re-issued
+    %% requests and the search would spend several samples ramping up to one.
     {Core0, _} = rabbitmq_stream_s3_remote_reader_core:init(
-        StreamId, FragRef, ?SEGMENT_HEADER_B, Iterator, #{request_size => 1000, max_depth => 4}
+        StreamId, FragRef, ?SEGMENT_HEADER_B, Iterator, #{
+            request_size => 1000,
+            max_depth => 4,
+            auto_tune => false,
+            inflight_initial => 4
+        }
     ),
     %% Reads that cannot be served grow the prefetch window until the reader
     %% pipelines; failing every range then leaves a batch for the retry to
@@ -951,13 +1002,18 @@ pool_busy_short_circuits_the_rest_of_a_batch_test() ->
     ?assert(length(Starts) > 1),
     State = #state{stream = StreamId, cfg = build_cfg(#{}), core = Core},
     %% Enter the batch as if a checkout had already timed out.
-    {State1, true} = execute_effects(Starts, true, State),
+    {State1, pool_busy} = execute_effects(Starts, pool_busy, State),
     %% No request was issued, and the core has every range queued for retry.
     ?assertEqual(#{}, State1#state.requests),
     ?assertEqual(
         [{0, Start, End} || {start_request, _, _, {Start, End}, 0} <- Starts],
         rabbitmq_stream_s3_remote_reader_core:outstanding_ranges(State1#state.core)
-    ).
+    ),
+    %% The kind survives the short-circuit. The two differ in what the core
+    %% makes of them, so reporting the rest of an exhausted batch as merely busy
+    %% would lose the contention signal for every range behind the first.
+    {State2, pool_exhausted} = execute_effects(Starts, pool_exhausted, State),
+    ?assertEqual(#{}, State2#state.requests).
 
 %% A read cannot complete faster than the tier can deliver what it asked for, so
 %% a fixed deadline caps the chunk size the remote tier can serve: past the cap

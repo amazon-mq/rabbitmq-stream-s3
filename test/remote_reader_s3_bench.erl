@@ -184,13 +184,21 @@ run_one() ->
                         %% fragment, so sweeping this measures multi-fragment
                         %% look-ahead against single-fragment reach rather than
                         %% against a differently-configured reader.
-                        max_lookahead => env_int("S3B_LOOKAHEAD", Depth)
+                        max_lookahead => env_int("S3B_LOOKAHEAD", Depth),
+                        %% Off, `S3B_DEPTH` is the concurrency the reader runs
+                        %% at, which is how every fixed-concurrency sweep here
+                        %% was measured. On, it is only the ceiling: the reader
+                        %% searches below it, and the sweeps are the ground
+                        %% truth for what it ought to find.
+                        auto_tune => env_int("S3B_AUTO_TUNE", 0) =:= 1,
+                        inflight_initial => env_int("S3B_INFLIGHT_INITIAL", Depth)
                     }
                 }),
                 %% One machine-readable line; the sweep script tabulates.
                 io:format(
                     "S3BENCH depth=~b window=~bM request=~bM fragment=~bM "
                     "latency=~bms mib_s=~.1f inflight_avg=~.1f inflight_max=~.1f "
+                    "target_final=~b target_max=~b "
                     "msgq_avg=~.1f msgq_max=~b reds_per_s=~.2fM elapsed=~.2f "
                     "miss=~b req=~b timeouts=~b queued=~b~n",
                     [
@@ -202,6 +210,8 @@ run_one() ->
                         maps:get(mib_s, R),
                         maps:get(inflight_mean, R),
                         float(maps:get(inflight_max, R)),
+                        maps:get(target_final, R),
+                        maps:get(target_max, R),
                         maps:get(msgq_mean, R),
                         maps:get(msgq_max, R),
                         maps:get(reds_per_s, R) / 1_000_000,
@@ -516,15 +526,21 @@ measure(#{fragments := {Stream, [First | _] = Fragments}, opts := Opts} = Args) 
     after 5000 -> erlang:demonitor(MRef, [flush])
     end,
     Elapsed = max(1, T1 - T0) / 1000,
-    Depths = [D || {D, _, _} <- InFlight],
-    Queues = [Q || {_, Q, _} <- InFlight],
-    Reds = [R || {_, _, R} <- InFlight],
+    Depths = [D || {D, _, _, _} <- InFlight],
+    Queues = [Q || {_, Q, _, _} <- InFlight],
+    Reds = [R || {_, _, R, _} <- InFlight],
+    Targets = [T || {_, _, _, T} <- InFlight],
     #{
         bytes => Bytes,
         elapsed_s => Elapsed,
         mib_s => Bytes / 1_048_576 / Elapsed,
         inflight_mean => mean(Depths),
         inflight_max => lists:max([0 | Depths]),
+        %% Where the search ended up, and how high it went on the way. Against
+        %% `inflight_mean` these separate a search that settled on the wrong
+        %% target from one that settled on the right target too slowly.
+        target_final => trunc(lists:last([0 | Targets])),
+        target_max => trunc(lists:max([0 | Targets])),
         %% Reader-process saturation. A queue that grows means the single
         %% gen_server is the funnel, whatever the pool and the network manage.
         msgq_mean => mean(Queues),
@@ -607,15 +623,27 @@ sample_loop(Reader, Acc) ->
     after 20 ->
         Sample =
             case process_info(Reader, [message_queue_len, reductions]) of
-                [{message_queue_len, Q}, {reductions, R}] -> {inflight_gauge(), Q, R};
-                _ -> {inflight_gauge(), 0, 0}
+                [{message_queue_len, Q}, {reductions, R}] ->
+                    {inflight_gauge(), Q, R, target_gauge()};
+                _ ->
+                    {inflight_gauge(), 0, 0, target_gauge()}
             end,
         sample_loop(Reader, [Sample | Acc])
     end.
 
 inflight_gauge() ->
+    gauge(<<"requests_in_flight">>).
+
+%% What the search is aiming for, against `inflight_gauge/0` for what it
+%% achieves. A run's average concurrency cannot tell a search that converged on
+%% the wrong target from one that converged on the right target slowly, and the
+%% two want different fixes.
+target_gauge() ->
+    gauge(<<"remote_reader_inflight_target">>).
+
+gauge(Name) ->
     try
-        #{<<"requests_in_flight">> := #{values := Values}} = seshat:format(rabbitmq_stream_s3),
+        #{Name := #{values := Values}} = seshat:format(rabbitmq_stream_s3),
         lists:sum(maps:values(Values))
     catch
         _:_ -> 0

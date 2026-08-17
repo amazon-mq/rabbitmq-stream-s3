@@ -26,6 +26,19 @@ all() ->
         become_local_at_end_of_manifest,
         not_found_triggers_refresh_iterator,
         %% New tests
+        tuner_ramps_while_throughput_answers,
+        tuner_starts_at_one_request,
+        tuner_ignores_samples_that_delivered_nothing,
+        tuner_stops_ramping_when_doubling_stops_paying,
+        tuner_reverses_when_the_rate_falls_away,
+        tuner_keeps_probing_across_a_plateau,
+        tuner_turns_around_when_the_rate_slips,
+        tuner_returns_to_the_best_target_it_found,
+        tuner_backs_off_on_contention,
+        tuner_stays_within_its_bounds,
+        exhausted_pool_is_contention_but_a_growing_one_is_not,
+        tuner_off_pins_the_target_where_it_started,
+        tuner_moves_the_target_from_what_the_tick_measured,
         fetch_rate_is_measured_over_the_sample_the_shell_stamps,
         sample_survives_an_iterator_refresh,
         tick_with_no_elapsed_time_keeps_the_sample_open,
@@ -98,6 +111,7 @@ all() ->
         become_local_cancels_the_retry_timers,
         partial_throttling_does_not_reset_the_backoff,
         retry_round_in_flight_does_not_reset_the_backoff,
+        contention_backoff_is_not_undone_by_its_own_retry,
         backoff_resets_once_the_retried_range_delivers,
         backoff_resets_when_the_retried_range_delivers_but_stays_queued,
         degenerate_prefetch_settings_are_clamped,
@@ -243,8 +257,17 @@ frag_ref(Offset, Size, Uid) ->
 init(StreamId, FragRef, Position, Iterator) ->
     init(StreamId, FragRef, Position, Iterator, #{}).
 
+%% The search is off unless a case asks for it. It starts at one request and
+%% ramps into its operating point over several samples, so with it on every case
+%% that observes what a reader issues would be observing where the ramp had got
+%% to. The cases whose subject is the search turn it back on and drive the
+%% samples themselves.
 init(StreamId, FragRef, Position, Iterator, Opts) ->
-    rabbitmq_stream_s3_remote_reader_core:init(StreamId, FragRef, Position, Iterator, Opts).
+    rabbitmq_stream_s3_remote_reader_core:init(
+        StreamId, FragRef, Position, Iterator, Opts#{
+            auto_tune => maps:get(auto_tune, Opts, false)
+        }
+    ).
 
 %% The core addresses a request by the id the pipeline minted for it, which is
 %% not something a test should have to track: what a test knows is which byte
@@ -340,6 +363,58 @@ fetch_rate(State) ->
 %% off a real clock and this drives directly.
 tick(State, ElapsedUs) ->
     rabbitmq_stream_s3_remote_reader_core:step(State, {tune_tick, ElapsedUs}).
+
+inflight_target(State) ->
+    rabbitmq_stream_s3_remote_reader_core:inflight_target(State).
+
+%% A reader whose fragment is far larger than anything these will fetch, so
+%% nothing but the search decides the target.
+tuner_state(Opts) ->
+    FragRef = frag_ref(0, 100_000_000, 42),
+    Iterator = mock_iterator([{0, 100_000_000, 42}]),
+    {S, _} = init(
+        stream_id(),
+        FragRef,
+        ?SEGMENT_HEADER_B,
+        Iterator,
+        maps:merge(
+            #{
+                request_size => 1000,
+                window_max => 100_000_000,
+                auto_tune => true
+            },
+            Opts
+        )
+    ),
+    S.
+
+%% Past the ramp and into the one-step-at-a-time search, which is where a reader
+%% spends its time. Reached the way a reader reaches it - the search starts at
+%% one request, doubles while the rate answers, and halves once it stops - so
+%% the target these start from is what that leaves behind (8) rather than
+%% something a case picks.
+climbing(State) ->
+    lists:foldl(
+        fun(Rate, Acc) -> tune(Rate, Acc) end,
+        State,
+        [1000, 2000, 4000, 8000, 16_000, 16_000]
+    ).
+
+%% Feed the search a run of sample rates, and return the target it held after
+%% each. The first rate only establishes a baseline, so it yields no target.
+rates(State, Rates) ->
+    {_, Targets} = lists:foldl(
+        fun(Rate, {Acc, Seen}) ->
+            Acc1 = tune(Rate, Acc),
+            {Acc1, [inflight_target(Acc1) | Seen]}
+        end,
+        {State, []},
+        Rates
+    ),
+    tl(lists:reverse(Targets)).
+
+tune(Rate, State) ->
+    rabbitmq_stream_s3_remote_reader_core:tune(Rate, State).
 
 %% Answer every outstanding range of a fragment, in queue order, with the
 %% fragment's byte pattern.
@@ -589,6 +664,165 @@ current_and_next_404_read_past_current_keeps_surviving_fragment(_Config) ->
 %% Prefetch window and retry tests
 %% ------------------------------------------------------------------
 
+%% ------------------------------------------------------------------
+%% Concurrency search
+%%
+%% The search is a pure function of the sample's rate and the state, so these
+%% feed it rates directly rather than arranging a store that produces them.
+%% `rates/2` returns the target after each sample, which is what the search is.
+%%
+%% Three properties of the curve are what the cases below pin down. Throughput
+%% is not monotonic in concurrency, so a search that could only climb would walk
+%% past the peak and stay there. A run of readings inside the epsilon is a
+%% plateau rather than a peak, so a search that held still on one would never
+%% move again. And past the peak the curve is broad and shallow, so a slide
+%% shows up as noise at every individual step and has to be caught against the
+%% best rate seen rather than against the previous one.
+%% ------------------------------------------------------------------
+
+tuner_ramps_while_throughput_answers(_Config) ->
+    S = tuner_state(#{max_depth => 128}),
+    ?assertEqual(1, inflight_target(S)),
+    ?assertEqual([2, 4, 8], rates(S, [1000, 2000, 4000, 8000])).
+
+tuner_starts_at_one_request(_Config) ->
+    %% What a reader fetches stays proportional to what its consumer has asked
+    %% for. Starting the search at the operating point instead charges the whole
+    %% target to `init/1`, which runs before the consumer has read anything: a
+    %% client that reads one message would download the target's worth of bytes
+    %% and hold the target's share of the general pool to do it.
+    S = tuner_state(#{max_depth => 128, inflight_initial => 32}),
+    ?assertEqual(1, inflight_target(S)),
+    %% And it is the ramp, not the setting, that reaches the operating point -
+    %% five samples of a rate that keeps answering, which is a second of reading.
+    ?assertEqual([2, 4, 8, 16, 32], rates(S, [1000, 2000, 4000, 8000, 16_000, 32_000])).
+
+tuner_ignores_samples_that_delivered_nothing(_Config) ->
+    %% A consumer that pauses, or that has yet to issue its first read, is not
+    %% evidence that the target is too high. Judged as a reading it would be:
+    %% a zero rate cannot improve on a zero rate, so the ramp would read the
+    %% pause as "doubling stopped paying", halve, and leave the climb to walk
+    %% back up a step at a time.
+    S = climbing(tuner_state(#{max_depth => 128})),
+    ?assertEqual(8, inflight_target(S)),
+    ?assertEqual([8, 8, 8], rates(S, [0, 0, 0, 0])),
+    %% The baseline survives the pause, so the sample that does carry bytes is
+    %% judged against the last one that did rather than against the silence.
+    ?assertEqual([8, 9], rates(S, [10_000, 0, 12_000])).
+
+tuner_stops_ramping_when_doubling_stops_paying(_Config) ->
+    %% The sample that halves also drops its baseline, since the rate it just
+    %% measured belongs to a target the reader has left, so the sample after it
+    %% re-reads before moving again.
+    S = tuner_state(#{max_depth => 128}),
+    ?assertEqual([2, 4, 2, 2, 3], rates(S, [1000, 2000, 4000, 4000, 9000, 20_000])).
+
+tuner_reverses_when_the_rate_falls_away(_Config) ->
+    S = climbing(tuner_state(#{max_depth => 128})),
+    ?assertEqual([9, 10, 9], rates(S, [1000, 2000, 4000, 1000])).
+
+tuner_keeps_probing_across_a_plateau(_Config) ->
+    S = climbing(tuner_state(#{max_depth => 128})),
+    ?assertEqual([9, 10, 11], rates(S, [10_000, 10_200, 9_900, 10_100])).
+
+tuner_turns_around_when_the_rate_slips(_Config) ->
+    S = climbing(tuner_state(#{max_depth => 128})),
+    ?assertEqual([9, 10, 9], rates(S, [10_000, 10_200, 10_100, 9_500])).
+
+tuner_returns_to_the_best_target_it_found(_Config) ->
+    %% Back to the best in one move, rather than unwinding at the pace it
+    %% drifted.
+    S = climbing(tuner_state(#{max_depth => 128})),
+    ?assertEqual([9, 10, 8, 8], rates(S, [10_000, 10_200, 10_100, 5_000, 4_000])).
+
+tuner_backs_off_on_contention(_Config) ->
+    %% S3 asking the reader to slow down reports the far side of the peak
+    %% directly rather than leaving it to be inferred from a slower sample, so it
+    %% is worth more than the one step a falling rate buys. `pool_busy` is not
+    %% this; see `note_contention/2`.
+    %% Ramped up first: the backoff gives back a quarter of the target, which is
+    %% only observable once the search has one to give back.
+    S = climbing(tuner_state(#{max_depth => 128})),
+    ?assertEqual(8, inflight_target(S)),
+    {S1, _} = fail(S, 0, slow_down),
+    {S2, _} = tick(S1, 100_000),
+    ?assertEqual(6, inflight_target(S2)),
+    %% The sample's count is cleared with it, so one round of failures costs one
+    %% backoff rather than one per failed range.
+    {S3, _} = tick(S2, 100_000),
+    ?assertEqual(6, inflight_target(S3)).
+
+exhausted_pool_is_contention_but_a_growing_one_is_not(_Config) ->
+    %% A checkout that finds nothing free means two different things either side
+    %% of the pool's ceiling. Below it the pool is opening connections and the
+    %% wait is the cost of the growth this reader asked for, so counting it
+    %% would make every attempt to grow undo itself. At the ceiling there is
+    %% nothing left to open and the wait is other readers, so coming down is the
+    %% only move that helps.
+    S0 = climbing(tuner_state(#{max_depth => 32})),
+    ?assertEqual(8, inflight_target(S0)),
+    {S1, _} = read(S0, ?SEGMENT_HEADER_B, 100),
+    [{0, Start, _} | _] = outstanding_ranges(S1),
+    %% Growing: the target is left where it was.
+    {S2, _} = fail(S1, 0, Start, pool_busy),
+    {S3, _} = tick(S2, 100_000),
+    ?assertEqual(8, inflight_target(S3)),
+    %% At the ceiling: a quarter given back, the same as a `slow_down`.
+    {S4, _} = fail(S3, 0, Start, pool_exhausted),
+    {S5, _} = tick(S4, 100_000),
+    ?assertEqual(6, inflight_target(S5)).
+
+tuner_stays_within_its_bounds(_Config) ->
+    %% `max_depth` is the ceiling the search may not cross, and one request is
+    %% the floor: at zero `has_room/1` is false however far behind the consumer
+    %% falls, so nothing would ever be requested again.
+    Up = rates(tuner_state(#{max_depth => 12}), [1000, 2000, 4000, 8000, 16_000]),
+    ?assertEqual([2, 4, 8, 12], Up),
+    %% Coming back down is asserted as the sequence it walks rather than as a
+    %% range. `retarget/2` clamps every write to `[1, max_depth]`, so a range
+    %% check is a test of that clamp and of nothing else: it holds whatever the
+    %% steps in between do, including with `step_target/2` inverted or the
+    %% return-to-best arm deleted.
+    Down = rates(
+        climbing(tuner_state(#{max_depth => 12})),
+        [1000, 500, 250, 125, 60, 30]
+    ),
+    ?assertEqual([7, 6, 6, 7, 6], Down),
+    %% The floor is the clamp's own case: `step_target/2` subtracts a
+    %% proportion, so at a target of one a down step reaches zero, and a target
+    %% of zero leaves `has_room/1` false however far behind the consumer falls -
+    %% nothing would ever be requested again.
+    AtFloor = climbing(tuner_state(#{max_depth => 1})),
+    ?assertEqual(1, inflight_target(AtFloor)),
+    ?assertEqual([1, 1, 1], rates(AtFloor, [1000, 500, 250, 125])).
+
+tuner_off_pins_the_target_where_it_started(_Config) ->
+    %% The way back, if searching ever proves to be the wrong call: the reader
+    %% runs at a fixed concurrency.
+    S = tuner_state(#{max_depth => 128, inflight_initial => 16, auto_tune => false}),
+    ?assertEqual([16, 16, 16], rates(S, [1000, 2000, 4000, 8000])).
+
+tuner_moves_the_target_from_what_the_tick_measured(_Config) ->
+    %% The search is tested directly above; this is the wiring. Bytes delivered
+    %% over a sample the shell stamped become a rate, the rate moves the target,
+    %% and the raised target issues against itself in the same pass rather than
+    %% waiting for a delivery that may be a whole sample away.
+    {S0, _} = pipelined_state(#{
+        window_max => 100_000_000, max_depth => 128, auto_tune => true
+    }),
+    ?assertEqual(1, inflight_target(S0)),
+    {S1, _} = deliver(S0, 0, 8, pattern(8, 1000), done),
+    {S2, _} = tick(S1, 100_000),
+    ?assertEqual(10_000, fetch_rate(S2)),
+    %% The first sample with bytes in it is the baseline, so it moves nothing.
+    ?assertEqual(1, inflight_target(S2)),
+    %% Better than the baseline, so the ramp doubles - and the pass the tick
+    %% drives issues into the room that made.
+    {S3, _} = deliver(S2, 0, 1008, pattern(1008, 4000), done),
+    {S4, Effects} = tick(S3, 100_000),
+    ?assertEqual(2, inflight_target(S4)),
+    ?assertMatch([_ | _], [E || {start_request, _, _, _, _} = E <- Effects]).
+
 sample_survives_an_iterator_refresh(_Config) ->
     %% The refresh rebuilds the state part-way through a measurement sample, but
     %% the sample's other term is the shell's: `sample_at` moves on the tick and
@@ -715,7 +949,10 @@ served_read_frees_its_bytes_from_the_window(_Config) ->
     FragRef = frag_ref(0, 100_000_000, 42),
     Iterator = mock_iterator([{0, 100_000_000, 42}]),
     {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, #{
-        request_size => 1000, window_max => 1000, max_depth => 32
+        request_size => 1000,
+        window_max => 1000,
+        max_depth => 32,
+        inflight_initial => 1
     }),
     ?assertEqual([{8, 1007}], fragment_ranges(S0, 0)),
     %% One range, a window's worth, answered in full. Nothing follows it: the
@@ -736,7 +973,32 @@ served_read_frees_its_bytes_from_the_window(_Config) ->
 window_test_state(Opts) ->
     FragRef = frag_ref(0, 100_000_000, 42),
     Iterator = mock_iterator([{0, 100_000_000, 42}]),
-    init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts#{max_depth => 32}).
+    init(
+        stream_id(),
+        FragRef,
+        ?SEGMENT_HEADER_B,
+        Iterator,
+        with_window_concurrency(Opts#{max_depth => 32})
+    ).
+
+%% Derive the concurrency target from the byte window, `window_max div
+%% request_size` capped by the depth, for the tests whose subject is something
+%% else. They describe the reach they want in bytes, and this turns it into the
+%% requests that reach it, so each does not have to state both.
+%%
+%% The search is off for the same reason. It starts at one request and ramps
+%% into its operating point, so with it on a reader reaches the derived
+%% concurrency several samples after `init/1` rather than at it - and these cases
+%% are about what the reader does with a given concurrency, not about how it
+%% arrives at one. The cases whose subject *is* the search ask for it back.
+with_window_concurrency(Opts) ->
+    RequestSize = maps:get(request_size, Opts, 4_194_304),
+    WindowMax = maps:get(window_max, Opts, 33_554_432),
+    Derived = max(1, WindowMax div RequestSize),
+    Opts#{
+        inflight_initial => maps:get(inflight_initial, Opts, Derived),
+        auto_tune => maps:get(auto_tune, Opts, false)
+    }.
 
 %% ------------------------------------------------------------------
 %% Pipelining: several ranges of one fragment in flight at once
@@ -842,7 +1104,9 @@ open_range_keeps_flushing_its_successors(_Config) ->
     %% flushes past it.
     {S1, _} = deliver(S0, 0, 8, pattern(8, 1000), continue),
     {S2, _} = deliver(S1, 0, 1008, pattern(1008, 1000), done),
-    ?assertEqual([{8, 1007}, {2008, 3007}, {3008, 4007}, {4008, 5007}], fragment_ranges(S2, 0)),
+    ?assertEqual(
+        [{8, 1007}, {2008, 3007}, {3008, 4007}, {4008, 5007}], fragment_ranges(S2, 0)
+    ),
     %% Everything after it must still flush, on this delivery and on the next.
     {S3, _} = deliver(S2, 0, 2008, pattern(2008, 1000), done),
     {S4, E4} = read(S3, 8, 3000),
@@ -872,9 +1136,10 @@ open_range_does_not_pull_the_frontier_back(_Config) ->
     %% asking for 1008 again would re-fetch bytes the buffer already holds.
     {S1, _} = deliver(S0, 0, 8, pattern(8, 1000), continue),
     {S2, _} = deliver(S1, 0, 1008, pattern(1008, 1000), done),
-    %% What matters is where the new ranges start, not how many the budgets
-    %% admit: the frontier is at the buffer's end, so nothing asks for 1008
-    %% again. How far past it the reader gets to run is the window's business.
+    %% What matters is where the new ranges start: the frontier is at the
+    %% buffer's end, so nothing asks for 1008 again. The open range holds no
+    %% concurrency slot - it owes nothing - so the target's room goes to ranges
+    %% that can still fetch something.
     ?assertEqual([{8, 1007}, {2008, 3007}, {3008, 4007}], fragment_ranges(S2, 0)),
     %% The consumer walks through the buffered bytes, pulling the frontier along
     %% behind it - always forwards, never back over what is buffered.
@@ -921,9 +1186,14 @@ short_completion_at_the_frontier_refetches_the_gap(_Config) ->
     %% happen either - and every read behind it would stall until the deadline.
     FragRef = frag_ref(0, 2000, 42),
     Iterator = mock_iterator([{0, 2000, 42}, {100, 100_000, 43}]),
-    Opts = #{request_size => 1000, window_max => 2000, max_depth => 8},
+    Opts = #{
+        request_size => 1000,
+        window_max => 2000,
+        max_depth => 8,
+        inflight_initial => 3
+    },
     {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
-    %% A miss takes the window to its ceiling, which covers the whole fragment.
+    %% Three requests in flight, which is more than covers the fragment.
     {S1, _} = read(S0, ?SEGMENT_HEADER_B, 3000),
     ?assertEqual([{8, 1007}, {1008, 2007}], fragment_ranges(S1, 0)),
     {S2, _} = deliver(S1, 0, 8, pattern(8, 1000), done),
@@ -1112,9 +1382,14 @@ next_fragment_flushes_while_current_range_streams(_Config) ->
     %% holding its bytes staged until the current fragment closes.
     FragRef = frag_ref(0, 2000, 42),
     Iterator = mock_iterator([{0, 2000, 42}, {100, 100_000, 43}]),
-    Opts = #{request_size => 1000, window_max => 4000, max_depth => 8},
+    Opts = #{
+        request_size => 1000,
+        window_max => 4000,
+        max_depth => 8,
+        inflight_initial => 4
+    },
     {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
-    %% Two misses grow the window past the current fragment, so the frontier
+    %% Four requests in flight reach past the current fragment, so the frontier
     %% spills into the next one.
     {S1, _} = read(S0, ?SEGMENT_HEADER_B, 3000),
     {S2, _} = read(S1, ?SEGMENT_HEADER_B, 3000),
@@ -1125,7 +1400,10 @@ next_fragment_flushes_while_current_range_streams(_Config) ->
     %% The next fragment's head range completes. Its bytes reach the prefetch
     %% buffer, so the request is done with and leaves the queue.
     {S4, _} = deliver(S3, 100, 8, pattern(8, 1000), done),
-    ?assertEqual([{1008, 2007}, {2008, 3007}, {3008, 4007}], fragment_ranges(S4, 100)),
+    %% Its head has left the queue, which is the point: the bytes went to the
+    %% prefetch buffer rather than staying staged behind a current-fragment
+    %% range that is still streaming.
+    ?assertEqual([{1008, 2007}, {2008, 3007}], fragment_ranges(S4, 100)),
     ?assertEqual([{8, 1007}, {1008, 2007}], fragment_ranges(S4, 0)).
 
 %% A reader with several ranges of one fragment outstanding. The window has to
@@ -1144,7 +1422,7 @@ pipelined_state(Opts) ->
         FragRef,
         ?SEGMENT_HEADER_B,
         Iterator,
-        maps:merge(#{request_size => 1000}, Opts)
+        with_window_concurrency(maps:merge(#{request_size => 1000}, Opts))
     ),
     lists:foldl(
         fun(_, {Acc, _}) -> read(Acc, ?SEGMENT_HEADER_B, 100) end,
@@ -1746,12 +2024,16 @@ known_404_fragment_is_not_refetched(_Config) ->
     %% each one would fire a whole `max_depth` of range GETs, and every 404 they
     %% earn wipes the queue and cancels the next fragment's prefetch with it.
     %% The refresh is driven by the first read that cannot be served.
-    Opts = #{request_size => 1_000, max_depth => 8, window_max => 1_000_000},
+    Opts = #{
+        request_size => 1_000,
+        max_depth => 8,
+        window_max => 1_000_000,
+        inflight_initial => 2
+    },
     FragRef = frag_ref(0, 1_000_000, 42),
     Iterator = mock_iterator([{0, 1_000_000, 42}, {100, 1_000_000, 43}]),
     {S0, _} = init(stream_id(), FragRef, 64, Iterator, Opts),
-    [{Start, End}] = fragment_ranges(S0, 0),
-    %% A read that misses grows the window, so a second range joins the first.
+    [{Start, End} | _] = fragment_ranges(S0, 0),
     {S1, _} = read(S0, 64, 100),
     ?assertMatch([_, _], fragment_ranges(S1, 0)),
     %% The first range is answered in full, which serves the read and leaves
@@ -2161,7 +2443,10 @@ read_larger_than_the_window_is_still_served(_Config) ->
     FragRef = frag_ref(0, 1_000_000, 42),
     Iterator = mock_iterator([{0, 1_000_000, 42}]),
     {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, #{
-        request_size => 1000, window_max => 2000, max_depth => 8
+        request_size => 1000,
+        window_max => 2000,
+        max_depth => 8,
+        inflight_initial => 2
     }),
     %% A read half again the window's ceiling.
     {S1, _} = read(S0, ?SEGMENT_HEADER_B, 3000),
@@ -2169,18 +2454,16 @@ read_larger_than_the_window_is_still_served(_Config) ->
     %% asked for nothing at all from here on, so no number of rounds served it.
     {Served, S} = answer_until_served(S1, 20),
     ?assertEqual(pattern(?SEGMENT_HEADER_B, 3000), Served),
-    %% Exceeding the window is confined to the read that needed it: once served,
-    %% the ceiling governs again, so what the reader fetches from there is back
-    %% within a request of the window rather than the 3000 bytes that one read
-    %% licensed. The slack is one range: `has_room/1` admits a range while the
-    %% budget has room and the range it then queues may cross the ceiling.
+    %% Exceeding the ceiling is confined to the read that needed it. Once served
+    %% the floor it put under `fetch_ceiling/1` is gone, so the reader is back to
+    %% the two requests its target allows, plus the one range of slack that
+    %% admitting on `has_room/1` always leaves.
     {Committed, _Buffered, _} = load(S),
-    ?assert(Committed =< window(S) + 1000),
-    ?assert(Committed < 3000),
-    %% What it fetched is genuinely ahead of the consumer: the served bytes are
-    %% behind it, so the read that follows them still waits on the wire.
-    {_S2, E} = read(S, ?SEGMENT_HEADER_B + 3000, 10),
-    ?assertEqual([], [R || {reply, {ok, _}} = R <- E]).
+    ?assert(Committed =< 3 * 1000),
+    %% And it is still fetching: serving an oversized read leaves the reader
+    %% running against its target rather than wedged at a ceiling it can no
+    %% longer grow past, which is the failure this whole case is named for.
+    ?assertMatch([_ | _], outstanding_ranges(S)).
 
 %% Answer every outstanding range in full, round after round, until the pending
 %% read is replied to. Returns the served bytes.
@@ -2297,6 +2580,37 @@ retry_round_in_flight_does_not_reset_the_backoff(_Config) ->
     %% A is throttled again: the backoff continues from 2s.
     {_S4, E} = fail(S3, 0, A, slow_down),
     ?assertEqual([{set_timer, fault, 2000}], E).
+
+contention_backoff_is_not_undone_by_its_own_retry(_Config) ->
+    %% Giving back a quarter of the target has to survive the retry that
+    %% follows it. The ranges the back-off put back are re-issued by
+    %% `issue_ready/1`, and gating that on the depth cap alone put every one of
+    %% them on the wire again at the concurrency S3 had just asked the reader to
+    %% come down from - so a throttled reader answered the throttling by
+    %% repeating it.
+    S0 = climbing(tuner_state(#{max_depth => 32})),
+    ?assertEqual(8, inflight_target(S0)),
+    %% A read fills the wire to the target.
+    {S1, _} = read(S0, ?SEGMENT_HEADER_B, 100),
+    Outstanding = outstanding_ranges(S1),
+    ?assertEqual(8, length(Outstanding)),
+    %% S3 throttles the whole round.
+    S2 = lists:foldl(
+        fun({0, Start, _}, Acc) ->
+            {Acc1, _} = fail(Acc, 0, Start, slow_down),
+            Acc1
+        end,
+        S1,
+        Outstanding
+    ),
+    {S3, _} = tick(S2, 100_000),
+    ?assertEqual(6, inflight_target(S3)),
+    %% The retry releases all eight, and the new target is what bounds how many
+    %% of them go back out. The other two keep their place in the queue and
+    %% follow as the ones ahead of them answer.
+    {S4, Effects} = retry(S3, fault),
+    ?assertEqual(6, length(starts(Effects))),
+    ?assertEqual(8, length(outstanding_ranges(S4))).
 
 backoff_resets_once_the_retried_range_delivers(_Config) ->
     %% The other side of the same rule: once the round has come back, the clock
