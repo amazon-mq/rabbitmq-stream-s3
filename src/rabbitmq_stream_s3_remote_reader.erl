@@ -56,6 +56,13 @@ synchronous feedback is generated.
 %% The most bucket boundaries the prefetch window histogram may have. A window
 %% many requests wide would otherwise get one time series per step it can make.
 -define(PREFETCH_WINDOW_BUCKET_LIMIT, 16).
+%% The length of a sample: how often the shell closes one and hands it to
+%% the core to measure a fetch rate over.
+%%
+%% The core has no clock, so this is where time enters it. Long enough that a
+%% single slow response does not decide a sample, and short enough that a reader
+%% converges within a consumer's first seconds rather than its first minute.
+-define(TUNE_INTERVAL_MS, 200).
 
 -type hint() :: chunk_boundary | within_chunk.
 -export_type([hint/0]).
@@ -107,7 +114,13 @@ synchronous feedback is generated.
         rabbitmq_stream_s3_remote_reader_core:backoff() => {reference(), reference()}
     },
     %% Set to true when the core emits `stop`.
-    stopping = false :: boolean()
+    stopping = false :: boolean(),
+    %% When the current tuning sample opened, in monotonic micros. The core is
+    %% handed the elapsed time rather than reading a clock of its own, and it is
+    %% measured here rather than assumed from `?TUNE_INTERVAL_MS`: a busy reader
+    %% is exactly the one whose timers land late, and it is also the one whose
+    %% rate the tuner is trying to read.
+    sample_at :: integer() | undefined
 }).
 
 %% API
@@ -314,8 +327,10 @@ init(
         stream = StreamId,
         cfg = Cfg,
         core = Core0,
-        reader_ref = erlang:monitor(process, Reader)
+        reader_ref = erlang:monitor(process, Reader),
+        sample_at = erlang:monotonic_time(microsecond)
     },
+    _ = erlang:send_after(?TUNE_INTERVAL_MS, self(), tune_tick),
     State = execute_effects(Effects, State0),
     {ok, State}.
 
@@ -398,6 +413,19 @@ handle_info({deadline_expired, _StaleToken}, State) ->
     %% already-queued message, so ignore the stale token rather than reset a
     %% newer read's buffer and cancel its in-flight requests.
     {noreply, State};
+handle_info(tune_tick, #state{core = Core0, sample_at = SampleAt} = State0) ->
+    %% Closes the core's measurement sample and opens the next. Unconditional and
+    %% untokened, unlike the retry timers: it carries no decision, so a tick that
+    %% arrives late or twice costs a sample's accuracy rather than correctness -
+    %% the elapsed time it carries is measured, so a late one is simply a longer
+    %% sample. A reader that has nothing in flight ticks over zero bytes.
+    Now = erlang:monotonic_time(microsecond),
+    {Core1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
+        Core0, {tune_tick, Now - SampleAt}
+    ),
+    _ = erlang:send_after(?TUNE_INTERVAL_MS, self(), tune_tick),
+    State = execute_effects(Effects, State0#state{core = Core1, sample_at = Now}),
+    maybe_stop(State);
 handle_info(Msg, #state{requests = Requests0, cancelled = Cancelled0} = State0) ->
     AsyncStates = #{Req => AsyncState || Req := {_, _, AsyncState} <- Requests0},
     case rabbitmq_stream_s3_api:match_async(Msg, AsyncStates, Cancelled0) of
