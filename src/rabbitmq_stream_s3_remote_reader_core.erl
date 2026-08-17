@@ -176,7 +176,22 @@ and transitions immediately if available, or signals that more data is needed.
     pending :: #pending{} | undefined,
 
     %% Current fragment returned 404
-    current_not_found = false :: boolean()
+    current_not_found = false :: boolean(),
+
+    %% Bytes S3 has delivered since the last tick, and the rate that came out of
+    %% the tick before it.
+    %%
+    %% This module has no clock: `step/2` takes events and hands back effects,
+    %% and reading the time inside it would make every result depend on when it
+    %% was computed. Rate control needs elapsed time all the same, so time
+    %% arrives as an input - the shell ticks on a timer and stamps each tick with
+    %% the micros actually elapsed, which is both what keeps this pure and what
+    %% lets a test drive a whole minute of tuning in virtual time.
+    sample_bytes = 0 :: non_neg_integer(),
+    %% Bytes per second over the last completed sample, or `undefined` before the
+    %% first tick. Measured on what S3 delivered, since that is the quantity
+    %% concurrency moves.
+    fetch_rate :: undefined | non_neg_integer()
 }).
 
 -type state() :: #state{}.
@@ -189,6 +204,9 @@ and transitions immediately if available, or signals that more data is needed.
     | {data, request_id(), binary(), done | continue}
     | {request_error, request_id(), fragment_offset(), term()}
     | {retry, backoff()}
+    %% Micros elapsed since the previous tick, measured by the shell. The only
+    %% way time enters this module; see `#state.sample_bytes`.
+    | {tune_tick, non_neg_integer()}
     | deadline_expired
     | {iterator_refreshed, rabbitmq_stream_s3_fragment_iterator:iterator() | end_of_manifest}.
 
@@ -234,7 +252,9 @@ and transitions immediately if available, or signals that more data is needed.
 %% The ranges the core is still waiting on, in queue order. Tests describe what
 %% S3 answers rather than which byte range the core happened to ask for, so
 %% they use this to address a delivery to the right request.
--export([outstanding_ranges/1, window_bytes/1, read_position/1, load/1, request_id/3]).
+-export([
+    outstanding_ranges/1, window_bytes/1, read_position/1, load/1, request_id/3, fetch_rate/1
+]).
 
 %% The id the pipeline minted for the range a fragment has outstanding at a
 %% position. Tests describe what S3 answers - a range of bytes - rather than
@@ -316,11 +336,25 @@ step_(State0, {data, Id, Data, DoneOrContinue}) ->
     {Signals, Pipeline} = rabbitmq_stream_s3_read_pipeline:data(
         Id, Data, DoneOrContinue, pipeline(State0)
     ),
-    {State1, Effects1} = absorb_signals(Signals, State0#state{pipeline = Pipeline}),
+    Sample = State0#state.sample_bytes + iolist_size(Data),
+    {State1, Effects1} = absorb_signals(
+        Signals, State0#state{pipeline = Pipeline, sample_bytes = Sample}
+    ),
     State2 = reset_idle_backoffs(State1),
     {State3, Effects2} = maybe_start_requests(State2),
     {State4, Effects3} = try_serve(State3),
     {State4, Effects1 ++ Effects2 ++ Effects3};
+step_(State, {tune_tick, ElapsedUs}) ->
+    %% Close the sample. An elapsed of zero would divide by it, and says nothing
+    %% either way, so it is left to accumulate into the next one - which is also
+    %% what makes the tick safe to deliver early or twice.
+    case ElapsedUs > 0 of
+        true ->
+            Rate = State#state.sample_bytes * 1_000_000 div ElapsedUs,
+            {State#state{sample_bytes = 0, fetch_rate = Rate}, []};
+        false ->
+            {State, []}
+    end;
 step_(State0, {request_error, _Id, Fragment, not_found}) ->
     case Fragment =:= current_fragment_offset(State0) of
         true ->
@@ -495,6 +529,14 @@ step_(State0, {iterator_refreshed, Iterator}) ->
                 stream = StreamId,
                 cfg = Cfg,
                 window = Cfg#cfg.request_size,
+                %% The sample carries across the rebuild for the same reason
+                %% its elapsed time does: the shell stamps `sample_at` on the
+                %% tick and nothing here can move it, so dropping the bytes
+                %% would hand the next tick a part-sample's bytes over a whole
+                %% sample's time and call the difference a slower reader. Both
+                %% terms of the measurement describe the interval since the last
+                %% tick, and a refresh part-way through it changes neither.
+                sample_bytes = State0#state.sample_bytes,
                 retry_delay = Cfg#cfg.min_retry_delay_ms,
                 pipeline = rabbitmq_stream_s3_read_pipeline:replace_fragment(
                     FragRef, ?SEGMENT_HEADER_B, pipeline(State0)
@@ -603,6 +645,12 @@ read_position(State) ->
 -spec load(state()) -> {non_neg_integer(), non_neg_integer(), non_neg_integer()}.
 load(State) ->
     {committed(State), buffered(State), inflight_count(State)}.
+
+%% Bytes per second over the last completed sample; `undefined` before the first
+%% tick closes one.
+-spec fetch_rate(state()) -> undefined | non_neg_integer().
+fetch_rate(#state{fetch_rate = Rate}) ->
+    Rate.
 
 -endif.
 
