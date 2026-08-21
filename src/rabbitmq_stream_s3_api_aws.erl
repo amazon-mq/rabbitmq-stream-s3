@@ -229,6 +229,12 @@ do_reload_config(State0) ->
                 }),
                 static;
             OtherSource ->
+                %% Evict any static credentials row a previous config left
+                %% behind. Without this, flipping allow_static_credentials off
+                %% and reloading would leave the old row in ETS, and
+                %% get_credentials_cached/0 would keep serving it (a static row
+                %% stores `undefined` expiry, so is_expired/1 never evicts it).
+                _ = ets:delete(?TABLE, credentials),
                 OtherSource
         end,
     case rabbitmq_stream_s3_config:aws_region() of
