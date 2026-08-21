@@ -263,7 +263,21 @@ resolve_credentials_source() ->
                         "them and falling back to container or EC2 instance credentials."
                     ),
                     managed_credentials_source()
-            end
+            end;
+        _ ->
+            %% Exactly one of access_key_id / secret_key is set. This is a
+            %% misconfiguration: static credentials need both. Warn and fall
+            %% back to managed credentials rather than crashing the credential
+            %% gen_server at init with a case_clause (which would restart-loop
+            %% instead of using IMDS or container credentials).
+            ?LOG_WARNING(
+                ?MODULE_STRING
+                ": only one of stream_s3.access_key_id and stream_s3.secret_key "
+                "is set. Static credentials require both; ignoring the partial "
+                "configuration and falling back to container or EC2 instance "
+                "credentials."
+            ),
+            managed_credentials_source()
     end.
 
 managed_credentials_source() ->
@@ -2337,7 +2351,33 @@ static_credentials_opt_in_test() ->
     after
         application:unset_env(rabbitmq_stream_s3, aws_access_key),
         application:unset_env(rabbitmq_stream_s3, aws_secret_key),
-        application:unset_env(rabbitmq_stream_s3, allow_static_credentials)
+        application:unset_env(rabbitmq_stream_s3, allow_static_credentials),
+        case ContainerUri of
+            false -> ok;
+            _ -> os:putenv("AWS_CONTAINER_CREDENTIALS_FULL_URI", ContainerUri)
+        end
+    end.
+
+partial_static_credentials_test() ->
+    %% Only one of access_key_id / secret_key set is a misconfiguration. It must
+    %% fall back to managed credentials, not crash resolve_credentials_source/0
+    %% with a case_clause (which would restart-loop the credential gen_server).
+    ContainerUri = os:getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI"),
+    os:unsetenv("AWS_CONTAINER_CREDENTIALS_FULL_URI"),
+    try
+        ok = application:set_env(rabbitmq_stream_s3, aws_access_key, <<"AKIAIOSFODNN7EXAMPLE">>),
+        application:unset_env(rabbitmq_stream_s3, aws_secret_key),
+        ?assertEqual(imds, resolve_credentials_source()),
+        application:unset_env(rabbitmq_stream_s3, aws_access_key),
+        ok = application:set_env(rabbitmq_stream_s3, aws_secret_key, <<"wJalrXUtnFEMI">>),
+        ?assertEqual(imds, resolve_credentials_source())
+    after
+        application:unset_env(rabbitmq_stream_s3, aws_access_key),
+        application:unset_env(rabbitmq_stream_s3, aws_secret_key),
+        case ContainerUri of
+            false -> ok;
+            _ -> os:putenv("AWS_CONTAINER_CREDENTIALS_FULL_URI", ContainerUri)
+        end
     end.
 
 expected_bucket_owner_test() ->
