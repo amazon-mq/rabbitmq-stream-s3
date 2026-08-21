@@ -140,6 +140,24 @@ set_account_id() ->
     end.
 
 end_per_group(_Group, Config) ->
+    %% Unset every app-env key init_per_group may have set. Left in place, these
+    %% leak into other suites sharing the CT node's VM: a later suite that
+    %% configures static credentials expecting them to be ignored, or that
+    %% expects no expected-bucket-owner header, would see this suite's state and
+    %% pass or fail for the wrong reason.
+    lists:foreach(
+        fun(Key) -> application:unset_env(rabbitmq_stream_s3, Key) end,
+        [
+            bucket,
+            account_id,
+            aws_access_key,
+            aws_secret_key,
+            allow_static_credentials,
+            aws_security_token,
+            aws_region,
+            rabbitmq_stream_s3_api
+        ]
+    ),
     Config.
 
 init_per_testcase(_Testcase, Config) ->
