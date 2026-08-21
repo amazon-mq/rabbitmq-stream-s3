@@ -76,6 +76,22 @@ fun(Conf) ->
     end
 end}.
 
+%% account_id - the AWS account ID that owns the data bucket. Optional. When
+%% set, every S3 request carries x-amz-expected-bucket-owner so that S3 rejects
+%% the request if the bucket is owned by a different account.
+
+{mapping, "stream_s3.account_id", "rabbitmq_stream_s3.account_id", [
+    {datatype, binary}
+]}.
+
+{translation, "rabbitmq_stream_s3.account_id",
+fun(Conf) ->
+    case cuttlefish:conf_get("stream_s3.account_id", Conf, undefined) of
+        undefined -> cuttlefish:unset();
+        Value     -> Value
+    end
+end}.
+
 
 %% S3 tiered storage for Osiris.
 

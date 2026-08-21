@@ -75,6 +75,18 @@ A minimal illustrative policy (real deployments typically add KMS, transport, an
 }
 ```
 
+### Bucket ownership
+
+Optional. When an account ID is configured, every S3 request carries an `x-amz-expected-bucket-owner` header and S3 rejects the request with `403` unless the bucket is owned by that account. This prevents a request from silently reaching a bucket owned by someone else, for example when a bucket name is mistyped or a bucket name released by its owner is claimed by another account.
+
+```ini
+# AWS account ID that owns the data bucket.
+# Type: binary. Default: not set (the header is not sent).
+stream_s3.account_id = 123456789012
+```
+
+The value is not validated at startup: a wrong account ID makes every S3 request fail with `403`, which looks exactly like a credentials or bucket problem (see [troubleshooting.md](./troubleshooting.md#nothing-is-tiered-to-the-remote-tier)). Leave the setting out entirely rather than guessing at the value.
+
 ### Continuous Membership Reconciliation (CMR)
 
 Mirrors [Quorum Queue CMR](https://www.rabbitmq.com/docs/quorum-queues#member-reconciliation) for streams.

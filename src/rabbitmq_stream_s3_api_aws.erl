@@ -1657,7 +1657,18 @@ sign_headers(
             _ ->
                 DefaultHeaders1#{<<"x-amz-security-token">> => SecurityToken}
         end,
-    Headers1 = maps:merge(DefaultHeaders, Headers0),
+    MergedHeaders = maps:merge(DefaultHeaders, Headers0),
+    %% Assert the expected bucket owner when an account ID is configured. S3
+    %% then rejects the request with 403 if the bucket is owned by another
+    %% account, blocking bucket redirection. Applied after the merge so a
+    %% caller-supplied header cannot override the configured value.
+    Headers1 =
+        case rabbitmq_stream_s3_config:account_id() of
+            undefined ->
+                MergedHeaders;
+            AccountId ->
+                MergedHeaders#{<<"x-amz-expected-bucket-owner">> => AccountId}
+        end,
     URIMap = uri_string:parse(Path),
     CanonicalRequest0 = <<
         %% <HTTPMethod>\n
@@ -2277,6 +2288,38 @@ sign_test() ->
     ),
 
     ok.
+
+expected_bucket_owner_test() ->
+    Sign = fun(Headers) ->
+        sign_headers(
+            {{2013, 5, 24}, {0, 0, 0}},
+            <<"examplebucket.s3.amazonaws.com">>,
+            <<"us-east-1">>,
+            Headers,
+            <<"AKIAIOSFODNN7EXAMPLE">>,
+            <<"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY">>,
+            undefined,
+            <<"GET">>,
+            <<"/test.txt">>,
+            <<>>,
+            #{}
+        )
+    end,
+    %% No account ID configured: the header is not sent at all.
+    ?assertNot(maps:is_key(<<"x-amz-expected-bucket-owner">>, Sign(#{}))),
+    ok = application:set_env(rabbitmq_stream_s3, account_id, <<"123456789012">>),
+    try
+        Signed = Sign(#{<<"x-amz-expected-bucket-owner">> => <<"999999999999">>}),
+        %% The configured value wins over a caller-supplied header...
+        ?assertEqual(<<"123456789012">>, maps:get(<<"x-amz-expected-bucket-owner">>, Signed)),
+        %% ...and is covered by the signature.
+        #{<<"authorization">> := Authorization} = Signed,
+        ?assertNotEqual(
+            nomatch, binary:match(Authorization, <<"x-amz-expected-bucket-owner">>)
+        )
+    after
+        application:unset_env(rabbitmq_stream_s3, account_id)
+    end.
 
 match_async_active_request_test() ->
     Ref = make_ref(),

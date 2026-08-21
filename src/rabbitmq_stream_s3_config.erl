@@ -14,6 +14,7 @@ lives here. Callers use these functions instead of calling
 
 -export([
     api_backend/0,
+    account_id/0,
     aws_access_key/0,
     aws_secret_key/0,
     aws_security_token/0,
@@ -103,6 +104,14 @@ aws_region_endpoints() ->
 bucket() ->
     {ok, Bucket} = application:get_env(?APP, bucket),
     Bucket.
+
+%% The AWS account ID that owns the data bucket. Optional: when set, it is sent
+%% as x-amz-expected-bucket-owner on every S3 request so that S3 rejects the
+%% request if the bucket is owned by another account. The header is omitted when
+%% this returns `undefined`.
+-spec account_id() -> binary() | undefined.
+account_id() ->
+    application:get_env(?APP, account_id, undefined).
 
 -spec api_fs_data_dir() -> file:filename_all() | undefined.
 api_fs_data_dir() ->
@@ -340,6 +349,7 @@ defaults_test_() ->
         ?_assertEqual(undefined, aws_secret_key()),
         ?_assertEqual(undefined, aws_security_token()),
         ?_assertEqual(undefined, aws_region()),
+        ?_assertEqual(undefined, account_id()),
         ?_assertEqual(#{}, aws_region_endpoints()),
         ?_assertEqual(undefined, api_fs_data_dir()),
         ?_assertEqual(0, upload_pool_min_size()),

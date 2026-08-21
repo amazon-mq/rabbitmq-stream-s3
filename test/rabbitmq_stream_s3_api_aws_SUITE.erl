@@ -94,6 +94,7 @@ init_per_group(integration, Config) ->
         ->
             {ok, _} = application:ensure_all_started(gun),
             ok = application:set_env(rabbitmq_stream_s3, bucket, list_to_binary(Bucket0)),
+            ok = set_account_id(),
             ok = application:set_env(
                 rabbitmq_stream_s3, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_aws
             ),
@@ -119,10 +120,22 @@ init_per_group(integration, Config) ->
             ),
             ok = application:set_env(rabbitmq_stream_s3, aws_region, list_to_binary(Region)),
             ok = application:set_env(rabbitmq_stream_s3, bucket, list_to_binary(Bucket1)),
+            ok = set_account_id(),
             ok = application:set_env(
                 rabbitmq_stream_s3, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_aws
             ),
             Config
+    end.
+
+%% The account ID is optional. When AWS_ACCOUNT_ID is set the group also
+%% exercises the x-amz-expected-bucket-owner header; otherwise the header is
+%% omitted, so make sure no value leaked in from another suite.
+set_account_id() ->
+    case os:getenv("AWS_ACCOUNT_ID") of
+        false ->
+            application:unset_env(rabbitmq_stream_s3, account_id);
+        AccountId ->
+            application:set_env(rabbitmq_stream_s3, account_id, list_to_binary(AccountId))
     end.
 
 end_per_group(_Group, Config) ->
