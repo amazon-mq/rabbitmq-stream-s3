@@ -2345,15 +2345,17 @@ sign_test() ->
     ok.
 
 static_credentials_opt_in_test() ->
-    %% Whatever a node with no static credentials configured resolves to. The
-    %% test environment decides between imds and container, and the point of
-    %% the assertions below is that ignored static credentials land here.
-    Managed = resolve_credentials_source(),
+    %% Pin the managed source to a fixed value rather than sampling the ambient
+    %% environment: with the container-credentials URI unset,
+    %% managed_credentials_source/0 resolves to imds. The assertions then check
+    %% against a known expected source, not "whatever this host produces".
+    ContainerUri = os:getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI"),
+    os:unsetenv("AWS_CONTAINER_CREDENTIALS_FULL_URI"),
     ok = application:set_env(rabbitmq_stream_s3, aws_access_key, <<"AKIAIOSFODNN7EXAMPLE">>),
     ok = application:set_env(rabbitmq_stream_s3, aws_secret_key, <<"wJalrXUtnFEMI">>),
     try
-        %% Configured but not opted in: ignored.
-        ?assertEqual(Managed, resolve_credentials_source()),
+        %% Configured but not opted in: ignored, so it falls back to imds.
+        ?assertEqual(imds, resolve_credentials_source()),
         ok = application:set_env(rabbitmq_stream_s3, allow_static_credentials, true),
         ?assertEqual(
             {static, <<"AKIAIOSFODNN7EXAMPLE">>, <<"wJalrXUtnFEMI">>},
