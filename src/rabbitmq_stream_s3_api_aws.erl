@@ -1712,6 +1712,11 @@ sign_headers(
     %% then rejects the request with 403 if the bucket is owned by another
     %% account, blocking bucket redirection. Applied after the merge so a
     %% caller-supplied header cannot override the configured value.
+    %%
+    %% account_id() reads application env on every request, but that is cheap
+    %% on this hot path: application:get_env/2,3 is a single ets:lookup_element
+    %% on the application controller's protected ac_tab (read_concurrency), not
+    %% a gen_server call. No need to cache it in state like the region.
     Headers1 =
         case rabbitmq_stream_s3_config:account_id() of
             undefined ->
