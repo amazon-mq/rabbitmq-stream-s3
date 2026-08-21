@@ -217,16 +217,9 @@ format_status(#{state := #state{source = Source, refresh_timer = TRef}} = Status
 %% -------------------------------------------------------------------------
 
 do_reload_config(State0) ->
-    AccessKey0 = rabbitmq_stream_s3_config:aws_access_key(),
-    SecretKey0 = rabbitmq_stream_s3_config:aws_secret_key(),
     Source =
-        case {AccessKey0, SecretKey0} of
-            {undefined, undefined} ->
-                case os:getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI") of
-                    false -> imds;
-                    URI -> {container, URI}
-                end;
-            {AccessKey, SecretKey} when is_binary(AccessKey) andalso is_binary(SecretKey) ->
+        case resolve_credentials_source() of
+            {static, AccessKey, SecretKey} ->
                 _ = ets:insert(?TABLE, {
                     credentials,
                     AccessKey,
@@ -234,13 +227,70 @@ do_reload_config(State0) ->
                     rabbitmq_stream_s3_config:aws_security_token(),
                     undefined
                 }),
-                static
+                static;
+            OtherSource ->
+                %% Evict any static credentials row a previous config left
+                %% behind. Without this, flipping allow_static_credentials off
+                %% and reloading would leave the old row in ETS, and
+                %% get_credentials_cached/0 would keep serving it (a static row
+                %% stores `undefined` expiry, so is_expired/1 never evicts it).
+                _ = ets:delete(?TABLE, credentials),
+                OtherSource
         end,
     case rabbitmq_stream_s3_config:aws_region() of
         undefined -> ok;
         Region -> persistent_term:put(?REGION_KEY, Region)
     end,
     State0#state{source = Source}.
+
+resolve_credentials_source() ->
+    AccessKey0 = rabbitmq_stream_s3_config:aws_access_key(),
+    SecretKey0 = rabbitmq_stream_s3_config:aws_secret_key(),
+    case {AccessKey0, SecretKey0} of
+        {undefined, undefined} ->
+            managed_credentials_source();
+        {AccessKey, SecretKey} when is_binary(AccessKey) andalso is_binary(SecretKey) ->
+            case rabbitmq_stream_s3_config:allow_static_credentials() of
+                true ->
+                    ?LOG_WARNING(
+                        ?MODULE_STRING
+                        ": using static AWS credentials from "
+                        "stream_s3.access_key_id and stream_s3.secret_key. These are "
+                        "long-lived, stored in plaintext on disk, and are not rotated. "
+                        "Prefer an EC2 instance IAM role or container credentials in "
+                        "production."
+                    ),
+                    {static, AccessKey, SecretKey};
+                false ->
+                    ?LOG_WARNING(
+                        ?MODULE_STRING
+                        ": static AWS credentials are configured but "
+                        "stream_s3.allow_static_credentials is not set to true. Ignoring "
+                        "them and falling back to container or EC2 instance credentials."
+                    ),
+                    managed_credentials_source()
+            end;
+        _ ->
+            %% Exactly one of access_key_id / secret_key is set. This is a
+            %% misconfiguration: static credentials need both. Warn and fall
+            %% back to managed credentials rather than crashing the credential
+            %% gen_server at init with a case_clause (which would restart-loop
+            %% instead of using IMDS or container credentials).
+            ?LOG_WARNING(
+                ?MODULE_STRING
+                ": only one of stream_s3.access_key_id and stream_s3.secret_key "
+                "is set. Static credentials require both; ignoring the partial "
+                "configuration and falling back to container or EC2 instance "
+                "credentials."
+            ),
+            managed_credentials_source()
+    end.
+
+managed_credentials_source() ->
+    case os:getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI") of
+        false -> imds;
+        URI -> {container, URI}
+    end.
 
 do_refresh_credentials(#state{source = static} = State) ->
     {{error, no_credentials}, State};
@@ -1657,7 +1707,23 @@ sign_headers(
             _ ->
                 DefaultHeaders1#{<<"x-amz-security-token">> => SecurityToken}
         end,
-    Headers1 = maps:merge(DefaultHeaders, Headers0),
+    MergedHeaders = maps:merge(DefaultHeaders, Headers0),
+    %% Assert the expected bucket owner when an account ID is configured. S3
+    %% then rejects the request with 403 if the bucket is owned by another
+    %% account, blocking bucket redirection. Applied after the merge so a
+    %% caller-supplied header cannot override the configured value.
+    %%
+    %% account_id() reads application env on every request, but that is cheap
+    %% on this hot path: application:get_env/2,3 is a single ets:lookup_element
+    %% on the application controller's protected ac_tab (read_concurrency), not
+    %% a gen_server call. No need to cache it in state like the region.
+    Headers1 =
+        case rabbitmq_stream_s3_config:account_id() of
+            undefined ->
+                MergedHeaders;
+            AccountId ->
+                MergedHeaders#{<<"x-amz-expected-bucket-owner">> => AccountId}
+        end,
     URIMap = uri_string:parse(Path),
     CanonicalRequest0 = <<
         %% <HTTPMethod>\n
@@ -2277,6 +2343,87 @@ sign_test() ->
     ),
 
     ok.
+
+static_credentials_opt_in_test() ->
+    %% Pin the managed source to a fixed value rather than sampling the ambient
+    %% environment: with the container-credentials URI unset,
+    %% managed_credentials_source/0 resolves to imds. The assertions then check
+    %% against a known expected source, not "whatever this host produces".
+    ContainerUri = os:getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI"),
+    os:unsetenv("AWS_CONTAINER_CREDENTIALS_FULL_URI"),
+    ok = application:set_env(rabbitmq_stream_s3, aws_access_key, <<"AKIAIOSFODNN7EXAMPLE">>),
+    ok = application:set_env(rabbitmq_stream_s3, aws_secret_key, <<"wJalrXUtnFEMI">>),
+    try
+        %% Configured but not opted in: ignored, so it falls back to imds.
+        ?assertEqual(imds, resolve_credentials_source()),
+        ok = application:set_env(rabbitmq_stream_s3, allow_static_credentials, true),
+        ?assertEqual(
+            {static, <<"AKIAIOSFODNN7EXAMPLE">>, <<"wJalrXUtnFEMI">>},
+            resolve_credentials_source()
+        )
+    after
+        application:unset_env(rabbitmq_stream_s3, aws_access_key),
+        application:unset_env(rabbitmq_stream_s3, aws_secret_key),
+        application:unset_env(rabbitmq_stream_s3, allow_static_credentials),
+        case ContainerUri of
+            false -> ok;
+            _ -> os:putenv("AWS_CONTAINER_CREDENTIALS_FULL_URI", ContainerUri)
+        end
+    end.
+
+partial_static_credentials_test() ->
+    %% Only one of access_key_id / secret_key set is a misconfiguration. It must
+    %% fall back to managed credentials, not crash resolve_credentials_source/0
+    %% with a case_clause (which would restart-loop the credential gen_server).
+    ContainerUri = os:getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI"),
+    os:unsetenv("AWS_CONTAINER_CREDENTIALS_FULL_URI"),
+    try
+        ok = application:set_env(rabbitmq_stream_s3, aws_access_key, <<"AKIAIOSFODNN7EXAMPLE">>),
+        application:unset_env(rabbitmq_stream_s3, aws_secret_key),
+        ?assertEqual(imds, resolve_credentials_source()),
+        application:unset_env(rabbitmq_stream_s3, aws_access_key),
+        ok = application:set_env(rabbitmq_stream_s3, aws_secret_key, <<"wJalrXUtnFEMI">>),
+        ?assertEqual(imds, resolve_credentials_source())
+    after
+        application:unset_env(rabbitmq_stream_s3, aws_access_key),
+        application:unset_env(rabbitmq_stream_s3, aws_secret_key),
+        case ContainerUri of
+            false -> ok;
+            _ -> os:putenv("AWS_CONTAINER_CREDENTIALS_FULL_URI", ContainerUri)
+        end
+    end.
+
+expected_bucket_owner_test() ->
+    Sign = fun(Headers) ->
+        sign_headers(
+            {{2013, 5, 24}, {0, 0, 0}},
+            <<"examplebucket.s3.amazonaws.com">>,
+            <<"us-east-1">>,
+            Headers,
+            <<"AKIAIOSFODNN7EXAMPLE">>,
+            <<"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY">>,
+            undefined,
+            <<"GET">>,
+            <<"/test.txt">>,
+            <<>>,
+            #{}
+        )
+    end,
+    %% No account ID configured: the header is not sent at all.
+    ?assertNot(maps:is_key(<<"x-amz-expected-bucket-owner">>, Sign(#{}))),
+    ok = application:set_env(rabbitmq_stream_s3, account_id, <<"123456789012">>),
+    try
+        Signed = Sign(#{<<"x-amz-expected-bucket-owner">> => <<"999999999999">>}),
+        %% The configured value wins over a caller-supplied header...
+        ?assertEqual(<<"123456789012">>, maps:get(<<"x-amz-expected-bucket-owner">>, Signed)),
+        %% ...and is covered by the signature.
+        #{<<"authorization">> := Authorization} = Signed,
+        ?assertNotEqual(
+            nomatch, binary:match(Authorization, <<"x-amz-expected-bucket-owner">>)
+        )
+    after
+        application:unset_env(rabbitmq_stream_s3, account_id)
+    end.
 
 match_async_active_request_test() ->
     Ref = make_ref(),

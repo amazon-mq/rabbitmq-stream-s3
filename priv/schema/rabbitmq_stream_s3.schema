@@ -36,7 +36,8 @@ fun(Conf) ->
     end
 end}.
 
-%% access_key_id
+%% access_key_id - static AWS access key ID. Ignored unless
+%% stream_s3.allow_static_credentials is set to true.
 
 {mapping, "stream_s3.access_key_id", "rabbitmq_stream_s3.aws_access_key", [
     {datatype, binary}
@@ -50,7 +51,8 @@ fun(Conf) ->
     end
 end}.
 
-%% secret_key
+%% secret_key - static AWS secret access key. Ignored unless
+%% stream_s3.allow_static_credentials is set to true.
 
 {mapping, "stream_s3.secret_key", "rabbitmq_stream_s3.aws_secret_key", [
     {datatype, binary}
@@ -64,6 +66,15 @@ fun(Conf) ->
     end
 end}.
 
+%% allow_static_credentials - whether the static credentials above are honoured.
+%% Off by default: they are long-lived, stored in plaintext on disk, and never
+%% rotated. When this is not true, configured static credentials are ignored and
+%% the plugin falls back to container or EC2 instance credentials.
+
+{mapping, "stream_s3.allow_static_credentials", "rabbitmq_stream_s3.allow_static_credentials", [
+    {datatype, {enum, [true, false]}}
+]}.
+
 {mapping, "stream_s3.bucket", "rabbitmq_stream_s3.bucket", [
     {datatype, binary}
 ]}.
@@ -71,6 +82,22 @@ end}.
 {translation, "rabbitmq_stream_s3.bucket",
 fun(Conf) ->
     case cuttlefish:conf_get("stream_s3.bucket", Conf, undefined) of
+        undefined -> cuttlefish:unset();
+        Value     -> Value
+    end
+end}.
+
+%% account_id - the AWS account ID that owns the data bucket. Optional. When
+%% set, every S3 request carries x-amz-expected-bucket-owner so that S3 rejects
+%% the request if the bucket is owned by a different account.
+
+{mapping, "stream_s3.account_id", "rabbitmq_stream_s3.account_id", [
+    {datatype, binary}
+]}.
+
+{translation, "rabbitmq_stream_s3.account_id",
+fun(Conf) ->
+    case cuttlefish:conf_get("stream_s3.account_id", Conf, undefined) of
         undefined -> cuttlefish:unset();
         Value     -> Value
     end

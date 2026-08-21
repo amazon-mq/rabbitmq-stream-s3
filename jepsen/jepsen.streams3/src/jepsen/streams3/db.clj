@@ -14,7 +14,8 @@
     * the node trusts the test CA (resources/ca.crt -> system store),
     * region_endpoints.<region> resolves <bucket>.<endpoint> to Toxiproxy,
       which L4-passes through to MinIO:443,
-    * static access_key_id/secret_key are configured so the IMDS/container
+    * static access_key_id/secret_key are configured, with the
+      allow_static_credentials opt-in they require, so the IMDS/container
       credential paths are never used."
   (:require [clojure.tools.logging :refer [info]]
             [clojure.string :as str]
@@ -82,6 +83,7 @@
      ;; --- S3 tier: point the AWS backend at MinIO via Toxiproxy ---
      (str "stream_s3.region = " s3-region)
      (str "stream_s3.region_endpoints." s3-region " = " s3-region-tld)
+     "stream_s3.allow_static_credentials = true"
      (str "stream_s3.access_key_id = " s3-access-key)
      (str "stream_s3.secret_key = " s3-secret-key)
      (str "stream_s3.bucket = " s3-bucket)

@@ -14,9 +14,11 @@ lives here. Callers use these functions instead of calling
 
 -export([
     api_backend/0,
+    account_id/0,
     aws_access_key/0,
     aws_secret_key/0,
     aws_security_token/0,
+    allow_static_credentials/0,
     aws_region/0,
     aws_region_endpoints/0,
     bucket/0,
@@ -86,6 +88,14 @@ aws_secret_key() ->
 aws_security_token() ->
     application:get_env(?APP, aws_security_token, undefined).
 
+%% Whether static credentials from rabbitmq.conf are honored. Off by default:
+%% they are long-lived, stored in plaintext on disk, and never rotated. When
+%% this is false, configured static credentials are ignored and the plugin
+%% falls back to container or EC2 instance credentials.
+-spec allow_static_credentials() -> boolean().
+allow_static_credentials() ->
+    application:get_env(?APP, allow_static_credentials, false).
+
 -spec aws_region() -> binary() | undefined.
 aws_region() ->
     case application:get_env(?APP, aws_region) of
@@ -103,6 +113,14 @@ aws_region_endpoints() ->
 bucket() ->
     {ok, Bucket} = application:get_env(?APP, bucket),
     Bucket.
+
+%% The AWS account ID that owns the data bucket. Optional: when set, it is sent
+%% as x-amz-expected-bucket-owner on every S3 request so that S3 rejects the
+%% request if the bucket is owned by another account. The header is omitted when
+%% this returns `undefined`.
+-spec account_id() -> binary() | undefined.
+account_id() ->
+    application:get_env(?APP, account_id, undefined).
 
 -spec api_fs_data_dir() -> file:filename_all() | undefined.
 api_fs_data_dir() ->
@@ -339,7 +357,9 @@ defaults_test_() ->
         ?_assertEqual(undefined, aws_access_key()),
         ?_assertEqual(undefined, aws_secret_key()),
         ?_assertEqual(undefined, aws_security_token()),
+        ?_assertEqual(false, allow_static_credentials()),
         ?_assertEqual(undefined, aws_region()),
+        ?_assertEqual(undefined, account_id()),
         ?_assertEqual(#{}, aws_region_endpoints()),
         ?_assertEqual(undefined, api_fs_data_dir()),
         ?_assertEqual(0, upload_pool_min_size()),
