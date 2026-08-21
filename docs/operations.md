@@ -32,12 +32,16 @@ The default is `amazonaws.com`, and the China, US intelligence community, and Eu
 
 The plugin resolves AWS credentials in this order:
 
-1. Static credentials from `rabbitmq.conf` (`stream_s3.access_key_id` and `stream_s3.secret_key`).
+1. Static credentials from `rabbitmq.conf` (`stream_s3.access_key_id` and `stream_s3.secret_key`), and only when `stream_s3.allow_static_credentials = true`. Off by default.
 2. Container credentials endpoint (when `AWS_CONTAINER_CREDENTIALS_FULL_URI` is set).
 3. EC2 instance metadata service (IMDSv2).
 
+Static credentials are long-lived, stored in plaintext on disk, and never rotated, so they are intended for development and testing only. Production deployments should use an EC2 instance IAM role or container credentials. When `stream_s3.allow_static_credentials` is not `true`, configured static keys are ignored, a warning is logged, and the plugin falls back to container or instance credentials.
+
 ```ini
 # Not recommended for production. Prefer IAM roles.
+# The keys below are ignored unless this is set to true.
+stream_s3.allow_static_credentials = true
 stream_s3.access_key_id = AKIAIOSFODNN7EXAMPLE
 stream_s3.secret_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 ```

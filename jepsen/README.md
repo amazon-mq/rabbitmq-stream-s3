@@ -24,7 +24,7 @@ control ──ssh──► n1..n5 (RabbitMQ + rabbitmq_stream_s3, Erlang 27)
                               └─ minio:443  (virtual-host routing, our CA)
 ```
 
-The AWS backend is hardwired to TLS/443 with `verify_peer` and virtual-hosted addressing (`<bucket>.<endpoint>`). MinIO therefore serves HTTPS with a cert our nodes trust, and the S3 vhost DNS names alias to Toxiproxy so S3 faults are injectable. Static credentials in `rabbitmq.conf` keep the IMDS/container credential paths out of the picture.
+The AWS backend is hardwired to TLS/443 with `verify_peer` and virtual-hosted addressing (`<bucket>.<endpoint>`). MinIO therefore serves HTTPS with a cert our nodes trust, and the S3 vhost DNS names alias to Toxiproxy so S3 faults are injectable. Static credentials in `rabbitmq.conf`, enabled with `stream_s3.allow_static_credentials = true`, keep the IMDS/container credential paths out of the picture.
 
 ## Running
 

@@ -113,6 +113,7 @@ init_per_group(integration, Config) ->
             {ok, _} = application:ensure_all_started(gun),
             ok = application:set_env(rabbitmq_stream_s3, aws_access_key, list_to_binary(AccessKey)),
             ok = application:set_env(rabbitmq_stream_s3, aws_secret_key, list_to_binary(SecretKey)),
+            ok = application:set_env(rabbitmq_stream_s3, allow_static_credentials, true),
             ok = application:set_env(
                 rabbitmq_stream_s3,
                 aws_security_token,
