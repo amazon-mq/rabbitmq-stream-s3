@@ -249,7 +249,15 @@ reconcile_child({_Id, Pid, worker, [osiris_replica]}) when is_pid(Pid) ->
         StreamId = stream_id_of(Pid),
         case rabbitmq_stream_s3_manifest_replica:is_context_registered(StreamId) of
             true ->
-                ok;
+                %% Context is registered, but the row may still be wedged in
+                %% pending with no applied sync (rabbitmq_stream_s3#362): a
+                %% member-restart burst can leave the final re-registration
+                %% unable to request a sync, and once publishing stops no edits
+                %% arrive to gap-detect and re-request one. Re-request a sync
+                %% from the writer when the row is unresolved. The writer's
+                %% register_acceptor handler re-syncs idempotently, so this is a
+                %% no-op once the row resolves.
+                maybe_resync_pending_replica(Pid, StreamId);
             false ->
                 ?LOG_INFO(
                     "Reconciliation: replica ~p for stream ~ts has no manifest "
@@ -262,7 +270,7 @@ reconcile_child({_Id, Pid, worker, [osiris_replica]}) when is_pid(Pid) ->
     catch
         Class:Reason ->
             ?LOG_WARNING(
-                "Reconciliation could not re-register replica ~p: ~ts:~p",
+                "Reconciliation could not reconcile replica ~p: ~ts:~p",
                 [Pid, Class, Reason],
                 #{domain => ?RMQLOG_DOMAIN_STREAM_S3}
             )
@@ -286,6 +294,51 @@ register_replica_context(Pid, StreamId) ->
     rabbitmq_stream_s3_manifest_replica:register_replica_context(
         StreamId, Pid, Dir, Shared, Counter
     ).
+
+%% Re-request a manifest sync for a replica whose context is registered but
+%% whose cache row is still pending with no applied sync (rabbitmq_stream_s3#362).
+%% Sends {register_acceptor, node()} to the writer, whose handler re-syncs the
+%% persisted manifest idempotently. A resolved row reports not-awaiting, so this
+%% is a no-op on the steady-state ticks. The writer node comes from the queue
+%% record, the same source discover-time re-registration uses.
+maybe_resync_pending_replica(Pid, StreamId) ->
+    case rabbitmq_stream_s3_manifest_replica:is_awaiting_sync(StreamId) of
+        false ->
+            ok;
+        true ->
+            #{reference := Reference} = osiris_util:get_reader_context(Pid),
+            case register_with_writer(StreamId, Reference) of
+                {ok, WriterNode} ->
+                    ?LOG_INFO(
+                        "Reconciliation: replica for stream ~ts is registered but "
+                        "still awaiting its first sync; re-requested a sync from "
+                        "writer node ~p",
+                        [StreamId, WriterNode],
+                        #{domain => ?RMQLOG_DOMAIN_STREAM_S3}
+                    );
+                error ->
+                    ok
+            end
+    end.
+
+%% Look up the stream's writer node from the queue record and register this
+%% node as an acceptor with the writer's replica reader for manifest broadcast.
+%% The writer's register_acceptor handler re-syncs the persisted manifest
+%% idempotently. Returns {ok, WriterNode} so callers can log, or error when the
+%% queue record is unavailable (the writer's replica reader isn't up yet; the
+%% cast is skipped and the replica reader will proactively sync us on startup).
+register_with_writer(StreamId, Reference) ->
+    case rabbit_amqqueue:lookup(Reference) of
+        {ok, Q} ->
+            WriterNode = maps:get(leader_node, amqqueue:get_type_state(Q)),
+            gen_server:cast(
+                {via, rabbitmq_stream_s3_registry, {StreamId, WriterNode}},
+                {register_acceptor, node()}
+            ),
+            {ok, WriterNode};
+        _ ->
+            error
+    end.
 
 append_retention(StreamId, Config) ->
     Fun = {'fun', local_retention_fun(StreamId)},
@@ -373,18 +426,9 @@ attach_replica(Pid) ->
         StreamId, Pid, Dir, Shared, Counter
     ),
     %% Register with the writer's replica reader for manifest broadcast.
-    %% If the writer's replica reader isn't up yet, the cast is dropped;
+    %% If the writer's replica reader isn't up yet, the cast is skipped;
     %% the replica reader will proactively sync us on its startup.
-    case rabbit_amqqueue:lookup(Reference) of
-        {ok, Q} ->
-            WriterNode = maps:get(leader_node, amqqueue:get_type_state(Q)),
-            gen_server:cast(
-                {via, rabbitmq_stream_s3_registry, {StreamId, WriterNode}},
-                {register_acceptor, node()}
-            );
-        _ ->
-            ok
-    end,
+    _ = register_with_writer(StreamId, Reference),
     %% Inject the local-tier retention fun into the running replica while
     %% preserving its configured policy, via the same current-spec transform
     %% as attach_writer/1.
