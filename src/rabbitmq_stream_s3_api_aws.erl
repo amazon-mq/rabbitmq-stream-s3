@@ -1930,6 +1930,11 @@ sse_headers(Key) ->
 %% rather than failing the upload: the context is auditing metadata, not an
 %% input to correctness. Configured pairs are applied last, so an operator who
 %% sets "stream_id" explicitly gets the value they asked for.
+%%
+%% Rebuilt on every PUT rather than memoised per stream. The result depends only
+%% on the stream ID and the configured pairs, so it could be cached, but a PUT
+%% moves a whole fragment or manifest object and the encode is a few hundred
+%% bytes next to that, so the per-upload cost is not worth a cache to remove.
 -spec encryption_context(key()) -> binary().
 encryption_context(Key) ->
     StreamId =
@@ -1939,6 +1944,15 @@ encryption_context(Key) ->
         end,
     Configured = rabbitmq_stream_s3_config:kms_encryption_context(),
     Context = maps:merge(#{<<"stream_id">> => StreamId}, Configured),
+    %% `rabbit_json:encode/1` raises on a binary that is not valid UTF-8, but
+    %% the stream ID cannot be one: it is the osiris stream name, which
+    %% `rabbit_stream_queue:stream_name/1` produces through
+    %% `osiris_util:to_base64uri/1`, so it holds only `[A-Za-z0-9_-]`. The
+    %% AMQP queue name it derives from is not required to be valid UTF-8
+    %% (`rabbit_channel:check_name/2` does not enforce it), but that encoding
+    %% neutralises it before it reaches here. The configured values are
+    %% rejected at config time if empty and are otherwise operator-supplied
+    %% UTF-8.
     base64:encode(iolist_to_binary(rabbit_json:encode(Context))).
 
 %% Computes the aws-chunked framing overhead for a single chunk of DataSize bytes.

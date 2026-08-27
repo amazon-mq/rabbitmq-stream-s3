@@ -234,7 +234,7 @@ stream_s3.kms_key_id = arn:aws:kms:us-east-1:123456789012:key/example-key-id
 
 #### Encryption context
 
-When a KMS key is configured, every upload carries an [encryption context](https://docs.aws.amazon.com/kms/latest/developerguide/concepts.html#encrypt_context). KMS records it in its CloudTrail entry for the operation, so the audit trail says which stream the data belongs to. The plugin always includes the stream ID under the `stream_id` key, and S3 appends its own `aws:s3:arn` pair on top. Any number of additional pairs can be configured:
+When a KMS key is configured, every upload carries an [encryption context](https://docs.aws.amazon.com/kms/latest/developerguide/concepts.html#encrypt_context). KMS records it in its CloudTrail entry for the operation, so the audit trail says which stream the data belongs to. The plugin always includes the stream ID under the `stream_id` key, and S3 appends its own `aws:s3:arn` pair on top of any context supplied on the request (see [Encryption context](https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingKMSEncryption.html#encryption-context): "Amazon S3 appends the default encryption context of `aws:s3:arn` to the one that you provide"). Any number of additional pairs can be configured:
 
 ```ini
 # Pairs to add to the SSE-KMS encryption context of every uploaded object.
