@@ -626,17 +626,15 @@ classify_group(StreamId, Key, _Info) ->
     | {group, stream_id(), osiris:offset()}
     | {manifest, stream_id(), osiris:epoch()}
     | unknown.
-parse_key(<<"rabbitmq/stream/", Rest/binary>>) ->
-    case binary:split(Rest, <<"/">>) of
-        [StreamId, <<"data/", Filename/binary>>] ->
+parse_key(Key) ->
+    case rabbitmq_stream_s3:split_key(Key) of
+        {StreamId, <<"data/", Filename/binary>>} ->
             parse_data_filename(StreamId, Filename);
-        [StreamId, <<"metadata/", Filename/binary>>] ->
+        {StreamId, <<"metadata/", Filename/binary>>} ->
             parse_metadata_filename(StreamId, Filename);
         _ ->
             unknown
-    end;
-parse_key(_) ->
-    unknown.
+    end.
 
 parse_data_filename(StreamId, Filename) ->
     %% <offset>.<uid>.fragment
