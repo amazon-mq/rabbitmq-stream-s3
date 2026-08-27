@@ -82,6 +82,7 @@ efficiently using the `rabbitmq_stream_s3_array` module.
     fragment_key/2,
     fragment_key/3,
     stream_prefix/1,
+    key_stream_id/1,
     index_file_offset/1,
     fragment_key_offset/1,
     segment_file_offset/1
@@ -205,6 +206,22 @@ delimiter, a LIST on this prefix could match a sibling stream's objects.
 stream_prefix(StreamId) when is_binary(StreamId) ->
     <<"rabbitmq/stream/", StreamId/binary, "/">>.
 
+-doc """
+Extracts the stream ID from any of this plugin's object keys.
+
+Returns `undefined` for a key which does not follow the layout built by
+`stream_prefix/1`, for example an object in the bucket which was not written
+by this plugin.
+""".
+-spec key_stream_id(key()) -> stream_id() | undefined.
+key_stream_id(<<"rabbitmq/stream/", Rest/binary>>) ->
+    case binary:split(Rest, <<"/">>) of
+        [StreamId, _] when StreamId =/= <<>> -> StreamId;
+        _ -> undefined
+    end;
+key_stream_id(_Key) ->
+    undefined.
+
 -doc "Extracts the first offset from a segment filename".
 -spec segment_file_offset(file:filename_all()) -> osiris:offset().
 segment_file_offset(Filename) ->
@@ -245,6 +262,18 @@ fragment_key_offset_test() ->
     StreamId = <<"__my-stream">>,
     ?assertEqual(0, fragment_key_offset(fragment_key(StreamId, 0, 16#deadbeef))),
     ?assertEqual(1234, fragment_key_offset(fragment_key(StreamId, 1234, 16#deadbeef))),
+    ok.
+
+key_stream_id_test() ->
+    StreamId = <<"__my-stream">>,
+    ?assertEqual(StreamId, key_stream_id(fragment_key(StreamId, 100, 16#deadbeef))),
+    ?assertEqual(
+        StreamId, key_stream_id(manifest_key(StreamId, #manifest_ref{epoch = 1, uid = 2}))
+    ),
+    %% Keys which this plugin never writes.
+    ?assertEqual(undefined, key_stream_id(<<"some/other/key">>)),
+    ?assertEqual(undefined, key_stream_id(<<"rabbitmq/stream/">>)),
+    ?assertEqual(undefined, key_stream_id(<<"rabbitmq/stream//data/x">>)),
     ok.
 
 ensure_stream_id_binary_passthrough_test() ->

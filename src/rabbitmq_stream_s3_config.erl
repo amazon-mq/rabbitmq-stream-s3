@@ -59,7 +59,8 @@ lives here. Callers use these functions instead of calling
     max_transfer_bytes_per_sec/0,
     max_transfer_burst_bytes/0,
     verify_crc_on_read/0,
-    kms_key_id/0
+    kms_key_id/0,
+    kms_encryption_context/0
 ]).
 
 -define(APP, rabbitmq_stream_s3).
@@ -348,6 +349,12 @@ verify_crc_on_read() ->
 kms_key_id() ->
     application:get_env(?APP, kms_key_id, undefined).
 
+%% Pairs to add to the SSE-KMS encryption context of every uploaded object.
+%% Only used when a KMS key is configured.
+-spec kms_encryption_context() -> #{binary() => binary()}.
+kms_encryption_context() ->
+    application:get_env(?APP, kms_encryption_context, #{}).
+
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
@@ -396,7 +403,8 @@ defaults_test_() ->
         ?_assertEqual(60_000, retention_task_timeout()),
         ?_assertEqual(5000, tick_timeout_milliseconds()),
         ?_assertEqual(false, verify_crc_on_read()),
-        ?_assertEqual(undefined, kms_key_id())
+        ?_assertEqual(undefined, kms_key_id()),
+        ?_assertEqual(#{}, kms_encryption_context())
     ].
 
 configured_test_() ->

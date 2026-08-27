@@ -294,3 +294,30 @@ fun(Conf) ->
         Value     -> Value
     end
 end}.
+
+%% Additional pairs to include in the SSE-KMS encryption context of every
+%% uploaded object, for example:
+%%
+%%     stream_s3.kms_encryption_context.cluster = eu-prod-1
+%%
+%% The stream ID is always part of the context under the "stream_id" key. A
+%% pair configured under that name replaces it.
+{mapping, "stream_s3.kms_encryption_context.$name", "rabbitmq_stream_s3.kms_encryption_context", [
+    {datatype, binary}
+]}.
+
+{translation, "rabbitmq_stream_s3.kms_encryption_context",
+fun(Conf) ->
+    case cuttlefish_variable:filter_by_prefix("stream_s3.kms_encryption_context", Conf) of
+        [] ->
+            cuttlefish:unset();
+        Settings ->
+            lists:foldl(
+              fun ({["stream_s3", "kms_encryption_context", Name], Value}, Acc) ->
+                      Acc#{list_to_binary(Name) => Value};
+                  (Other, _Acc) ->
+                      cuttlefish:invalid(
+                        lists:flatten(io_lib:format("~p is invalid", [Other])))
+              end, #{}, Settings)
+    end
+end}.
