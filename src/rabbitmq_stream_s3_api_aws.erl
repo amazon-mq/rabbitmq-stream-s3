@@ -402,7 +402,7 @@ get_range_async(Key, Range, Opts) when is_binary(Key) andalso is_map(Opts) ->
 -doc "Uploads the given `Data` as an object at key `Key`".
 -spec put(key(), iodata(), request_opts()) -> ok | {error, any()}.
 put(Key, Data, Opts) when is_binary(Key) andalso is_map(Opts) ->
-    Headers0 = sse_headers(),
+    Headers0 = sse_headers(Key),
     Headers =
         case Opts of
             #{crc32 := Checksum} ->
@@ -425,7 +425,7 @@ stream_put(Key, ContentLength, Opts0) when is_binary(Key) andalso is_map(Opts0) 
     Method = <<"PUT">>,
     Path = key_to_path(Key),
     EncodedLength = aws_chunked_encoded_length(ContentLength),
-    Headers0 = (sse_headers())#{
+    Headers0 = (sse_headers(Key))#{
         <<"content-length">> => integer_to_binary(EncodedLength),
         <<"content-encoding">> => <<"aws-chunked">>,
         <<"x-amz-decoded-content-length">> => integer_to_binary(ContentLength),
@@ -1902,18 +1902,58 @@ key_to_path(Key) ->
 
 %% Server-side encryption headers for PUT requests. Always requests SSE-S3
 %% (AES256) to satisfy bucket policies that deny uploads without an explicit
-%% encryption header. When a KMS key is configured, uses SSE-KMS instead.
--spec sse_headers() -> req_headers().
-sse_headers() ->
+%% encryption header. When a KMS key is configured, uses SSE-KMS instead and
+%% attaches an encryption context.
+-spec sse_headers(key()) -> req_headers().
+sse_headers(Key) ->
     case rabbitmq_stream_s3_config:kms_key_id() of
         undefined ->
             #{<<"x-amz-server-side-encryption">> => <<"AES256">>};
         KeyId ->
             #{
                 <<"x-amz-server-side-encryption">> => <<"aws:kms">>,
-                <<"x-amz-server-side-encryption-aws-kms-key-id">> => KeyId
+                <<"x-amz-server-side-encryption-aws-kms-key-id">> => KeyId,
+                <<"x-amz-server-side-encryption-context">> => encryption_context(Key)
             }
     end.
+
+%% The SSE-KMS encryption context: the stream the object belongs to plus any
+%% pairs the operator configured. KMS records the context in its CloudTrail
+%% entry for every operation on the object, so the audit trail identifies the
+%% stream without having to parse object keys.
+%%
+%% S3 requires the header value to be base64-encoded JSON. It stores the
+%% context and re-supplies it to KMS on read, so the read path needs no
+%% matching change.
+%%
+%% A key which does not belong to a stream yields a "stream_id" of "unknown"
+%% rather than failing the upload: the context is auditing metadata, not an
+%% input to correctness. Configured pairs are applied last, so an operator who
+%% sets "stream_id" explicitly gets the value they asked for.
+%%
+%% Rebuilt on every PUT rather than memoised per stream. The result depends only
+%% on the stream ID and the configured pairs, so it could be cached, but a PUT
+%% moves a whole fragment or manifest object and the encode is a few hundred
+%% bytes next to that, so the per-upload cost is not worth a cache to remove.
+-spec encryption_context(key()) -> binary().
+encryption_context(Key) ->
+    StreamId =
+        case rabbitmq_stream_s3:key_stream_id(Key) of
+            undefined -> <<"unknown">>;
+            Id -> Id
+        end,
+    Configured = rabbitmq_stream_s3_config:kms_encryption_context(),
+    Context = maps:merge(#{<<"stream_id">> => StreamId}, Configured),
+    %% `rabbit_json:encode/1` raises on a binary that is not valid UTF-8, but
+    %% the stream ID cannot be one: it is the osiris stream name, which
+    %% `rabbit_stream_queue:stream_name/1` produces through
+    %% `osiris_util:to_base64uri/1`, so it holds only `[A-Za-z0-9_-]`. The
+    %% AMQP queue name it derives from is not required to be valid UTF-8
+    %% (`rabbit_channel:check_name/2` does not enforce it), but that encoding
+    %% neutralises it before it reaches here. The configured values are
+    %% rejected at config time if empty and are otherwise operator-supplied
+    %% UTF-8.
+    base64:encode(iolist_to_binary(rabbit_json:encode(Context))).
 
 %% Computes the aws-chunked framing overhead for a single chunk of DataSize bytes.
 %% Each chunk is framed as: <hex-size>\r\n<data>\r\n
@@ -1989,6 +2029,75 @@ note_request_finished() ->
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
+
+%% Without a KMS key, uploads ask for SSE-S3 and carry no encryption context.
+sse_headers_without_kms_key_test() ->
+    with_env([{kms_key_id, undefined}, {kms_encryption_context, undefined}], fun() ->
+        Headers = sse_headers(<<"rabbitmq/stream/s1/data/x.fragment">>),
+        ?assertEqual(<<"AES256">>, maps:get(<<"x-amz-server-side-encryption">>, Headers)),
+        ?assertNot(maps:is_key(<<"x-amz-server-side-encryption-aws-kms-key-id">>, Headers)),
+        ?assertNot(maps:is_key(<<"x-amz-server-side-encryption-context">>, Headers))
+    end).
+
+%% With a KMS key, uploads ask for SSE-KMS with that key and a context holding
+%% the stream ID.
+sse_headers_with_kms_key_test() ->
+    with_env([{kms_key_id, <<"arn:key">>}, {kms_encryption_context, undefined}], fun() ->
+        Headers = sse_headers(<<"rabbitmq/stream/s1/data/x.fragment">>),
+        ?assertEqual(<<"aws:kms">>, maps:get(<<"x-amz-server-side-encryption">>, Headers)),
+        ?assertEqual(
+            <<"arn:key">>,
+            maps:get(<<"x-amz-server-side-encryption-aws-kms-key-id">>, Headers)
+        ),
+        ?assertEqual(#{<<"stream_id">> => <<"s1">>}, decoded_context(Headers))
+    end).
+
+%% Configured pairs are added to the context, and one named "stream_id"
+%% replaces the stream ID.
+sse_headers_context_includes_configured_pairs_test() ->
+    Configured = #{<<"cluster">> => <<"eu-prod-1">>, <<"tier">> => <<"gold">>},
+    with_env([{kms_key_id, <<"arn:key">>}, {kms_encryption_context, Configured}], fun() ->
+        ?assertEqual(
+            Configured#{<<"stream_id">> => <<"s1">>},
+            decoded_context(sse_headers(<<"rabbitmq/stream/s1/data/x.fragment">>))
+        )
+    end),
+    Override = #{<<"stream_id">> => <<"fixed">>},
+    with_env([{kms_key_id, <<"arn:key">>}, {kms_encryption_context, Override}], fun() ->
+        ?assertEqual(
+            Override, decoded_context(sse_headers(<<"rabbitmq/stream/s1/data/x.fragment">>))
+        )
+    end).
+
+%% A key outside a stream's prefix still uploads, with a placeholder stream ID.
+sse_headers_context_for_unrecognized_key_test() ->
+    with_env([{kms_key_id, <<"arn:key">>}, {kms_encryption_context, undefined}], fun() ->
+        ?assertEqual(
+            #{<<"stream_id">> => <<"unknown">>},
+            decoded_context(sse_headers(<<"some/other/key">>))
+        )
+    end).
+
+decoded_context(Headers) ->
+    rabbit_json:decode(
+        base64:decode(maps:get(<<"x-amz-server-side-encryption-context">>, Headers))
+    ).
+
+%% Runs Fun with the given `rabbitmq_stream_s3` application environment entries
+%% in place, restoring the previous values afterwards. `undefined` means that
+%% the entry is unset.
+with_env(Entries, Fun) ->
+    App = rabbitmq_stream_s3,
+    Previous = [{Key, application:get_env(App, Key, undefined)} || {Key, _} <- Entries],
+    _ = [apply_env(App, Key, Value) || {Key, Value} <- Entries],
+    try
+        Fun()
+    after
+        _ = [apply_env(App, Key, Value) || {Key, Value} <- Previous]
+    end.
+
+apply_env(App, Key, undefined) -> application:unset_env(App, Key);
+apply_env(App, Key, Value) -> application:set_env(App, Key, Value).
 
 note_request_started_and_finished_balance_test() ->
     with_counter(fun(Read) ->

@@ -294,3 +294,46 @@ fun(Conf) ->
         Value     -> Value
     end
 end}.
+
+%% Additional pairs to include in the SSE-KMS encryption context of every
+%% uploaded object, for example:
+%%
+%%     stream_s3.kms_encryption_context.cluster = eu-prod-1
+%%
+%% The stream ID is always part of the context under the "stream_id" key. A
+%% pair configured under that name replaces it.
+{mapping, "stream_s3.kms_encryption_context.$name", "rabbitmq_stream_s3.kms_encryption_context", [
+    {datatype, binary},
+    {validators, ["kms_encryption_context_value_not_empty"]}
+]}.
+
+%% KMS rejects an encryption context pair with an empty value, and because the
+%% same context is sent on every GenerateDataKey call an empty value stops all
+%% uploads. Reject it at config time so the error surfaces at boot rather than
+%% as a stalled upload path.
+{validator, "kms_encryption_context_value_not_empty",
+ "an encryption context value must not be empty",
+fun(Value) ->
+    Value =/= <<>> andalso Value =/= ""
+end}.
+
+{translation, "rabbitmq_stream_s3.kms_encryption_context",
+fun(Conf) ->
+    case cuttlefish_variable:filter_by_prefix("stream_s3.kms_encryption_context", Conf) of
+        [] ->
+            cuttlefish:unset();
+        Settings ->
+            lists:foldl(
+              fun ({["stream_s3", "kms_encryption_context", Name], Value}, Acc) ->
+                      Acc#{list_to_binary(Name) => Value};
+                  %% The mapping admits exactly one trailing segment, so a
+                  %% variable that reaches here always has three; this clause
+                  %% cannot fire for any accepted key. It is kept as a guard so
+                  %% that a future change to the mapping which widens what
+                  %% matches fails loudly rather than silently dropping a pair.
+                  (Other, _Acc) ->
+                      cuttlefish:invalid(
+                        lists:flatten(io_lib:format("~p is invalid", [Other])))
+              end, #{}, Settings)
+    end
+end}.

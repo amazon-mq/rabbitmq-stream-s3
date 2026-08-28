@@ -232,6 +232,33 @@ When the bucket requires SSE-KMS, configure the key ARN:
 stream_s3.kms_key_id = arn:aws:kms:us-east-1:123456789012:key/example-key-id
 ```
 
+#### Encryption context
+
+When a KMS key is configured, every upload carries an [encryption context](https://docs.aws.amazon.com/kms/latest/developerguide/concepts.html#encrypt_context). KMS records it in its CloudTrail entry for the operation, so the audit trail says which stream the data belongs to. The plugin always includes the stream ID under the `stream_id` key, and S3 appends its own `aws:s3:arn` pair on top of any context supplied on the request (see [Encryption context](https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingKMSEncryption.html#encryption-context): "Amazon S3 appends the default encryption context of `aws:s3:arn` to the one that you provide"). Any number of additional pairs can be configured:
+
+```ini
+# Pairs to add to the SSE-KMS encryption context of every uploaded object.
+# The name after the prefix is the context key. Has no effect unless
+# stream_s3.kms_key_id is also set.
+# Type: binary. Default: none.
+stream_s3.kms_encryption_context.cluster = eu-prod-1
+stream_s3.kms_encryption_context.department = payments
+```
+
+`rabbitmq.conf` reads a dot as a nesting separator, so a context key which contains one is written with the dots escaped:
+
+```ini
+stream_s3.kms_encryption_context.com\.example\.tenant = acme
+```
+
+A pair configured as `stream_s3.kms_encryption_context.stream_id` replaces the stream ID with a fixed value.
+
+S3 stores the context with the object and re-supplies it to KMS on read, so consumers need no configuration of their own. Because the context differs per stream, a key policy or grant that constrains it has to match on the keys (`kms:EncryptionContextKeys`) or on the pairs that are the same for every object, not on an exact context. Check the policy and grants of a KMS key that already exists before pointing the plugin at it: a grant with an `EncryptionContextEquals` constraint, or a policy that matches the context keys against `aws:s3:arn` alone, denies `GenerateDataKey` once the plugin sends pairs of its own, and uploads stop.
+
+Configure the same pairs on every node of a cluster. Each node reads fragments uploaded by the other nodes, and KMS evaluates a key policy condition on `Decrypt` as well as on `GenerateDataKey`, so a value which differs per node, such as a node name or an availability zone, means one node cannot read what another wrote as soon as a policy conditions on it.
+
+On a bucket with [S3 Bucket Keys](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-key.html) enabled, S3 serves most uploads from a cached bucket-level key rather than calling KMS, and the KMS CloudTrail events that remain name the bucket ARN rather than the object ARN. The context is still stored with each object, but there is no longer a KMS event per operation for it to annotate.
+
 For more information on S3 server-side encryption options, see [Protecting data with server-side encryption](https://docs.aws.amazon.com/AmazonS3/latest/userguide/serv-side-encryption.html).
 
 ## Monitoring
