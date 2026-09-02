@@ -430,12 +430,51 @@ grow(
         monitors = Monitors0
     } = State0
 ) ->
-    Count = map_size(Monitors0),
-    InFlight = Count - length(Available) - map_size(Checkouts),
-    Demand = queue:len(Pending) - InFlight,
-    Target = max(MinSize - Count, max(Demand, 0)),
-    N = min(Target, MaxSize - Count),
+    N = grow_count(#{
+        min_size => MinSize,
+        max_size => MaxSize,
+        open => map_size(Monitors0),
+        available => length(Available),
+        checkouts => map_size(Checkouts),
+        pending => queue:len(Pending)
+    }),
     grow(N, State0).
+
+-doc """
+How many connections to open, given what the pool currently holds.
+
+Separated from the state it is read out of because it is the pool's whole growth
+policy and nothing else in this module is: it is pure arithmetic over six
+integers, and it is the answer to "why did the pool not already have a
+connection for this caller?".
+
+`InFlight` is the connections already being opened - `open` counts those as well
+as the established ones - so demand a handshake is already on its way to serving
+does not open a second connection for the same caller. That is what makes growth
+*reactive*: a burst of N concurrent checkouts does not open N connections, it
+opens as many as are not already covered, and the rest of the callers wait in
+`pending` behind the handshakes in progress.
+""".
+-spec grow_count(#{
+    min_size := non_neg_integer(),
+    max_size := pos_integer(),
+    open := non_neg_integer(),
+    available := non_neg_integer(),
+    checkouts := non_neg_integer(),
+    pending := non_neg_integer()
+}) -> non_neg_integer().
+grow_count(#{
+    min_size := MinSize,
+    max_size := MaxSize,
+    open := Count,
+    available := Available,
+    checkouts := Checkouts,
+    pending := Pending
+}) ->
+    InFlight = Count - Available - Checkouts,
+    Demand = Pending - InFlight,
+    Target = max(MinSize - Count, max(Demand, 0)),
+    max(0, min(Target, MaxSize - Count)).
 
 grow(0, State) ->
     State;
