@@ -166,11 +166,23 @@ general_pool_max_size() ->
 prefetch_request_size() ->
     application:get_env(?APP, prefetch_request_size, 4_194_304).
 
-%% Ceiling on how far ahead of the consumer a reader fetches, and so on its
-%% memory: it holds or has outstanding at most this plus one request.
+%% How far ahead of the consumer a reader may buffer.
+%%
+%% Bounds buffering, not fetching: how far ahead to buffer and how many requests
+%% to run at once are separate budgets, and it is the second that sets
+%% bandwidth. Raising this alone buys nothing.
+%%
+%% It is a gate on issuing a range rather than a cap on held bytes, so it is not
+%% the whole of what a reader can hold. The ranges already committed when the
+%% gate closes still deliver, and their bytes land in a buffer behind it, so
+%% worst-case held memory is this plus what the fetch side has committed - which
+%% is `prefetch_max_depth` requests' worth once the search has raised the target
+%% that far. At the defaults that is 128 MiB and 256 MiB. That is substantial
+%% per reader, and small against what a node streaming at these rates is already
+%% holding.
 -spec prefetch_window_max() -> pos_integer().
 prefetch_window_max() ->
-    application:get_env(?APP, prefetch_window_max, 33_554_432).
+    application:get_env(?APP, prefetch_window_max, 134_217_728).
 
 %% The most range GETs one reader may ever have in flight - a ceiling, not the
 %% operating point. What a reader runs at is searched for from measured
@@ -213,13 +225,15 @@ prefetch_auto_tune() ->
 %% off, which it is not by default.
 %%
 %% With the search on this is not consulted at all: a reader starts at one
-%% request and the ramp doubles it into an operating point within a few epochs,
-%% so what a reader runs at is measured rather than configured, and
-%% `prefetch_max_depth` is the only bound on it. What this sets is the fixed
-%% concurrency a reader runs at with the search turned off.
+%% request and the ramp doubles it into an operating point within a second of
+%% sustained reading, so what a reader runs at is measured rather than
+%% configured, and `prefetch_max_depth` is the only bound on it. What this sets
+%% is the fixed concurrency a reader runs at with the search turned off, which
+%% is why it is sized for a consumer reading faster than the local tier can
+%% serve it rather than for the smallest useful reader.
 -spec prefetch_inflight_initial() -> pos_integer().
 prefetch_inflight_initial() ->
-    application:get_env(?APP, prefetch_inflight_initial, 8).
+    application:get_env(?APP, prefetch_inflight_initial, 32).
 
 %% Most fragments a reader may look ahead to beyond the one it is reading.
 %%
@@ -432,11 +446,11 @@ defaults_test_() ->
         ?_assertEqual(2, general_pool_min_size()),
         ?_assertEqual(200, general_pool_max_size()),
         ?_assertEqual(4_194_304, prefetch_request_size()),
-        ?_assertEqual(33_554_432, prefetch_window_max()),
+        ?_assertEqual(134_217_728, prefetch_window_max()),
         ?_assertEqual(64, prefetch_max_depth()),
         ?_assertEqual(64, prefetch_max_lookahead()),
         ?_assertEqual(true, prefetch_auto_tune()),
-        ?_assertEqual(8, prefetch_inflight_initial()),
+        ?_assertEqual(32, prefetch_inflight_initial()),
         ?_assertEqual(?MAX_FRAGMENT_SIZE_B, fragment_target_size()),
         ?_assertEqual(5, persist_threshold()),
         ?_assertEqual(2000, persist_interval_ms()),

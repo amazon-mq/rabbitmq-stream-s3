@@ -874,16 +874,25 @@ stale_retry_is_ignored_per_kind_test() ->
 
 %% The histogram's boundaries have to follow the values the window can take, or
 %% it reports resolution it cannot deliver. The window moves in whole requests
-%% between `prefetch_request_size` and `prefetch_window_max`, so every step it
-%% can make needs its own bucket - and none of them may land in +Inf, which is
-%% for a window that has escaped its ceiling.
-prefetch_window_buckets_resolve_every_window_step_test() ->
+%% between `prefetch_request_size` and `prefetch_window_max`, so no value it can
+%% reach may land in +Inf - that bucket is for a window that has escaped its
+%% ceiling - and no boundary below the ceiling may be one the window can never
+%% reach, which is what an empty bucket would be.
+%%
+%% Every step gets a boundary of its own only while the window spans no more
+%% than `?PREFETCH_WINDOW_BUCKET_LIMIT` requests. Past that the spacing widens
+%% and steps share a bucket, which is the cap doing its job: a boundary costs a
+%% time series on every node, and the window is worth locating rather than
+%% counting exactly.
+prefetch_window_buckets_track_every_window_value_test() ->
     {RequestSize, WindowMax} = Sizing = read_prefetch_sizing(),
     Buckets = prefetch_window_buckets(Sizing),
     Windows = lists:seq(RequestSize, WindowMax, RequestSize),
     Observed = [bucket_of(W, Buckets) || W <- Windows],
-    ?assertEqual(length(Windows), length(lists:usort(Observed))),
-    ?assertNot(lists:member(infinity, Observed)).
+    ?assertNot(lists:member(infinity, Observed)),
+    Reachable = [B || B <- Buckets, B =/= infinity, B =< lists:max(Windows)],
+    ?assertEqual(Reachable, lists:usort(Observed)),
+    ?assert(length(Buckets) =< ?PREFETCH_WINDOW_BUCKET_LIMIT + 1).
 
 %% The boundaries are derived, so sizings other than the default have to hold
 %% up too: the ceiling is always the top finite boundary (nothing the window can
