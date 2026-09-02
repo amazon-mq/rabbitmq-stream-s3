@@ -421,19 +421,37 @@ buffered_end(_Fragment, _P) ->
 %% How far ahead of the consumer the reader has got: the buffered bytes it has
 %% not read yet, plus the part of every outstanding range that is not in a
 %% buffer. This is what the prefetch window bounds.
+%%
+%% Split into its two terms because they answer different questions - how much
+%% memory the reader is holding, against how hard it is currently fetching - and
+%% the sum is what couples them: a full buffer subtracts directly from the room
+%% `has_room/1` will admit for new ranges.
 -spec outstanding(pipeline()) -> non_neg_integer().
-outstanding(#pipeline{buffer = Buffer, read_pos = ReadPos, next = Next, reqs = Reqs}) ->
-    Unread =
-        max(0, rabbitmq_stream_s3_read_buffer:end_pos(Buffer) - ReadPos) +
-            case Next of
-                {_, NextBuffer} ->
-                    rabbitmq_stream_s3_read_buffer:end_pos(NextBuffer) - ?SEGMENT_HEADER_B;
-                _ ->
-                    0
-            end,
+outstanding(#pipeline{} = P) ->
+    buffered(P) + committed(P).
+
+%% Bytes held in a buffer that the consumer has not read: the current
+%% fragment's unread run, plus everything prefetched for the next fragment
+%% (none of which has been read, by definition).
+-spec buffered(pipeline()) -> non_neg_integer().
+buffered(#pipeline{buffer = Buffer, read_pos = ReadPos, next = Next}) ->
+    max(0, rabbitmq_stream_s3_read_buffer:end_pos(Buffer) - ReadPos) +
+        case Next of
+            {_, NextBuffer} ->
+                rabbitmq_stream_s3_read_buffer:end_pos(NextBuffer) - ?SEGMENT_HEADER_B;
+            _ ->
+                0
+        end.
+
+%% Bytes the reader has committed to fetching that have not reached a buffer
+%% yet. Every queued range counts, not only the ones on the wire: a range in
+%% backoff or awaiting a depth slot is just as committed, which is why
+%% `ready/2` is not window-gated.
+-spec committed(pipeline()) -> non_neg_integer().
+committed(#pipeline{reqs = Reqs}) ->
     lists:foldl(
         fun(#req{range_end = RangeEnd, flushed = Flushed}, Acc) -> Acc + RangeEnd + 1 - Flushed end,
-        Unread,
+        0,
         Reqs
     ).
 
