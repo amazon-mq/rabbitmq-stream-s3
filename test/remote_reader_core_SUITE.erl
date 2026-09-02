@@ -233,7 +233,7 @@ mock_iterator_counting_groups(FragEntries, Children, Counter) ->
     end.
 
 frag_ref(Offset, Size, Uid) ->
-    #fragment_ref{offset = Offset, uid = Uid, size = Size}.
+    rabbitmq_stream_s3_test_helpers:frag_ref(Offset, Size, Uid).
 
 init(StreamId, FragRef, Position, Iterator) ->
     init(StreamId, FragRef, Position, Iterator, #{}).

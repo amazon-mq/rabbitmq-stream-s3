@@ -585,6 +585,7 @@ read_position(State) ->
 -spec load(state()) -> {non_neg_integer(), non_neg_integer()}.
 load(State) ->
     {outstanding(State), inflight_count(State)}.
+
 -endif.
 
 %% ------------------------------------------------------------------
