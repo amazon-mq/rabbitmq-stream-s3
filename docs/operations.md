@@ -496,6 +496,7 @@ Owned by `rabbitmq_stream_s3_remote_reader`. One counter set per node, summed ac
 | `rabbitmq_stream_s3_read`                              | counter | Number of reads                                                   |
 | `rabbitmq_stream_s3_remote_reader_total_requests`      | counter | S3 requests initiated                                             |
 | `rabbitmq_stream_s3_remote_reader_fatal_errors`        | counter | Remote readers stopped by a non-retryable S3 error                |
+| `rabbitmq_stream_s3_remote_reader_inflight_target`     | gauge   | Requests a remote reader is aiming to keep in flight               |
 
 ### Prefetch window histogram
 
@@ -503,7 +504,7 @@ Owned by `rabbitmq_stream_s3_remote_reader`. One counter set per node, summed ac
 |-------------------------------------|-------------------------------------------------------------------|
 | `rabbitmq_stream_s3_prefetch_window_bytes_bucket`      | Distribution of the remote reader's prefetch window                |
 
-The boundaries are derived from the configured sizes at boot: the window moves in whole requests between `prefetch_request_size` and `prefetch_window_max`, so they are spaced by the request size up to the window cap. At the default sizing that is 4, 8, 12, 16, 20, 24, 28, 32 MiB and `+Inf`. The top finite boundary is always the window cap, so `+Inf` stays empty in normal operation. A window that spans more than 16 requests is spaced out rather than given a boundary per step, which bounds the number of series.
+The boundaries are derived from the configured sizes at boot: the window moves in whole requests between `prefetch_request_size` and `prefetch_window_max`, so they are spaced by the request size up to the window cap. At the default sizing that is 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128 MiB and `+Inf`: a 128 MiB window is 32 requests wide, which is more than the sixteen boundaries allowed, so the stride is widened to two requests. The top finite boundary is always the window cap, so `+Inf` stays empty in normal operation. A window that spans more than 16 requests is spaced out rather than given a boundary per step, which bounds the number of series.
 
 Because the boundaries are fixed at boot, both settings are read at boot too, and readers started later keep running with the sizing the node booted with. Changing either one takes effect on restart.
 
@@ -537,7 +538,9 @@ The pipeline gauges (`rabbitmq_stream_s3_bytes_in_assembly`, `rabbitmq_stream_s3
 
 S3 supports at least 3,500 PUT/POST/DELETE and 5,500 GET requests per second per partitioned prefix and scales automatically under sustained load. Each fragment is one PUT, so even very high stream throughput produces few PUTs per second. The realistic concern is GETs from many consumers reading old data on the same stream simultaneously. S3's automatic scaling handles sustained load but a sudden burst on a previously idle stream may see brief throttling.
 
-Each remote reader issues fixed-size range GETs (`prefetch_request_size`, 4 MiB) and runs up to `prefetch_max_depth` (8) of them concurrently, so a lagging consumer's request rate is bounded by its depth rather than by its throughput. Lowering the depth trades a consumer's catch-up rate for a lower request rate and fewer pooled connections.
+Each remote reader issues fixed-size range GETs (`prefetch_request_size`, 4 MiB) and runs up to `prefetch_max_depth` (64) of them concurrently, so a lagging consumer's request rate is bounded by its depth rather than by its throughput. Lowering the depth trades a consumer's catch-up rate for a lower request rate and fewer pooled connections.
+
+That is a ceiling rather than what a reader runs at. Concurrency is searched for from measured throughput: a reader starts at one request and the search doubles it while the rate keeps answering, so a consumer that reads a little and stops never reaches the ceiling. `rabbitmq_stream_s3_remote_reader_inflight_target` is where a reader's current target can be read, and budgeting from the ceiling rather than from that gauge overstates the request rate of every reader that is not saturated. Setting `prefetch_auto_tune = false` pins every reader at `prefetch_inflight_initial` instead.
 
 ### Local disk and page cache
 
