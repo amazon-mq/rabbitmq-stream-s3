@@ -151,6 +151,39 @@ fun(Conf) ->
 end}.
 
 %%
+%% Remote read prefetch
+%%
+%% What a reader runs at is searched for from measured throughput, so these are
+%% bounds and starting points rather than an operating point. `auto_tune = false`
+%% is the way back: it pins every reader at `inflight_initial` for its whole
+%% life, and is what to set before taking a throughput measurement that has to
+%% be reproducible.
+
+{mapping, "stream_s3.prefetch.request_size", "rabbitmq_stream_s3.prefetch_request_size", [
+    {datatype, bytesize}
+]}.
+
+{mapping, "stream_s3.prefetch.window_max", "rabbitmq_stream_s3.prefetch_window_max", [
+    {datatype, bytesize}
+]}.
+
+{mapping, "stream_s3.prefetch.max_depth", "rabbitmq_stream_s3.prefetch_max_depth", [
+    {datatype, integer}, {validators, ["non_zero_positive_integer"]}
+]}.
+
+{mapping, "stream_s3.prefetch.max_lookahead", "rabbitmq_stream_s3.prefetch_max_lookahead", [
+    {datatype, integer}, {validators, ["non_zero_positive_integer"]}
+]}.
+
+{mapping, "stream_s3.prefetch.auto_tune", "rabbitmq_stream_s3.prefetch_auto_tune", [
+    {datatype, {enum, [true, false]}}
+]}.
+
+{mapping, "stream_s3.prefetch.inflight_initial", "rabbitmq_stream_s3.prefetch_inflight_initial", [
+    {datatype, integer}, {validators, ["non_zero_positive_integer"]}
+]}.
+
+%%
 %% Manifest-tree branching factor
 %%
 

@@ -204,6 +204,46 @@ stream_s3.max_transfer_bytes_per_sec = unlimited
 stream_s3.max_transfer_burst_bytes = 10485760
 ```
 
+### Tuning the remote read path
+
+These bound what one consumer reading from S3 may fetch. What a reader runs at is searched for from the throughput it measures, so most of them are ceilings rather than operating points.
+
+```ini
+# Bytes per range GET. Fixed rather than adaptive: a single S3 connection
+# transfers at roughly the same rate whatever range size is asked of it, so
+# what scales a reader's bandwidth is the number of requests in flight
+# rather than their size. Default: 4 MiB.
+stream_s3.prefetch.request_size = 4194304
+
+# The byte budget a reader fetches and buffers within. Fetching is
+# guaranteed a share of it and buffering takes the rest. Default: 128 MiB.
+stream_s3.prefetch.window_max = 134217728
+
+# The most range GETs one reader may have in flight. A ceiling rather than
+# the operating point, and also a reader's share of the HTTP connection
+# pool.
+# Type: positive integer. Default: 64.
+stream_s3.prefetch.max_depth = 64
+
+# Most fragments a reader may look ahead to beyond the one it is reading. A
+# backstop for the two bounds above rather than the working limit; at 1 a
+# reader holds exactly one prefetched fragment.
+# Type: positive integer. Default: the value of max_depth.
+stream_s3.prefetch.max_lookahead = 64
+
+# Whether a reader searches for its concurrency from the throughput it
+# measures. Off, every reader runs at inflight_initial for its whole life,
+# which is what to set before taking a throughput measurement that has to be
+# reproducible.
+# Type: boolean. Default: true.
+stream_s3.prefetch.auto_tune = true
+
+# Requests in flight a reader runs at with auto_tune off. Not consulted
+# while the search is on.
+# Type: positive integer. Default: 32.
+stream_s3.prefetch.inflight_initial = 32
+```
+
 ### Read-path integrity
 
 ```ini
