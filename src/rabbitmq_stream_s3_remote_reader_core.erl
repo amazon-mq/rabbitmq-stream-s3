@@ -61,10 +61,10 @@ for a request whose predecessors have not finished are held in that request's
 `staged` list and appended once it reaches the head. See
 `rabbitmq_stream_s3_read_pipeline`.
 
-Prefetch is sized by one number, the window: the bytes to hold or have
-outstanding ahead of the consumer. Request size is fixed, so the window is
-really a concurrency control - a buffer miss doubles it, sustained hits give a
-request back. See "prefetch window control" below.
+Prefetch is sized by two budgets. The window bounds the bytes held ahead of the
+consumer and grows on a buffer miss; the concurrency target bounds the range
+GETs in flight and is what sets bandwidth. See "buffer window control" and
+"concurrency control" below.
 
 Fragment transitions happen when the read position exceeds the current
 fragment's data region. The core checks for pre-fetched next-fragment data
@@ -88,11 +88,30 @@ and transitions immediately if available, or signals that more data is needed.
     %% Bytes per range request. Fixed: concurrency, not size, is what scales a
     %% remote reader's bandwidth past one connection's transfer rate.
     request_size :: pos_integer(),
-    %% Ceiling on the prefetch window, and so on this reader's memory: it can
-    %% hold or have outstanding at most `window_max + request_size` bytes.
+    %% Ceiling on the prefetch window, and so on the bytes this reader may hold
+    %% that the consumer has not read.
     window_max :: pos_integer(),
-    %% Most requests that may be in flight at once, across both fragments.
+    %% Most requests that may be in flight at once, across every fragment.
     max_depth :: pos_integer(),
+    %% Most fragments the reader may look ahead to beyond the one it is reading.
+    %%
+    %% A backstop, not the working limit: what governs reach is the window and
+    %% the depth cap in `has_room/1`, and the look-ahead only ever extends when
+    %% every fragment it already holds is spoken for. This bounds the walk for
+    %% the cases those do not - a run of fragments with empty data regions
+    %% consumes no request, so nothing else would stop it.
+    max_lookahead :: pos_integer(),
+    %% Whether `inflight_target` is searched for or pinned where it started.
+    %% On unless the caller says otherwise, matching what the plugin ships (see
+    %% `prefetch_auto_tune`), so a caller that says nothing gets the shipped
+    %% behaviour. Note that the search only ever moves the target on a
+    %% `tune_tick`, so a caller that never ticks runs at `inflight_initial`
+    %% whatever this says.
+    auto_tune :: boolean(),
+    %% Where the search starts. Not the ceiling: `max_depth` is what the reader
+    %% may never exceed, and starting at it would leave a tuner with nowhere to
+    %% go and no way to discover it had overshot.
+    inflight_initial :: pos_integer(),
     min_retry_delay_ms :: pos_integer(),
     max_retry_delay_ms :: pos_integer()
 }).
@@ -107,9 +126,8 @@ and transitions immediately if available, or signals that more data is needed.
     stream :: stream_id(),
     cfg :: #cfg{},
 
-    %% Prefetch window: how far ahead of the consumer to fetch. See the
-    %% "prefetch window control" section.
-    window :: pos_integer(),
+    %% Bytes served since the last miss, which is what decays the window. See
+    %% the "buffer window control" section.
     bytes_served_since_miss = 0 :: non_neg_integer(),
     %% The pending read has already been counted as a miss.
     missed_pending = false :: boolean(),
@@ -130,19 +148,27 @@ and transitions immediately if available, or signals that more data is needed.
     %% Fragment iterator
     iterator :: rabbitmq_stream_s3_fragment_iterator:iterator(),
 
-    %% The entry the iterator points at, and the iterator advanced past it,
-    %% memoised. `next/1` is a synchronous S3 GET whenever that entry sits
-    %% behind a group node, so the answer is kept for as long as the iterator is
-    %% the same one (it is only ever replaced wholesale, never advanced in
-    %% place), and the fragment transition reuses it rather than fetching the
-    %% group a second time. `unknown` means "not looked up yet"; `failed` means
-    %% the group fetch failed transiently, which is not an answer to keep but is
-    %% a reason not to ask again until a retry timer fires.
-    next_peek = unknown ::
-        unknown
-        | failed
-        | none
-        | {ok, #fragment_ref{}, rabbitmq_stream_s3_fragment_iterator:iterator()},
+    %% The entries the iterator has been walked forward onto, nearest first,
+    %% each paired with the iterator advanced past it. `next/1` is a synchronous
+    %% S3 GET whenever an entry sits behind a group node, so every answer is kept
+    %% for as long as the iterator is the same one (it is only ever replaced
+    %% wholesale, never advanced in place), and a fragment transition promotes
+    %% the head rather than fetching the group a second time.
+    %%
+    %% Walking more than one fragment ahead is what lets the window exceed the
+    %% reach of a single fragment: at a fragment's tail one entry reaches `F`
+    %% bytes, so a window above `F` would otherwise have nowhere to go. Each
+    %% entry memoises its own advanced iterator, so walking N ahead costs at
+    %% most N descents in total, and normally far fewer - a run of leaf entries
+    %% behind one group node is walked in memory once the first of them has been
+    %% descended to.
+    peeks = [] :: [{#fragment_ref{}, rabbitmq_stream_s3_fragment_iterator:iterator()}],
+
+    %% What the iterator said when it was last walked past the end of `peeks`.
+    %% `unknown` means it has not been asked; `none` that the manifest ends
+    %% there; `failed` that the group fetch failed transiently, which is not an
+    %% answer to keep but is a reason not to ask again until a retry timer fires.
+    peek_tail = unknown :: unknown | none | failed,
 
     %% The backoff kinds whose retry timer is armed and has not fired yet.
     %% Without this a batch of N failing requests would arm N timers and drive N
@@ -155,7 +181,56 @@ and transitions immediately if available, or signals that more data is needed.
     pending :: #pending{} | undefined,
 
     %% Current fragment returned 404
-    current_not_found = false :: boolean()
+    current_not_found = false :: boolean(),
+
+    %% Bytes S3 has delivered since the last tick, and the rate that came out of
+    %% the tick before it.
+    %%
+    %% This module has no clock: `step/2` takes events and hands back effects,
+    %% and reading the time inside it would make every result depend on when it
+    %% was computed. Rate control needs elapsed time all the same, so time
+    %% arrives as an input - the shell ticks on a timer and stamps each tick with
+    %% the micros actually elapsed, which is both what keeps this pure and what
+    %% lets a test drive a whole minute of tuning in virtual time.
+    sample_bytes = 0 :: non_neg_integer(),
+    %% Bytes per second over the last completed sample, or `undefined` before the
+    %% first tick. Measured on what S3 delivered, since that is the quantity
+    %% concurrency moves.
+    fetch_rate :: undefined | non_neg_integer(),
+
+    %% How far ahead of the consumer to have already buffered. AIMD on the
+    %% buffer miss, which is the signal that measures it: a read that had to
+    %% wait means the reader was not buffered far enough ahead. Capped at
+    %% `window_max`, so it is also this reader's bound on held memory.
+    window :: pos_integer(),
+
+    %% How many requests the reader is aiming to keep in flight, and the state
+    %% of the search that sets it. See "concurrency control".
+    inflight_target :: pos_integer(),
+    %% `ramp` doubles while throughput answers, to reach the right order of
+    %% magnitude in a few samples rather than one request at a time; `climb`
+    %% steps by one and reverses when the rate falls off.
+    tune_phase = ramp :: ramp | climb,
+    probe_dir = up :: up | down,
+    %% The rate the previous target produced, which is what a sample's rate is
+    %% judged against.
+    prev_rate :: undefined | non_neg_integer(),
+    %% The best rate this reader has measured, and the target that produced it.
+    %% An anchor, because comparing each sample only against the one before it
+    %% cannot see a slow slide: past the peak the throughput curve is broad and
+    %% shallow, so every step reads as noise while the total falls away.
+    best_rate :: undefined | non_neg_integer(),
+    best_target :: undefined | pos_integer(),
+    %% Steps taken since the best was last beaten. Bounds how far the search
+    %% wanders from the best point it knows: on a shallow slope nothing else
+    %% turns it around and it walks to the ceiling.
+    probes_since_best = 0 :: non_neg_integer(),
+
+    %% Contention seen during the current sample: requests that never left the
+    %% node for want of a pooled connection, or that S3 asked to slow down.
+    %% Distinct from a buffer miss, which says the consumer waited and nothing
+    %% about whether the fetch side has room for more.
+    sample_contention = 0 :: non_neg_integer()
 }).
 
 -type state() :: #state{}.
@@ -168,6 +243,9 @@ and transitions immediately if available, or signals that more data is needed.
     | {data, request_id(), binary(), done | continue}
     | {request_error, request_id(), fragment_offset(), term()}
     | {retry, backoff()}
+    %% Micros elapsed since the previous tick, measured by the shell. The only
+    %% way time enters this module; see `#state.sample_bytes`.
+    | {tune_tick, non_neg_integer()}
     | deadline_expired
     | {iterator_refreshed, rabbitmq_stream_s3_fragment_iterator:iterator() | end_of_manifest}.
 
@@ -206,14 +284,24 @@ and transitions immediately if available, or signals that more data is needed.
     init/5,
     step/2,
     pending/1,
-    current_fragment_offset/1
+    current_fragment_offset/1,
+    inflight_target/1,
+    searching/1
 ]).
 
 -ifdef(TEST).
 %% The ranges the core is still waiting on, in queue order. Tests describe what
 %% S3 answers rather than which byte range the core happened to ask for, so
 %% they use this to address a delivery to the right request.
--export([outstanding_ranges/1, window_bytes/1, read_position/1, load/1, request_id/3]).
+-export([
+    outstanding_ranges/1,
+    window_bytes/1,
+    read_position/1,
+    load/1,
+    request_id/3,
+    fetch_rate/1,
+    tune/2
+]).
 
 %% The id the pipeline minted for the range a fragment has outstanding at a
 %% position. Tests describe what S3 answers - a range of bytes - rather than
@@ -247,6 +335,7 @@ init(StreamId, FragRef, Position, Iterator, Opts) ->
         stream = StreamId,
         cfg = Cfg,
         window = Cfg#cfg.request_size,
+        inflight_target = initial_target(Cfg),
         retry_delay = Cfg#cfg.min_retry_delay_ms,
         pipeline = rabbitmq_stream_s3_read_pipeline:new(StreamId, FragRef, Position),
         iterator = Iterator
@@ -295,11 +384,30 @@ step_(State0, {data, Id, Data, DoneOrContinue}) ->
     {Signals, Pipeline} = rabbitmq_stream_s3_read_pipeline:data(
         Id, Data, DoneOrContinue, pipeline(State0)
     ),
-    {State1, Effects1} = absorb_signals(Signals, State0#state{pipeline = Pipeline}),
+    Sample = State0#state.sample_bytes + iolist_size(Data),
+    {State1, Effects1} = absorb_signals(
+        Signals, State0#state{pipeline = Pipeline, sample_bytes = Sample}
+    ),
     State2 = reset_idle_backoffs(State1),
     {State3, Effects2} = maybe_start_requests(State2),
     {State4, Effects3} = try_serve(State3),
     {State4, Effects1 ++ Effects2 ++ Effects3};
+step_(State0, {tune_tick, ElapsedUs}) ->
+    %% Close the sample. An elapsed of zero would divide by it, and says nothing
+    %% either way, so it is left to accumulate into the next one - which is also
+    %% what makes the tick safe to deliver early or twice.
+    case ElapsedUs > 0 of
+        true ->
+            Rate = State0#state.sample_bytes * 1_000_000 div ElapsedUs,
+            State1 = tune(Rate, State0#state{sample_bytes = 0, fetch_rate = Rate}),
+            %% A raised target does nothing until something issues against it,
+            %% and the reader that most needs the extra concurrency is the one
+            %% whose in-flight requests are all still streaming - so no delivery
+            %% is due to drive a pass on its own.
+            maybe_start_requests(State1#state{sample_contention = 0});
+        false ->
+            {State0, []}
+    end;
 step_(State0, {request_error, _Id, Fragment, not_found}) ->
     case Fragment =:= current_fragment_offset(State0) of
         true ->
@@ -326,14 +434,22 @@ step_(State0, {request_error, Id, _Fragment, Reason}) when
     %% exponential backoff. Only the failed range is retried: co-pending
     %% requests keep streaming, and the range is restarted at the last byte that
     %% reached a buffer so no bytes are re-fetched or lost.
-    fail_range(Id, fault, State0);
+    fail_range(Id, fault, note_contention(Reason, State0));
 step_(State0, {request_error, Id, _Fragment, pool_busy}) ->
     %% Pool is growing — a connection becomes available once its TLS handshake
     %% completes (fast on same-region S3, but not instant). Use a mild backoff
     %% (25, 50, 100, 200, 400, 500, 500...) starting low to catch the connection
     %% as soon as it is ready, doubling up to a 500ms cap so we don't spin if the
     %% pool cannot grow (e.g. S3 unreachable).
-    fail_range(Id, pool_busy, State0);
+    fail_range(Id, pool_busy, note_contention(pool_busy, State0));
+step_(State0, {request_error, Id, _Fragment, pool_exhausted}) ->
+    %% The same wait on the same clock - a connection still frees up by being
+    %% checked in, and that happens in milliseconds - but a different reading of
+    %% what it means. The pool is at `general_pool_max_size` with nothing left to
+    %% open, so this reader is not waiting on growth it provoked; it is waiting
+    %% on the other readers, and its own concurrency is part of what they are
+    %% waiting on. See `note_contention/2`.
+    fail_range(Id, pool_busy, note_contention(pool_exhausted, State0));
 step_(State0, {request_error, _Id, _Fragment, Reason}) ->
     %% Non-retryable error (e.g. 403 AccessDenied, an unexpected status). Report
     %% the reason before stopping so an operator can answer "why did this
@@ -400,13 +516,13 @@ step_(#state{cfg = #cfg{min_retry_delay_ms = MinDelay}} = State0, deadline_expir
     %%
     %% The prefetched next fragment is dropped along with them. Its own ranges
     %% are cancelled with the rest, but its bytes keep counting against the
-    %% prefetch window (see `outstanding/1`), so keeping it would hold window
-    %% space that nothing is left to fetch into. With the window at its ceiling
-    %% that is permanent: `has_room/1` stays false however many misses the reader
-    %% takes, `extend_frontier/1` issues nothing, and no range is ever requested
-    %% for the current fragment again - every subsequent read waits out its own
-    %% deadline. Below the ceiling it costs at least one more of them before the
-    %% window doubles past what the stale prefetch holds.
+    %% buffer budget (see `buffered/1`), so keeping it would hold budget that
+    %% nothing is left to fetch into. With the window at its ceiling that is
+    %% permanent: `has_room/1` stays false however many misses the reader takes,
+    %% `extend_frontier/1` issues nothing, and no range is ever requested for the
+    %% current fragment again - every subsequent read waits out its own deadline.
+    %% Below the ceiling it costs at least one more of them before the window
+    %% doubles past what the stale prefetch holds.
     %% The look-ahead memo is left alone. An answered one is the truth about an
     %% iterator this event does not touch, and re-resolving it would spend a
     %% group GET on an answer already in hand; a `failed` one needs no clearing,
@@ -446,7 +562,8 @@ step_(State0, {iterator_refreshed, end_of_manifest}) ->
     State = State0#state{
         pipeline = Pipeline,
         pending = undefined,
-        next_peek = unknown,
+        peeks = [],
+        peek_tail = unknown,
         current_not_found = false,
         timers = #{}
     },
@@ -473,6 +590,26 @@ step_(State0, {iterator_refreshed, Iterator}) ->
                 stream = StreamId,
                 cfg = Cfg,
                 window = Cfg#cfg.request_size,
+                %% The iterator refresh rebuilds the state, so the search starts
+                %% over. What it had learned was about a fragment the reader is
+                %% no longer on, and it converges again within a few samples.
+                %%
+                %% The target itself is carried across rather than restarted at
+                %% `initial_target/1`. The ramp starts at one request because a
+                %% new reader has no consumer demand behind it yet; this one has
+                %% been serving a consumer all along, so dropping it to one
+                %% request would spend several samples re-earning concurrency it
+                %% has already shown it can use.
+                inflight_target = State0#state.inflight_target,
+                %% The sample carries across for the same reason its elapsed time
+                %% does: the shell stamps `sample_at` on the tick and nothing
+                %% here can move it, so a rebuild that dropped the bytes would
+                %% hand the next tick a part-sample's bytes over a whole sample's
+                %% time and call the difference a slower reader. Both terms of
+                %% the measurement describe the interval since the last tick,
+                %% and a refresh part-way through it changes neither.
+                sample_bytes = State0#state.sample_bytes,
+                sample_contention = State0#state.sample_contention,
                 retry_delay = Cfg#cfg.min_retry_delay_ms,
                 pipeline = rabbitmq_stream_s3_read_pipeline:replace_fragment(
                     FragRef, ?SEGMENT_HEADER_B, pipeline(State0)
@@ -521,20 +658,19 @@ other_fragment_not_found(Fragment, State0) ->
     {Dropped, Pipeline0} = rabbitmq_stream_s3_read_pipeline:drop_fragment(
         Fragment, pipeline(State0)
     ),
-    Pipeline =
+    {DroppedPast, Pipeline} =
         case Prefetched of
             true ->
-                {[], P} = rabbitmq_stream_s3_read_pipeline:drop_fragment(
-                    next_not_found, Pipeline0
-                ),
-                P;
+                rabbitmq_stream_s3_read_pipeline:drop_fragment(
+                    {not_found, Fragment}, Pipeline0
+                );
             false ->
-                Pipeline0
+                {[], Pipeline0}
         end,
     %% Try to serve: a recorded 404 may trigger a refresh when the consumer
     %% reads past the current fragment.
     {State, Effects} = try_serve(State0#state{pipeline = Pipeline}),
-    {State, [{cancel_request, Id} || Id <- Dropped] ++ Effects}.
+    {State, [{cancel_request, Id} || Id <- Dropped ++ DroppedPast] ++ Effects}.
 
 %% Whether `Fragment` is the fragment the reader is prefetching. The pipeline
 %% knows it once bytes have arrived for it; before that the look-ahead memo is
@@ -546,12 +682,9 @@ other_fragment_not_found(Fragment, State0) ->
 %% synchronous group GET (see `peek_next_fragment/2`). A memo that has not been
 %% answered costs nothing to be strict about, since a prefetch is only ever
 %% started for a peek that resolved.
-is_prefetched_fragment(Fragment, #state{next_peek = Peek} = State) ->
+is_prefetched_fragment(Fragment, #state{peeks = Peeks} = State) ->
     rabbitmq_stream_s3_read_pipeline:prefetching(Fragment, pipeline(State)) orelse
-        case Peek of
-            {ok, #fragment_ref{offset = Fragment}, _Advanced} -> true;
-            _ -> false
-        end.
+        lists:any(fun({#fragment_ref{offset = Offset}, _}) -> Offset =:= Fragment end, Peeks).
 
 %% @doc Returns the pending read, if any.
 -spec pending(state()) -> undefined | {byte_offset(), pos_integer()}.
@@ -562,6 +695,25 @@ pending(#state{pending = #pending{offset = O, bytes = B}}) -> {O, B}.
 -spec current_fragment_offset(state()) -> osiris:offset().
 current_fragment_offset(State) ->
     rabbitmq_stream_s3_read_pipeline:current_fragment_offset(pipeline(State)).
+
+-doc """
+How many requests the reader is currently aiming to keep in flight.
+
+Published as a gauge by the shell. Read against `requests_in_flight` for what
+the reader is achieving, it tells an operator whether a slow remote read is a
+reader aiming low or a reader aiming high and not getting there - two different
+problems that look identical from outside.
+""".
+-spec inflight_target(state()) -> pos_integer().
+inflight_target(#state{inflight_target = Target}) ->
+    Target.
+
+%% Whether this reader's target can still move, which is to say whether there is
+%% anything for the shell's tick to feed. Asked rather than read from the
+%% options so the default lives in one place, `build_cfg/1`.
+-spec searching(state()) -> boolean().
+searching(#state{cfg = #cfg{auto_tune = AutoTune}}) ->
+    AutoTune.
 
 pipeline(#state{pipeline = Pipeline}) -> Pipeline.
 
@@ -580,11 +732,18 @@ window_bytes(#state{window = Window}) ->
 read_position(State) ->
     rabbitmq_stream_s3_read_pipeline:read_position(pipeline(State)).
 
-%% Bytes held or asked for ahead of the consumer, and how many requests are in
-%% flight: the two quantities the prefetch window and depth cap bound.
--spec load(state()) -> {non_neg_integer(), non_neg_integer()}.
+%% What the two budgets and the depth cap bound, split the way `has_room/1`
+%% bounds them: bytes on the wire, bytes held unread, and requests in flight.
+-spec load(state()) -> {non_neg_integer(), non_neg_integer(), non_neg_integer()}.
 load(State) ->
-    {outstanding(State), inflight_count(State)}.
+    {committed(State), buffered(State), rabbitmq_stream_s3_read_pipeline:inflight(pipeline(State))}.
+
+%% Bytes per second over the last completed sample; `undefined` before the first
+%% tick closes one.
+-spec fetch_rate(state()) -> undefined | non_neg_integer().
+fetch_rate(#state{fetch_rate = Rate}) ->
+    Rate.
+
 -endif.
 
 %% ------------------------------------------------------------------
@@ -661,10 +820,10 @@ try_fragment_transition(State0) ->
             try_peeked_transition(State0)
     end.
 
-try_peeked_transition(#state{next_peek = Peek0} = State0) ->
-    {Peek, _Attempted} = peek_next_fragment(State0, Peek0),
-    State = State0#state{next_peek = Peek},
-    case State#state.next_peek of
+try_peeked_transition(#state{peeks = Peeks0, peek_tail = Tail0} = State0) ->
+    {Peeks, Tail, _Attempted} = peek_next_fragment(State0, Peeks0, Tail0),
+    State = State0#state{peeks = Peeks, peek_tail = Tail},
+    case peek_head(Peeks, Tail) of
         {ok, _FragRef, _Advanced} ->
             {await, State};
         none ->
@@ -722,7 +881,7 @@ retry_group_fetch(State) ->
 not_found_refresh(#state{current_not_found = true} = State) ->
     %% Path 2: the current fragment 404'd. Refresh past its own offset.
     {State, [{refresh_iterator, current_fragment_offset(State)}]};
-not_found_refresh(#state{next_peek = Peek0} = State0) ->
+not_found_refresh(#state{peeks = Peeks0, peek_tail = Tail0} = State0) ->
     %% Path 1: the prefetched next fragment 404'd. Refresh past it, falling
     %% back to the current offset if the iterator is exhausted (the 404'd
     %% next was the last entry in the manifest).
@@ -731,9 +890,9 @@ not_found_refresh(#state{next_peek = Peek0} = State0) ->
     %% directly here spent a synchronous group GET on an answer this reader has
     %% usually already paid for - and it is the answer that told it to prefetch
     %% the fragment that has just 404'd, so it is memoised by definition.
-    {Peek, _Attempted} = peek_next_fragment(State0, Peek0),
-    State = State0#state{next_peek = Peek},
-    case Peek of
+    {Peeks, Tail, _Attempted} = peek_next_fragment(State0, Peeks0, Tail0),
+    State = State0#state{peeks = Peeks, peek_tail = Tail},
+    case peek_head(Peeks, Tail) of
         {ok, #fragment_ref{offset = NotFoundOffset}, _Advanced} ->
             {State, [{refresh_iterator, NotFoundOffset}]};
         none ->
@@ -747,13 +906,17 @@ not_found_refresh(#state{next_peek = Peek0} = State0) ->
 %% Moves to the fragment being prefetched, resetting what this module tracks
 %% about the fragment left behind. The pipeline decides what that costs in
 %% cancelled requests (see its `advance/1`).
+%%
+%% `peek_tail` is left where it is. It says what follows the *last* of the
+%% peeks, and popping the head does not move the last one, so the marker means
+%% the same thing after the transition as before it.
 goto_next_fragment(State0) ->
     {_NewOffset, Cancels, Pipeline} = rabbitmq_stream_s3_read_pipeline:advance(pipeline(State0)),
-    Iterator = advance_iterator(State0),
+    {Iterator, Peeks} = advance_iterator(State0),
     State = State0#state{
         pipeline = Pipeline,
         iterator = Iterator,
-        next_peek = unknown,
+        peeks = Peeks,
         current_not_found = false
     },
     {State, cancel_effects(Cancels)}.
@@ -761,15 +924,20 @@ goto_next_fragment(State0) ->
 cancel_effects(all) -> [{cancel_requests, all}];
 cancel_effects(Ids) -> [{cancel_request, Id} || Id <- Ids].
 
-%% The peek already advanced the iterator past the entry being moved to, and
-%% paid for the group fetch that took, so take its answer rather than descending
-%% into the same group again.
-advance_iterator(#state{next_peek = {ok, _FragRef, Advanced}}) ->
-    Advanced;
+%% The look-ahead already advanced the iterator past the entry being moved to,
+%% and paid for the group fetch that took, so take its answer rather than
+%% descending into the same group again.
+%%
+%% Only the head is consumed. The entries behind it were walked from the same
+%% iterator and are still the fragments after the new current one, so keeping
+%% them is what stops a transition costing back the reach the look-ahead just
+%% bought - and what stops the descents being paid for twice.
+advance_iterator(#state{peeks = [{_FragRef, Advanced} | Rest]}) ->
+    {Advanced, Rest};
 advance_iterator(#state{iterator = Iterator}) ->
     case rabbitmq_stream_s3_fragment_iterator:next(Iterator) of
-        {ok, _, It} -> It;
-        _ -> Iterator
+        {ok, _, It} -> {It, []};
+        _ -> {Iterator, []}
     end.
 
 %% A response that closed without delivering a byte is queued against the fault
@@ -855,11 +1023,19 @@ idle(Kind, #state{timers = Timers} = State) ->
     not is_map_key(Kind, Timers) andalso
         not rabbitmq_stream_s3_read_pipeline:waits_on(Kind, pipeline(State)).
 
-inflight_count(State) ->
-    rabbitmq_stream_s3_read_pipeline:inflight(pipeline(State)).
+%% Requests in flight that still owe bytes - what is occupying the wire, and so
+%% what the concurrency target counts. See the pipeline's `inflight_owing/1`.
+inflight_owing(State) ->
+    rabbitmq_stream_s3_read_pipeline:inflight_owing(pipeline(State)).
 
-outstanding(State) ->
-    rabbitmq_stream_s3_read_pipeline:outstanding(pipeline(State)).
+%% Bytes on the wire or queued for it, not yet in a buffer. Bounded for
+%% throughput; see `has_room/1`.
+committed(State) ->
+    rabbitmq_stream_s3_read_pipeline:committed(pipeline(State)).
+
+%% Bytes in a buffer the consumer has not read. Bounded for memory.
+buffered(State) ->
+    rabbitmq_stream_s3_read_pipeline:buffered(pipeline(State)).
 
 %% ------------------------------------------------------------------
 %% Internal: request issuance
@@ -874,7 +1050,7 @@ maybe_start_requests(State0) ->
 %% `init/5` or from an iterator refresh. It differs from
 %% `maybe_start_requests/1` in that it does not resolve the next-fragment peek:
 %% passing `none` for it holds the frontier inside the current fragment without
-%% touching the iterator, and `#state.next_peek` is left `unknown` so the first
+%% touching the iterator, and `#state.peek_tail` is left `unknown` so the first
 %% delivery resolves it instead.
 %%
 %% That matters because `init/5` runs inside the shell's `gen_server:init/1`,
@@ -891,17 +1067,32 @@ maybe_start_requests(State0) ->
 %% `issue_ready/1` is skipped rather than reordered: the queue is empty at both
 %% call sites.
 start_current_request(State) ->
-    {State1, _Peek, _Attempted, Effects} = extend_frontier(State, none, []),
+    %% `none` for the look-ahead's tail is what defers it: it reads as "the
+    %% manifest ends here", so the frontier fills the current fragment and stops
+    %% without walking the iterator. It is passed rather than stored, so the
+    %% state's own look-ahead is untouched.
+    {State1, _Peeks, _Tail, _Attempted, Effects} = extend_frontier(State, [], none, []),
     {State1, Effects}.
 
 %% (Re-)issue ranges that are queued and not in flight. Their bytes are already
-%% counted in `outstanding/1`, so they are not window-gated - a range the reader
+%% counted in `committed/1`, so they are not budget-gated - a range the reader
 %% has committed to must be fetched, or the buffer never becomes contiguous
 %% again and every read behind it stalls until the deadline. They do take a
-%% slot, so the depth cap still applies; running before `extend_frontier/1`
+%% slot, so the concurrency bound applies; running before `extend_frontier/1`
 %% keeps new ranges from taking the slots they are waiting for.
-issue_ready(#state{cfg = #cfg{max_depth = MaxDepth}} = State) ->
-    {Specs, Pipeline} = rabbitmq_stream_s3_read_pipeline:ready(MaxDepth, pipeline(State)),
+%%
+%% That bound is the target as well as the depth cap. `has_room/1` is the only
+%% other place the target is enforced, and it governs first issue, so gating
+%% here on `max_depth` alone let a contention back-off undo itself: the tick cut
+%% the target, the fault timer fired, `release/2` marked every backed-off range
+%% `ready`, and this re-issued all of them at the old concurrency. Deferring
+%% them is not a stall - the target is never below one, so a pass with nothing
+%% in flight always issues at least one range, and each delivery drives another
+%% pass.
+issue_ready(#state{inflight_target = Target, cfg = #cfg{max_depth = MaxDepth}} = State) ->
+    {Specs, Pipeline} = rabbitmq_stream_s3_read_pipeline:ready(
+        min(MaxDepth, Target), pipeline(State)
+    ),
     {State#state{pipeline = Pipeline}, [start_request_effect(Spec) || Spec <- Specs]}.
 
 %% Append new ranges at the fetch frontier while the depth cap and the prefetch
@@ -918,9 +1109,11 @@ issue_ready(#state{cfg = #cfg{max_depth = MaxDepth}} = State) ->
 %% (see `not_found_refresh/1`), so the only thing to do until then is wait.
 extend_frontier(#state{current_not_found = true} = State) ->
     {State, []};
-extend_frontier(#state{next_peek = Peek0} = State) ->
-    {State1, Peek, Attempted, Effects} = extend_frontier(State, Peek0, []),
-    arm_peek_retry(Peek, Attempted, State1#state{next_peek = Peek}, Effects).
+extend_frontier(#state{peeks = Peeks0, peek_tail = Tail0} = State) ->
+    {State1, Peeks, Tail, Attempted, Effects} = extend_frontier(State, Peeks0, Tail0, []),
+    arm_peek_retry(
+        Tail, Attempted, State1#state{peeks = Peeks, peek_tail = Tail}, Effects
+    ).
 
 %% A group fetch that failed while looking ahead has to arm the retry itself.
 %% Nothing else in this pass will: the ranges already queued are healthy, so no
@@ -948,60 +1141,87 @@ arm_peek_retry(failed, true, State, Effects) ->
 arm_peek_retry(_Peek, _Attempted, State, Effects) ->
     {State, Effects}.
 
-extend_frontier(State, Peek0, Acc) ->
-    extend_frontier(State, Peek0, false, Acc).
+extend_frontier(State, Peeks0, Tail0, Acc) ->
+    extend_frontier(State, Peeks0, Tail0, false, Acc).
 
-extend_frontier(State, Peek0, Attempted0, Acc) ->
+extend_frontier(State, Peeks0, Tail0, Attempted0, Acc) ->
     case has_room(State) of
         false ->
-            {State, Peek0, Attempted0, lists:reverse(Acc)};
+            {State, Peeks0, Tail0, Attempted0, lists:reverse(Acc)};
         true ->
-            case next_range(State, Peek0) of
-                {Peek, Attempted, {FragRef, Range}} ->
+            case next_range(State, Peeks0, Tail0) of
+                {Peeks, Tail, Attempted, {FragRef, Range}} ->
                     {Spec, Pipeline} = rabbitmq_stream_s3_read_pipeline:push(
                         FragRef, Range, pipeline(State)
                     ),
                     extend_frontier(
                         State#state{pipeline = Pipeline},
-                        Peek,
+                        Peeks,
+                        Tail,
                         Attempted0 orelse Attempted,
                         [start_request_effect(Spec) | Acc]
                     );
-                {Peek, Attempted, none} ->
-                    {State, Peek, Attempted0 orelse Attempted, lists:reverse(Acc)}
+                {Peeks, Tail, Attempted, none} ->
+                    {State, Peeks, Tail, Attempted0 orelse Attempted, lists:reverse(Acc)}
             end
     end.
 
 start_request_effect({Id, Key, Range, Fragment}) ->
     {start_request, Id, Key, Range, Fragment}.
 
-has_room(#state{cfg = #cfg{max_depth = MaxDepth}} = State) ->
-    inflight_count(State) < MaxDepth andalso outstanding(State) < fetch_ceiling(State).
-
-%% How far ahead the reader may fetch. That is the prefetch window, except that
-%% the window bounds *prefetch* and the read in hand is not optional: a read of
-%% N bytes cannot be served while fewer than N are outstanding. Gating on the
-%% window alone therefore trapped any read larger than `window_max`. Once
-%% `outstanding` reached the ceiling `has_room/1` stayed false, `note_miss/1`
-%% could not grow the window past `min(WindowMax, _)`, and `extend_frontier/1`
-%% issued nothing - forever. The read deadline was no escape either: it clears
-%% the buffer, the reader refetches to the same ceiling, and wedges again, so
-%% the consumer loops on deadlines instead of making progress. Reads are chunk
-%% sized (`data_size` from the chunk header), so a chunk larger than the
-%% window - or a smaller one while a next-fragment prefetch is held, since that
-%% counts against `outstanding/1` too - was enough.
+%% Two budgets, not one. How hard to fetch and how much to hold ahead of the
+%% consumer are different quantities answering different questions, so
+%% `committed` is bounded for throughput and `buffered` for memory. Summing them
+%% against a single ceiling would make a full buffer subtract directly from
+%% concurrency: a consumer draining slower than the reader fetches would slow
+%% the reader down, when a consumer that cannot keep up is a reason to stop
+%% fetching *more*, once, at a memory bound, not a reason to fetch each range it
+%% already owes less concurrently.
 %%
-%% Flooring at what the pending read needs is the whole fix. The other terms in
-%% `outstanding/1` cannot starve it: the next-fragment buffer only holds bytes
-%% once the current fragment is entirely buffered or in flight, and a pending
-%% read that `try_read/3` left awaiting is below that fragment's index
-%% boundary, so what is already on the wire completes it.
-fetch_ceiling(#state{window = Window, pending = #pending{} = Pending} = State) ->
-    #pending{offset = Offset, bytes = Bytes} = Pending,
+%% The cost is that the two budgets add rather than share: worst-case memory per
+%% reader is the sum of the ceilings rather than one of them.
+has_room(#state{inflight_target = Target, cfg = #cfg{max_depth = MaxDepth}} = State) ->
+    %% Two counts, because they bound two things. `inflight_owing` is the
+    %% throughput gate: a request awaiting only its closing frame is not using
+    %% the wire, so holding a slot open for it is throughput given away.
+    %% `inflight` is the resource cap: that request is still holding a pooled
+    %% connection, and `max_depth` is what bounds a reader's share of the pool.
+    %% Gating on the first alone would let a reader hold more connections than
+    %% its depth allows, since every range that has finished but not closed buys
+    %% another.
+    inflight_owing(State) < Target andalso
+        rabbitmq_stream_s3_read_pipeline:inflight(pipeline(State)) < MaxDepth andalso
+        committed(State) < fetch_ceiling(State) andalso
+        buffered(State) < buffer_ceiling(State).
+
+%% How much the reader may have on the wire: what the concurrency target is
+%% worth in bytes, floored at what the pending read needs.
+%%
+%% The floor is not optional. A read of N bytes cannot be served while fewer
+%% than N are outstanding, so a ceiling below N wedges the reader for good:
+%% `has_room/1` stays false, `extend_frontier/1` issues nothing, and the read
+%% deadline is no escape, since it clears the buffer and the reader refetches to
+%% the same ceiling. Reads are chunk sized (`data_size` from the chunk header),
+%% so a chunk larger than the budget is enough to reach it. Both ceilings carry
+%% the same floor: either one held below the pending read is the same wedge by a
+%% different route.
+fetch_ceiling(#state{inflight_target = Target, cfg = #cfg{request_size = RequestSize}} = State) ->
+    max(Target * RequestSize, pending_need(State)).
+
+%% How much the reader may hold that the consumer has not read. Bounds memory
+%% and nothing else: reaching it says the consumer is behind, which is a reason
+%% to stop fetching ahead but not a reason to fetch what is already owed any
+%% less concurrently.
+buffer_ceiling(#state{window = Window} = State) ->
+    max(Window, pending_need(State)).
+
+%% What the pending read still needs from beyond the read position. Zero with no
+%% read in hand, which cannot floor anything.
+pending_need(#state{pending = #pending{offset = Offset, bytes = Bytes}} = State) ->
     ReadPos = rabbitmq_stream_s3_read_pipeline:read_position(pipeline(State)),
-    max(Window, Offset + Bytes - ReadPos);
-fetch_ceiling(#state{window = Window}) ->
-    Window.
+    Offset + Bytes - ReadPos;
+pending_need(#state{}) ->
+    0.
 
 %% The next range to request: the tail of the current fragment's data region,
 %% or the head of the prefetched next fragment once the current one is fully
@@ -1018,76 +1238,138 @@ fetch_ceiling(#state{window = Window}) ->
 %% one per delivered frame, since a current fragment that is fully spoken for
 %% reaches this on every pass until the transition. Either blocks the reader
 %% while the caller's read deadline burns.
-next_range(State, Peek) ->
+next_range(State, Peeks, Tail) ->
     FragRef = rabbitmq_stream_s3_read_pipeline:current_fragment(pipeline(State)),
     #fragment_ref{offset = Fragment, size = FragSize} = FragRef,
     Frontier = rabbitmq_stream_s3_read_pipeline:frontier(Fragment, pipeline(State)),
     case range_in_fragment(Frontier, FragSize, State) of
-        {Start, End} -> {Peek, false, {FragRef, {Start, End}}};
-        none -> next_fragment_range(State, Peek)
+        {Start, End} -> {Peeks, Tail, false, {FragRef, {Start, End}}};
+        none -> next_fragment_range(State, Peeks, Tail)
     end.
 
 %% A next fragment known to be 404 is not looked ahead to: there is nothing to
 %% prefetch and the transition decides what to do about it.
-next_fragment_range(State, Peek0) ->
+next_fragment_range(State, Peeks0, Tail0) ->
     case rabbitmq_stream_s3_read_pipeline:prefetch(pipeline(State)) of
         not_found ->
-            {Peek0, false, none};
+            {Peeks0, Tail0, false, none};
         _ ->
-            {Peek, Attempted} = peek_next_fragment(State, Peek0),
-            {Peek, Attempted, peeked_range(Peek, State)}
+            spill(State, Peeks0, Tail0, Peeks0, false)
     end.
 
-peeked_range(none, _State) ->
-    none;
-peeked_range(failed, _State) ->
-    %% The peek could not be resolved (a transient group fetch failure). Nothing
-    %% to prefetch for the next fragment until the retry clears it.
-    none;
-peeked_range({ok, #fragment_ref{offset = Offset, size = Size} = FragRef, _Advanced}, State) ->
-    Frontier = rabbitmq_stream_s3_read_pipeline:frontier(Offset, pipeline(State)),
-    case range_in_fragment(Frontier, Size, State) of
-        {Start, End} -> {FragRef, {Start, End}};
-        none -> none
-    end.
-
-%% What the iterator points at. The iterator is only ever replaced, never
-%% advanced in place, so the answer holds until it is - which is where the memo
-%% in `#state.next_peek` is dropped. A group fetch that failed transiently is
-%% recorded as `failed` rather than as `none`: `none` is what says the manifest
-%% ends here, and remembering that of a fetch that merely failed would leave the
-%% reader awaiting a next fragment it has stopped asking for.
+%% Walk the fragments already looked ahead to for one with room left, extending
+%% the look-ahead by one when every one of them is spoken for.
 %%
-%% `failed` says only that the last attempt failed. Whether to attempt again is
-%% not stored alongside it but read off the fault clock: the memo is honoured
-%% while that clock is armed and re-attempted once it is not. Each attempt is a
-%% synchronous group GET inside the core, so something has to pace them, and the
-%% clock is what paces every other retry here - `min_retry_delay_ms` to
-%% `max_retry_delay_ms`, one round at a time. The `pool_busy` clock cannot
-%% stand in: it runs 25-500ms and fires for as long as the pool has no free
-%% connection, which says nothing about whether the group object is fetchable.
-%%
-%% Deriving it rather than storing it is what keeps the two from drifting apart.
-%% A memo that recorded "waiting on the fault clock" as a fact of its own had to
-%% be reset by hand at every site that disowns that clock, and a site that forgot
-%% - `deadline_expired` did - stranded it: nothing re-attempted the fetch and
-%% nothing armed a clock to pace one, so the frontier stopped spilling into the
-%% next fragment for the rest of the current one. Read off the clock, that state
-%% cannot be reached: dropping the clock is what licenses the next attempt.
-%% Returns `{Peek, Attempted}`. Whether a fetch was actually attempted is what
-%% decides the retry clock: a pass that never reached the look-ahead owes
-%% nothing, and arming for it would keep the clock alive - and an armed clock is
-%% exactly what suppresses the next attempt.
-peek_next_fragment(#state{timers = Timers}, failed) when is_map_key(fault, Timers) ->
-    {failed, false};
-peek_next_fragment(#state{iterator = Iterator}, Peek) when Peek =:= unknown; Peek =:= failed ->
-    case rabbitmq_stream_s3_fragment_iterator:next(Iterator) of
-        {ok, FragRef, Advanced} -> {{ok, FragRef, Advanced}, true};
-        end_of_manifest -> {none, true};
-        {error, {group_fetch_failed, _}} -> {failed, true}
+%% Walking past a full fragment rather than stopping at it is what lets the
+%% window exceed one fragment: stopping would put the end of the frontier at the
+%% first fully-spoken-for fragment, so reach at a fragment tail would be one
+%% fragment however large the window is.
+spill(State, Peeks, Tail, [], Attempted) ->
+    %% Any fragment a further walk turns up is past the last one prefetched, so
+    %% a horizon at all is a horizon this side of it: there is nothing to find.
+    case rabbitmq_stream_s3_read_pipeline:prefetch_horizon(pipeline(State)) of
+        unlimited ->
+            case extend_peeks(State, Peeks, Tail) of
+                {Peeks1, Tail1, true} when length(Peeks1) > length(Peeks) ->
+                    spill(State, Peeks1, Tail1, lists:nthtail(length(Peeks), Peeks1), true);
+                {Peeks1, Tail1, Attempted1} ->
+                    {Peeks1, Tail1, Attempted orelse Attempted1, none}
+            end;
+        _Horizon ->
+            {Peeks, Tail, Attempted, none}
     end;
-peek_next_fragment(_State, Peek) ->
-    {Peek, false}.
+spill(State, Peeks, Tail, [{FragRef, _Advanced} | Rest], Attempted) ->
+    #fragment_ref{offset = Offset, size = Size} = FragRef,
+    %% The look-ahead can be deeper than the horizon: a 404 arrives for a
+    %% fragment the iterator was walked past long before, and the peeks on the
+    %% far side of it are kept - `not_found_refresh/1` reads the 404'd offset off
+    %% the head of them. They are not fetchable, so the walk stops here.
+    case beyond_horizon(Offset, State) of
+        true ->
+            {Peeks, Tail, Attempted, none};
+        false ->
+            Frontier = rabbitmq_stream_s3_read_pipeline:frontier(Offset, pipeline(State)),
+            case range_in_fragment(Frontier, Size, State) of
+                {Start, End} -> {Peeks, Tail, Attempted, {FragRef, {Start, End}}};
+                %% Walking past this fragment without issuing into it leaves it
+                %% unseated in the pipeline's `nexts`, which is what would put
+                %% the heads of `peeks` and `nexts` on different fragments -
+                %% and `not_found_refresh/1` reads the 404'd offset off the
+                %% first of them. It cannot happen here: `range_in_fragment/3`
+                %% answers `none` for an unseated fragment only when its data
+                %% region is empty, and `fragment_iterator:next/1` yields only
+                %% fragment entries, descending into the group entries that are
+                %% the size-0 case. An already-seated fragment answers `none`
+                %% once it is fully spoken for, which is the case this walk is
+                %% for.
+                none -> spill(State, Peeks, Tail, Rest, Attempted)
+            end
+    end.
+
+beyond_horizon(Offset, State) ->
+    case rabbitmq_stream_s3_read_pipeline:prefetch_horizon(pipeline(State)) of
+        unlimited -> false;
+        Horizon -> Offset > Horizon
+    end.
+
+%% Walk the iterator one fragment further forward, memoising the entry and the
+%% iterator advanced past it. Returns `{Peeks, Tail, Attempted}`.
+%%
+%% Nothing is walked past the lookahead cap, past the end of the manifest, or
+%% while the fault clock is armed over a failed descent. Each attempt is a
+%% synchronous group GET inside the core, so something has to pace them, and the
+%% fault clock is what paces every other retry here. The `pool_busy` clock
+%% cannot stand in: it fires for as long as the pool has no free connection,
+%% which says nothing about whether the group object is fetchable.
+%%
+%% Whether to re-attempt is read off that clock rather than stored beside the
+%% `failed` marker, so the two cannot drift apart: dropping the clock is what
+%% licenses the next attempt, which means every site that disowns the clock
+%% licenses one without having to remember to.
+%%
+%% `Attempted` says whether a fetch was actually made, which is what decides the
+%% retry clock: a pass that never reached the look-ahead owes nothing, and arming
+%% for it would keep alive the very clock that suppresses the next attempt.
+extend_peeks(State, Peeks, Tail) ->
+    case length(Peeks) >= max_lookahead(State) of
+        true -> {Peeks, Tail, false};
+        false -> extend_peeks_(State, Peeks, Tail)
+    end.
+
+extend_peeks_(#state{timers = Timers}, Peeks, failed) when is_map_key(fault, Timers) ->
+    {Peeks, failed, false};
+extend_peeks_(State, Peeks, Tail) when Tail =:= unknown; Tail =:= failed ->
+    case rabbitmq_stream_s3_fragment_iterator:next(peek_iterator(State, Peeks)) of
+        {ok, FragRef, Advanced} -> {Peeks ++ [{FragRef, Advanced}], unknown, true};
+        end_of_manifest -> {Peeks, none, true};
+        {error, {group_fetch_failed, _}} -> {Peeks, failed, true}
+    end;
+extend_peeks_(_State, Peeks, none) ->
+    {Peeks, none, false}.
+
+%% The iterator to walk forward from: the one advanced past the last fragment
+%% already looked ahead to, or the reader's own when none has been.
+peek_iterator(#state{iterator = Iterator}, []) ->
+    Iterator;
+peek_iterator(_State, Peeks) ->
+    {_FragRef, Advanced} = lists:last(Peeks),
+    Advanced.
+
+%% Ensure at least one fragment has been looked ahead to, for the callers that
+%% only ever need the nearest one. Returns `{Peeks, Tail, Attempted}`.
+peek_next_fragment(_State, [_ | _] = Peeks, Tail) ->
+    {Peeks, Tail, false};
+peek_next_fragment(State, [], Tail) ->
+    extend_peeks(State, [], Tail).
+
+%% What the nearest look-ahead resolved to. Callers that ask about "the next
+%% fragment" want the head, and the terminal marker only speaks for them when
+%% there is no head.
+peek_head([{FragRef, Advanced} | _], _Tail) -> {ok, FragRef, Advanced};
+peek_head([], Tail) -> Tail.
+
+max_lookahead(#state{cfg = #cfg{max_lookahead = MaxLookahead}}) ->
+    MaxLookahead.
 
 range_in_fragment(Frontier, FragSize, State) ->
     IdxStartPos = ?SEGMENT_HEADER_B + FragSize,
@@ -1123,25 +1405,31 @@ build_cfg(Opts) ->
         %% and every read waits out its whole deadline - three times over, with
         %% nothing in the log to say why.
         max_depth = max(1, maps:get(max_depth, Opts, 8)),
+        %% Defaulted to the depth cap because a fragment is only ever looked
+        %% ahead to in order to put a range in it, and no more ranges can be in
+        %% flight than the depth allows - so at this value the backstop cannot
+        %% bind before `has_room/1` does, which is the intent.
+        max_lookahead = max(1, maps:get(max_lookahead, Opts, maps:get(max_depth, Opts, 8))),
+        auto_tune = maps:get(auto_tune, Opts, true),
+        %% Defaulted to the ceiling, so a caller that says only how deep a reader
+        %% may run gets exactly that depth and nothing to search from. The plugin
+        %% passes it explicitly (`prefetch_inflight_initial`).
+        inflight_initial = max(1, maps:get(inflight_initial, Opts, maps:get(max_depth, Opts, 8))),
         min_retry_delay_ms = maps:get(min_retry_delay_ms, Opts, 1_000),
         max_retry_delay_ms = maps:get(max_retry_delay_ms, Opts, 30_000)
     }.
 
 %% ------------------------------------------------------------------
-%% Internal: prefetch window control
+%% Internal: buffer window control
 %%
-%% One knob: `window`, the bytes to hold or have outstanding ahead of the
-%% consumer. Request size is fixed, so the window sets how many requests run
-%% concurrently (up to `#cfg.max_depth`), which is what determines a remote
-%% reader's bandwidth - a single S3 connection tops out around 40 MB/s no
-%% matter how large a range is asked of it.
+%% One knob: `window`, the bytes to hold ahead of the consumer, bounded by
+%% `#cfg.window_max`. It bounds buffering only. How many requests run at once is
+%% the concurrency target's job, and that is what sets bandwidth.
 %%
-%% A buffer miss means the reader is not fetching far enough ahead, so the
+%% A buffer miss means the reader is not buffered far enough ahead, so the
 %% window doubles. Sustained hits mean it is further ahead than it needs to be,
 %% so it gives a request back. This is the opposite of a congestion window: the
-%% miss is a starvation signal, not a signal to back off. The read size this
-%% replaced halved on every miss, so it collapsed to its floor exactly when a
-%% consumer was falling behind and never recovered.
+%% miss is a starvation signal, not a signal to back off.
 %% ------------------------------------------------------------------
 
 %% Bytes per range request.
@@ -1151,12 +1439,16 @@ request_size(#state{cfg = #cfg{request_size = RequestSize}}) ->
 window(#state{window = Window}) ->
     Window.
 
-%% Only the first miss for a given pending read counts. `try_serve/1` re-runs on
-%% every delivery while a read waits, so counting each of those would run the
-%% window to its ceiling on one slow read - and inflate `buffer_miss`, which
-%% counts reads that had to wait, not deliveries they waited through. Growing
-%% once per missed read also keeps a consumer that reads a couple of records and
-%% disconnects from provoking a full window: it only ever misses once or twice.
+%% Only the first miss for a given pending read is counted. `try_serve/1` re-runs
+%% on every delivery while a read waits, and `buffer_miss` counts reads that had
+%% to wait rather than the deliveries they waited through.
+%%
+%% A miss sizes the *buffer* only, which is what it measures: a read that had to
+%% wait means the reader was not buffered far enough ahead of the consumer. It
+%% cannot size the fetch side, because past the throughput peak more concurrency
+%% is what *causes* the consumer to wait - growing on a miss there would buy
+%% more of the thing making it miss. The fetch side is sized from measured
+%% throughput; see "concurrency control".
 note_miss(#state{missed_pending = true} = State) ->
     {State, []};
 note_miss(#state{cfg = #cfg{window_max = WindowMax}, window = Window} = State0) ->
@@ -1183,6 +1475,240 @@ decay(#state{cfg = #cfg{request_size = RequestSize}, window = Window} = State) w
     };
 decay(State) ->
     State.
+
+%% ------------------------------------------------------------------
+%% Internal: concurrency control
+%%
+%% One controlled variable, `inflight_target`: how many range GETs to keep on
+%% the wire. Concurrency is what sets a remote reader's bandwidth, since a
+%% single S3 connection transfers at roughly one rate whatever range size is
+%% asked of it.
+%%
+%% It is searched for rather than configured because the answer is not a
+%% property of the configuration: the same reader against the same store wants
+%% materially different concurrency with a cold connection pool and a warm one.
+%% Past the peak throughput falls away as requests queue for connections rather
+%% than running, so this is a search for a maximum rather than a climb to a
+%% ceiling, and the fall-off is the signal to come back down. `#cfg.max_depth`
+%% is the ceiling, not the operating point.
+%%
+%% The search starts at one request rather than at the operating point, so what
+%% a reader fetches stays proportional to what its consumer has asked for. A
+%% reader that starts at the operating point pays for it on attach: the first
+%% pass runs inside `init/1` and issues the whole target at once, so a consumer
+%% reading a single message downloads the target's worth of bytes and holds the
+%% target's share of the general pool to do it. Ramping instead makes that cost
+%% something a consumer earns - the doubling reaches the same order of magnitude
+%% within a second of sustained reading, and a consumer that stops never pays
+%% for concurrency it did not use.
+%% ------------------------------------------------------------------
+
+%% A rate must beat the last one by this much to count as an improvement, in
+%% percent. Below it the difference is sample noise, and acting on noise makes
+%% the target wander instead of settle.
+-define(TUNE_EPSILON_PCT, 5).
+
+%% How far below the best rate seen the search will drift before returning to
+%% the target that produced it. Wider than the epsilon, so ordinary sample noise
+%% around the peak does not keep yanking it back, and narrow enough that a real
+%% slide is caught before it has cost much throughput.
+-define(TUNE_FALLBACK_PCT, 10).
+
+%% Steps the search may take without beating its best before it goes back to
+%% where that best was and tries the other direction. Small, because each step
+%% past the peak is throughput spent to learn nothing.
+-define(TUNE_PROBE_LIMIT, 3).
+
+%% Contention is S3 asking the reader to slow down. Counted per sample and acted
+%% on at the tick, so a burst of failures from one round costs one backoff
+%% rather than one each.
+%%
+%% `pool_busy` is deliberately not counted. The pool grows reactively, so a
+%% checkout that finds nothing free is what *raising* concurrency looks like
+%% while the connections open: it is the cost of growing, not evidence of having
+%% grown too far. Counting it would make every attempt to grow undo itself. It
+%% resolves on its own, and if the extra concurrency genuinely does not pay, the
+%% sample rate says so.
+%%
+%% `pool_exhausted` is counted, because at the pool's ceiling that reasoning
+%% inverts. There is nothing left to open, so the wait is not the cost of
+%% growing and does not resolve on its own: every checkout waits out its
+%% timeout for as long as the demand lasts. Nor does the sample rate say so on
+%% its own - a rate set by pool waiting rather than by concurrency reads as
+%% flat, and `classify/2` answers flat by stepping the target further the way it
+%% was already going. Several readers at the ceiling would each step up into a
+%% wall they are collectively holding up. Coming down is the only move that can
+%% help, and it is the pool, not the reader, that can tell the two conditions
+%% apart - see `rabbitmq_stream_s3_api_aws_pool:saturation/1`.
+note_contention(slow_down, #state{sample_contention = Count} = State) ->
+    State#state{sample_contention = Count + 1};
+note_contention(pool_exhausted, #state{sample_contention = Count} = State) ->
+    State#state{sample_contention = Count + 1};
+note_contention(_Reason, #state{} = State) ->
+    State.
+
+%% Where the search starts, and where a reader that does not search stays.
+%%
+%% One request with the search on: the ramp is what reaches the operating point,
+%% so `inflight_initial` does not decide it and is not consulted. With the search
+%% off nothing would ever move the target, so the configured value is both the
+%% start and the whole life.
+initial_target(#cfg{auto_tune = false, max_depth = MaxDepth, inflight_initial = Initial}) ->
+    min(MaxDepth, Initial);
+initial_target(#cfg{}) ->
+    1.
+
+tune(_Rate, #state{cfg = #cfg{auto_tune = false}} = State) ->
+    State;
+tune(_Rate, #state{sample_contention = Contention} = State) when Contention > 0 ->
+    %% S3 asked the reader to slow down. Unlike a slower sample this is not a hint
+    %% that the peak is behind us, it is the far side of it being reported
+    %% directly, so it is worth more than one step: give back a quarter and
+    %% resume the search from there.
+    Target = State#state.inflight_target,
+    retarget(Target - max(1, Target div 4), State#state{
+        tune_phase = climb,
+        probe_dir = down,
+        prev_rate = undefined,
+        best_rate = undefined,
+        best_target = undefined,
+        probes_since_best = 0
+    });
+tune(0, #state{} = State) ->
+    %% A sample that delivered nothing says nothing about concurrency, so it is
+    %% not a reading: a consumer that pauses, or one that has yet to issue its
+    %% first read, is not evidence that the target is too high. Judged as one it
+    %% would be, since a zero rate cannot improve on a zero rate - the ramp would
+    %% read the pause as "doubling stopped paying", halve, and hand the climb a
+    %% target it then has to walk back up a step at a time. The baseline is kept
+    %% rather than cleared, so the next sample that does carry bytes is compared
+    %% against the last one that did.
+    State;
+tune(Rate, #state{prev_rate = undefined} = State) ->
+    %% Nothing to compare against yet - the first sample, or the one after a
+    %% contention backoff. Take the reading and move on the next tick.
+    State#state{prev_rate = Rate};
+tune(
+    Rate,
+    #state{tune_phase = ramp, inflight_target = Target, prev_rate = Prev, cfg = Cfg} = State
+) ->
+    case improved(Rate, Prev) of
+        false ->
+            %% Doubling stopped paying. The peak is between here and half of
+            %% here, so go back and look for it a step at a time. The reading
+            %% goes with it: it belongs to a target the reader has left.
+            retarget(max(1, Target div 2), State#state{
+                tune_phase = climb, probe_dir = up, prev_rate = undefined
+            });
+        true when Target >= Cfg#cfg.max_depth ->
+            %% Still paying, but there is nowhere left to double into. Hold at
+            %% the ceiling and search from there rather than halving away from
+            %% a rate that was still improving - the ceiling may well be the
+            %% best place this reader can be, and the climb will step down soon
+            %% enough if it is not.
+            State#state{tune_phase = climb, probe_dir = up, prev_rate = Rate};
+        true ->
+            %% Double rather than step, so a reader reaches the right order of
+            %% magnitude in a few samples instead of thirty.
+            retarget(Target * 2, State#state{prev_rate = Rate})
+    end;
+tune(
+    Rate,
+    #state{
+        tune_phase = climb,
+        inflight_target = Target,
+        probe_dir = Dir,
+        best_rate = Best,
+        best_target = BestTarget
+    } = State
+) ->
+    if
+        Best =/= undefined, Rate * 100 < Best * (100 - ?TUNE_FALLBACK_PCT) ->
+            %% Well below the best this reader has managed. Go back to where that
+            %% was rather than stepping towards it, and search again from there -
+            %% the drift that got here was made of steps too small to notice, so
+            %% unwinding it one at a time would take as long as it took to
+            %% happen. The best is forgotten with the move: it belongs to
+            %% conditions that may not hold any more, and keeping it would stop
+            %% the reader ever settling anywhere else.
+            retarget(BestTarget, State#state{
+                prev_rate = undefined,
+                best_rate = undefined,
+                best_target = undefined,
+                probes_since_best = 0,
+                probe_dir = up
+            });
+        Best =:= undefined; Rate * 100 > Best * (100 + ?TUNE_EPSILON_PCT) ->
+            %% A new best, by enough to be a reading rather than noise. Without
+            %% that margin the best ratchets: any lucky sample at a higher target
+            %% records one there, so the anchor climbs with the search instead of
+            %% holding it, and nothing stops the target walking past the peak.
+            retarget(step_target(Target, Dir), State#state{
+                prev_rate = Rate,
+                best_rate = Rate,
+                best_target = Target,
+                probes_since_best = 0
+            });
+        State#state.probes_since_best >= ?TUNE_PROBE_LIMIT ->
+            %% Several steps without beating the best. Go back to it and try the
+            %% other way, rather than carrying on into ground that has already
+            %% failed to pay - a shallow slope reads as noise at every step, so
+            %% nothing else here would turn the search around.
+            retarget(BestTarget, State#state{
+                prev_rate = undefined,
+                probes_since_best = 0,
+                probe_dir = flip(Dir)
+            });
+        true ->
+            Probed = State#state.probes_since_best + 1,
+            case classify(Rate, State#state.prev_rate) of
+                worse ->
+                    %% The last step was the wrong way. Turn around and take it
+                    %% back.
+                    Reversed = flip(Dir),
+                    retarget(step_target(Target, Reversed), State#state{
+                        probe_dir = Reversed, prev_rate = Rate, probes_since_best = Probed
+                    });
+                _ ->
+                    %% Off the best but not far off it: a plateau, not a peak.
+                    %% Keep probing the way we were. Holding still here is how
+                    %% the search stops searching: a held target produces another
+                    %% flat reading, which holds again, for ever.
+                    retarget(step_target(Target, Dir), State#state{
+                        prev_rate = Rate, probes_since_best = Probed
+                    })
+            end
+    end.
+
+%% Clamped to the configured ceiling, and never below one: a target of zero
+%% leaves `has_room/1` false however far behind the consumer falls, so nothing
+%% would ever be requested again.
+retarget(Target, #state{cfg = #cfg{max_depth = MaxDepth}} = State) ->
+    State#state{inflight_target = max(1, min(MaxDepth, Target))}.
+
+%% Proportional, not one at a time. The ramp can leave the search a long way
+%% from the peak - doubling overshoots by up to half of where it lands, and
+%% against the ceiling by more - and a step of one would take a sample each to
+%% walk back, so the reader would spend most of its run getting there.
+step_target(Target, up) -> Target + max(1, Target div 8);
+step_target(Target, down) -> Target - max(1, Target div 8).
+
+flip(up) -> down;
+flip(down) -> up.
+
+improved(Rate, Prev) ->
+    Rate * 100 > Prev * (100 + ?TUNE_EPSILON_PCT).
+
+classify(Rate, Prev) ->
+    case improved(Rate, Prev) of
+        true ->
+            better;
+        false ->
+            case Rate * 100 < Prev * (100 - ?TUNE_EPSILON_PCT) of
+                true -> worse;
+                false -> flat
+            end
+    end.
 
 %% ------------------------------------------------------------------
 %% Internal: invariants (see `checked/2`)

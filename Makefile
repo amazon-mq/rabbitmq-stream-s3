@@ -41,5 +41,34 @@ BENCH_MODULES = $(filter-out rabbitmq_stream_s3_bench,$(patsubst test/%.erl,%,$(
 .PHONY: bench
 bench: $(addprefix bench-,$(BENCH_MODULES))
 
+# ERL_LIBS puts the umbrella's deps on the path. read_buffer_bench needs none of
+# them, but remote_reader_s3_bench drives the real S3 client and so needs gun,
+# seshat and thoas.
 bench-%: test-build
-	$(gen_verbose) erl -noshell -pa ebin -pa test -eval '$*:run(), halt(0).'
+	$(gen_verbose) ERL_LIBS=$(CURDIR)/.. erl -noshell -pa ebin -pa test -eval '$*:run(), halt(0).'
+
+# The object store remote_reader_s3_bench measures against: MinIO, with latency
+# shaped by `tc netem`. Same shape as jepsen/docker/, minus TLS - the harness
+# injects the pool's `open_fun` and dials by address, so no certificates or
+# /etc/hosts entry are needed. `remote_reader_s3_bench:run/0` skips cleanly when
+# this is not up.
+#
+# The network name and the MinIO image are the script's own, not settings here:
+# it reads S3_BENCH_MINIO from the environment, and make passes a command-line
+# assignment through to the recipe, so `make s3-bench-up S3_BENCH_MINIO=...`
+# reaches it.
+S3_BENCH_ENGINE ?= podman
+
+.PHONY: s3-bench-up
+s3-bench-up:
+	$(gen_verbose) ./scripts/s3-bench-env.sh up $(S3_BENCH_ENGINE)
+
+# Runs the stress-tested configurations and prints each beside its measured
+# result. The harness's own regression test - see scripts/s3-bench-validate.sh.
+.PHONY: s3-bench-validate
+s3-bench-validate:
+	$(gen_verbose) ./scripts/s3-bench-validate.sh
+
+.PHONY: s3-bench-down
+s3-bench-down:
+	$(gen_verbose) ./scripts/s3-bench-env.sh down $(S3_BENCH_ENGINE)

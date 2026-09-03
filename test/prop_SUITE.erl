@@ -1734,8 +1734,19 @@ gen_rrc_event(NextReadPos) ->
         {2, ?LET(E, gen_rrc_error_event(), {E, NextReadPos})},
         {1, ?LET(Kind, oneof([fault, pool_busy]), {{retry, Kind}, NextReadPos})},
         {1, ?LET(E, gen_rrc_iterator_refreshed_event(), {E, NextReadPos})},
+        {1, ?LET(E, gen_rrc_tune_tick_event(), {E, NextReadPos})},
         {1, {deadline_expired, NextReadPos}}
     ]).
+
+%% Closing a sample is an event like any other, and without it in the sequence
+%% the concurrency search is never fuzzed: `inflight_target` holds wherever it
+%% started, so `tune/2`, `retarget/2` and `note_contention/2` never run against
+%% a state any of the other events built. The elapsed time is generated too,
+%% because it is half of the rate the search reads - a tick is the one event
+%% carrying time into the core, and the sample it closes is whatever the events
+%% before it delivered.
+gen_rrc_tune_tick_event() ->
+    ?LET(ElapsedUs, range(1, 1_000_000), {tune_tick, ElapsedUs}).
 
 gen_rrc_read_event(NextReadPos) ->
     ?LET(
@@ -1759,7 +1770,16 @@ gen_rrc_error_event() ->
     ?LET(
         {Reason, Which},
         {
-            oneof([timeout, slow_down, connection_error, stream_error, internal_error, pool_busy]),
+            oneof([
+                timeout,
+                slow_down,
+                connection_error,
+                stream_error,
+                internal_error,
+                pool_busy,
+                pool_exhausted,
+                not_found
+            ]),
             range(0, 7)
         },
         {fail, Which, Reason}
@@ -2246,13 +2266,12 @@ rrc_ranges_disjoint([]) ->
 %% may push the reader past its window.
 %% Every property above this one drives a single-fragment manifest whose group
 %% fun returns `{error, not_found}`, so the look-ahead can only ever answer
-%% `end_of_manifest`: `next_peek = failed` - the state a transient group fetch
-%% leaves behind, and the state the reader has to climb back out of - was
-%% unreachable in all 500 iterations of each of them. That is why a stranded
-%% memo survived several reviews. This fixture puts every fragment after the
-%% first behind a group node and lets the generator decide how many of those
-%% fetches fail, so the region is reachable and the invariants checked inside
-%% `step/2` apply to it like anywhere else.
+%% `end_of_manifest`, leaving `peek_tail = failed` unreachable in all 500
+%% iterations of each of them. That is the state a transient group fetch leaves
+%% behind and the one the reader has to climb back out of. This fixture puts
+%% every fragment after the first behind a group node and lets the generator
+%% decide how many of those fetches fail, so the region is reachable and the
+%% invariants checked inside `step/2` apply to it like anywhere else.
 %%
 %% The oracle is the recovery, because the failure is not a crash: a reader
 %% carrying a stranded memo keeps serving the fragment it is on and stops only
@@ -2285,7 +2304,18 @@ prop_remote_reader_core_look_ahead_recovers() ->
             %% lasts. Iterator refreshes are dropped: the generator builds them
             %% around a single-fragment manifest of its own, which would replace
             %% this fixture with one that has nothing to look ahead to.
-            S1 = run_rrc_events([E || E <- Events, not is_rrc_refresh(E)], S0),
+            %%
+            %% 404s go with them, because they are the other half of the same
+            %% thing. A 404 on the current fragment parks the reader on
+            %% `{refresh_iterator, _}` by design - it cannot know which fragment
+            %% to move to until the shell tells it - so a sequence containing
+            %% one asks this property whether the reader recovers from a state
+            %% whose recovery is an effect this fixture never honours. The
+            %% answer is no, and it is the right answer. What a 404 does to the
+            %% reader is the core suite's subject, and the other two properties
+            %% over this generator still fuzz it.
+            Chaos = [E || E <- Events, not is_rrc_refresh(E), not is_rrc_not_found(E)],
+            S1 = run_rrc_events(Chaos, S0),
             %% Phase 2: S3 is healthy and the read the shell was waiting on has
             %% expired.
             counters:put(Failures, 1, 0),
@@ -2297,6 +2327,9 @@ prop_remote_reader_core_look_ahead_recovers() ->
 
 is_rrc_refresh({iterator_refreshed, _}) -> true;
 is_rrc_refresh(_Event) -> false.
+
+is_rrc_not_found({fail, _Which, not_found}) -> true;
+is_rrc_not_found(_Event) -> false.
 
 %% A round answers everything outstanding and reads, which is what walks the
 %% consumer to the end of the fragment and puts the frontier where it has to
@@ -2408,19 +2441,36 @@ prop_remote_reader_core_load_bounded() ->
             ),
             %% `read_pos` is never negative, so the most any pending read can
             %% ask for is the furthest byte any read in the sequence reaches.
+            %%
+            %% The two budgets are bounded by different things: what may be on
+            %% the wire comes from the concurrency target, which cannot exceed
+            %% `max_depth`; what may be held unread comes from the AIMD window,
+            %% which cannot exceed `window_max`. Each may cross its ceiling by
+            %% the one range `has_room/1` admits before checking again, and each
+            %% is floored at what the read in hand needs.
+            %%
+            %% Bounded separately is not bounded independently, though, and only
+            %% the committed bound is a ceiling on its own. `has_room/1` gates
+            %% issuing a range, not holding bytes: once the buffer budget is
+            %% spent the ranges already committed still deliver, and their bytes
+            %% land in a buffer behind the closed gate. So whatever may be
+            %% committed may also end up buffered, and the buffered bound
+            %% carries the committed one.
             MaxReadEnd = lists:max([0 | [O + B || {read, O, B, _} <- Events]]),
-            MaxOutstanding = max(WindowMax, MaxReadEnd) + RequestSize,
-            check_rrc_load(Events, S0, MaxOutstanding, MaxDepth)
+            CommittedBound = max(MaxDepth * RequestSize, MaxReadEnd) + RequestSize,
+            BufferedBound = max(WindowMax, MaxReadEnd) + CommittedBound,
+            check_rrc_load(Events, S0, {CommittedBound, BufferedBound}, MaxDepth)
         end
     ).
 
-check_rrc_load([], _State, _MaxOutstanding, _MaxDepth) ->
+check_rrc_load([], _State, _Bounds, _MaxDepth) ->
     true;
-check_rrc_load([Event | Rest], State0, MaxOutstanding, MaxDepth) ->
+check_rrc_load([Event | Rest], State0, {CommittedBound, BufferedBound} = Bounds, MaxDepth) ->
     State = run_rrc_events([Event], State0),
-    {Outstanding, InFlight} = rabbitmq_stream_s3_remote_reader_core:load(State),
-    Outstanding =< MaxOutstanding andalso InFlight =< MaxDepth andalso
-        check_rrc_load(Rest, State, MaxOutstanding, MaxDepth).
+    {Committed, Buffered, InFlight} = rabbitmq_stream_s3_remote_reader_core:load(State),
+    Committed =< CommittedBound andalso Buffered =< BufferedBound andalso
+        InFlight =< MaxDepth andalso
+        check_rrc_load(Rest, State, Bounds, MaxDepth).
 
 %% =========================================================================
 %% Read buffer (block queue) properties

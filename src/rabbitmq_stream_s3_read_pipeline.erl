@@ -13,7 +13,8 @@ for a range whose predecessors are unfinished are staged on that range and
 appended once it heads its fragment's queue.
 
 This module owns that queue, the buffers it assembles into - the current
-fragment's and the prefetched next one's - and the consumer's read position. It
+fragment's and one per fragment prefetched ahead of it - and the consumer's
+read position. It
 decides nothing: how much to fetch, when to retry and when to move on are the
 core's, which drives this through `push/3`, `ready/2`, `data/4` and `fail/3`.
 The split is bytes against policy. Everything here is a pure function of what
@@ -105,8 +106,28 @@ stays four blocks: flattening them here would undo what the block queue is for.
     %% up to a block of consumed bytes would keep counting against the window.
     read_pos :: byte_offset(),
 
-    %% Next fragment (pre-fetched)
-    next :: {#fragment_ref{}, rabbitmq_stream_s3_read_buffer:buffer()} | undefined | not_found,
+    %% Fragments ahead of the current one, nearest first and contiguous in
+    %% manifest order. The head is what the next transition moves to.
+    %%
+    %% An entry appears when a range is first issued into its fragment
+    %% (`register_next/2`), not when bytes first arrive for it. That is what
+    %% keeps the list in manifest order: ranges are issued strictly forward, but
+    %% their answers are not, so a list built from deliveries could seat a later
+    %% fragment at the head and skip the one between it and the current one at
+    %% the next transition.
+    nexts = [] :: [{#fragment_ref{}, rabbitmq_stream_s3_read_buffer:buffer()}],
+
+    %% Whether the fragment following the last of `nexts` - or following the
+    %% current one, when `nexts` is empty - is known to be missing.
+    %%
+    %% Positional rather than an offset, so it is exact only while `nexts` is
+    %% contiguous. A fragment is seated when a range is issued into it, and
+    %% every fragment with a data region gets one, so the only fragment the
+    %% look-ahead can walk past without seating is one whose data region is
+    %% empty. Such a fragment holds no chunks, which is what makes recording the
+    %% hole one fragment early harmless: neither the prefetch it blocks nor the
+    %% iterator refresh that skips past it gives up a byte the consumer wants.
+    next_missing = false :: boolean(),
 
     %% Outstanding ranges, ordered by `{fragment, range_start}` and disjoint.
     %% Normally contiguous within a fragment too, but not while a request that
@@ -148,8 +169,10 @@ arms it.
     current_fragment_offset/1,
     read_position/1,
     frontier/2,
-    outstanding/1,
+    committed/1,
+    buffered/1,
     inflight/1,
+    inflight_owing/1,
     waits_on/2,
     push/3,
     ready/2,
@@ -161,6 +184,7 @@ arms it.
     drop_prefetch/1,
     prefetch/1,
     prefetching/2,
+    prefetch_horizon/1,
     advance/1,
     read/3
 ]).
@@ -186,8 +210,7 @@ new(StreamId, FragRef, Position) ->
         stream = StreamId,
         frag_ref = FragRef,
         buffer = rabbitmq_stream_s3_read_buffer:new(Position),
-        read_pos = Position,
-        next = undefined
+        read_pos = Position
     }.
 
 -doc """
@@ -215,37 +238,80 @@ current_fragment_offset(#pipeline{frag_ref = #fragment_ref{offset = Offset}}) ->
 read_position(#pipeline{read_pos = ReadPos}) ->
     ReadPos.
 
--doc "What the prefetch of the next fragment holds: nothing, bytes, or a 404.".
+-doc """
+What the prefetch of the next fragment holds: nothing, bytes, or a 404.
+
+A registered fragment that has yet to receive a byte reads as `undefined`, the
+same as no prefetch at all. The transition it would answer is one the caller
+cannot take yet - there is nothing to serve on the far side of it - and saying
+so keeps a fragment's arrival, rather than a range being issued into it, as what
+moves the reader onto it.
+""".
 -spec prefetch(pipeline()) -> undefined | not_found | {#fragment_ref{}, byte_offset()}.
-prefetch(#pipeline{next = {FragRef, Buffer}}) ->
-    {FragRef, rabbitmq_stream_s3_read_buffer:end_pos(Buffer)};
-prefetch(#pipeline{next = Next}) ->
-    Next.
+prefetch(#pipeline{nexts = [{FragRef, Buffer} | _]}) ->
+    case rabbitmq_stream_s3_read_buffer:end_pos(Buffer) of
+        ?SEGMENT_HEADER_B -> undefined;
+        EndPos -> {FragRef, EndPos}
+    end;
+prefetch(#pipeline{next_missing = true}) ->
+    not_found;
+prefetch(#pipeline{}) ->
+    undefined.
 
 -doc """
-Whether the prefetch holds bytes for `Fragment`.
+Whether `Fragment` is one the reader is prefetching.
 
 An answer can still arrive for a fragment the reader has left behind at a
 transition, and what such a frame says about the prefetch is nothing: it is
-about a fragment nobody is reading any more. Only bytes are conclusive here -
-before any have arrived the pipeline does not know which fragment is being
-prefetched, and the caller has to say (see the core's
-`is_prefetched_fragment/2`).
+about a fragment nobody is reading any more. Registration happens on issuance,
+so this is answered for a fragment that has yet to deliver a byte - which is the
+case the caller most needs it for, since that is when a 404 arrives.
 """.
 -spec prefetching(fragment_offset(), pipeline()) -> boolean().
-prefetching(Fragment, #pipeline{next = {#fragment_ref{offset = Fragment}, _}}) ->
-    true;
-prefetching(_Fragment, #pipeline{}) ->
-    false.
+prefetching(Fragment, #pipeline{nexts = Nexts}) ->
+    find_next(Fragment, Nexts) =/= error.
 
 -doc """
-Records that the next fragment is known to be missing, so nothing is prefetched
-for it and the core can decide what to do when the consumer reaches it.
+The last fragment the reader may still fetch into, or `unlimited`.
+
+A hole bounds the frontier, and the look-ahead can be several fragments deeper
+than the hole is: a 404 arrives for a fragment the iterator has already been
+walked past, so the core can hold peeks on the far side of it. Rather than have
+the core carry a second copy of where the hole is and keep the two in step, it
+asks - this module learns of the 404 and owns the answer.
 """.
--spec drop_fragment(fragment_offset() | next_not_found, pipeline()) ->
+-spec prefetch_horizon(pipeline()) -> unlimited | fragment_offset().
+prefetch_horizon(#pipeline{next_missing = false}) ->
+    unlimited;
+prefetch_horizon(#pipeline{nexts = Nexts, frag_ref = #fragment_ref{offset = Current}}) ->
+    last_next_offset(Nexts, Current).
+
+%% Where the hole sits when `next_missing` is set: after the last prefetched
+%% fragment, or after the current one when nothing is prefetched.
+last_next_offset([], Current) ->
+    Current;
+last_next_offset(Nexts, _Current) ->
+    {#fragment_ref{offset = Offset}, _} = lists:last(Nexts),
+    Offset.
+
+-doc """
+Records that `Fragment` is known to be missing, so nothing is prefetched at or
+past it and the core can decide what to do when the consumer reaches it.
+
+Everything at or past the hole goes, not just the fragment itself: the reader
+reaches a fragment only by walking the ones before it, so a buffer or a range
+beyond a fragment that is gone is work nothing will ever collect. Returns the
+ids of the ranges that had been issued past it, which the caller cancels.
+""".
+-spec drop_fragment(fragment_offset() | {not_found, fragment_offset()}, pipeline()) ->
     {[request_id()], pipeline()}.
-drop_fragment(next_not_found, #pipeline{} = P) ->
-    {[], checked(P#pipeline{next = not_found})};
+drop_fragment({not_found, Fragment}, #pipeline{nexts = Nexts, reqs = Reqs} = P) ->
+    Kept = lists:takewhile(fun({#fragment_ref{offset = O}, _}) -> O < Fragment end, Nexts),
+    {Dropped, KeptReqs} = lists:partition(fun(#req{fragment = F}) -> F >= Fragment end, Reqs),
+    {
+        [Id || #req{id = Id} <- Dropped],
+        checked(P#pipeline{nexts = Kept, next_missing = true, reqs = KeptReqs})
+    };
 drop_fragment(Fragment, #pipeline{reqs = Reqs} = P) ->
     {Dropped, Kept} = lists:partition(fun(#req{fragment = F}) -> F =:= Fragment end, Reqs),
     {[Id || #req{id = Id} <- Dropped], checked(P#pipeline{reqs = Kept})}.
@@ -261,20 +327,33 @@ it is exactly as valid afterwards as before.
 clear_requests(#pipeline{} = P) ->
     checked(P#pipeline{reqs = []}).
 
-%% Give up the bytes prefetched for the next fragment. A `not_found` next is
-%% kept: it holds no bytes, so it costs the window nothing, and a fragment
+%% Give up the bytes prefetched ahead of the current fragment. A bare `not_found`
+%% is kept: it holds no bytes, so it costs the window nothing, and a fragment
 %% retention has deleted does not come back - forgetting it would spend another
 %% GET learning the same 404. That clause changes nothing, so it needs no
-%% `checked/1`. Clearing `next` cannot break an invariant on its own - only
-%% `not_found` constrains the queue - but it goes through `checked/1` anyway so
-%% that every mutator does; see `checked/1`.
+%% `checked/1`.
+%%
+%% Dropping buffered fragments drops the marker with them, because the marker is
+%% positional: it says the fragment after the last of `nexts` is gone, so keeping
+%% it over an emptied list would move the hole onto the fragment immediately
+%% after the current one - which is a fragment the reader has buffered bytes for.
+%% Re-peeking costs one GET to learn the same 404 again; getting the position
+%% wrong strands the reader on a fragment it believes is missing.
+%%
+%% The ranges into those fragments go with their seats. A range whose fragment
+%% has no seat can never reach a buffer, so leaving them would wedge the queue
+%% while holding pooled connections - the caller drops the whole queue in the
+%% same breath, but the pairing belongs to whichever operation breaks it.
 -spec drop_prefetch(pipeline()) -> pipeline().
-drop_prefetch(#pipeline{next = not_found} = P) -> P;
-drop_prefetch(#pipeline{} = P) -> checked(P#pipeline{next = undefined}).
+drop_prefetch(#pipeline{nexts = []} = P) ->
+    P;
+drop_prefetch(#pipeline{reqs = Reqs, frag_ref = #fragment_ref{offset = Current}} = P) ->
+    Kept = [Req || #req{fragment = F} = Req <- Reqs, F =< Current],
+    checked(P#pipeline{nexts = [], next_missing = false, reqs = Kept}).
 
 -doc """
-Moves to the fragment `next` was prefetching, or resets the current one when
-there is nothing to move to.
+Moves to the nearest prefetched fragment holding bytes, or resets the current
+one when there is nothing to move to.
 
 Returns the offset now being read and what the shell must cancel: the ranges
 still outstanding against the fragment being left behind sort ahead of the new
@@ -282,9 +361,24 @@ current fragment's, so leaving them in the queue would block reassembly forever.
 In practice the transition can only happen once the old fragment's data region
 is fully buffered, so the list is normally empty; dropping them defensively
 costs nothing and turns a possible deadlock into a cancelled request.
+
+Bytes, not a seat in `nexts`, are what make a fragment somewhere to move to. A
+fragment is seated as soon as a range is issued into it, so the head can be a
+fragment nothing has answered for yet; moving onto that one would put the reader
+on an empty buffer and call it progress. The callers divide on exactly this
+line - a transition asks `prefetch/1` first, and the become-local path wants the
+reset - so the distinction lives here rather than in either of them.
 """.
 -spec advance(pipeline()) -> {fragment_offset(), all | [request_id()], pipeline()}.
-advance(#pipeline{next = {NextFragRef, Buffer}, frag_ref = FragRef} = P0) ->
+advance(#pipeline{nexts = [{_FragRef, Buffer} | _] = Nexts} = P0) ->
+    case rabbitmq_stream_s3_read_buffer:end_pos(Buffer) > ?SEGMENT_HEADER_B of
+        true -> advance_to(Nexts, P0);
+        false -> reset_current(P0)
+    end;
+advance(#pipeline{} = P0) ->
+    reset_current(P0).
+
+advance_to([{NextFragRef, Buffer} | Rest], #pipeline{frag_ref = FragRef} = P0) ->
     #fragment_ref{offset = NextOffset} = NextFragRef,
     #fragment_ref{offset = CurrentOffset} = FragRef,
     %% Forward navigation must be strictly increasing. A fragment iterator that
@@ -299,13 +393,14 @@ advance(#pipeline{next = {NextFragRef, Buffer}, frag_ref = FragRef} = P0) ->
         frag_ref = NextFragRef,
         buffer = Buffer,
         read_pos = rabbitmq_stream_s3_read_buffer:start_pos(Buffer),
-        next = undefined
+        nexts = Rest
     },
     {Stale, Reqs} = lists:partition(
         fun(#req{fragment = Fragment}) -> Fragment < NextOffset end, P#pipeline.reqs
     ),
-    {NextOffset, [Id || #req{id = Id} <- Stale], checked(P#pipeline{reqs = Reqs})};
-advance(#pipeline{frag_ref = #fragment_ref{offset = CurrentOffset}, reqs = Reqs} = P0) ->
+    {NextOffset, [Id || #req{id = Id} <- Stale], checked(P#pipeline{reqs = Reqs})}.
+
+reset_current(#pipeline{frag_ref = #fragment_ref{offset = CurrentOffset}, reqs = Reqs} = P0) ->
     %% There was no prefetched fragment to move to, so the fragment does not
     %% change and the buffer is reset under the requests still reading it. Those
     %% requests can no longer flush - their `flushed` is past the empty buffer's
@@ -320,7 +415,8 @@ advance(#pipeline{frag_ref = #fragment_ref{offset = CurrentOffset}, reqs = Reqs}
     P = P0#pipeline{
         buffer = rabbitmq_stream_s3_read_buffer:new(?SEGMENT_HEADER_B),
         read_pos = ?SEGMENT_HEADER_B,
-        next = undefined,
+        nexts = [],
+        next_missing = false,
         reqs = []
     },
     {CurrentOffset, Cancels, checked(P)}.
@@ -352,18 +448,59 @@ push(
         pos = Start,
         status = inflight
     },
-    {start_spec(Req), checked(P#pipeline{next_id = Id + 1, reqs = insert_req(Req, Reqs)})}.
+    P1 = register_next(FragRef, P#pipeline{next_id = Id + 1, reqs = insert_req(Req, Reqs)}),
+    {start_spec(Req), checked(P1)}.
+
+%% Seat a fragment beyond the current one in `nexts` the moment a range is
+%% issued into it, with the empty buffer its deliveries will fill. See the
+%% field's own comment for why issuance rather than delivery is what orders the
+%% list; appending is enough because `next_range/2` only ever spills forward.
+register_next(
+    #fragment_ref{offset = Fragment} = FragRef,
+    #pipeline{frag_ref = #fragment_ref{offset = Current}, nexts = Nexts} = P
+) when Fragment > Current ->
+    case find_next(Fragment, Nexts) of
+        error ->
+            Buffer = rabbitmq_stream_s3_read_buffer:new(?SEGMENT_HEADER_B),
+            P#pipeline{nexts = Nexts ++ [{FragRef, Buffer}]};
+        {ok, _Buffer} ->
+            P
+    end;
+register_next(_FragRef, #pipeline{} = P) ->
+    P.
+
+find_next(_Fragment, []) ->
+    error;
+find_next(Fragment, [{#fragment_ref{offset = Fragment}, Buffer} | _]) ->
+    {ok, Buffer};
+find_next(Fragment, [_ | Rest]) ->
+    find_next(Fragment, Rest).
+
+replace_next(Fragment, Buffer, [{#fragment_ref{offset = Fragment} = FragRef, _} | Rest]) ->
+    [{FragRef, Buffer} | Rest];
+replace_next(Fragment, Buffer, [Entry | Rest]) ->
+    [Entry | replace_next(Fragment, Buffer, Rest)];
+replace_next(Fragment, _Buffer, []) ->
+    %% Only reachable with a delivery for a fragment that has no seat, which
+    %% `checked/1` rules out and `set_buffer_for/3` never asks for. Named rather
+    %% than left to `function_clause`: the pairing between a range and its seat
+    %% is maintained across `register_next/2`, `drop_fragment/2`,
+    %% `drop_prefetch/1` and `advance/1`, and a break in it reaches the consumer
+    %% as `{error, {remote_reader_down, _}}` with nothing at the point of
+    %% failure to say which of them dropped the seat.
+    error({unseated_fragment, Fragment}).
 
 %% (Re-)issue ranges that are queued and not in flight. Their bytes are already
-%% counted in `outstanding/1`, so the caller does not window-gate them - a range
+%% counted in `committed/1`, so the caller does not budget-gate them - a range
 %% the reader has committed to must be fetched, or the buffer never becomes
 %% contiguous again and every read behind it stalls until the deadline. They do
-%% take a slot, so the depth cap still applies.
+%% take a slot, so `Cap` still applies: the caller's concurrency bound, which is
+%% the depth cap and the search's target together (see its `issue_ready/1`).
 -spec ready(pos_integer(), pipeline()) -> {[start_spec()], pipeline()}.
-ready(MaxDepth, #pipeline{reqs = Reqs} = P) ->
+ready(Cap, #pipeline{reqs = Reqs} = P) ->
     {Reqs1, {_, Specs}} = lists:mapfoldl(
         fun
-            (#req{status = ready} = Req, {InFlight, Acc}) when InFlight < MaxDepth ->
+            (#req{status = ready} = Req, {InFlight, Acc}) when InFlight < Cap ->
                 {Req#req{status = inflight}, {InFlight + 1, [start_spec(Req) | Acc]}};
             (Req, Acc) ->
                 {Req, Acc}
@@ -413,33 +550,62 @@ frontier(Fragment, #pipeline{reqs = Reqs} = P) ->
 
 buffered_end(Fragment, #pipeline{frag_ref = #fragment_ref{offset = Fragment}, buffer = Buffer}) ->
     rabbitmq_stream_s3_read_buffer:end_pos(Buffer);
-buffered_end(Fragment, #pipeline{next = {#fragment_ref{offset = Fragment}, Buffer}}) ->
-    rabbitmq_stream_s3_read_buffer:end_pos(Buffer);
-buffered_end(_Fragment, _P) ->
-    ?SEGMENT_HEADER_B.
+buffered_end(Fragment, #pipeline{nexts = Nexts}) ->
+    case find_next(Fragment, Nexts) of
+        {ok, Buffer} -> rabbitmq_stream_s3_read_buffer:end_pos(Buffer);
+        error -> ?SEGMENT_HEADER_B
+    end.
 
-%% How far ahead of the consumer the reader has got: the buffered bytes it has
-%% not read yet, plus the part of every outstanding range that is not in a
-%% buffer. This is what the prefetch window bounds.
--spec outstanding(pipeline()) -> non_neg_integer().
-outstanding(#pipeline{buffer = Buffer, read_pos = ReadPos, next = Next, reqs = Reqs}) ->
-    Unread =
-        max(0, rabbitmq_stream_s3_read_buffer:end_pos(Buffer) - ReadPos) +
-            case Next of
-                {_, NextBuffer} ->
-                    rabbitmq_stream_s3_read_buffer:end_pos(NextBuffer) - ?SEGMENT_HEADER_B;
-                _ ->
-                    0
-            end,
+%% How far ahead of the consumer the reader has got, in two terms rather than
+%% one. They answer different questions - how much memory the reader is holding,
+%% against how hard it is currently fetching - and the core bounds each on its
+%% own. See its `has_room/1`.
+
+%% Bytes held in a buffer that the consumer has not read: the current
+%% fragment's unread run, plus everything prefetched for the fragments after it
+%% (none of which has been read, by definition).
+-spec buffered(pipeline()) -> non_neg_integer().
+buffered(#pipeline{buffer = Buffer, read_pos = ReadPos, nexts = Nexts}) ->
+    max(0, rabbitmq_stream_s3_read_buffer:end_pos(Buffer) - ReadPos) +
+        lists:sum([
+            rabbitmq_stream_s3_read_buffer:end_pos(NextBuffer) - ?SEGMENT_HEADER_B
+         || {_FragRef, NextBuffer} <- Nexts
+        ]).
+
+%% Bytes the reader has committed to fetching that have not reached a buffer
+%% yet. Every queued range counts, not only the ones on the wire: a range in
+%% backoff or awaiting a depth slot is just as committed, which is why
+%% `ready/2` is not window-gated.
+-spec committed(pipeline()) -> non_neg_integer().
+committed(#pipeline{reqs = Reqs}) ->
     lists:foldl(
         fun(#req{range_end = RangeEnd, flushed = Flushed}, Acc) -> Acc + RangeEnd + 1 - Flushed end,
-        Unread,
+        0,
         Reqs
     ).
 
 -spec inflight(pipeline()) -> non_neg_integer().
 inflight(#pipeline{reqs = Reqs}) ->
     length([Req || #req{status = inflight} = Req <- Reqs]).
+
+-doc """
+In flight and still owing bytes: what is actually occupying the wire.
+
+A request that has delivered every byte it owes stays in the queue until its
+closing frame arrives, and until then it is a request doing nothing. Counting it
+against the concurrency target would spend a slot on a response that is over,
+which at a target sized for throughput is throughput given away. What it is
+still holding is a pooled connection, and that is accounted for separately: the
+core's `has_room/1` counts every in-flight request, owing bytes or not, against
+`max_depth`, which is what bounds a reader's share of the pool.
+""".
+-spec inflight_owing(pipeline()) -> non_neg_integer().
+inflight_owing(#pipeline{reqs = Reqs}) ->
+    length([
+        Req
+     || #req{status = inflight, range_end = RangeEnd, flushed = Flushed} = Req <- Reqs,
+        Flushed =< RangeEnd
+    ]).
 
 -doc """
 Whether anything is waiting on a backoff clock: a range queued against it, or
@@ -713,22 +879,13 @@ buffer_for(
     #pipeline{frag_ref = #fragment_ref{offset = Fragment}, buffer = Buffer}
 ) ->
     {ok, Buffer};
-buffer_for(#req{fragment = Fragment}, #pipeline{next = {#fragment_ref{offset = Fragment}, Buffer}}) ->
-    {ok, Buffer};
-buffer_for(
-    #req{fragment = Fragment},
-    #pipeline{next = undefined, frag_ref = #fragment_ref{offset = Current}}
-) when
-    Fragment > Current
-->
-    %% First bytes to reach a buffer for the prefetched next fragment. Only
-    %% while `next` holds nothing: a `not_found` there is what says the fragment
-    %% is gone, and creating a buffer over it would put the reader back to
-    %% fetching an object retention has deleted.
-    {ok, rabbitmq_stream_s3_read_buffer:new(?SEGMENT_HEADER_B)};
-buffer_for(_Req, _P) ->
-    %% A fragment the reader has already moved past.
-    error.
+buffer_for(#req{fragment = Fragment}, #pipeline{nexts = Nexts}) ->
+    %% `error` is a fragment with no seat in `nexts`: one the reader has moved
+    %% past, or one dropped behind a 404. Every fragment it is still prefetching
+    %% was seated when its first range was issued, so a delivery never creates a
+    %% buffer here. That is what stops one being created over a hole and putting
+    %% the reader back to fetching an object retention has deleted.
+    find_next(Fragment, Nexts).
 
 set_buffer_for(
     #req{fragment = Fragment},
@@ -736,8 +893,8 @@ set_buffer_for(
     #pipeline{frag_ref = #fragment_ref{offset = Fragment}} = P
 ) ->
     P#pipeline{buffer = Buffer};
-set_buffer_for(#req{frag_ref = FragRef}, Buffer, P) ->
-    P#pipeline{next = {FragRef, Buffer}}.
+set_buffer_for(#req{fragment = Fragment}, Buffer, #pipeline{nexts = Nexts} = P) ->
+    P#pipeline{nexts = replace_next(Fragment, Buffer, Nexts)}.
 
 %% ------------------------------------------------------------------
 %% Reading
@@ -817,12 +974,41 @@ read(Offset, Bytes, #pipeline{frag_ref = #fragment_ref{size = FragSize}, buffer 
 %% fetched twice, far from the edit that caused it. Routing all of them through
 %% one place is what makes the check a net rather than a spot assertion, and it
 %% costs nothing in production (`checked/1` is a no-op outside TEST).
-checked(#pipeline{reqs = Reqs, next = Next, frag_ref = #fragment_ref{offset = Current}} = P) ->
-    %% Nothing is prefetched once the next fragment is known to be missing, so a
-    %% range above the current fragment cannot coexist with a `not_found` next.
-    %% That state is what would let a delivery create a buffer over the 404 (see
-    %% `buffer_for/2`) and send the reader back to an object retention deleted.
-    (Next =/= not_found orelse lists:all(fun(#req{fragment = F}) -> F =< Current end, Reqs)) orelse
+checked(
+    #pipeline{
+        reqs = Reqs,
+        nexts = Nexts,
+        next_missing = Missing,
+        frag_ref = #fragment_ref{offset = Current}
+    } = P
+) ->
+    %% The prefetched fragments run forward from the current one, without
+    %% repeats. `advance/1` promotes the head whole, so a list out of order
+    %% would move the reader onto a fragment past one it never read - delivering
+    %% a hole to the consumer with nothing else to signal it.
+    Offsets = [Offset || {#fragment_ref{offset = Offset}, _} <- Nexts],
+    (Offsets =:= lists:sort(Offsets) andalso length(lists:usort(Offsets)) =:= length(Offsets)) orelse
+        error({prefetch_out_of_order, Current, Offsets}),
+    lists:all(fun(Offset) -> Offset > Current end, Offsets) orelse
+        error({prefetch_below_current, Current, Offsets}),
+    %% Every range beyond the current fragment has a seat in `nexts`. `push/3`
+    %% makes one, and every path that takes a seat away takes that fragment's
+    %% ranges with it. Without the pairing a delivery finds no buffer to append
+    %% to (`buffer_for/2` creates none), so its bytes are dropped while the range
+    %% stays queued holding a pooled connection - a stall with nothing at the
+    %% point of failure to say why.
+    lists:all(
+        fun(#req{fragment = F}) -> F =< Current orelse find_next(F, Nexts) =/= error end,
+        Reqs
+    ) orelse
+        error({unseated_request, Current, Offsets, [F || #req{fragment = F} <- Reqs]}),
+    %% Nothing is fetched past a fragment known to be missing. Such a range
+    %% could not reach a buffer - `buffer_for/2` seats none beyond the hole - so
+    %% it would wedge the queue while holding a pooled connection.
+    (not Missing orelse
+        lists:all(
+            fun(#req{fragment = F}) -> F =< last_next_offset(Nexts, Current) end, Reqs
+        )) orelse
         error({prefetch_after_not_found, Current, Reqs}),
     Ids = [Id || #req{id = Id} <- Reqs],
     length(lists:usort(Ids)) =:= length(Ids) orelse error({duplicate_request_ids, Ids}),
