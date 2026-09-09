@@ -42,10 +42,7 @@ all() ->
         fetch_rate_is_measured_over_the_sample_the_shell_stamps,
         sample_survives_an_iterator_refresh,
         tick_with_no_elapsed_time_keeps_the_sample_open,
-        window_grows_on_miss,
-        window_capped_at_window_max,
-        window_decays_after_sustained_hits,
-        served_read_frees_its_bytes_from_the_window,
+        served_read_frees_its_bytes_from_the_budget,
         pipeline_fills_to_window_and_depth,
         out_of_order_arrival_is_reassembled,
         mid_pipeline_error_reissues_only_that_range,
@@ -359,10 +356,6 @@ outstanding_ranges(State) ->
 
 fragment_ranges(State, Fragment) ->
     [{Start, End} || {F, Start, End} <- outstanding_ranges(State), F =:= Fragment].
-
-%% The prefetch window: how far ahead of the consumer the reader will fetch.
-window(State) ->
-    rabbitmq_stream_s3_remote_reader_core:window_bytes(State).
 
 %% What the window and the depth cap are bounding: `{Outstanding, InFlight}`.
 load(State) ->
@@ -892,145 +885,6 @@ tick_with_no_elapsed_time_keeps_the_sample_open(_Config) ->
     {S3, _} = tick(S2, 100_000),
     ?assertEqual(10_000, fetch_rate(S3)).
 
-window_grows_on_miss(_Config) ->
-    %% A read that cannot be served means the reader is not fetching far enough
-    %% ahead, so the window doubles. The read size this replaced halved on every
-    %% miss, which drove it to its floor exactly when a consumer fell behind.
-    {S0, _} = window_test_state(#{request_size => 1024, window_max => 65_536}),
-    ?assertEqual(1024, window(S0)),
-    {S1, E1} = read(S0, ?SEGMENT_HEADER_B, 50),
-    ?assertMatch([{observe, miss, _} | _], E1),
-    ?assertEqual(2048, window(S1)),
-    %% Every delivery re-runs the serve attempt while a read waits, but only the
-    %% first counts: one slow read must not run the window to its ceiling, nor
-    %% inflate buffer_miss, which counts reads that waited rather than the
-    %% deliveries they waited through.
-    {S2, E2} = deliver(S1, 0, ?SEGMENT_HEADER_B, <<>>, continue),
-    ?assertEqual([], [E || {observe, miss, _} = E <- E2]),
-    ?assertEqual(2048, window(S2)),
-    %% A new read that also misses does grow it again.
-    {S3, _} = read(S2, ?SEGMENT_HEADER_B, 50),
-    ?assertEqual(4096, window(S3)).
-
-window_capped_at_window_max(_Config) ->
-    {S0, _} = window_test_state(#{request_size => 1024, window_max => 4096}),
-    S = lists:foldl(
-        fun(I, Acc) ->
-            {Acc1, _} = read(Acc, ?SEGMENT_HEADER_B + I, 50),
-            Acc1
-        end,
-        S0,
-        lists:seq(0, 9)
-    ),
-    ?assertEqual(4096, window(S)).
-
-window_decays_after_sustained_hits(_Config) ->
-    %% A consumer that outruns the reader drives the window to its ceiling; once
-    %% it is being kept up with, each window's worth of bytes served without a
-    %% miss hands one request back.
-    {S0, _} = window_test_state(#{request_size => 1024, window_max => 16_384}),
-    %% Five reads with nothing buffered: 1024 doubled five times, capped.
-    S1 = lists:foldl(
-        fun(I, Acc) ->
-            {Acc1, _} = read(Acc, ?SEGMENT_HEADER_B + I, 50),
-            Acc1
-        end,
-        S0,
-        lists:seq(0, 4)
-    ),
-    ?assertEqual(16_384, window(S1)),
-    %% Now answer everything the reader asks for and read it straight back, so
-    %% every read is a hit.
-    Final = lists:foldl(
-        fun(I, State0) ->
-            State1 = serve_all(State0, 0),
-            {State, _} = read(State1, ?SEGMENT_HEADER_B + I * 512, 512),
-            State
-        end,
-        S1,
-        lists:seq(0, 199)
-    ),
-    ?assert(window(Final) < 16_384).
-
-served_read_frees_its_bytes_from_the_window(_Config) ->
-    %% The window bounds how far ahead of the *consumer* the reader fetches, so
-    %% the bytes a read carries away stop counting against it the moment they
-    %% are served. Measuring from the start of the last read instead held a
-    %% read's worth of the window shut until the next one arrived, and the
-    %% frontier trailed that much behind where the window allows.
-    FragRef = frag_ref(0, 100_000_000, 42),
-    Iterator = mock_iterator([{0, 100_000_000, 42}]),
-    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, #{
-        request_size => 1000,
-        window_max => 1000,
-        max_depth => 32,
-        inflight_initial => 1
-    }),
-    ?assertEqual([{8, 1007}], fragment_ranges(S0, 0)),
-    %% One range answered in full. The reserved fetch share is a guarantee, so
-    %% the next range issues on it even though nobody has read a byte yet - what
-    %% the buffer holds cannot stop fetching below the share.
-    {S1, E1} = deliver(S0, 0, pattern(8, 1000), done),
-    ?assertEqual([{key(), {1008, 2007}, 0}], starts(E1)),
-    ?assertEqual({1000, 1000, 1}, load(S1)),
-    %% Reading half the buffered bytes stops them counting against the buffer
-    %% the moment they are served. Measuring from the start of the last read
-    %% instead held a read's worth shut until the next one arrived.
-    {S2, E2} = read(S1, ?SEGMENT_HEADER_B, 500),
-    ?assertEqual([{reply, {ok, pattern(?SEGMENT_HEADER_B, 500)}}], replies(E2)),
-    ?assertEqual({1000, 500, 1}, load(S2)).
-
-%% A reader on a fragment far larger than any window it can reach, so the
-%% fragment's size never bounds what these tests observe.
-window_test_state(Opts) ->
-    FragRef = frag_ref(0, 100_000_000, 42),
-    Iterator = mock_iterator([{0, 100_000_000, 42}]),
-    init(
-        stream_id(),
-        FragRef,
-        ?SEGMENT_HEADER_B,
-        Iterator,
-        pinned_concurrency(Opts#{max_depth => 32})
-    ).
-
-%% Concurrency pinned from the window without the fetch-share scaling: these
-%% cases assert the window's own value against `window_max`, so the configured
-%% maximum has to be exactly what they passed.
-pinned_concurrency(Opts) ->
-    RequestSize = maps:get(request_size, Opts, 4_194_304),
-    WindowMax = maps:get(window_max, Opts, 33_554_432),
-    Opts#{
-        inflight_initial => maps:get(inflight_initial, Opts, max(1, WindowMax div RequestSize)),
-        auto_tune => maps:get(auto_tune, Opts, false)
-    }.
-
-%% Derive the concurrency target from the byte window, `window_max div
-%% request_size` capped by the depth, for the tests whose subject is something
-%% else. They describe the reach they want in bytes, and this turns it into the
-%% requests that reach it, so each does not have to state both.
-%%
-%% The search is off for the same reason. It starts at one request and ramps
-%% into its operating point, so with it on a reader reaches the derived
-%% concurrency several samples after `init/1` rather than at it - and these cases
-%% are about what the reader does with a given concurrency, not about how it
-%% arrives at one. The cases whose subject *is* the search ask for it back.
-%% The reach asked for is the fetch side's. `window_max` is partitioned and
-%% fetching reserves 3/4 of it, so the configured maximum has to be 4/3 of the
-%% reach for the derived concurrency to be issuable.
-with_window_concurrency(Opts) ->
-    RequestSize = maps:get(request_size, Opts, 4_194_304),
-    Reach = maps:get(window_max, Opts, 33_554_432),
-    Derived = max(1, Reach div RequestSize),
-    Opts#{
-        window_max => Reach * 4 div 3,
-        inflight_initial => maps:get(inflight_initial, Opts, Derived),
-        auto_tune => maps:get(auto_tune, Opts, false)
-    }.
-
-%% ------------------------------------------------------------------
-%% Pipelining: several ranges of one fragment in flight at once
-%% ------------------------------------------------------------------
-
 pipeline_fills_to_window_and_depth(_Config) ->
     %% The window bounds the bytes outstanding and max_depth bounds the number
     %% of requests; whichever binds first stops the frontier.
@@ -1355,18 +1209,17 @@ become_local_does_not_advance_the_iterator(_Config) ->
     ?assertEqual(0, counters:get(Fetches, 1)).
 
 window_ceiling_below_the_request_size_is_clamped(_Config) ->
-    %% `prefetch_window_max` and `prefetch_request_size` are independent
-    %% settings with no schema to reject a ceiling below the floor. Unclamped,
-    %% the window starts at one request and `note_miss/1`'s
-    %% `min(WindowMax, Window * 2)` then *shrinks* it on a miss - the opposite
-    %% of what a miss means - and never admits a second range.
+    %% `prefetch_window_max` and `prefetch_request_size` are independent settings
+    %% with no schema to reject a ceiling below the floor. Unclamped, every byte
+    %% bound derived from the ceiling falls below one request and the reader can
+    %% never issue.
     FragRef = frag_ref(0, 1_000_000, 42),
     Iterator = mock_iterator([{0, 1_000_000, 42}]),
     Opts = #{request_size => 1000, window_max => 100},
     {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
-    ?assertEqual(1000, window(S0)),
-    {S1, _} = read(S0, ?SEGMENT_HEADER_B, 5000),
-    ?assert(window(S1) >= 1000).
+    ?assert(rabbitmq_stream_s3_remote_reader_core:fetch_ceiling(S0) >= 1000),
+    ?assert(rabbitmq_stream_s3_remote_reader_core:memory_ceiling(S0) >= 1000),
+    ?assertMatch([_ | _], fragment_ranges(S0, 0)).
 
 next_fragment_404_refresh_reuses_the_peek(_Config) ->
     %% Deciding which offset to refresh past means naming the fragment that
@@ -1440,14 +1293,51 @@ next_fragment_flushes_while_current_range_streams(_Config) ->
     ?assertEqual([{1008, 2007}, {2008, 3007}], fragment_ranges(S4, 100)),
     ?assertEqual([{8, 1007}, {1008, 2007}], fragment_ranges(S4, 0)).
 
-%% A reader with several ranges of one fragment outstanding. The window has to
-%% be grown by misses first, which is what a consumer outrunning the reader
-%% does; ten reads take it to its ceiling for any window_max these tests use.
+served_read_frees_its_bytes_from_the_budget(_Config) ->
+    %% The byte budget bounds how far ahead of the *consumer* the reader fetches,
+    %% so the bytes a read carries away stop counting against it the moment they
+    %% are served.
+    FragRef = frag_ref(0, 100_000_000, 42),
+    Iterator = mock_iterator([{0, 100_000_000, 42}]),
+    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, #{
+        request_size => 1000,
+        window_max => 1000,
+        max_depth => 32,
+        inflight_initial => 1
+    }),
+    ?assertEqual([{8, 1007}], fragment_ranges(S0, 0)),
+    %% One range answered in full. The reserved fetch share is a guarantee, so
+    %% the next range issues on it even though nobody has read a byte yet.
+    {S1, E1} = deliver(S0, 0, pattern(8, 1000), done),
+    ?assertEqual([{key(), {1008, 2007}, 0}], starts(E1)),
+    ?assertEqual({1000, 1000, 1}, load(S1)),
+    %% Reading half the buffered bytes stops them counting the moment they are
+    %% served. Measuring from the start of the last read instead held a read's
+    %% worth shut until the next one arrived.
+    {S2, E2} = read(S1, ?SEGMENT_HEADER_B, 500),
+    ?assertEqual([{reply, {ok, pattern(?SEGMENT_HEADER_B, 500)}}], replies(E2)),
+    ?assertEqual({1000, 500, 1}, load(S2)).
+
+%% Derives the concurrency target from the byte reach a case asks for, so each
+%% does not have to state both. The search is off for the same reason: these
+%% cases are about what the reader does with a given concurrency, not how it
+%% arrives at one. The reach asked for is the fetch side's, and fetching
+%% reserves 3/4 of `window_max`, so the configured maximum is 4/3 of it.
+with_window_concurrency(Opts) ->
+    RequestSize = maps:get(request_size, Opts, 4_194_304),
+    Reach = maps:get(window_max, Opts, 33_554_432),
+    Derived = max(1, Reach div RequestSize),
+    Opts#{
+        window_max => Reach * 4 div 3,
+        inflight_initial => maps:get(inflight_initial, Opts, Derived),
+        auto_tune => maps:get(auto_tune, Opts, false)
+    }.
+
+%% A reader with several ranges of one fragment outstanding.
 %%
-%% The reads are small on purpose. Any unservable read grows the window, and a
-%% large one would additionally raise the fetch ceiling to its own size (see
-%% `fetch_ceiling/1`) - which is correct, but would mean these tests observed a
-%% frontier set by the read rather than by the window they are about.
+%% The reads are small on purpose: a large one raises the fetch ceiling to its
+%% own size (see `fetch_ceiling/1`), which would mean these tests observed a
+%% frontier set by the read rather than by the budget they are about.
 pipelined_state(Opts) ->
     FragRef = frag_ref(0, 100_000_000, 42),
     Iterator = mock_iterator([{0, 100_000_000, 42}]),
@@ -2125,8 +2015,7 @@ observe_effects_emitted_for_hit_miss_and_transition(_Config) ->
     {S1, MissEffects} = rabbitmq_stream_s3_remote_reader_core:step(
         S0, {read, 8, 100, chunk_boundary}
     ),
-    [{observe, miss, MissReadSize}] = [E || E = {observe, _, _} <- MissEffects],
-    ?assert(is_integer(MissReadSize) andalso MissReadSize > 0),
+    ?assertEqual([{observe, miss}], [E || E = {observe, miss} <- MissEffects]),
 
     %% Data arrives, then a read against the buffered range emits a hit.
     Data = binary:copy(<<0>>, 200),
@@ -2134,8 +2023,7 @@ observe_effects_emitted_for_hit_miss_and_transition(_Config) ->
     {S3, HitEffects} = rabbitmq_stream_s3_remote_reader_core:step(
         S2, {read, 8, 100, chunk_boundary}
     ),
-    [{observe, hit, HitReadSize}] = [E || E = {observe, _, _} <- HitEffects],
-    ?assert(is_integer(HitReadSize) andalso HitReadSize > 0),
+    ?assertEqual([{observe, hit}], [E || E = {observe, hit} <- HitEffects]),
 
     %% Pre-fetch the next fragment, then read past the current fragment's end
     %% to trigger a fragment transition observation.
@@ -2144,9 +2032,9 @@ observe_effects_emitted_for_hit_miss_and_transition(_Config) ->
     {_S5, TransEffects} = rabbitmq_stream_s3_remote_reader_core:step(
         S4, {read, 208, 50, chunk_boundary}
     ),
-    [{observe, fragment_transition, TransReadSize}] =
-        [E || E = {observe, _, _} <- TransEffects],
-    ?assert(is_integer(TransReadSize) andalso TransReadSize > 0).
+    ?assertEqual(
+        [{observe, fragment_transition}], [E || E = {observe, fragment_transition} <- TransEffects]
+    ).
 
 %% The reasons a placement pass can stop, which the shell turns into one
 %% Prometheus counter each. They partition the passes, so a share of them is
