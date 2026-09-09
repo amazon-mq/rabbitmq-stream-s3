@@ -166,20 +166,13 @@ general_pool_max_size() ->
 prefetch_request_size() ->
     application:get_env(?APP, prefetch_request_size, 4_194_304).
 
-%% How far ahead of the consumer a reader may buffer.
+%% The byte budget a reader fetches and buffers within.
 %%
-%% Bounds buffering, not fetching: how far ahead to buffer and how many requests
-%% to run at once are separate budgets, and it is the second that sets
-%% bandwidth. Raising this alone buys nothing.
-%%
-%% It is a gate on issuing a range rather than a cap on held bytes, so it is not
-%% the whole of what a reader can hold. The ranges already committed when the
-%% gate closes still deliver, and their bytes land in a buffer behind it, so
-%% worst-case held memory is this plus what the fetch side has committed - which
-%% is `prefetch_max_depth` requests' worth once the search has raised the target
-%% that far. At the defaults that is 128 MiB and 256 MiB. That is substantial
-%% per reader, and small against what a node streaming at these rates is already
-%% holding.
+%% Not the whole of what a reader may hold: fetching is guaranteed a share of
+%% this that buffering cannot take, so the worst case is a full share committed
+%% on top of a buffer holding the rest. A reader's memory bound is therefore
+%% twice this, 256 MiB at the default. That is substantial per reader, and small
+%% against what a node streaming at these rates is already holding.
 -spec prefetch_window_max() -> pos_integer().
 prefetch_window_max() ->
     application:get_env(?APP, prefetch_window_max, 134_217_728).

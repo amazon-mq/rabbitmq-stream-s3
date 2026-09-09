@@ -200,7 +200,8 @@ run_one() ->
                     "latency=~bms mib_s=~.1f inflight_avg=~.1f inflight_max=~.1f "
                     "target_final=~b target_max=~b "
                     "msgq_avg=~.1f msgq_max=~b reds_per_s=~.2fM elapsed=~.2f "
-                    "miss=~b req=~b timeouts=~b queued=~b~n",
+                    "miss=~b req=~b timeouts=~b queued=~b "
+                    "stall=t~b/d~b/f~b/b~b/r~b committed=~bM/~bM buffered=~bM/~bM~n",
                     [
                         Depth,
                         WindowMiB,
@@ -219,7 +220,16 @@ run_one() ->
                         maps:get(misses, maps:get(counters, R)),
                         maps:get(requests, maps:get(counters, R)),
                         maps:get(timeouts, maps:get(counters, R)),
-                        maps:get(checkout_queued, maps:get(counters, R))
+                        maps:get(checkout_queued, maps:get(counters, R)),
+                        maps:get(stall_target, maps:get(counters, R)),
+                        maps:get(stall_depth, maps:get(counters, R)),
+                        maps:get(stall_fetch, maps:get(counters, R)),
+                        maps:get(stall_buffer, maps:get(counters, R)),
+                        maps:get(stall_reach, maps:get(counters, R)),
+                        trunc(maps:get(committed_mean, R)) div 1_048_576,
+                        trunc(maps:get(fetch_ceiling_mean, R)) div 1_048_576,
+                        trunc(maps:get(buffered_mean, R)) div 1_048_576,
+                        trunc(maps:get(memory_ceiling_mean, R)) div 1_048_576
                     ]
                 );
             _ ->
@@ -526,10 +536,11 @@ measure(#{fragments := {Stream, [First | _] = Fragments}, opts := Opts} = Args) 
     after 5000 -> erlang:demonitor(MRef, [flush])
     end,
     Elapsed = max(1, T1 - T0) / 1000,
-    Depths = [D || {D, _, _, _} <- InFlight],
-    Queues = [Q || {_, Q, _, _} <- InFlight],
-    Reds = [R || {_, _, R, _} <- InFlight],
-    Targets = [T || {_, _, _, T} <- InFlight],
+    Depths = [D || {D, _, _, _, _} <- InFlight],
+    Queues = [Q || {_, Q, _, _, _} <- InFlight],
+    Reds = [R || {_, _, R, _, _} <- InFlight],
+    Targets = [T || {_, _, _, T, _} <- InFlight],
+    Bytes4 = [B || {_, _, _, _, B} <- InFlight],
     #{
         bytes => Bytes,
         elapsed_s => Elapsed,
@@ -545,6 +556,14 @@ measure(#{fragments := {Stream, [First | _] = Fragments}, opts := Opts} = Args) 
         %% gen_server is the funnel, whatever the pool and the network manage.
         msgq_mean => mean(Queues),
         msgq_max => lists:max([0 | Queues]),
+        %% Sampled during the run, not read after it: these are gauges, and
+        %% `terminate/2` gives a reader's contribution back, so a post-run read
+        %% is always zero. Which side of the partitioned budget is saturated is
+        %% the question the counters alone cannot answer.
+        committed_mean => mean([C || {C, _, _, _} <- Bytes4]),
+        fetch_ceiling_mean => mean([F || {_, F, _, _} <- Bytes4]),
+        buffered_mean => mean([B || {_, _, B, _} <- Bytes4]),
+        memory_ceiling_mean => mean([B || {_, _, _, B} <- Bytes4]),
         counters => counters(),
         reds_per_s =>
             case Reds of
@@ -624,15 +643,24 @@ sample_loop(Reader, Acc) ->
         Sample =
             case process_info(Reader, [message_queue_len, reductions]) of
                 [{message_queue_len, Q}, {reductions, R}] ->
-                    {inflight_gauge(), Q, R, target_gauge()};
+                    {inflight_gauge(), Q, R, target_gauge(), byte_gauges()};
                 _ ->
-                    {inflight_gauge(), 0, 0, target_gauge()}
+                    {inflight_gauge(), 0, 0, target_gauge(), byte_gauges()}
             end,
         sample_loop(Reader, [Sample | Acc])
     end.
 
 inflight_gauge() ->
     gauge(<<"requests_in_flight">>).
+
+%% The two byte budgets and what is held against each.
+byte_gauges() ->
+    {
+        gauge(<<"remote_reader_committed_bytes">>),
+        gauge(<<"remote_reader_fetch_ceiling_bytes">>),
+        gauge(<<"remote_reader_buffered_bytes">>),
+        gauge(<<"remote_reader_memory_ceiling_bytes">>)
+    }.
 
 %% What the search is aiming for, against `inflight_gauge/0` for what it
 %% achieves. A run's average concurrency cannot tell a search that converged on
@@ -641,12 +669,17 @@ inflight_gauge() ->
 target_gauge() ->
     gauge(<<"remote_reader_inflight_target">>).
 
+%% Zero when nothing is registered yet, but an error when the registry is up
+%% and the name is not in it: a renamed metric otherwise reads as a column of
+%% zeroes for as long as it takes someone to notice, which was one release.
 gauge(Name) ->
-    try
-        #{Name := #{values := Values}} = seshat:format(rabbitmq_stream_s3),
-        lists:sum(maps:values(Values))
-    catch
-        _:_ -> 0
+    case catch seshat:format(rabbitmq_stream_s3) of
+        #{Name := #{values := Values}} ->
+            lists:sum(maps:values(Values));
+        #{} = Formatted when map_size(Formatted) > 0 ->
+            error({unknown_gauge, Name});
+        _ ->
+            0
     end.
 
 %% Counters worth having on every result line. A run that comes out slow needs
@@ -671,7 +704,18 @@ counters() ->
         requests => Get(<<"remote_reader_total_requests">>),
         timeouts => Get(<<"request_timeouts">>),
         checkouts => Get(<<"checkouts">>),
-        checkout_queued => Get(<<"checkout_queued">>)
+        checkout_queued => Get(<<"checkout_queued">>),
+        %% Which bound stopped each placement pass, and the two byte budgets
+        %% with what is held against them. Without these a run that comes out
+        %% slow says only that it was slow: a buffer quietly taking the fetch
+        %% side's share and a reader that is simply busy look identical from
+        %% throughput alone, and telling them apart on the rig cost several
+        %% thirty-minute cycles that this harness could have answered in one.
+        stall_target => Get(<<"remote_reader_prefetch_stall_target">>),
+        stall_depth => Get(<<"remote_reader_prefetch_stall_depth">>),
+        stall_fetch => Get(<<"remote_reader_prefetch_stall_fetch_budget">>),
+        stall_buffer => Get(<<"remote_reader_prefetch_stall_buffer">>),
+        stall_reach => Get(<<"remote_reader_prefetch_stall_reach">>)
     }.
 
 %% The manifest the reader navigates: a flat run of leaf entries, or the tree a

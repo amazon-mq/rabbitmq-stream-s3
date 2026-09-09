@@ -2103,13 +2103,24 @@ run_rrc_failure_steps([{Rot, Outcomes, LenWant} | Steps], S0, ReadFloor, Probe) 
 %% never served.
 %%
 %% The rounds are capped so a wedge fails the property instead of hanging the
-%% suite. The cap is generous: with no reads to advance the consumer, the buffer
-%% fills to the prefetch window within a few rounds and the core stops issuing,
-%% so a healthy queue empties in about `window_max / request_size` of them.
--define(RRC_DRAIN_ROUNDS, 64).
+%% suite rather than because any particular number of them is meaningful.
+-define(LOOK_AHEAD_ROUNDS, 96).
+
+%% How many rounds the drain is allowed. A round answers every range outstanding
+%% at its start, so at `max_depth` 1 it moves one request size, and the queue
+%% only empties once the reader has both served the read it is holding and
+%% filled the read-ahead behind it. Both scale with the request size, so a fixed
+%% cap cannot cover them.
+%%
+%% 4000 is the longest read the failure-step generator produces, so the first
+%% term is the rounds that read needs on its own at this request size. 16 covers
+%% the byte ceiling at the fixture's sizing, and 8 is slack for the rounds a
+%% miss and its retry cost.
+drain_rounds(RequestSize) ->
+    4000 div RequestSize + 16 + 8.
 
 rrc_drains(State0, ReadFloor, {ProbeLen, RequestSize}) ->
-    case rrc_drain(State0, ?RRC_DRAIN_ROUNDS) of
+    case rrc_drain(State0, drain_rounds(RequestSize)) of
         false ->
             false;
         {ok, State0b} ->
@@ -2321,7 +2332,7 @@ prop_remote_reader_core_look_ahead_recovers() ->
             counters:put(Failures, 1, 0),
             {S2, _} = rabbitmq_stream_s3_remote_reader_core:step(S1, deadline_expired),
             ReadFloor = rabbitmq_stream_s3_remote_reader_core:read_position(S2),
-            rrc_looks_ahead_again(S2, ReadFloor, ?RRC_DRAIN_ROUNDS)
+            rrc_looks_ahead_again(S2, ReadFloor, ?LOOK_AHEAD_ROUNDS)
         end
     ).
 
@@ -2439,38 +2450,32 @@ prop_remote_reader_core_load_bounded() ->
             {S0, _} = rabbitmq_stream_s3_remote_reader_core:init(
                 <<"prop-stream">>, FragRef, 8, Iterator, Opts
             ),
-            %% `read_pos` is never negative, so the most any pending read can
-            %% ask for is the furthest byte any read in the sequence reaches.
-            %%
-            %% The two budgets are bounded by different things: what may be on
-            %% the wire comes from the concurrency target, which cannot exceed
-            %% `max_depth`; what may be held unread comes from the AIMD window,
-            %% which cannot exceed `window_max`. Each may cross its ceiling by
-            %% the one range `has_room/1` admits before checking again, and each
-            %% is floored at what the read in hand needs.
-            %%
-            %% Bounded separately is not bounded independently, though, and only
-            %% the committed bound is a ceiling on its own. `has_room/1` gates
-            %% issuing a range, not holding bytes: once the buffer budget is
-            %% spent the ranges already committed still deliver, and their bytes
-            %% land in a buffer behind the closed gate. So whatever may be
-            %% committed may also end up buffered, and the buffered bound
-            %% carries the committed one.
+            %% The fetch share is a guarantee the buffer cannot take, so the
+            %% bound on everything held is `memory_ceiling/1` - twice
+            %% `window_max` - crossable by the one range `has_room/1` admits
+            %% before checking again, and floored at what the read in hand needs.
             MaxReadEnd = lists:max([0 | [O + B || {read, O, B, _} <- Events]]),
-            CommittedBound = max(MaxDepth * RequestSize, MaxReadEnd) + RequestSize,
-            BufferedBound = max(WindowMax, MaxReadEnd) + CommittedBound,
-            check_rrc_load(Events, S0, {CommittedBound, BufferedBound}, MaxDepth)
+            HeldBound = max(2 * WindowMax, MaxReadEnd) + RequestSize,
+            check_rrc_load(Events, S0, HeldBound, MaxDepth)
         end
     ).
 
-check_rrc_load([], _State, _Bounds, _MaxDepth) ->
+check_rrc_load([], _State, _HeldBound, _MaxDepth) ->
     true;
-check_rrc_load([Event | Rest], State0, {CommittedBound, BufferedBound} = Bounds, MaxDepth) ->
+check_rrc_load([Event | Rest], State0, HeldBound, MaxDepth) ->
     State = run_rrc_events([Event], State0),
     {Committed, Buffered, InFlight} = rabbitmq_stream_s3_remote_reader_core:load(State),
-    Committed =< CommittedBound andalso Buffered =< BufferedBound andalso
-        InFlight =< MaxDepth andalso
-        check_rrc_load(Rest, State, Bounds, MaxDepth).
+    case Committed + Buffered =< HeldBound andalso InFlight =< MaxDepth of
+        true ->
+            check_rrc_load(Rest, State, HeldBound, MaxDepth);
+        false ->
+            ct:pal(
+                "load bound violated after ~p: committed=~p buffered=~p held=~p "
+                "bound=~p inflight=~p max_depth=~p",
+                [Event, Committed, Buffered, Committed + Buffered, HeldBound, InFlight, MaxDepth]
+            ),
+            false
+    end.
 
 %% =========================================================================
 %% Read buffer (block queue) properties
