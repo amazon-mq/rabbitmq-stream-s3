@@ -99,6 +99,18 @@ all() ->
         current_fragment_404_no_pending_read_keeps_next_live_fragment,
         current_and_next_404_read_past_current_keeps_surviving_fragment,
         observe_effects_emitted_for_hit_miss_and_transition,
+        %% Every placement pass names the bound that stopped it, which is what
+        %% makes "why is this reader not fetching harder?" answerable from
+        %% outside the process
+        every_placement_pass_reports_exactly_one_stall,
+        serve_rate_measures_what_the_consumer_took,
+        the_two_ceilings_move_independently,
+        stall_target_reported_when_the_concurrency_target_binds,
+        stall_depth_reported_when_the_depth_cap_binds,
+        stall_fetch_budget_reported_when_backed_off_ranges_hold_the_budget,
+        stall_buffer_reported_when_the_consumer_is_behind,
+        stall_reach_reported_at_the_end_of_the_manifest,
+        stall_peek_failed_reported_when_the_group_fetch_fails,
         %% A retryable error drops only the failed fragment, not all in-flight
         retryable_error_preserves_co_pending_request,
         %% pool_busy backoff (separate from the network-error backoff)
@@ -2113,6 +2125,193 @@ observe_effects_emitted_for_hit_miss_and_transition(_Config) ->
     [{observe, fragment_transition, TransReadSize}] =
         [E || E = {observe, _, _} <- TransEffects],
     ?assert(is_integer(TransReadSize) andalso TransReadSize > 0).
+
+%% The reasons a placement pass can stop, which the shell turns into one
+%% Prometheus counter each. They partition the passes, so a share of them is
+%% readable as "this is what governs this reader's bandwidth" - and each names
+%% the one setting that would raise it. See the core's `stall_reason/1`.
+
+%% Opts that put every bound out of reach but the one a case is about, so the
+%% reason it asserts is the reason it arranged rather than whichever bound
+%% happened to bind first.
+stall_opts(Overrides) ->
+    maps:merge(
+        #{
+            request_size => 1_000,
+            window_max => 10_000_000,
+            max_depth => 8,
+            inflight_initial => 8,
+            auto_tune => false
+        },
+        Overrides
+    ).
+
+stalls(Effects) ->
+    [Reason || {observe, {stall, Reason}} <- Effects].
+
+every_placement_pass_reports_exactly_one_stall(_Config) ->
+    %% The counters are only readable as shares if the passes they count are
+    %% partitioned: a pass that reported twice, or not at all, makes every ratio
+    %% drawn from them wrong by an unknown amount.
+    FragRef = frag_ref(0, 1_000_000, 42),
+    Iterator = mock_iterator([{0, 1_000_000, 42}, {100, 1_000_000, 43}]),
+    {S0, InitEffects} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, stall_opts(#{})),
+    %% Init is not a placement pass: it defers the look-ahead deliberately, so
+    %% reporting `reach` for it would say the manifest ran out on a reader that
+    %% has simply not looked yet.
+    ?assertEqual([], stalls(InitEffects)),
+    Start = range_start(S0, 0),
+    {S1, E1} = deliver(S0, 0, Start, pattern(Start, 500), continue),
+    ?assertMatch([_], stalls(E1)),
+    %% A served read is a placement pass too: it frees the bytes it served from
+    %% the window, which is exactly when there is new room to fetch into.
+    {S2, E2} = read(S1, ?SEGMENT_HEADER_B, 100),
+    ?assertMatch([_], stalls(E2)),
+    {S3, E3} = rabbitmq_stream_s3_remote_reader_core:step(S2, {tune_tick, 200_000}),
+    ?assertMatch([_], stalls(E3)),
+    {_S4, E4} = retry(S3, fault),
+    ?assertMatch([_], stalls(E4)).
+
+serve_rate_measures_what_the_consumer_took(_Config) ->
+    %% The serve rate is measured on bytes the consumer actually took, over the
+    %% same sample as the fetch rate. Fetching without serving must not move it:
+    %% a reader filling its buffer while the consumer reads nothing is exactly
+    %% the case the pair exists to tell apart.
+    FragRef = frag_ref(0, 1_000_000, 42),
+    Iterator = mock_iterator([{0, 1_000_000, 42}, {100, 1_000_000, 43}]),
+    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, stall_opts(#{})),
+    Start = range_start(S0, 0),
+    {S1, _} = deliver(S0, 0, Start, pattern(Start, 1_000), done),
+    %% A sample with bytes fetched and none read: fetch moves, serve does not.
+    {S2, _} = rabbitmq_stream_s3_remote_reader_core:step(S1, {tune_tick, 1_000_000}),
+    ?assertEqual(1_000, rabbitmq_stream_s3_remote_reader_core:fetch_rate(S2)),
+    ?assertEqual(0, rabbitmq_stream_s3_remote_reader_core:serve_rate(S2)),
+    %% The consumer takes 500 bytes over the next second, and nothing is fetched.
+    {S3, E3} = read(S2, ?SEGMENT_HEADER_B, 500),
+    ?assertMatch([{reply, {ok, _}} | _], E3),
+    {S4, _} = rabbitmq_stream_s3_remote_reader_core:step(S3, {tune_tick, 1_000_000}),
+    ?assertEqual(500, rabbitmq_stream_s3_remote_reader_core:serve_rate(S4)),
+    ?assertEqual(0, rabbitmq_stream_s3_remote_reader_core:fetch_rate(S4)),
+    %% Each sample stands alone: the bytes just reported are not carried over.
+    {S5, _} = rabbitmq_stream_s3_remote_reader_core:step(S4, {tune_tick, 1_000_000}),
+    ?assertEqual(0, rabbitmq_stream_s3_remote_reader_core:serve_rate(S5)).
+
+the_two_ceilings_move_independently(_Config) ->
+    %% The point of publishing both: they are set by unrelated things. The fetch
+    %% ceiling scales with the concurrency target, so it moves when the search
+    %% does; the buffer ceiling is whatever the window control has decayed to,
+    %% and sits at one request until a miss grows it. A `buffer` stall read
+    %% against the configured maximum rather than against this floor is the
+    %% wrong conclusion, which is what the pair exists to prevent.
+    RequestSize = 1_000,
+    Opts = stall_opts(#{request_size => RequestSize, window_max => 64_000, inflight_initial => 4}),
+    FragRef = frag_ref(0, 1_000_000, 42),
+    Iterator = mock_iterator([{0, 1_000_000, 42}, {100, 1_000_000, 43}]),
+    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
+    %% The window starts at one request, well below `window_max`.
+    ?assertEqual(4 * RequestSize, rabbitmq_stream_s3_remote_reader_core:fetch_ceiling(S0)),
+    ?assertEqual(RequestSize, rabbitmq_stream_s3_remote_reader_core:buffer_ceiling(S0)),
+    %% A read the buffer cannot serve is a miss, which doubles the window. The
+    %% fetch ceiling is untouched: the two controls do not talk to each other.
+    {S1, _} = read(S0, ?SEGMENT_HEADER_B, 100),
+    ?assertEqual(4 * RequestSize, rabbitmq_stream_s3_remote_reader_core:fetch_ceiling(S1)),
+    ?assertEqual(2 * RequestSize, rabbitmq_stream_s3_remote_reader_core:buffer_ceiling(S1)),
+    %% What they do share is the pending read's floor, and a read larger than
+    %% either budget lifts both - so a ceiling reported mid-read is the read's
+    %% size rather than the setting behind it. Worth knowing before reading the
+    %% gauges: a chunk larger than the window is what that looks like.
+    {S2, _} = read(S1, ?SEGMENT_HEADER_B, 500_000),
+    Need = 500_000,
+    ?assertEqual(Need, rabbitmq_stream_s3_remote_reader_core:fetch_ceiling(S2)),
+    ?assertEqual(Need, rabbitmq_stream_s3_remote_reader_core:buffer_ceiling(S2)).
+
+stall_target_reported_when_the_concurrency_target_binds(_Config) ->
+    %% The tuner's target is the bound. This is the healthy steady state at a
+    %% settled target, and the one that says "raise the target" when it is not.
+    FragRef = frag_ref(0, 1_000_000, 42),
+    Iterator = mock_iterator([{0, 1_000_000, 42}, {100, 1_000_000, 43}]),
+    Opts = stall_opts(#{max_depth => 8, inflight_initial => 1}),
+    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
+    ?assertEqual(1, length(outstanding_ranges(S0))),
+    %% The one range is still owing, so it holds the only slot the target allows.
+    Start = range_start(S0, 0),
+    {_S1, E1} = deliver(S0, 0, Start, pattern(Start, 100), continue),
+    ?assertEqual([target], stalls(E1)).
+
+stall_depth_reported_when_the_depth_cap_binds(_Config) ->
+    %% `max_depth` bounds the reader's share of the connection pool, and it
+    %% counts a request that has delivered every byte but not closed - which the
+    %% concurrency target deliberately does not. So the depth cap binds while the
+    %% target still has room exactly when responses are finishing but not
+    %% closing, and it is the only bound that can report that.
+    FragRef = frag_ref(0, 1_000_000, 42),
+    Iterator = mock_iterator([{0, 1_000_000, 42}, {100, 1_000_000, 43}]),
+    Opts = stall_opts(#{max_depth => 2, inflight_initial => 2}),
+    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
+    [{Start, End}, _] = fragment_ranges(S0, 0),
+    %% Fully delivered, not closed: out of the target's count, still in the
+    %% depth cap's.
+    {_S1, E1} = deliver(S0, 0, Start, pattern(Start, End - Start + 1), continue),
+    ?assertEqual([depth], stalls(E1)).
+
+stall_fetch_budget_reported_when_backed_off_ranges_hold_the_budget(_Config) ->
+    %% The byte budget counts every range the reader has committed to, including
+    %% those waiting on a retry clock; the concurrency target counts only what is
+    %% on the wire. A reader whose ranges have all backed off is therefore at its
+    %% byte budget with nothing in flight - fetching nothing, and not because the
+    %% target says so. Nothing else reports that state.
+    FragRef = frag_ref(0, 1_000_000, 42),
+    Iterator = mock_iterator([{0, 1_000_000, 42}, {100, 1_000_000, 43}]),
+    Opts = stall_opts(#{max_depth => 8, inflight_initial => 4}),
+    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
+    Ranges = fragment_ranges(S0, 0),
+    ?assertEqual(4, length(Ranges)),
+    %% Every range fails and is queued against the fault clock.
+    S1 = lists:foldl(
+        fun({Start, _End}, S) -> element(1, fail(S, 0, Start, slow_down)) end,
+        S0,
+        Ranges
+    ),
+    ?assertEqual(4, length(outstanding_ranges(S1))),
+    {_S2, E2} = rabbitmq_stream_s3_remote_reader_core:step(S1, {tune_tick, 200_000}),
+    ?assertEqual([fetch_budget], stalls(E2)).
+
+stall_buffer_reported_when_the_consumer_is_behind(_Config) ->
+    %% The buffer ceiling is the one bound that is not about the fetch side at
+    %% all: reaching it says the consumer has not read what the reader already
+    %% holds. Counted with the others, it is what stops a slow consumer being
+    %% read as a slow reader.
+    FragRef = frag_ref(0, 1_000_000, 42),
+    Iterator = mock_iterator([{0, 1_000_000, 42}, {100, 1_000_000, 43}]),
+    Opts = stall_opts(#{request_size => 1_000, window_max => 1_000}),
+    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
+    [{Start, End} | _] = fragment_ranges(S0, 0),
+    %% A whole window's worth buffered and nobody has read a byte of it.
+    {_S1, E1} = deliver(S0, 0, Start, pattern(Start, End - Start + 1), done),
+    ?assertEqual([buffer], stalls(E1)).
+
+stall_reach_reported_at_the_end_of_the_manifest(_Config) ->
+    %% Budget left over and nothing to spend it on. No setting raises this, which
+    %% is exactly why it is worth telling apart from the four that a setting does
+    %% raise: a reader reported here is one that has run out of stream.
+    FragRef = frag_ref(0, 200, 42),
+    Iterator = mock_iterator([{0, 200, 42}]),
+    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, stall_opts(#{})),
+    Start = range_start(S0, 0),
+    {_S1, E1} = deliver(S0, 0, Start, pattern(Start, 100), continue),
+    ?assertEqual([reach], stalls(E1)).
+
+stall_peek_failed_reported_when_the_group_fetch_fails(_Config) ->
+    %% Also budget left over and nothing to spend it on, but for a transient
+    %% reason that resolves itself on the fault clock. Folded into `reach` it
+    %% would read as a reader that had run out of stream, and an S3 having
+    %% trouble fetching group objects would look like the end of the manifest.
+    FragRef = frag_ref(0, 200, 42),
+    Iterator = mock_iterator_failing_group([{0, 200, 42}], {100, 500, 43}),
+    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, stall_opts(#{})),
+    Start = range_start(S0, 0),
+    {_S1, E1} = deliver(S0, 0, Start, pattern(Start, 100), continue),
+    ?assertEqual([peek_failed], stalls(E1)).
 
 pool_busy_backoff_capped_at_500(_Config) ->
     %% pool_busy means the pool is growing (a connection's TLS handshake is in

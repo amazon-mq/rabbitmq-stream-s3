@@ -40,6 +40,16 @@ synchronous feedback is generated.
 -define(C_TOTAL_REQUESTS, 7).
 -define(C_FATAL_ERRORS, 8).
 -define(C_INFLIGHT_TARGET, 9).
+-define(C_FETCH_RATE, 10).
+-define(C_STALL_TARGET, 11).
+-define(C_STALL_DEPTH, 12).
+-define(C_STALL_FETCH_BUDGET, 13).
+-define(C_STALL_BUFFER, 14).
+-define(C_STALL_REACH, 15).
+-define(C_STALL_PEEK_FAILED, 16).
+-define(C_SERVE_RATE, 17).
+-define(C_FETCH_CEILING, 18).
+-define(C_BUFFER_CEILING, 19).
 -define(COUNTER_KEY, {rabbitmq_stream_s3_remote_reader, counter}).
 -define(PREFETCH_SIZING_KEY, {rabbitmq_stream_s3_remote_reader, prefetch_sizing}).
 -define(COUNTERS, [
@@ -58,7 +68,46 @@ synchronous feedback is generated.
     %% remote read - is the reader aiming low, or aiming high and not getting
     %% there - are indistinguishable from outside the process.
     {remote_reader_inflight_target, ?C_INFLIGHT_TARGET, gauge,
-        "Requests the remote reader is currently aiming to keep in flight"}
+        "Requests the remote reader is currently aiming to keep in flight"},
+    %% The reading the concurrency search acts on. Against `inflight_target`,
+    %% it says whether a target that has settled low settled there because
+    %% concurrency stopped paying or because the samples it was judged on were
+    %% noise.
+    {remote_reader_fetch_rate_bytes, ?C_FETCH_RATE, gauge,
+        "Bytes per second measured over the remote reader's last tuning sample"},
+    %% The other end of the reader, over the same sample. The pair is what says
+    %% which end the ceiling is at: a serve rate that holds flat while the fetch
+    %% side is given more concurrency puts it downstream of this reader
+    %% altogether, and no prefetch setting will move it.
+    {remote_reader_serve_rate_bytes, ?C_SERVE_RATE, gauge,
+        "Bytes per second handed to the consumer over the remote reader's last sample"},
+    %% One of these per placement pass, naming the bound that stopped it. They
+    %% partition the passes, so the shares answer "what governs this reader's
+    %% bandwidth?" - and each names the single setting that would raise it.
+    {remote_reader_prefetch_stall_target, ?C_STALL_TARGET, counter,
+        "Placement passes stopped by the concurrency target (raise it, or let auto-tune)"},
+    {remote_reader_prefetch_stall_depth, ?C_STALL_DEPTH, counter,
+        "Placement passes stopped by prefetch_max_depth"},
+    {remote_reader_prefetch_stall_fetch_budget, ?C_STALL_FETCH_BUDGET, counter,
+        "Placement passes stopped by the in-flight byte budget (target x prefetch_request_size)"},
+    {remote_reader_prefetch_stall_buffer, ?C_STALL_BUFFER, counter,
+        "Placement passes stopped by the buffer ceiling: the consumer is behind, "
+        "or prefetch_window_max is low"},
+    {remote_reader_prefetch_stall_reach, ?C_STALL_REACH, counter,
+        "Placement passes with budget left but nothing to ask for: the manifest or "
+        "the look-ahead horizon ran out, which no budget would fix"},
+    {remote_reader_prefetch_stall_peek_failed, ?C_STALL_PEEK_FAILED, counter,
+        "Placement passes with budget left but a failed group fetch blocking the look-ahead"},
+    %% What the two byte bounds were actually worth, so a stall reason can be
+    %% read without knowing how the bound is derived. They are set by unrelated
+    %% things - the fetch ceiling scales with the concurrency target, the buffer
+    %% ceiling is whatever the window control has decayed to - so a `buffer`
+    %% stall against a ceiling of one request and one against the configured
+    %% maximum are opposite findings that the counter alone cannot tell apart.
+    {remote_reader_fetch_ceiling_bytes, ?C_FETCH_CEILING, gauge,
+        "Bytes the remote reader may currently have committed to fetching"},
+    {remote_reader_buffer_ceiling_bytes, ?C_BUFFER_CEILING, gauge,
+        "Bytes the remote reader may currently hold that the consumer has not read"}
 ]).
 %% The most bucket boundaries the prefetch window histogram may have. A window
 %% many requests wide would otherwise get one time series per step it can make.
@@ -128,12 +177,20 @@ synchronous feedback is generated.
     %% is exactly the one whose timers land late, and it is also the one whose
     %% rate the tuner is trying to read.
     sample_at :: integer() | undefined,
-    %% What this reader last published to the `inflight_target` gauge. The gauge
-    %% is node-wide, so it is kept by adding this reader's delta the way
-    %% `requests_in_flight` is - writing the target outright would make the
-    %% gauge mean "whichever reader ticked last", which on a node with several
-    %% consumers is not a number about anything.
-    published_target = 0 :: non_neg_integer()
+    %% What this reader last published to each per-reader gauge, by counter
+    %% index. Every one of them is node-wide, so each is kept by adding this
+    %% reader's delta rather than writing its value - a plain write would make
+    %% the gauge mean "whichever reader ticked last", which on a node with
+    %% several consumers is not a number about anything. Summed across readers
+    %% they are the node's figures: what it is aiming for, what it is achieving,
+    %% and what it is allowed to hold.
+    %%
+    %% Held in one map rather than a field each because publishing and releasing
+    %% are two sites that have to agree about the same set: a gauge added to the
+    %% tick and forgotten in `terminate/2` leaves a node that has churned through
+    %% consumers reporting a value no reader is holding, and nothing about the
+    %% number itself would say so.
+    published = #{} :: #{pos_integer() => non_neg_integer()}
 }).
 
 %% API
@@ -343,21 +400,16 @@ init(
         reader_ref = erlang:monitor(process, Reader),
         sample_at = erlang:monotonic_time(microsecond)
     },
-    %% With the search off the target never moves, so there is nothing for a
-    %% tick to measure: arming it anyway would wake every reader five times a
-    %% second for its whole life to compute a rate nothing reads. The gauge is
-    %% published once here instead of on the first tick, so a pinned reader
-    %% still reports the target it is running at.
-    State1 =
-        case rabbitmq_stream_s3_remote_reader_core:searching(Core0) of
-            true ->
-                _ = erlang:send_after(?TUNE_INTERVAL_MS, self(), tune_tick),
-                State0;
-            false ->
-                Target = rabbitmq_stream_s3_remote_reader_core:inflight_target(Core0),
-                counters:add(counter(), ?C_INFLIGHT_TARGET, Target),
-                State0#state{published_target = Target}
-        end,
+    %% Armed whether or not the search is on. With the search off the target
+    %% never moves, and the tick was once skipped for that reason - but the
+    %% target is no longer the only thing it publishes. The measured rates and
+    %% the buffer ceiling all move under a pinned reader too: the window control
+    %% that sets the ceiling is driven by buffer misses and hits, not by
+    %% `auto_tune`. Skipping the tick left a pinned reader publishing the one
+    %% figure that was genuinely static and nothing else, which is the shape of
+    %% reader an operator is most likely to be measuring.
+    _ = erlang:send_after(?TUNE_INTERVAL_MS, self(), tune_tick),
+    State1 = publish_gauges(Core0, State0),
     State = execute_effects(Effects, State1),
     {ok, State}.
 
@@ -451,11 +503,8 @@ handle_info(tune_tick, #state{core = Core0, sample_at = SampleAt} = State0) ->
         Core0, {tune_tick, Now - SampleAt}
     ),
     _ = erlang:send_after(?TUNE_INTERVAL_MS, self(), tune_tick),
-    Target = rabbitmq_stream_s3_remote_reader_core:inflight_target(Core1),
-    counters:add(counter(), ?C_INFLIGHT_TARGET, Target - State0#state.published_target),
-    State = execute_effects(
-        Effects, State0#state{core = Core1, sample_at = Now, published_target = Target}
-    ),
+    State1 = publish_gauges(Core1, State0#state{core = Core1, sample_at = Now}),
+    State = execute_effects(Effects, State1),
     maybe_stop(State);
 handle_info(Msg, #state{requests = Requests0, cancelled = Cancelled0} = State0) ->
     AsyncStates = #{Req => AsyncState || Req := {_, _, AsyncState} <- Requests0},
@@ -474,13 +523,44 @@ handle_info(Msg, #state{requests = Requests0, cancelled = Cancelled0} = State0) 
             {noreply, State0}
     end.
 
-terminate(_Reason, #state{published_target = Target} = State) ->
+terminate(_Reason, State) ->
     _ = cancel_all_requests(State),
-    %% Give the node-wide gauge back what this reader was holding, or a node
-    %% that has churned through consumers reads as aiming for a concurrency no
-    %% reader is asking for.
-    counters:sub(counter(), ?C_INFLIGHT_TARGET, Target),
+    release_gauges(State),
     ok.
+
+%% This reader's contribution to each node-wide gauge, brought up to date in one
+%% place so that adding a gauge is one line here rather than one line at each of
+%% the sites that publish and the one that gives it back.
+publish_gauges(Core, #state{published = Published0} = State) ->
+    Values = [
+        {?C_INFLIGHT_TARGET, rabbitmq_stream_s3_remote_reader_core:inflight_target(Core)},
+        %% A sample the core declined to read (an idle tick, or the first one)
+        %% leaves the rate `undefined`. Published as zero, which is what it
+        %% measured.
+        {?C_FETCH_RATE, measured(rabbitmq_stream_s3_remote_reader_core:fetch_rate(Core))},
+        {?C_SERVE_RATE, measured(rabbitmq_stream_s3_remote_reader_core:serve_rate(Core))},
+        {?C_FETCH_CEILING, rabbitmq_stream_s3_remote_reader_core:fetch_ceiling(Core)},
+        {?C_BUFFER_CEILING, rabbitmq_stream_s3_remote_reader_core:buffer_ceiling(Core)}
+    ],
+    Published = lists:foldl(
+        fun({Ix, Value}, Acc) ->
+            counters:add(counter(), Ix, Value - maps:get(Ix, Acc, 0)),
+            Acc#{Ix => Value}
+        end,
+        Published0,
+        Values
+    ),
+    State#state{published = Published}.
+
+%% Give the node-wide gauges back what this reader was holding. Without this a
+%% node that has churned through consumers reads as aiming for a concurrency no
+%% reader is asking for, at a rate nobody is achieving.
+release_gauges(#state{published = Published}) ->
+    maps:foreach(fun(Ix, Value) -> counters:sub(counter(), Ix, Value) end, Published).
+
+%% An unread sample is zero bytes per second, which is what it measured.
+measured(undefined) -> 0;
+measured(Rate) -> Rate.
 
 format_status(#{state := #state{stream = StreamId, core = Core, from = From}} = Status) ->
     Status#{
@@ -613,6 +693,9 @@ execute_effect({observe, fragment_transition, Window}, PoolBusy, State) ->
     counters:add(counter(), ?C_FRAGMENT_TRANSITION, 1),
     rabbitmq_stream_s3_histogram:observe(?MODULE, Window),
     {State, PoolBusy};
+execute_effect({observe, {stall, Reason}}, PoolBusy, State) ->
+    counters:add(counter(), stall_counter(Reason), 1),
+    {State, PoolBusy};
 execute_effect(
     {start_request, Id, Key, {RangeStart, _} = Range, FragOffset},
     false,
@@ -692,6 +775,13 @@ execute_effect({fatal_error, Reason}, PoolBusy, #state{stream = StreamId} = Stat
     {State, PoolBusy};
 execute_effect(stop, PoolBusy, State) ->
     {State#state{stopping = true}, PoolBusy}.
+
+stall_counter(target) -> ?C_STALL_TARGET;
+stall_counter(depth) -> ?C_STALL_DEPTH;
+stall_counter(fetch_budget) -> ?C_STALL_FETCH_BUDGET;
+stall_counter(buffer) -> ?C_STALL_BUFFER;
+stall_counter(reach) -> ?C_STALL_REACH;
+stall_counter(peek_failed) -> ?C_STALL_PEEK_FAILED.
 
 %% Both kinds wait on the pool clock; they differ in what the core makes of
 %% them. See the core's `note_contention/2`. The kind is also what the rest of
