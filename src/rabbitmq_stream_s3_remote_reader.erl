@@ -43,13 +43,15 @@ synchronous feedback is generated.
 -define(C_FETCH_RATE, 10).
 -define(C_STALL_TARGET, 11).
 -define(C_STALL_DEPTH, 12).
--define(C_STALL_FETCH_BUDGET, 13).
--define(C_STALL_BUFFER, 14).
--define(C_STALL_REACH, 15).
--define(C_STALL_PEEK_FAILED, 16).
--define(C_SERVE_RATE, 17).
--define(C_FETCH_CEILING, 18).
--define(C_BUFFER_CEILING, 19).
+-define(C_STALL_BUFFER, 13).
+-define(C_STALL_REACH, 14).
+-define(C_STALL_PEEK_FAILED, 15).
+-define(C_SERVE_RATE, 16).
+-define(C_FETCH_CEILING, 17).
+-define(C_MEMORY_CEILING, 18).
+-define(C_COMMITTED, 19).
+-define(C_BUFFERED, 20).
+-define(C_STALL_FETCH_BUDGET, 21).
 -define(COUNTER_KEY, {rabbitmq_stream_s3_remote_reader, counter}).
 -define(PREFETCH_SIZING_KEY, {rabbitmq_stream_s3_remote_reader, prefetch_sizing}).
 -define(COUNTERS, [
@@ -69,10 +71,9 @@ synchronous feedback is generated.
     %% there - are indistinguishable from outside the process.
     {remote_reader_inflight_target, ?C_INFLIGHT_TARGET, gauge,
         "Requests the remote reader is currently aiming to keep in flight"},
-    %% The reading the concurrency search acts on. Against `inflight_target`,
-    %% it says whether a target that has settled low settled there because
-    %% concurrency stopped paying or because the samples it was judged on were
-    %% noise.
+    %% The reading the concurrency search acts on. Against `inflight_target` it
+    %% separates a target that settled low because concurrency stopped paying
+    %% from one settled on noisy samples.
     {remote_reader_fetch_rate_bytes, ?C_FETCH_RATE, gauge,
         "Bytes per second measured over the remote reader's last tuning sample"},
     %% The other end of the reader, over the same sample. The pair is what says
@@ -89,25 +90,26 @@ synchronous feedback is generated.
     {remote_reader_prefetch_stall_depth, ?C_STALL_DEPTH, counter,
         "Placement passes stopped by prefetch_max_depth"},
     {remote_reader_prefetch_stall_fetch_budget, ?C_STALL_FETCH_BUDGET, counter,
-        "Placement passes stopped by the in-flight byte budget (target x prefetch_request_size)"},
+        "Placement passes stopped by the fetch share of prefetch_window_max"},
     {remote_reader_prefetch_stall_buffer, ?C_STALL_BUFFER, counter,
-        "Placement passes stopped by the buffer ceiling: the consumer is behind, "
-        "or prefetch_window_max is low"},
+        "Placement passes stopped by the memory ceiling: the consumer is far behind"},
     {remote_reader_prefetch_stall_reach, ?C_STALL_REACH, counter,
         "Placement passes with budget left but nothing to ask for: the manifest or "
         "the look-ahead horizon ran out, which no budget would fix"},
     {remote_reader_prefetch_stall_peek_failed, ?C_STALL_PEEK_FAILED, counter,
         "Placement passes with budget left but a failed group fetch blocking the look-ahead"},
-    %% What the two byte bounds were actually worth, so a stall reason can be
-    %% read without knowing how the bound is derived. They are set by unrelated
-    %% things - the fetch ceiling scales with the concurrency target, the buffer
-    %% ceiling is whatever the window control has decayed to - so a `buffer`
-    %% stall against a ceiling of one request and one against the configured
-    %% maximum are opposite findings that the counter alone cannot tell apart.
+    %% Each byte budget with what is held against it. Published split rather than
+    %% summed: a total pinned at its ceiling says nothing about which side is
+    %% using it, and a buffer quietly taking the fetch side's share looks
+    %% identical to a reader that is simply busy.
     {remote_reader_fetch_ceiling_bytes, ?C_FETCH_CEILING, gauge,
         "Bytes the remote reader may currently have committed to fetching"},
-    {remote_reader_buffer_ceiling_bytes, ?C_BUFFER_CEILING, gauge,
-        "Bytes the remote reader may currently hold that the consumer has not read"}
+    {remote_reader_committed_bytes, ?C_COMMITTED, gauge,
+        "Bytes the remote reader has committed to fetching and not yet received"},
+    {remote_reader_memory_ceiling_bytes, ?C_MEMORY_CEILING, gauge,
+        "Bytes the remote reader may currently hold in total, buffered and in flight"},
+    {remote_reader_buffered_bytes, ?C_BUFFERED, gauge,
+        "Bytes the remote reader holds that the consumer has not read"}
 ]).
 %% The most bucket boundaries the prefetch window histogram may have. A window
 %% many requests wide would otherwise get one time series per step it can make.
@@ -400,14 +402,9 @@ init(
         reader_ref = erlang:monitor(process, Reader),
         sample_at = erlang:monotonic_time(microsecond)
     },
-    %% Armed whether or not the search is on. With the search off the target
-    %% never moves, and the tick was once skipped for that reason - but the
-    %% target is no longer the only thing it publishes. The measured rates and
-    %% the buffer ceiling all move under a pinned reader too: the window control
-    %% that sets the ceiling is driven by buffer misses and hits, not by
-    %% `auto_tune`. Skipping the tick left a pinned reader publishing the one
-    %% figure that was genuinely static and nothing else, which is the shape of
-    %% reader an operator is most likely to be measuring.
+    %% Armed whether or not the search is on. A pinned reader's target never
+    %% moves, but the rates and the byte budgets do, and those are what an
+    %% operator measuring a pinned reader is looking at.
     _ = erlang:send_after(?TUNE_INTERVAL_MS, self(), tune_tick),
     State1 = publish_gauges(Core0, State0),
     State = execute_effects(Effects, State1),
@@ -540,7 +537,9 @@ publish_gauges(Core, #state{published = Published0} = State) ->
         {?C_FETCH_RATE, measured(rabbitmq_stream_s3_remote_reader_core:fetch_rate(Core))},
         {?C_SERVE_RATE, measured(rabbitmq_stream_s3_remote_reader_core:serve_rate(Core))},
         {?C_FETCH_CEILING, rabbitmq_stream_s3_remote_reader_core:fetch_ceiling(Core)},
-        {?C_BUFFER_CEILING, rabbitmq_stream_s3_remote_reader_core:buffer_ceiling(Core)}
+        {?C_MEMORY_CEILING, rabbitmq_stream_s3_remote_reader_core:memory_ceiling(Core)},
+        {?C_COMMITTED, rabbitmq_stream_s3_remote_reader_core:committed(Core)},
+        {?C_BUFFERED, rabbitmq_stream_s3_remote_reader_core:buffered(Core)}
     ],
     Published = lists:foldl(
         fun({Ix, Value}, Acc) ->
@@ -916,6 +915,15 @@ counter() ->
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
+
+%% `seshat:new/4` sizes the array from the field count and rejects a spec whose
+%% indexes are not exactly 1..N, so removing a counter without renumbering the
+%% ones after it leaves a gap and `init_counters/0` raises. That happens during
+%% plugin start, where it stops the broker booting, and no suite covers it: the
+%% error is logged rather than fatal under the test harness.
+counter_indexes_are_contiguous_test() ->
+    Indexes = lists:sort([Ix || {_Name, Ix, _Kind, _Help} <- ?COUNTERS]),
+    ?assertEqual(lists:seq(1, length(?COUNTERS)), Indexes).
 
 %% A deadline_expired carrying a token that does not match the current read's
 %% token (its read was already served, or it was superseded by a newer read)
