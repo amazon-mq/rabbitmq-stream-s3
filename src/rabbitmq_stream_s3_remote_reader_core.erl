@@ -193,6 +193,18 @@ and transitions immediately if available, or signals that more data is needed.
     %% concurrency moves.
     fetch_rate :: undefined | non_neg_integer(),
 
+    %% The same two quantities for the other end of the reader: bytes handed to
+    %% the consumer, over the same sample.
+    %%
+    %% Fetched and served are equal over any long run - what is fetched is what
+    %% is served - so this is not a second reading of the same thing. What it
+    %% answers is whether the serve rate moves when the fetch side is given more
+    %% concurrency. A serve rate that does not move says the ceiling is
+    %% downstream of this module, which is the one conclusion the fetch-side
+    %% metrics cannot reach on their own.
+    served_sample = 0 :: non_neg_integer(),
+    serve_rate :: undefined | non_neg_integer(),
+
     %% How far ahead of the consumer to have already buffered. AIMD on the
     %% buffer miss, which is the signal that measures it: a read that had to
     %% wait means the reader was not buffered far enough ahead. Capped at
@@ -246,6 +258,16 @@ and transitions immediately if available, or signals that more data is needed.
 
 -type observe_kind() :: hit | miss | fragment_transition.
 
+-doc """
+Why a placement pass stopped issuing, which is the only thing that decides how
+hard a reader fetches.
+
+Four of these are budgets and say raise that budget; `reach` and `peek_failed`
+say the reader ran out of fragments to ask for rather than out of room, which no
+budget would fix. See `stall_reason/1` and "concurrency control".
+""".
+-type stall_reason() :: target | depth | fetch_budget | buffer | reach | peek_failed.
+
 -type effect() ::
     {reply, read_result()}
     | {start_request, request_id(), rabbitmq_stream_s3:key(), {byte_offset(), byte_offset()},
@@ -256,6 +278,7 @@ and transitions immediately if available, or signals that more data is needed.
     | {cancel_timers, all}
     | {refresh_iterator, osiris:offset()}
     | {observe, observe_kind(), pos_integer()}
+    | {observe, {stall, stall_reason()}}
     | {fatal_error, term()}
     | stop.
 
@@ -281,7 +304,10 @@ and transitions immediately if available, or signals that more data is needed.
     pending/1,
     current_fragment_offset/1,
     inflight_target/1,
-    searching/1
+    fetch_rate/1,
+    serve_rate/1,
+    fetch_ceiling/1,
+    buffer_ceiling/1
 ]).
 
 -ifdef(TEST).
@@ -294,7 +320,6 @@ and transitions immediately if available, or signals that more data is needed.
     read_position/1,
     load/1,
     request_id/3,
-    fetch_rate/1,
     tune/2
 ]).
 
@@ -394,7 +419,17 @@ step_(State0, {tune_tick, ElapsedUs}) ->
     case ElapsedUs > 0 of
         true ->
             Rate = State0#state.sample_bytes * 1_000_000 div ElapsedUs,
-            State1 = tune(Rate, State0#state{sample_bytes = 0, fetch_rate = Rate}),
+            %% Closed over the same elapsed time as the fetch rate, so the two
+            %% are comparable sample by sample rather than only on average.
+            %% Nothing is tuned from it: it measures the consumer, which is not
+            %% this reader's to control.
+            ServeRate = State0#state.served_sample * 1_000_000 div ElapsedUs,
+            State1 = tune(Rate, State0#state{
+                sample_bytes = 0,
+                fetch_rate = Rate,
+                served_sample = 0,
+                serve_rate = ServeRate
+            }),
             %% A raised target does nothing until something issues against it,
             %% and the reader that most needs the extra concurrency is the one
             %% whose in-flight requests are all still streaming - so no delivery
@@ -601,6 +636,7 @@ step_(State0, {iterator_refreshed, Iterator}) ->
                 %% the measurement describe the interval since the last tick,
                 %% and a refresh part-way through it changes neither.
                 sample_bytes = State0#state.sample_bytes,
+                served_sample = State0#state.served_sample,
                 sample_contention = State0#state.sample_contention,
                 retry_delay = Cfg#cfg.min_retry_delay_ms,
                 pipeline = rabbitmq_stream_s3_read_pipeline:replace_fragment(
@@ -700,12 +736,33 @@ problems that look identical from outside.
 inflight_target(#state{inflight_target = Target}) ->
     Target.
 
-%% Whether this reader's target can still move, which is to say whether there is
-%% anything for the shell's tick to feed. Asked rather than read from the
-%% options so the default lives in one place, `build_cfg/1`.
--spec searching(state()) -> boolean().
-searching(#state{cfg = #cfg{auto_tune = AutoTune}}) ->
-    AutoTune.
+-doc """
+Bytes per second over the last completed sample, or `undefined` before the first
+tick closes one.
+
+This is the reading the concurrency search acts on, not a derived statistic:
+every move the target makes is a comparison between two of these. Published so
+that a target which has settled somewhere unexpected can be read against the
+rates that put it there - a search that is working and a search misled by a
+noisy sample produce the same target and are otherwise indistinguishable.
+""".
+-spec fetch_rate(state()) -> undefined | non_neg_integer().
+fetch_rate(#state{fetch_rate = Rate}) ->
+    Rate.
+
+-doc """
+Bytes per second handed to the consumer over the last completed sample, or
+`undefined` before the first tick closes one.
+
+Read against `fetch_rate/1`, which is measured over the same sample. They agree
+over any long run, so what this is for is the comparison across operating
+points: a serve rate that does not move when the fetch side is given more
+concurrency says the ceiling is downstream of this reader, and no amount of
+prefetch tuning will move it. Nothing on the fetch side can answer that.
+""".
+-spec serve_rate(state()) -> undefined | non_neg_integer().
+serve_rate(#state{serve_rate = Rate}) ->
+    Rate.
 
 pipeline(#state{pipeline = Pipeline}) -> Pipeline.
 
@@ -729,12 +786,6 @@ read_position(State) ->
 -spec load(state()) -> {non_neg_integer(), non_neg_integer(), non_neg_integer()}.
 load(State) ->
     {committed(State), buffered(State), rabbitmq_stream_s3_read_pipeline:inflight(pipeline(State))}.
-
-%% Bytes per second over the last completed sample; `undefined` before the first
-%% tick closes one.
--spec fetch_rate(state()) -> undefined | non_neg_integer().
-fetch_rate(#state{fetch_rate = Rate}) ->
-    Rate.
 
 -endif.
 
@@ -1102,10 +1153,37 @@ issue_ready(#state{inflight_target = Target, cfg = #cfg{max_depth = MaxDepth}} =
 extend_frontier(#state{current_not_found = true} = State) ->
     {State, []};
 extend_frontier(#state{peeks = Peeks0, peek_tail = Tail0} = State) ->
-    {State1, Peeks, Tail, Attempted, Effects} = extend_frontier(State, Peeks0, Tail0, []),
+    {State1, Peeks, Tail, Attempted, Stall, Effects} =
+        extend_frontier(State, Peeks0, Tail0, false, []),
+    %% Observed here rather than in the inner pass so the count is one per
+    %% placement pass. `start_current_request/1` shares that pass but is not one:
+    %% it defers the look-ahead deliberately, so it would report `reach` on a
+    %% reader that is simply new.
+    %%
+    %% An idle reader is not stalled, it is finished, and the tick drives a pass
+    %% five times a second whether or not there is anything to fetch for.
+    %% Counted, those passes are most of the counts on a node holding attached
+    %% readers nobody is reading from.
     arm_peek_retry(
-        Tail, Attempted, State1#state{peeks = Peeks, peek_tail = Tail}, Effects
+        Tail,
+        Attempted,
+        State1#state{peeks = Peeks, peek_tail = Tail},
+        Effects ++ observe_stall(State1, Stall)
     ).
+
+%% A reader holding nothing, owing nothing and asked for nothing is finished,
+%% not stalled - and the tick drives a pass five times a second regardless. A
+%% full buffer is not this: that reader would fetch if it had room, which is
+%% what `buffer` reports.
+observe_stall(State, Stall) ->
+    Idle =
+        State#state.pending =:= undefined andalso
+            committed(State) =:= 0 andalso
+            buffered(State) =:= 0,
+    case Idle of
+        true -> [];
+        false -> [{observe, {stall, Stall}}]
+    end.
 
 %% A group fetch that failed while looking ahead has to arm the retry itself.
 %% Nothing else in this pass will: the ranges already queued are healthy, so no
@@ -1134,12 +1212,17 @@ arm_peek_retry(_Peek, _Attempted, State, Effects) ->
     {State, Effects}.
 
 extend_frontier(State, Peeks0, Tail0, Acc) ->
-    extend_frontier(State, Peeks0, Tail0, false, Acc).
+    {State1, Peeks, Tail, Attempted, _Stall, Effects} =
+        extend_frontier(State, Peeks0, Tail0, false, Acc),
+    {State1, Peeks, Tail, Attempted, Effects}.
 
+%% Also returns why the pass stopped. Every pass ends on exactly one bound - a
+%% budget, or having nothing left to ask for - so counting the reasons partitions
+%% them, and the shares are readable as "this is what governs this reader".
 extend_frontier(State, Peeks0, Tail0, Attempted0, Acc) ->
     case has_room(State) of
         false ->
-            {State, Peeks0, Tail0, Attempted0, lists:reverse(Acc)};
+            {State, Peeks0, Tail0, Attempted0, stall_reason(State), lists:reverse(Acc)};
         true ->
             case next_range(State, Peeks0, Tail0) of
                 {Peeks, Tail, Attempted, {FragRef, Range}} ->
@@ -1154,7 +1237,23 @@ extend_frontier(State, Peeks0, Tail0, Attempted0, Acc) ->
                         [start_request_effect(Spec) | Acc]
                     );
                 {Peeks, Tail, Attempted, none} ->
-                    {State, Peeks, Tail, Attempted0 orelse Attempted, lists:reverse(Acc)}
+                    %% Room to fetch, but nothing to fetch: the reader is limited
+                    %% by its reach rather than by any budget. A look-ahead that
+                    %% failed is called out separately because it is transient -
+                    %% a group GET that errored, retried on the fault clock -
+                    %% where a plain `reach` is the manifest or the horizon, and
+                    %% the two want opposite responses.
+                    %% Only when this pass tried to extend the look-ahead. A
+                    %% `failed` tail left by an earlier pass says nothing about
+                    %% why this one found nothing: the walk may have stopped at
+                    %% the horizon or the look-ahead cap, both of which are
+                    %% `reach`. Same pair `arm_peek_retry/4` decides on.
+                    Stall =
+                        case {Tail, Attempted0 orelse Attempted} of
+                            {failed, true} -> peek_failed;
+                            _ -> reach
+                        end,
+                    {State, Peeks, Tail, Attempted0 orelse Attempted, Stall, lists:reverse(Acc)}
             end
     end.
 
@@ -1186,6 +1285,24 @@ has_room(#state{inflight_target = Target, cfg = #cfg{max_depth = MaxDepth}} = St
         committed(State) < fetch_ceiling(State) andalso
         buffered(State) < buffer_ceiling(State).
 
+%% Which bound stopped the pass, which is knowable only here: a reader sitting
+%% at any of them looks the same from outside the process.
+%%
+%% A second pass rather than a reason threaded out of `has_room/1`, which runs
+%% once per range issued and short-circuits. The order matches it, so the reason
+%% named is the bound that stopped the pass rather than one that also holds.
+stall_reason(#state{inflight_target = Target, cfg = #cfg{max_depth = MaxDepth}} = State) ->
+    Owing = inflight_owing(State),
+    Inflight = rabbitmq_stream_s3_read_pipeline:inflight(pipeline(State)),
+    Committed = committed(State),
+    FetchCeiling = fetch_ceiling(State),
+    if
+        Owing >= Target -> target;
+        Inflight >= MaxDepth -> depth;
+        Committed >= FetchCeiling -> fetch_budget;
+        true -> buffer
+    end.
+
 %% How much the reader may have on the wire: what the concurrency target is
 %% worth in bytes, floored at what the pending read needs.
 %%
@@ -1197,6 +1314,15 @@ has_room(#state{inflight_target = Target, cfg = #cfg{max_depth = MaxDepth}} = St
 %% so a chunk larger than the budget is enough to reach it. Both ceilings carry
 %% the same floor: either one held below the pending read is the same wedge by a
 %% different route.
+%%
+%% Published as a gauge, with `buffer_ceiling/1`. Naming the bound that stopped a
+%% pass (see `stall_reason/1`) says which of the two governs a reader; it does
+%% not say what either was worth at the time, and the two are set by unrelated
+%% things - this one scales with the concurrency target, the other is whatever
+%% the window control has decayed to. A `buffer` stall is read very differently
+%% against a ceiling of one request than against one of the configured maximum,
+%% so the reason alone is not self-interpreting.
+-spec fetch_ceiling(state()) -> non_neg_integer().
 fetch_ceiling(#state{inflight_target = Target, cfg = #cfg{request_size = RequestSize}} = State) ->
     max(Target * RequestSize, pending_need(State)).
 
@@ -1204,6 +1330,13 @@ fetch_ceiling(#state{inflight_target = Target, cfg = #cfg{request_size = Request
 %% and nothing else: reaching it says the consumer is behind, which is a reason
 %% to stop fetching ahead but not a reason to fetch what is already owed any
 %% less concurrently.
+%%
+%% Note that this moves on its own, whatever the concurrency search is doing:
+%% `window` is grown by a buffer miss and decayed by sustained hits, and neither
+%% is gated on `auto_tune`. A reader with the search pinned off still has a
+%% moving buffer ceiling, which is why the tick that publishes it runs for
+%% pinned readers too.
+-spec buffer_ceiling(state()) -> non_neg_integer().
 buffer_ceiling(#state{window = Window} = State) ->
     max(Window, pending_need(State)).
 
@@ -1448,8 +1581,8 @@ note_miss(#state{cfg = #cfg{window_max = WindowMax}, window = Window} = State0) 
     },
     {State, [{observe, miss, State#state.window}]}.
 
-note_hit(Bytes, #state{bytes_served_since_miss = Since} = State) ->
-    decay(State#state{bytes_served_since_miss = Since + Bytes}).
+note_hit(Bytes, #state{bytes_served_since_miss = Since, served_sample = Served} = State) ->
+    decay(State#state{bytes_served_since_miss = Since + Bytes, served_sample = Served + Bytes}).
 
 %% A window's worth of reads served without a miss: hand a request back. Decaying
 %% by bytes rather than by a count of hits keeps this proportional to the window.
