@@ -128,9 +128,9 @@ With the store down it skips cleanly, so `gmake bench` stays green.
 
 `gmake bench-remote_reader_s3_bench` dials the port MinIO publishes on the host, which is unshaped: `tc netem` applies on the bridge, and a run outside the network namespace does not cross it. Use the sweep for anything where latency is part of the question.
 
-**One configuration per OS process.** A scenario sweeping in-process inherits the previous one's warm pool and grown prefetch window, so it reads faster for reasons unrelated to what it is measuring. `scripts/s3-bench-sweep.sh` restarts the wire and the VM for every point; parameters come from `S3B_*` environment variables.
+**One configuration per OS process.** A scenario sweeping in-process inherits the previous one's warm pool and grown concurrency target, so it reads faster for reasons unrelated to what it is measuring. `scripts/s3-bench-sweep.sh` restarts the wire and the VM for every point; parameters come from `S3B_*` environment variables.
 
-**Give runs time to leave the ramp.** Three things start small: the prefetch window grows on misses, the pool starts at `min_size`, and with `S3B_AUTO_TUNE=1` the concurrency search starts at one request and doubles per sample. The same configuration measured 140.7 MiB/s over 0.9 s and 219.3 MiB/s over 9.3 s. Budget for ten seconds or more.
+**Give runs time to leave the ramp.** Two things start small: the pool starts at `min_size`, and with `S3B_AUTO_TUNE=1` the concurrency search starts at one request and doubles per sample. The same configuration measured 140.7 MiB/s over 0.9 s and 219.3 MiB/s over 9.3 s. Budget for ten seconds or more.
 
 **Read every result against the substrate.** `S3B_SUBSTRATE=1` measures what the store delivers at a given concurrency with the reader taken out. A reader figure that tracks that line is measuring MinIO, not the prefetch policy.
 

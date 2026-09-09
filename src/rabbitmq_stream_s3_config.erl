@@ -156,8 +156,8 @@ general_pool_max_size() ->
 %%
 %% A single S3 connection transfers at roughly 40 MB/s whatever range size is
 %% asked of it, so a remote reader's bandwidth is set by how many range GETs it
-%% runs concurrently. Request size is fixed and the prefetch window is what
-%% adapts; see rabbitmq_stream_s3_remote_reader_core.
+%% runs concurrently. Request size is fixed and what adapts is how many run at
+%% once; see rabbitmq_stream_s3_remote_reader_core.
 %% ------------------------------------------------------------------
 
 %% Bytes per range GET. Large enough to amortise time-to-first-byte over the

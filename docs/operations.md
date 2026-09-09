@@ -244,6 +244,8 @@ stream_s3.prefetch.auto_tune = true
 stream_s3.prefetch.inflight_initial = 32
 ```
 
+All six are read when a reader starts, which is when a consumer begins reading the remote tier. Changing one leaves readers already running on the values they started with, so a consumer part-way through a backlog keeps its old sizing until it reattaches.
+
 ### Read-path integrity
 
 ```ini
@@ -566,20 +568,6 @@ Read `committed_bytes` against `fetch_ceiling_bytes` and `buffered_bytes`
 against `memory_ceiling_bytes` to see which side of the budget is saturated.
 Summed they cannot tell a buffer taking the fetch side's share from a reader
 that is simply busy.
-
-### Prefetch window histogram
-
-| Metric                              | Description                                                       |
-|-------------------------------------|-------------------------------------------------------------------|
-| `rabbitmq_stream_s3_prefetch_window_bytes_bucket`      | Distribution of the remote reader's prefetch window                |
-
-The boundaries are derived from the configured sizes at boot: the window moves in whole requests between `prefetch_request_size` and `prefetch_window_max`, so they are spaced by the request size up to the window cap. At the default sizing that is 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128 MiB and `+Inf`: a 128 MiB window is 32 requests wide, which is more than the sixteen boundaries allowed, so the stride is widened to two requests. The top finite boundary is always the window cap, so `+Inf` stays empty in normal operation. A window that spans more than 16 requests is spaced out rather than given a boundary per step, which bounds the number of series.
-
-Because the boundaries are fixed at boot, both settings are read at boot too, and readers started later keep running with the sizing the node booted with. Changing either one takes effect on restart.
-
-This metric replaces `rabbitmq_stream_s3_read_size_bytes_bucket`, which no longer exists. Panels and alerts that name the old metric go blank rather than error, so they have to be repointed by hand; the bundled Grafana dashboard already is.
-
-The window grows on a miss and shrinks on sustained hits, so it reads as a load signal rather than a health one. A window pinned at its ceiling while `rabbitmq_stream_s3_buffer_miss` still climbs means consumers are outrunning the remote tier: prefetch has grown as far as it is allowed to and reads are still waiting on S3. A window sitting at its floor means the reader is staying ahead of its consumers and has given back every request it took.
 
 ## Dashboards
 

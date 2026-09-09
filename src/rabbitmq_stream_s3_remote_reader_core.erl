@@ -38,7 +38,7 @@ it starts and hands it back with every frame.
 - `{cancel_timers, all}` - drop every armed retry timer, and any `retry` event
   an already-fired one has left in the shell's mailbox
 - `{refresh_iterator, Offset}` - rebuild iterator past the given offset
-- `{observe, Kind, Window}` - report a notable read-path event for metrics
+- `{observe, Kind}` - report a notable read-path event for metrics
 - `{fatal_error, Reason}` - a non-retryable error is stopping the reader; report it (log + metric) before `stop`
 - `stop` - shut down the remote reader
 
@@ -61,10 +61,9 @@ for a request whose predecessors have not finished are held in that request's
 `staged` list and appended once it reaches the head. See
 `rabbitmq_stream_s3_read_pipeline`.
 
-Prefetch is sized by two budgets. The window bounds the bytes held ahead of the
-consumer and grows on a buffer miss; the concurrency target bounds the range
-GETs in flight and is what sets bandwidth. See "buffer window control" and
-"concurrency control" below.
+Prefetch is sized by a byte budget partitioned between fetching and buffering,
+and by a concurrency target that bounds the range GETs in flight and is what
+sets bandwidth. See `has_room/1` and "concurrency control" below.
 
 Fragment transitions happen when the read position exceeds the current
 fragment's data region. The core checks for pre-fetched next-fragment data
@@ -93,8 +92,8 @@ and transitions immediately if available, or signals that more data is needed.
     %% Bytes per range request. Fixed: concurrency, not size, is what scales a
     %% remote reader's bandwidth past one connection's transfer rate.
     request_size :: pos_integer(),
-    %% Ceiling on the prefetch window, and so on the bytes this reader may hold
-    %% that the consumer has not read.
+    %% The byte budget fetching and buffering are partitioned out of. Half the
+    %% real bound on a reader's memory; see `memory_ceiling/1`.
     window_max :: pos_integer(),
     %% Most requests that may be in flight at once, across every fragment.
     max_depth :: pos_integer(),
@@ -131,10 +130,9 @@ and transitions immediately if available, or signals that more data is needed.
     stream :: stream_id(),
     cfg :: #cfg{},
 
-    %% Bytes served since the last miss, which is what decays the window. See
-    %% the "buffer window control" section.
-    bytes_served_since_miss = 0 :: non_neg_integer(),
-    %% The pending read has already been counted as a miss.
+    %% The pending read has already been counted as a miss, so `buffer_miss`
+    %% counts reads that had to wait rather than the deliveries they waited
+    %% through.
     missed_pending = false :: boolean(),
 
     %% Retry state: one backoff clock per kind, grown and reset independently.
@@ -204,12 +202,6 @@ and transitions immediately if available, or signals that more data is needed.
     served_sample = 0 :: non_neg_integer(),
     serve_rate :: undefined | non_neg_integer(),
 
-    %% How far ahead of the consumer to have already buffered. AIMD on the
-    %% buffer miss, which is the signal that measures it: a read that had to
-    %% wait means the reader was not buffered far enough ahead. Capped at
-    %% `window_max`, so it is also this reader's bound on held memory.
-    window :: pos_integer(),
-
     %% How many requests the reader is aiming to keep in flight, and the state
     %% of the search that sets it. See "concurrency control".
     inflight_target :: pos_integer(),
@@ -276,8 +268,7 @@ budget would fix. See `stall_reason/1` and "concurrency control".
     | {set_timer, backoff(), pos_integer()}
     | {cancel_timers, all}
     | {refresh_iterator, osiris:offset()}
-    | {observe, observe_kind(), pos_integer()}
-    | {observe, {stall, stall_reason()}}
+    | {observe, observe_kind() | {stall, stall_reason()}}
     | {fatal_error, term()}
     | stop.
 
@@ -317,7 +308,6 @@ budget would fix. See `stall_reason/1` and "concurrency control".
 %% they use this to address a delivery to the right request.
 -export([
     outstanding_ranges/1,
-    window_bytes/1,
     read_position/1,
     load/1,
     request_id/3,
@@ -355,7 +345,6 @@ init(StreamId, FragRef, Position, Iterator, Opts) ->
     State = #state{
         stream = StreamId,
         cfg = Cfg,
-        window = Cfg#cfg.request_size,
         inflight_target = initial_target(Cfg),
         retry_delay = Cfg#cfg.min_retry_delay_ms,
         pipeline = rabbitmq_stream_s3_read_pipeline:new(StreamId, FragRef, Position),
@@ -573,7 +562,6 @@ step_(State0, {iterator_refreshed, Iterator}) ->
             State = #state{
                 stream = StreamId,
                 cfg = Cfg,
-                window = Cfg#cfg.request_size,
                 %% The refresh rebuilds the state, so the search starts over:
                 %% what it had learned was about a fragment the reader has left.
                 %% The target itself carries across - the ramp starts at one
@@ -718,10 +706,6 @@ pipeline(#state{pipeline = Pipeline}) -> Pipeline.
 outstanding_ranges(State) ->
     rabbitmq_stream_s3_read_pipeline:outstanding_ranges(pipeline(State)).
 
--spec window_bytes(state()) -> pos_integer().
-window_bytes(#state{window = Window}) ->
-    Window.
-
 %% Where the consumer has read up to, so a test can carry on reading from
 %% wherever an earlier phase left the reader rather than assuming a position.
 -spec read_position(state()) -> byte_offset().
@@ -745,11 +729,11 @@ try_serve(#state{pending = undefined} = State) ->
 try_serve(#state{pending = #pending{offset = Offset, bytes = Bytes}} = State) ->
     case try_read(State, Offset, Bytes) of
         {ok, Data, State1} ->
-            State2 = note_hit(iolist_size(Data), State1#state{pending = undefined}),
+            State2 = note_served(iolist_size(Data), State1#state{pending = undefined}),
             {State3, Effects} = maybe_start_requests(State2),
             {State3, [
                 {reply, {ok, Data}},
-                {observe, hit, window(State3)}
+                {observe, hit}
                 | Effects
             ]};
         {next_fragment, NextOffset, CancelEffects, State1} ->
@@ -759,7 +743,7 @@ try_serve(#state{pending = #pending{offset = Offset, bytes = Bytes}} = State) ->
                 CancelEffects ++
                     [
                         {reply, {next_fragment, NextOffset}},
-                        {observe, fragment_transition, window(State3)}
+                        {observe, fragment_transition}
                         | Effects
                     ]};
         {await, State1} ->
@@ -1391,15 +1375,13 @@ range_in_fragment(Frontier, FragSize, State) ->
 build_cfg(Opts) ->
     %% At least one byte per request. Zero makes `range_in_fragment/3` return
     %% `{Frontier, Frontier - 1}` - an inverted range, which is a `bytes=8-7`
-    %% header S3 rejects and which counts nothing against the window, so the
+    %% header S3 rejects and which counts nothing against the budget, so the
     %% reader fills its whole depth with them and never gets a byte.
     RequestSize = max(1, maps:get(request_size, Opts, 4_194_304)),
     #cfg{
         request_size = RequestSize,
-        %% Never below one request. A ceiling under the floor inverts the
-        %% signal the design rests on: `note_miss/1` would *shrink* the window
-        %% when the reader is not fetching far enough ahead, and the histogram's
-        %% boundaries are derived from these same two numbers.
+        %% Never below one request: every byte bound is derived from it, and a
+        %% ceiling under the floor puts them all below a single range.
         window_max = max(RequestSize, maps:get(window_max, Opts, 33_554_432)),
         %% At least one request in flight. Zero leaves `has_room/1` false
         %% however far behind the consumer falls, so nothing is ever requested
@@ -1420,59 +1402,21 @@ build_cfg(Opts) ->
         max_retry_delay_ms = maps:get(max_retry_delay_ms, Opts, 30_000)
     }.
 
-%% ------------------------------------------------------------------
-%% Internal: buffer window control
-%%
-%% One knob: `window`, the bytes to hold ahead of the consumer, bounded by
-%% `#cfg.window_max`. It bounds buffering only. How many requests run at once is
-%% the concurrency target's job, and that is what sets bandwidth.
-%%
-%% A buffer miss means the reader is not buffered far enough ahead, so the
-%% window doubles. Sustained hits mean it is further ahead than it needs to be,
-%% so it gives a request back. This is the opposite of a congestion window: the
-%% miss is a starvation signal, not a signal to back off.
-%% ------------------------------------------------------------------
-
 %% Bytes per range request.
 request_size(#state{cfg = #cfg{request_size = RequestSize}}) ->
     RequestSize.
 
-window(#state{window = Window}) ->
-    Window.
+%% Bytes handed to the consumer, accumulated into the sample the tick closes.
+note_served(Bytes, #state{served_sample = Served} = State) ->
+    State#state{served_sample = Served + Bytes}.
 
 %% Only the first miss for a given pending read is counted. `try_serve/1` re-runs
 %% on every delivery while a read waits, and `buffer_miss` counts reads that had
 %% to wait rather than the deliveries they waited through.
-%%
-%% A miss sizes the *buffer* only. It cannot size the fetch side: past the
-%% throughput peak, more concurrency is what causes the consumer to wait, so
-%% growing on a miss there buys more of the thing making it miss.
 note_miss(#state{missed_pending = true} = State) ->
     {State, []};
-note_miss(#state{cfg = #cfg{window_max = WindowMax}, window = Window} = State0) ->
-    State = State0#state{
-        window = min(WindowMax, Window * 2),
-        bytes_served_since_miss = 0,
-        missed_pending = true
-    },
-    {State, [{observe, miss, State#state.window}]}.
-
-note_hit(Bytes, #state{bytes_served_since_miss = Since, served_sample = Served} = State) ->
-    decay(State#state{bytes_served_since_miss = Since + Bytes, served_sample = Served + Bytes}).
-
-%% A window's worth of reads served without a miss: hand a request back. Decaying
-%% by bytes rather than by a count of hits keeps this proportional to the window.
-%% Reads come two per chunk (a header over-read and the body), so a hit count
-%% would shrink the window after a handful of chunks however large it is.
-decay(#state{cfg = #cfg{request_size = RequestSize}, window = Window} = State) when
-    State#state.bytes_served_since_miss > Window
-->
-    State#state{
-        window = max(RequestSize, Window - RequestSize),
-        bytes_served_since_miss = 0
-    };
-decay(State) ->
-    State.
+note_miss(State0) ->
+    {State0#state{missed_pending = true}, [{observe, miss}]}.
 
 %% ------------------------------------------------------------------
 %% Internal: concurrency control
