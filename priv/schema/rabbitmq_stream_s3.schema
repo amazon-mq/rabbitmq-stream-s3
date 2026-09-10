@@ -163,15 +163,11 @@ end}.
     {datatype, bytesize}
 ]}.
 
-{mapping, "stream_s3.prefetch.window_max", "rabbitmq_stream_s3.prefetch_window_max", [
+{mapping, "stream_s3.prefetch.max_memory", "rabbitmq_stream_s3.prefetch_max_memory", [
     {datatype, bytesize}
 ]}.
 
 {mapping, "stream_s3.prefetch.max_depth", "rabbitmq_stream_s3.prefetch_max_depth", [
-    {datatype, integer}, {validators, ["non_zero_positive_integer"]}
-]}.
-
-{mapping, "stream_s3.prefetch.max_lookahead", "rabbitmq_stream_s3.prefetch_max_lookahead", [
     {datatype, integer}, {validators, ["non_zero_positive_integer"]}
 ]}.
 

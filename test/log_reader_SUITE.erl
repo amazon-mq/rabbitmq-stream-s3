@@ -128,7 +128,7 @@ end_per_testcase(_TestCase, Config) ->
     %% Restore the default prefetch sizing if a test shrank it, including the
     %% copy published at boot; see `pipeline_within_fragments/0`.
     application:unset_env(rabbitmq_stream_s3, prefetch_request_size),
-    application:unset_env(rabbitmq_stream_s3, prefetch_window_max),
+    application:unset_env(rabbitmq_stream_s3, prefetch_max_memory),
     application:unset_env(rabbitmq_stream_s3, prefetch_max_depth),
     ok = rabbitmq_stream_s3_remote_reader:init_counters(),
     Config.
@@ -269,12 +269,9 @@ read_retries_transient_remote_error(Config) ->
 %% fragment these tests write is a single request, which never interleaves.
 pipeline_within_fragments() ->
     ok = application:set_env(rabbitmq_stream_s3, prefetch_request_size, 256),
-    ok = application:set_env(rabbitmq_stream_s3, prefetch_window_max, 8192),
+    ok = application:set_env(rabbitmq_stream_s3, prefetch_max_memory, 16384),
     ok = application:set_env(rabbitmq_stream_s3, prefetch_max_depth, 8),
-    %% The request size and window ceiling are read once at boot, so republish
-    %% them the way a restart would - otherwise readers keep running with the
-    %% sizing frozen when the suite started and never interleave.
-    ok = rabbitmq_stream_s3_remote_reader:init_counters().
+    ok.
 
 read_with_out_of_order_remote_responses(Config) ->
     %% Several ranges of a fragment are fetched at once, so their responses

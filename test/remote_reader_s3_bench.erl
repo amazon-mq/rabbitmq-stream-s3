@@ -122,7 +122,7 @@ So sweeping is `scripts/s3-bench-sweep.sh`'s job: it restarts the wire and
 starts a fresh VM for every point. Parameters come from the environment so a
 shell loop can set them:
 
-    S3B_DEPTH, S3B_WINDOW_MIB, S3B_REQUEST_MIB, S3B_FRAGMENT_MIB,
+    S3B_DEPTH, S3B_MEMORY_MIB, S3B_REQUEST_MIB, S3B_FRAGMENT_MIB,
     S3B_BUDGET_MIB, S3B_RATE_KBPS, S3B_LATENCY_MS, S3B_JITTER_MS,
     S3B_SUBSTRATE (set to measure the substrate ceiling instead of the reader)
 """.
@@ -145,7 +145,7 @@ run_one() ->
     ok = setup(),
     try
         Depth = env_int("S3B_DEPTH", 8),
-        WindowMiB = env_int("S3B_WINDOW_MIB", 32),
+        MemoryMiB = env_int("S3B_MEMORY_MIB", 64),
         RequestMiB = env_int("S3B_REQUEST_MIB", 4),
         FragmentMiB = env_int("S3B_FRAGMENT_MIB", 64),
         BudgetMiB = env_int("S3B_BUDGET_MIB", 128),
@@ -178,7 +178,7 @@ run_one() ->
                     budget => Budget,
                     opts => #{
                         max_depth => Depth,
-                        window_max => WindowMiB * 1_048_576,
+                        max_memory => MemoryMiB * 1_048_576,
                         request_size => RequestMiB * 1_048_576,
                         %% At 1 the reader holds exactly one prefetched
                         %% fragment, so sweeping this measures multi-fragment
@@ -196,7 +196,7 @@ run_one() ->
                 }),
                 %% One machine-readable line; the sweep script tabulates.
                 io:format(
-                    "S3BENCH depth=~b window=~bM request=~bM fragment=~bM "
+                    "S3BENCH depth=~b memory=~bM request=~bM fragment=~bM "
                     "latency=~bms mib_s=~.1f inflight_avg=~.1f inflight_max=~.1f "
                     "target_final=~b target_max=~b "
                     "msgq_avg=~.1f msgq_max=~b reds_per_s=~.2fM elapsed=~.2f "
@@ -204,7 +204,7 @@ run_one() ->
                     "stall=t~b/d~b/f~b/b~b/r~b committed=~bM/~bM buffered=~bM/~bM~n",
                     [
                         Depth,
-                        WindowMiB,
+                        MemoryMiB,
                         RequestMiB,
                         FragmentMiB,
                         Latency,

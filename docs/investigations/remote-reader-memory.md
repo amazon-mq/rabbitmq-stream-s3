@@ -1,6 +1,6 @@
 # Remote reader memory behavior
 
-> Status update (2026-08-13). The prefetch ceiling this doc cites, `read_size_max` at 64 MiB with a further next-fragment prefetch at the full window size, has been retired. The pipelined prefetch of [#349](https://github.com/amazon-mq/rabbitmq-stream-s3/issues/349) replaced it with a single window spanning both fragments, capped by `prefetch_window_max` (32 MiB), so the per-consumer ceiling is that plus one in-flight request rather than the ~128 MiB quoted below. The block-queue findings and every measurement below are unaffected and remain valid.
+> Status update (2026-09-14). The prefetch ceiling this doc cites, `read_size_max` at 64 MiB with a further next-fragment prefetch at the full window size, has been retired, and so has the `prefetch_window_max` (32 MiB) that an earlier revision of this banner named in its place. The read path now prefetches across as many fragments as demand reaches for and bounds the reader by `prefetch_max_memory` (256 MiB at the default), which covers buffered plus committed bytes together. That is the per-consumer ceiling to size against, not the ~128 MiB quoted below. See [read-path.md](../read-path.md) for the mechanism and [operations.md](../operations.md) for the setting. The block-queue findings and every measurement below are unaffected and remain valid.
 
 This doc is an investigation into the memory impact of remote tier reads.
 

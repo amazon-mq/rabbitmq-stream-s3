@@ -28,9 +28,8 @@ lives here. Callers use these functions instead of calling
     general_pool_min_size/0,
     general_pool_max_size/0,
     prefetch_request_size/0,
-    prefetch_window_max/0,
+    prefetch_max_memory/0,
     prefetch_max_depth/0,
-    prefetch_max_lookahead/0,
     prefetch_auto_tune/0,
     prefetch_inflight_initial/0,
     fragment_target_size/0,
@@ -67,6 +66,8 @@ lives here. Callers use these functions instead of calling
 ]).
 
 -define(APP, rabbitmq_stream_s3).
+
+-define(MEMORY_REQUESTS, 64).
 
 %% The API backend module. Defaults to the AWS implementation.
 -spec api_backend() -> module().
@@ -166,16 +167,20 @@ general_pool_max_size() ->
 prefetch_request_size() ->
     application:get_env(?APP, prefetch_request_size, 4_194_304).
 
-%% The byte budget a reader fetches and buffers within.
+%% Bytes one remote reader may hold, buffered and in flight together.
 %%
-%% Not the whole of what a reader may hold: fetching is guaranteed a share of
-%% this that buffering cannot take, so the worst case is a full share committed
-%% on top of a buffer holding the rest. A reader's memory bound is therefore
-%% twice this, 256 MiB at the default. That is substantial per reader, and small
-%% against what a node streaming at these rates is already holding.
--spec prefetch_window_max() -> pos_integer().
-prefetch_window_max() ->
-    application:get_env(?APP, prefetch_window_max, 134_217_728).
+%% Half of it is what fetching may commit and the other half is the buffer's,
+%% and fetching does not consult the buffer - so the worst case, and this bound,
+%% is a full fetch ceiling on top of a buffer holding as much. That is
+%% substantial per reader, and small against what a node streaming at these
+%% rates is already holding.
+%%
+%% The default counts requests because half of it is spent on them: a flat size
+%% would buy fewer at a larger request size. At the default request size it is
+%% 256 MiB, 32 requests of fetching against 128 MiB of buffer.
+-spec prefetch_max_memory() -> pos_integer().
+prefetch_max_memory() ->
+    application:get_env(?APP, prefetch_max_memory, ?MEMORY_REQUESTS * prefetch_request_size()).
 
 %% The most range GETs one reader may ever have in flight - a ceiling, not the
 %% operating point. What a reader runs at is searched for from measured
@@ -228,18 +233,6 @@ prefetch_auto_tune() ->
 -spec prefetch_inflight_initial() -> pos_integer().
 prefetch_inflight_initial() ->
     application:get_env(?APP, prefetch_inflight_initial, 32).
-
-%% Most fragments a reader may look ahead to beyond the one it is reading.
-%%
-%% A backstop rather than the working limit: what governs how far ahead a reader
-%% fetches is `prefetch_window_max` and `prefetch_max_depth`, and a fragment is
-%% only ever looked ahead to in order to put a range in it - so at the depth cap
-%% this cannot bind first. It bounds the walk for the cases those do not. At 1 a
-%% reader holds exactly one prefetched fragment, which is the way back if
-%% looking further ahead ever proves to be the wrong call.
--spec prefetch_max_lookahead() -> pos_integer().
-prefetch_max_lookahead() ->
-    application:get_env(?APP, prefetch_max_lookahead, prefetch_max_depth()).
 
 %% Target byte size at which the replica reader cuts a fragment for upload.
 -spec fragment_target_size() -> pos_integer().
@@ -440,9 +433,8 @@ defaults_test_() ->
         ?_assertEqual(2, general_pool_min_size()),
         ?_assertEqual(200, general_pool_max_size()),
         ?_assertEqual(4_194_304, prefetch_request_size()),
-        ?_assertEqual(134_217_728, prefetch_window_max()),
+        ?_assertEqual(268_435_456, prefetch_max_memory()),
         ?_assertEqual(64, prefetch_max_depth()),
-        ?_assertEqual(64, prefetch_max_lookahead()),
         ?_assertEqual(true, prefetch_auto_tune()),
         ?_assertEqual(32, prefetch_inflight_initial()),
         ?_assertEqual(?MAX_FRAGMENT_SIZE_B, fragment_target_size()),
@@ -481,6 +473,25 @@ configured_test_() ->
         fun(_) ->
             application:set_env(rabbitmq_stream_s3, bucket, <<"my-bucket">>),
             ?_assertEqual(<<"my-bucket">>, bucket())
+        end
+    ]}.
+
+default_memory_follows_the_request_size_test_() ->
+    {foreach, fun() -> ok end, fun(_) -> application:unset_env(?APP, prefetch_request_size) end, [
+        fun(_) ->
+            application:set_env(?APP, prefetch_request_size, 16_777_216),
+            [
+                ?_assertEqual(?MEMORY_REQUESTS, prefetch_max_memory() div 16_777_216),
+                ?_assertEqual(268_435_456 * 4, prefetch_max_memory())
+            ]
+        end,
+        fun(_) ->
+            %% A configured bound stands at any request size.
+            application:set_env(?APP, prefetch_request_size, 16_777_216),
+            application:set_env(?APP, prefetch_max_memory, 268_435_456),
+            Configured = prefetch_max_memory(),
+            application:unset_env(?APP, prefetch_max_memory),
+            ?_assertEqual(268_435_456, Configured)
         end
     ]}.
 

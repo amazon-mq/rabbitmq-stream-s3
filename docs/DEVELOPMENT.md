@@ -121,10 +121,13 @@ For memory questions the harness provides `sample_binary_memory/1` (peak VM bina
 gmake s3-bench-up                        # MinIO (needs podman or docker)
 gmake bench-remote_reader_s3_bench       # one configuration
 ./scripts/s3-bench-sweep.sh depth 8 16 32
+./scripts/s3-bench-defaults.sh           # the configuration the plugin ships
 gmake s3-bench-down
 ```
 
 With the store down it skips cleanly, so `gmake bench` stays green.
+
+**Only `s3-bench-defaults.sh` measures what ships.** `S3B_AUTO_TUNE` defaults to 0 in the harness and `s3-bench-validate.sh` pins it to 0, so both of those run at a fixed concurrency while the plugin ships `prefetch_auto_tune = true`. That is deliberate for a reproducibility gate, since the brokers the gate compares against ran fixed too. It does mean a run that is meant to say what a consumer will get has to be `s3-bench-defaults.sh`, or `S3B_AUTO_TUNE=1` passed explicitly.
 
 `gmake bench-remote_reader_s3_bench` dials the port MinIO publishes on the host, which is unshaped: `tc netem` applies on the bridge, and a run outside the network namespace does not cross it. Use the sweep for anything where latency is part of the question.
 
@@ -134,7 +137,7 @@ With the store down it skips cleanly, so `gmake bench` stays green.
 
 **Read every result against the substrate.** `S3B_SUBSTRATE=1` measures what the store delivers at a given concurrency with the reader taken out. A reader figure that tracks that line is measuring MinIO, not the prefetch policy.
 
-**Validate before trusting it.** `gmake s3-bench-validate` runs the configurations that were actually stress-tested and prints each beside its measured result. Nothing there is fitted per scenario — only the broker's own configuration and each stream's manifest shape (derived from fragment count against `rebalance_threshold`). Two of the three scenarios reproduce within ~6%; the third is a known outlier.
+**Validate before trusting it.** `gmake s3-bench-validate` runs the configurations that were actually stress-tested and prints each beside its measured result. Nothing there is fitted per scenario — only the broker's own configuration and each stream's manifest shape (derived from fragment count against `rebalance_threshold`). Both scenarios reproduce within ~6%. A third measured point is deliberately not checked, for the reason the script gives beside it.
 
 **Latency comes from `tc netem`.** Nothing sits between the client and MinIO. Delaying packets in a kernel queue lets the transfer pipeline through it, so the delay lands once as time to first byte, which is what latency costs a range GET; delaying at the application layer would charge it per chunk and scale the cost with transfer size. Set `S3B_LATENCY_MS`; a sidecar applies the qdisc inside MinIO's network namespace.
 
