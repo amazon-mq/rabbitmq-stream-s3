@@ -65,7 +65,13 @@ in_netns() {
 
 # Held constant unless the axis being swept overrides it.
 export S3B_DEPTH="${S3B_DEPTH:-8}"
-export S3B_WINDOW_MIB="${S3B_WINDOW_MIB:-128}"
+# Whether the memory bound was pinned by the caller. The request axis scales it
+# in step otherwise, because the plugin's own default is a multiple of the
+# request size: holding it flat while sweeping the request size measures a
+# configuration no operator has, and reproduces the shrinking concurrency that
+# the request-denominated default exists to prevent.
+MEMORY_PINNED=${S3B_MEMORY_MIB:+1}
+export S3B_MEMORY_MIB="${S3B_MEMORY_MIB:-256}"
 export S3B_REQUEST_MIB="${S3B_REQUEST_MIB:-4}"
 export S3B_FRAGMENT_MIB="${S3B_FRAGMENT_MIB:-64}"
 export S3B_BUDGET_MIB="${S3B_BUDGET_MIB:-128}"
@@ -90,7 +96,9 @@ export S3B_AGG_MBIT="${S3B_AGG_MBIT:-0}"
 
 
 echo "sweeping $AXIS over: ${VALUES[*]}"
-echo "fixed: depth=$S3B_DEPTH window=${S3B_WINDOW_MIB}M request=${S3B_REQUEST_MIB}M" \
+[ "$AXIS" = request ] && [ -z "$MEMORY_PINNED" ] &&
+  echo "note: memory scales with the request size (64x), as the plugin's default does"
+echo "fixed: depth=$S3B_DEPTH memory=${S3B_MEMORY_MIB}M request=${S3B_REQUEST_MIB}M" \
      "fragment=${S3B_FRAGMENT_MIB}M latency=${S3B_LATENCY_MS}ms (0 = unmodelled)"
 echo
 
@@ -106,7 +114,9 @@ for v in "${VALUES[@]}"; do
   case "$AXIS" in
     depth)     export S3B_DEPTH="$v"; unset S3B_SUBSTRATE || true ;;
     fragment)  export S3B_FRAGMENT_MIB="$v"; unset S3B_SUBSTRATE || true ;;
-    request)   export S3B_REQUEST_MIB="$v"; unset S3B_SUBSTRATE || true ;;
+    request)   export S3B_REQUEST_MIB="$v"
+               [ -z "$MEMORY_PINNED" ] && export S3B_MEMORY_MIB=$((64 * v))
+               unset S3B_SUBSTRATE || true ;;
     rate)      export S3B_AGG_MBIT="$v"; unset S3B_SUBSTRATE || true ;;
     substrate) export S3B_DEPTH="$v"; export S3B_SUBSTRATE=1 ;;
     *) echo "unknown axis: $AXIS" >&2; exit 2 ;;

@@ -63,7 +63,7 @@ for a request whose predecessors have not finished are held in that request's
 
 Prefetch is sized by a byte budget partitioned between fetching and buffering,
 and by a concurrency target that bounds the range GETs in flight and is what
-sets bandwidth. See `has_room/1` and "concurrency control" below.
+sets bandwidth. See `room/1` and "concurrency control" below.
 
 Fragment transitions happen when the read position exceeds the current
 fragment's data region. The core checks for pre-fetched next-fragment data
@@ -79,11 +79,6 @@ and transitions immediately if available, or signals that more data is needed.
 -define(MIN_POOL_BUSY_DELAY_MS, 25).
 -define(MAX_POOL_BUSY_DELAY_MS, 500).
 
-%% The share of `window_max` fetching may reserve. The remainder is the buffer's
-%% and fetching cannot take it, which is what stops a filling buffer from
-%% locking the fetch side out.
--define(FETCH_SHARE_PCT, 75).
-
 %% ------------------------------------------------------------------
 %% Types
 %% ------------------------------------------------------------------
@@ -92,15 +87,15 @@ and transitions immediately if available, or signals that more data is needed.
     %% Bytes per range request. Fixed: concurrency, not size, is what scales a
     %% remote reader's bandwidth past one connection's transfer rate.
     request_size :: pos_integer(),
-    %% The byte budget fetching and buffering are partitioned out of. Half the
-    %% real bound on a reader's memory; see `memory_ceiling/1`.
-    window_max :: pos_integer(),
+    %% Everything the reader may hold, buffered and in flight together. Half is
+    %% what fetching may commit; the rest is the buffer's.
+    max_memory :: pos_integer(),
     %% Most requests that may be in flight at once, across every fragment.
     max_depth :: pos_integer(),
     %% Most fragments the reader may look ahead to beyond the one it is reading.
     %%
-    %% A backstop, not the working limit: what governs reach is the window and
-    %% the depth cap in `has_room/1`, and the look-ahead only ever extends when
+    %% A backstop, not the working limit: what governs reach is the byte budget
+    %% and the depth cap in `room/1`, and the look-ahead only ever extends when
     %% every fragment it already holds is spoken for. This bounds the walk for
     %% the cases those do not - a run of fragments with empty data regions
     %% consumes no request, so nothing else would stop it.
@@ -255,7 +250,7 @@ hard a reader fetches.
 
 Four of these are budgets and say raise that budget; `reach` and `peek_failed`
 say the reader ran out of fragments to ask for rather than out of room, which no
-budget would fix. See `stall_reason/1` and "concurrency control".
+budget would fix. See `room/1` and "concurrency control".
 """.
 -type stall_reason() :: target | depth | fetch_budget | buffer | reach | peek_failed.
 
@@ -712,7 +707,7 @@ outstanding_ranges(State) ->
 read_position(State) ->
     rabbitmq_stream_s3_read_pipeline:read_position(pipeline(State)).
 
-%% What the two budgets and the depth cap bound, split the way `has_room/1`
+%% What the two budgets and the depth cap bound, split the way `room/1`
 %% bounds them: bytes on the wire, bytes held unread, and requests in flight.
 -spec load(state()) -> {non_neg_integer(), non_neg_integer(), non_neg_integer()}.
 load(State) ->
@@ -983,7 +978,7 @@ inflight_owing(State) ->
     rabbitmq_stream_s3_read_pipeline:inflight_owing(pipeline(State)).
 
 %% Bytes on the wire or queued for it, not yet in a buffer. Bounded for
-%% throughput; see `has_room/1`.
+%% throughput; see `room/1`.
 -spec committed(state()) -> non_neg_integer().
 committed(State) ->
     rabbitmq_stream_s3_read_pipeline:committed(pipeline(State)).
@@ -1039,8 +1034,8 @@ issue_ready(#state{inflight_target = Target, cfg = #cfg{max_depth = MaxDepth}} =
     ),
     {State#state{pipeline = Pipeline}, [start_request_effect(Spec) || Spec <- Specs]}.
 
-%% Append new ranges at the fetch frontier while the depth cap and the prefetch
-%% window allow, spilling into the prefetched next fragment once every byte of
+%% Append new ranges at the fetch frontier while the depth cap and the byte
+%% budget allow, spilling into the prefetched next fragment once every byte of
 %% the current one has been spoken for.
 %%
 %% Nothing is fetched while the current fragment is known to be 404. Retention
@@ -1106,10 +1101,10 @@ extend_frontier(State, Peeks0, Tail0, Acc) ->
 %% budget, or having nothing left to ask for - so counting the reasons partitions
 %% them, and the shares are readable as "this is what governs this reader".
 extend_frontier(State, Peeks0, Tail0, Attempted0, Acc) ->
-    case has_room(State) of
-        false ->
-            {State, Peeks0, Tail0, Attempted0, stall_reason(State), lists:reverse(Acc)};
-        true ->
+    case room(State) of
+        {stall, Stall} ->
+            {State, Peeks0, Tail0, Attempted0, Stall, lists:reverse(Acc)};
+        ok ->
             case next_range(State, Peeks0, Tail0) of
                 {Peeks, Tail, Attempted, {FragRef, Range}} ->
                     {Spec, Pipeline} = rabbitmq_stream_s3_read_pipeline:push(
@@ -1146,43 +1141,46 @@ extend_frontier(State, Peeks0, Tail0, Attempted0, Acc) ->
 start_request_effect({Id, Key, Range, Fragment}) ->
     {start_request, Id, Key, Range, Fragment}.
 
+%% Whether another range may be issued, and if not, which bound stopped it. A
+%% reader sitting at any of them looks the same from outside the process, so the
+%% bound is reported as a counter.
+%%
+%% Returning the bound rather than a boolean keeps the order in one place: a
+%% second function that named it would have to be kept in step with this one.
+%% The cost is nothing, since a clause that returns a stall is reached where the
+%% equivalent `andalso` term would have been false, and the bounds below it are
+%% not evaluated either way.
+%%
 %% `inflight_owing` is the throughput gate - a request awaiting only its closing
 %% frame is not using the wire - and `inflight` is the resource cap, since that
 %% request still holds a pooled connection.
-has_room(#state{inflight_target = Target, cfg = #cfg{max_depth = MaxDepth}} = State) ->
-    inflight_owing(State) < Target andalso
-        rabbitmq_stream_s3_read_pipeline:inflight(pipeline(State)) < MaxDepth andalso
-        room_for_bytes(State).
-
-%% `buffered` decides both bounds, so it is taken once and threaded.
 %%
-%% The fetch share is a guarantee: below it, fetching does not consult the
-%% buffer, which routinely holds more than its share because a range is
-%% authorised without counting the committed bytes certain to land in it.
-%% `memory_ceiling/1` bounds the result and is the only thing here that stops
-%% issuance outright.
+%% Fetching never consults the buffer, which routinely holds more than its half
+%% because a range is authorised without counting the committed bytes certain to
+%% land in it. `memory_ceiling/1` bounds the two together and is the last word:
+%% the only bound here that stops issuance outright.
+-spec room(state()) -> ok | {stall, stall_reason()}.
+room(#state{inflight_target = Target, cfg = #cfg{max_depth = MaxDepth}} = State) ->
+    case inflight_owing(State) >= Target of
+        true ->
+            {stall, target};
+        false ->
+            case rabbitmq_stream_s3_read_pipeline:inflight(pipeline(State)) >= MaxDepth of
+                true -> {stall, depth};
+                false -> room_for_bytes(State)
+            end
+    end.
+
 room_for_bytes(State) ->
-    Buffered = buffered(State),
     Committed = committed(State),
-    Committed < fetch_ceiling(State, Buffered) andalso
-        Buffered + Committed < memory_ceiling(State).
-
-%% Which bound stopped the pass, which is knowable only here: a reader sitting
-%% at any of them looks the same from outside the process.
-%%
-%% A second pass rather than a reason threaded out of `has_room/1`, which runs
-%% once per range issued and short-circuits. The order matches it, so the reason
-%% named is the bound that stopped the pass rather than one that also holds.
-stall_reason(#state{inflight_target = Target, cfg = #cfg{max_depth = MaxDepth}} = State) ->
-    Owing = inflight_owing(State),
-    Inflight = rabbitmq_stream_s3_read_pipeline:inflight(pipeline(State)),
-    Committed = committed(State),
-    FetchCeiling = fetch_ceiling(State),
-    if
-        Owing >= Target -> target;
-        Inflight >= MaxDepth -> depth;
-        Committed >= FetchCeiling -> fetch_budget;
-        true -> buffer
+    case Committed >= fetch_ceiling(State) of
+        true ->
+            {stall, fetch_budget};
+        false ->
+            case buffered(State) + Committed >= memory_ceiling(State) of
+                true -> {stall, buffer};
+                false -> ok
+            end
     end.
 
 %% Both bounds are floored at what the pending read needs. A read of N bytes
@@ -1191,36 +1189,23 @@ stall_reason(#state{inflight_target = Target, cfg = #cfg{max_depth = MaxDepth}} 
 %% refetches to the same ceiling. Reads are chunk sized, so a chunk larger than
 %% the budget reaches it.
 %%
-%% Bytes the reader may have committed to fetching: whatever the buffer is not
-%% using, never below the share reserved for it, never above what the
-%% concurrency target is worth. A floor rather than a cap, so a buffer that does
-%% not need its share costs no fetch capacity.
+%% Bytes the reader may have committed to fetching: what the concurrency target
+%% is worth, capped at half `max_memory` so that the other half is always the
+%% buffer's. Nothing here reads the buffer, so a full one cannot lock fetching
+%% out. Every delivered byte moves from committed to buffered and stays there
+%% until the consumer reads it, so a bound the two shared would do exactly that.
 -spec fetch_ceiling(state()) -> non_neg_integer().
-fetch_ceiling(State) ->
-    fetch_ceiling(State, buffered(State)).
-
 fetch_ceiling(
-    #state{inflight_target = Target, cfg = #cfg{request_size = RequestSize, window_max = WindowMax}} =
-        State,
-    Buffered
+    #state{inflight_target = Target, cfg = #cfg{request_size = RequestSize, max_memory = MaxMemory}} =
+        State
 ) ->
-    Spare = max(fetch_share(State), WindowMax - Buffered),
-    max(min(Target * RequestSize, Spare), pending_need(State)).
+    max(min(Target * RequestSize, MaxMemory div 2), pending_need(State)).
 
-%% Everything the reader may hold, buffered or in flight. Twice `window_max`,
-%% because the fetch share is a guarantee the buffer cannot take: the worst case
-%% is a full share committed on top of a buffer holding the rest. So
-%% `prefetch_window_max` describes about half a reader's memory, not all of it.
+%% Everything the reader may hold, buffered or in flight. The configured bound
+%% itself, which the read in hand is the only thing that lifts.
 -spec memory_ceiling(state()) -> non_neg_integer().
-memory_ceiling(#state{cfg = #cfg{window_max = WindowMax}} = State) ->
-    max(2 * WindowMax, pending_need(State)).
-
-%% Floored at one request: a `window_max` small enough that the percentage rounds
-%% to zero would leave a share of nothing.
-fetch_share(#state{
-    inflight_target = Target, cfg = #cfg{request_size = RequestSize, window_max = WindowMax}
-}) ->
-    max(RequestSize, min(Target * RequestSize, WindowMax * ?FETCH_SHARE_PCT div 100)).
+memory_ceiling(#state{cfg = #cfg{max_memory = MaxMemory}} = State) ->
+    max(MaxMemory, pending_need(State)).
 
 %% What the pending read still needs from beyond the read position. Zero with no
 %% read in hand, which cannot floor anything.
@@ -1262,9 +1247,9 @@ next_fragment_range(State, Peeks0, Tail0) ->
 %% the look-ahead by one when every one of them is spoken for.
 %%
 %% Walking past a full fragment rather than stopping at it is what lets the
-%% window exceed one fragment: stopping would put the end of the frontier at the
-%% first fully-spoken-for fragment, so reach at a fragment tail would be one
-%% fragment however large the window is.
+%% frontier exceed one fragment: stopping would put its end at the first
+%% fully-spoken-for fragment, so reach at a fragment tail would be one fragment
+%% however large the budget is.
 spill(State, Peeks, Tail, [], Attempted) ->
     %% Any fragment a further walk turns up is past the last one prefetched, so
     %% a horizon at all is a horizon this side of it: there is nothing to find.
@@ -1380,18 +1365,19 @@ build_cfg(Opts) ->
     RequestSize = max(1, maps:get(request_size, Opts, 4_194_304)),
     #cfg{
         request_size = RequestSize,
-        %% Never below one request: every byte bound is derived from it, and a
-        %% ceiling under the floor puts them all below a single range.
-        window_max = max(RequestSize, maps:get(window_max, Opts, 33_554_432)),
-        %% At least one request in flight. Zero leaves `has_room/1` false
+        %% Never below two requests: fetching gets half of this, and a fetch
+        %% ceiling under one range leaves nothing that can be issued.
+        max_memory = max(2 * RequestSize, maps:get(max_memory, Opts, 67_108_864)),
+        %% At least one request in flight. Zero has `room/1` refuse
         %% however far behind the consumer falls, so nothing is ever requested
         %% and every read waits out its whole deadline - three times over, with
         %% nothing in the log to say why.
         max_depth = max(1, maps:get(max_depth, Opts, 8)),
-        %% Defaulted to the depth cap because a fragment is only ever looked
-        %% ahead to in order to put a range in it, and no more ranges can be in
-        %% flight than the depth allows - so at this value the backstop cannot
-        %% bind before `has_room/1` does, which is the intent.
+        %% The depth cap, because a fragment is only ever looked ahead to in
+        %% order to put a range in it, and no more ranges can be in flight than
+        %% the depth allows - so the backstop cannot bind before `room/1`
+        %% does, which is the intent. Not exposed as a setting for the same reason,
+        %% though a caller may still pass it.
         max_lookahead = max(1, maps:get(max_lookahead, Opts, maps:get(max_depth, Opts, 8))),
         auto_tune = maps:get(auto_tune, Opts, true),
         %% Defaulted to the ceiling, so a caller that says only how deep a reader
@@ -1609,7 +1595,7 @@ tune(
     end.
 
 %% Clamped to the configured ceiling, and never below one: a target of zero
-%% leaves `has_room/1` false however far behind the consumer falls, so nothing
+%% has `room/1` refuse however far behind the consumer falls, so nothing
 %% would ever be requested again.
 retarget(Target, #state{cfg = #cfg{max_depth = MaxDepth}} = State) ->
     State#state{inflight_target = max(1, min(MaxDepth, Target))}.
@@ -1673,7 +1659,7 @@ assert_clocks_have_waiters(#state{timers = Timers} = State, Event) ->
 %%
 %% "Bytes it has never asked for" is measured against the fragment's data region
 %% directly rather than by asking `extend_frontier/1` what it would issue: a
-%% check that consults `has_room/1` inherits whatever is wrong with it, and a
+%% check that consults `room/1` inherits whatever is wrong with it, and a
 %% broken ceiling would agree the reader is resting.
 assert_not_wedged(
     #state{pending = #pending{}, timers = Timers, current_not_found = false} = State,

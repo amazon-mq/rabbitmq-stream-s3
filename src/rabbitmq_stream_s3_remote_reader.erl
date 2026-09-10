@@ -89,7 +89,7 @@ synchronous feedback is generated.
     {remote_reader_prefetch_stall_depth, ?C_STALL_DEPTH, counter,
         "Placement passes stopped by prefetch_max_depth"},
     {remote_reader_prefetch_stall_fetch_budget, ?C_STALL_FETCH_BUDGET, counter,
-        "Placement passes stopped by the fetch share of prefetch_window_max"},
+        "Placement passes stopped by the cap on what may be committed"},
     {remote_reader_prefetch_stall_buffer, ?C_STALL_BUFFER, counter,
         "Placement passes stopped by the memory ceiling: the consumer is far behind"},
     {remote_reader_prefetch_stall_reach, ?C_STALL_REACH, counter,
@@ -223,13 +223,13 @@ init_counters() ->
     persistent_term:put(?COUNTER_KEY, Cnt),
     ok.
 
-%% The sizing a reader starts with. `window_max` is clamped to at least one
-%% request here rather than at each use, so no caller has to handle a ceiling
-%% configured below the floor.
+%% The sizing a reader starts with. `max_memory` is clamped to two requests here
+%% rather than at each use, so no caller has to handle a bound whose fetching
+%% half is below one request.
 -spec prefetch_sizing() -> {pos_integer(), pos_integer()}.
 prefetch_sizing() ->
     RequestSize = rabbitmq_stream_s3_config:prefetch_request_size(),
-    {RequestSize, max(RequestSize, rabbitmq_stream_s3_config:prefetch_window_max())}.
+    {RequestSize, max(2 * RequestSize, rabbitmq_stream_s3_config:prefetch_max_memory())}.
 
 start(Config) ->
     gen_server:start(?MODULE, Config, []).

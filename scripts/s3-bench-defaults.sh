@@ -49,15 +49,15 @@ REBALANCE_THRESHOLD=1024
 # measured `inflight` column, not the one it asked for.
 export S3B_AUTO_TUNE=1
 
-# name | request MiB | window MiB | depth | fragment MiB | pool_min
+# name | request MiB | memory MiB | depth | fragment MiB | pool_min
 PROFILES=(
-  "shipped-defaults        4  128   64    64   2"
-  "pre-4.4-defaults        4   32    8    64   2"
-  "window-x4               4  128    8    64   2"
-  "depth-x4                4   32   32    64   2"
-  "window-and-depth-x4     4  128   32    64   2"
-  "window-and-depth-x8     4  256   64    64   2"
-  "warm-pool               4  128   32    64  40"
+  "shipped-defaults        4  256   64    64   2"
+  "pre-4.4-defaults        4   64    8    64   2"
+  "memory-x4               4  256    8    64   2"
+  "depth-x4                4   64   32    64   2"
+  "memory-and-depth-x4     4  256   32    64   2"
+  "memory-and-depth-x8     4  512   64    64   2"
+  "warm-pool               4  256   32    64  40"
   "smaller-requests        2  128   32    64   2"
 )
 
@@ -80,11 +80,11 @@ REPS="${S3B_REPS:-2}"
 . ./scripts/s3-bench-lib.sh
 
 printf '\n%-24s %7s %7s %7s %7s %9s %9s %8s %s\n' \
-  profile req win depth frag 'MiB/s' '% of cap' inflight manifest
+  profile req mem depth frag 'MiB/s' '% of cap' inflight manifest
 printf '%s\n' "-------------------------------------------------------------------------------------------------"
 
 for profile in "${PROFILES[@]}"; do
-  read -r name req win depth frag pool <<<"$profile"
+  read -r name req mem depth frag pool <<<"$profile"
 
   entries=$(( STREAM_GIB * 1024 / frag ))
   if [ "$entries" -gt "$REBALANCE_THRESHOLD" ]; then manifest=grouped; else manifest=flat; fi
@@ -96,7 +96,7 @@ for profile in "${PROFILES[@]}"; do
   [ "$budget" -gt 8192 ] && budget=8192
 
   out=$(S3B_REPS="$REPS" S3B_BUDGET_MIB="$budget" S3B_REQUEST_MIB="$req" \
-        S3B_WINDOW_MIB="$win" S3B_FRAGMENT_MIB="$frag" S3B_MANIFEST="$manifest" \
+        S3B_MEMORY_MIB="$mem" S3B_FRAGMENT_MIB="$frag" S3B_MANIFEST="$manifest" \
         S3B_DRAIN_MIBS="$CLIENT_CAP" S3B_POOL_MIN="$pool" \
         ./scripts/s3-bench-sweep.sh depth "$depth" 2>&1 | grep '^S3BENCH' || true)
 
@@ -116,7 +116,7 @@ for profile in "${PROFILES[@]}"; do
   python3 -c "
 cap = $CLIENT_CAP
 pct = f'{$mibs*100/cap:8.1f}%' if cap else '       -'
-print(f'{\"$name\":<24} {$req:7d} {$win:7d} {$depth:7d} {$frag:7d} {$mibs:9.1f} {pct} {$infl:8.1f} $manifest $note')"
+print(f'{\"$name\":<24} {$req:7d} {$mem:7d} {$depth:7d} {$frag:7d} {$mibs:9.1f} {pct} {$infl:8.1f} $manifest $note')"
 done
 
 echo

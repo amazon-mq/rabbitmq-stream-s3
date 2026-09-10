@@ -34,13 +34,13 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# name | request | window | depth | fragment | manifest | drain | measured
+# name | request | memory | depth | fragment | manifest | drain | measured
 SCENARIOS=(
-  "shipped-defaults  4  32   8   64 grouped 0   249.1"
-  "near-client-cap   4 128  32  256 flat    589 554.85"
+  "shipped-defaults  4  64   8   64 grouped 0   249.1"
+  "near-client-cap   4 256  32  256 flat    589 554.85"
 )
 
-# A third measured point, depth-and-window-doubled (4/64/16/64, grouped),
+# A third measured point, depth-and-memory-doubled (4/128/16/64, grouped),
 # recorded 301.4 MiB/s. It is deliberately not checked here: the harness reads
 # about +46% against it while landing within 6% of both profiles above, and an
 # earlier virtual-time model could not fit it alongside them either. Two
@@ -63,7 +63,7 @@ printf '\n%-22s %9s %9s %9s %9s  %s\n' scenario harness measured err% inflight n
 printf '%s\n' "--------------------------------------------------------------------------------"
 
 for scenario in "${SCENARIOS[@]}"; do
-  read -r name req win depth frag manifest drain measured <<<"$scenario"
+  read -r name req mem depth frag manifest drain measured <<<"$scenario"
 
   # A larger fragment needs a proportionally larger budget or the run is over
   # before the window and pool have left their ramp.
@@ -71,7 +71,7 @@ for scenario in "${SCENARIOS[@]}"; do
   [ "$frag" -ge 256 ] && budget=4096
 
   out=$(S3B_REPS="$REPS" S3B_BUDGET_MIB="$budget" S3B_REQUEST_MIB="$req" \
-        S3B_WINDOW_MIB="$win" S3B_FRAGMENT_MIB="$frag" S3B_MANIFEST="$manifest" \
+        S3B_MEMORY_MIB="$mem" S3B_FRAGMENT_MIB="$frag" S3B_MANIFEST="$manifest" \
         S3B_DRAIN_MIBS="$drain" \
         ./scripts/s3-bench-sweep.sh depth "$depth" 2>&1 | grep '^S3BENCH' || true)
 

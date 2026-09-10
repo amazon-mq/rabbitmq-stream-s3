@@ -101,8 +101,8 @@ all() ->
         %% outside the process
         every_placement_pass_reports_exactly_one_stall,
         serve_rate_measures_what_the_consumer_took,
-        the_buffer_cannot_take_the_fetch_share,
-        the_fetch_side_takes_what_the_buffer_is_not_using,
+        the_buffer_cannot_lock_fetching_out,
+        the_fetch_ceiling_is_the_target_until_the_budget_is_smaller,
         stall_target_reported_when_the_concurrency_target_binds,
         stall_depth_reported_when_the_depth_cap_binds,
         stall_buffer_reported_when_the_consumer_is_behind,
@@ -385,7 +385,7 @@ tuner_state(Opts) ->
         maps:merge(
             #{
                 request_size => 1000,
-                window_max => 100_000_000,
+                max_memory => 200_000_000,
                 auto_tune => true
             },
             Opts
@@ -779,7 +779,7 @@ exhausted_pool_is_contention_but_a_growing_one_is_not(_Config) ->
 
 tuner_stays_within_its_bounds(_Config) ->
     %% `max_depth` is the ceiling the search may not cross, and one request is
-    %% the floor: at zero `has_room/1` is false however far behind the consumer
+    %% the floor: at zero `room/1` refuses however far behind the consumer
     %% falls, so nothing would ever be requested again.
     Up = rates(tuner_state(#{max_depth => 12}), [1000, 2000, 4000, 8000, 16_000]),
     ?assertEqual([2, 4, 8, 12], Up),
@@ -795,7 +795,7 @@ tuner_stays_within_its_bounds(_Config) ->
     ?assertEqual([7, 6, 6, 7, 6], Down),
     %% The floor is the clamp's own case: `step_target/2` subtracts a
     %% proportion, so at a target of one a down step reaches zero, and a target
-    %% of zero leaves `has_room/1` false however far behind the consumer falls -
+    %% of zero has `room/1` refuse however far behind the consumer falls -
     %% nothing would ever be requested again.
     AtFloor = climbing(tuner_state(#{max_depth => 1})),
     ?assertEqual(1, inflight_target(AtFloor)),
@@ -813,7 +813,7 @@ tuner_moves_the_target_from_what_the_tick_measured(_Config) ->
     %% and the raised target issues against itself in the same pass rather than
     %% waiting for a delivery that may be a whole sample away.
     {S0, _} = pipelined_state(#{
-        window_max => 100_000_000, max_depth => 128, auto_tune => true
+        max_memory => 200_000_000, max_depth => 128, auto_tune => true
     }),
     ?assertEqual(1, inflight_target(S0)),
     {S1, _} = deliver(S0, 0, 8, pattern(8, 1000), done),
@@ -841,7 +841,7 @@ sample_survives_an_iterator_refresh(_Config) ->
         frag_ref(0, 500, 42),
         ?SEGMENT_HEADER_B,
         mock_iterator(Entries),
-        #{request_size => 1000, window_max => 100_000, max_depth => 8, auto_tune => true}
+        #{request_size => 1000, max_memory => 200_000, max_depth => 8, auto_tune => true}
     ),
     {S1, _} = deliver(S0, 0, ?SEGMENT_HEADER_B, pattern(?SEGMENT_HEADER_B, 500), done),
     {S2, _} = rabbitmq_stream_s3_remote_reader_core:step(
@@ -856,7 +856,7 @@ fetch_rate_is_measured_over_the_sample_the_shell_stamps(_Config) ->
     %% The core has no clock: elapsed time arrives as an input on the tick, so a
     %% rate can be measured without `step/2` ever depending on when it was
     %% called - and a test can drive a sample of any length in no time at all.
-    {S0, _} = pipelined_state(#{window_max => 100_000, max_depth => 32}),
+    {S0, _} = pipelined_state(#{max_memory => 200_000, max_depth => 32}),
     ?assertEqual(undefined, fetch_rate(S0)),
     %% 2000 bytes delivered over a tenth of a second is 20 kB/s.
     {S1, _} = deliver(S0, 0, 8, pattern(8, 1000), done),
@@ -878,7 +878,7 @@ tick_with_no_elapsed_time_keeps_the_sample_open(_Config) ->
     %% carries no measurement. Dividing by it would fail; crediting the bytes to
     %% a zero-length sample would read as an unbounded rate. They stay in the
     %% sample instead, so the next tick to carry real elapsed time counts them.
-    {S0, _} = pipelined_state(#{window_max => 100_000, max_depth => 32}),
+    {S0, _} = pipelined_state(#{max_memory => 200_000, max_depth => 32}),
     {S1, _} = deliver(S0, 0, 8, pattern(8, 1000), done),
     {S2, _} = tick(S1, 0),
     ?assertEqual(undefined, fetch_rate(S2)),
@@ -888,19 +888,19 @@ tick_with_no_elapsed_time_keeps_the_sample_open(_Config) ->
 pipeline_fills_to_window_and_depth(_Config) ->
     %% The window bounds the bytes outstanding and max_depth bounds the number
     %% of requests; whichever binds first stops the frontier.
-    {ByWindow, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    {ByWindow, _} = pipelined_state(#{max_memory => 8_000, max_depth => 32}),
     ?assertEqual(
         [{8, 1007}, {1008, 2007}, {2008, 3007}, {3008, 4007}],
         fragment_ranges(ByWindow, 0)
     ),
-    {ByDepth, _} = pipelined_state(#{window_max => 1_000_000, max_depth => 3}),
+    {ByDepth, _} = pipelined_state(#{max_memory => 2_000_000, max_depth => 3}),
     ?assertEqual(3, length(fragment_ranges(ByDepth, 0))).
 
 out_of_order_arrival_is_reassembled(_Config) ->
     %% Responses to concurrent range requests interleave, but the read buffer
     %% only takes contiguous appends. Bytes for a range whose predecessors are
     %% unfinished are held back and appended once it reaches the head.
-    {S0, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    {S0, _} = pipelined_state(#{max_memory => 8_000, max_depth => 32}),
     %% Answer the third and second ranges; nothing can be served yet.
     {S1, _} = deliver(S0, 0, 2008, pattern(2008, 1000), done),
     {S2, E2} = read(S1, 8, 3000),
@@ -915,7 +915,7 @@ out_of_order_arrival_is_reassembled(_Config) ->
 mid_pipeline_error_reissues_only_that_range(_Config) ->
     %% One range failing must not disturb the others, and the retry must re-issue
     %% exactly the failed range rather than the frontier.
-    {S0, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    {S0, _} = pipelined_state(#{max_memory => 8_000, max_depth => 32}),
     Before = fragment_ranges(S0, 0),
     {S1, E1} = fail(S0, 0, 1008, slow_down),
     ?assertMatch([{set_timer, fault, 1000}], E1),
@@ -929,7 +929,7 @@ mid_pipeline_error_reissues_only_that_range(_Config) ->
 failing_batch_arms_one_timer(_Config) ->
     %% Every range failing at once must arm a single retry timer: one per
     %% failure would drive a retry pass each and multiply the backoff.
-    {S0, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    {S0, _} = pipelined_state(#{max_memory => 8_000, max_depth => 32}),
     {S, Timers} = lists:foldl(
         fun({Start, _End}, {Acc, TimerAcc}) ->
             {Acc1, Effects} = fail(Acc, 0, Start, slow_down),
@@ -955,7 +955,7 @@ fully_delivered_range_failing_before_fin_is_dropped(_Config) ->
     %% `range_end`, which is both a backwards range to ask S3 for and, because
     %% ranges are contiguous, a duplicate of its successor's key - so the
     %% successor's bytes would be routed to the dead request and dropped.
-    {S0, _} = pipelined_state(#{window_max => 8000, max_depth => 4}),
+    {S0, _} = pipelined_state(#{max_memory => 16_000, max_depth => 4}),
     ?assertEqual([{8, 1007}, {1008, 2007}, {2008, 3007}, {3008, 4007}], fragment_ranges(S0, 0)),
     %% The whole first range arrives, but the response does not close.
     {S1, _} = deliver(S0, 0, 8, pattern(8, 1000), continue),
@@ -979,7 +979,7 @@ open_range_keeps_flushing_its_successors(_Config) ->
     %% its fragment's queue, no byte of the fragment could ever reach the buffer
     %% again. Reads stalled until the deadline, and the closing frame arriving
     %% did not release them: the head was just as blocked once complete.
-    {S0, _} = pipelined_state(#{window_max => 8000, max_depth => 4}),
+    {S0, _} = pipelined_state(#{max_memory => 16_000, max_depth => 4}),
     ?assertEqual([{8, 1007}, {1008, 2007}, {2008, 3007}, {3008, 4007}], fragment_ranges(S0, 0)),
     %% The head delivers everything it owes without closing, and its successor
     %% flushes past it.
@@ -1008,10 +1008,10 @@ open_range_does_not_pull_the_frontier_back(_Config) ->
     %% already held - and that duplicate could never flush (its start is behind
     %% the buffer's end for good), so it wedged the queue for the rest of the
     %% fragment on top of wasting the fetch.
-    %% Buffered and in-flight bytes share one budget (`byte_ceiling/1`), so the
-    %% reach this case needs queued is stated as the total rather than as the
+    %% `memory_ceiling/1` bounds buffered and in-flight bytes together, so the
+    %% reach this case needs is stated as that whole bound rather than as the
     %% buffered half; concurrency is pinned so the budget does not derive it.
-    {S0, _} = pipelined_state(#{window_max => 6000, max_depth => 4, inflight_initial => 2}),
+    {S0, _} = pipelined_state(#{max_memory => 12_000, max_depth => 4, inflight_initial => 2}),
     ?assertEqual([{8, 1007}, {1008, 2007}], fragment_ranges(S0, 0)),
     %% The head owes nothing but stays open; its successor delivers, flushes
     %% past it and is dropped. The queue now ends at 1007, the buffer at 2008,
@@ -1042,7 +1042,7 @@ short_completion_refetches_the_gap(_Config) ->
     %% A response that ends before its range does must not leave a hole: the
     %% missing bytes are requested again, and the ranges queued behind it keep
     %% the bytes they have already received.
-    {S0, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    {S0, _} = pipelined_state(#{max_memory => 8_000, max_depth => 32}),
     {S1, _} = deliver(S0, 0, 1008, pattern(1008, 1000), done),
     {S2, _} = deliver(S1, 0, 8, pattern(8, 400), done),
     %% The delivered prefix is complete and already in the buffer, so what is
@@ -1070,11 +1070,12 @@ short_completion_at_the_frontier_refetches_the_gap(_Config) ->
     %% happen either - and every read behind it would stall until the deadline.
     FragRef = frag_ref(0, 2000, 42),
     Iterator = mock_iterator([{0, 2000, 42}, {100, 100_000, 43}]),
-    %% Buffered and in-flight bytes share one budget (`byte_ceiling/1`), so the
-    %% window_max here is the total this case needs queued, not the buffered half.
+    %% `memory_ceiling/1` bounds buffered and in-flight bytes together, so the
+    %% reach this case needs is stated as that whole bound, not the buffered
+    %% half.
     Opts = #{
         request_size => 1000,
-        window_max => 5000,
+        max_memory => 10_000,
         max_depth => 8,
         inflight_initial => 3
     },
@@ -1103,7 +1104,7 @@ short_completion_at_the_frontier_refetches_the_gap(_Config) ->
 empty_completion_backs_off(_Config) ->
     %% A response that closes without a byte would otherwise be re-issued
     %% immediately, spinning against whatever is answering that way.
-    {S0, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    {S0, _} = pipelined_state(#{max_memory => 8_000, max_depth => 32}),
     {S1, E1} = deliver(S0, 0, 8, <<>>, done),
     ?assertEqual([{set_timer, fault, 1000}], [E || {set_timer, _, _} = E <- E1]),
     ?assertEqual([], [E || {start_request, _, _, _, _} = E <- E1]),
@@ -1113,7 +1114,7 @@ over_delivery_is_clipped(_Config) ->
     %% A backend that answers with more than the range asked for must not push
     %% this request's bytes over its successor's range and have them appended
     %% twice.
-    {S0, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    {S0, _} = pipelined_state(#{max_memory => 8_000, max_depth => 32}),
     {S1, _} = deliver(S0, 0, 8, pattern(8, 2500), done),
     {S2, _} = deliver(S1, 0, 1008, pattern(1008, 1000), done),
     {_S3, E3} = read(S2, 8, 2000),
@@ -1122,7 +1123,7 @@ over_delivery_is_clipped(_Config) ->
 stale_data_for_dropped_range_is_ignored(_Config) ->
     %% A range cancelled by a read deadline can still have frames in flight.
     %% Appending those bytes would corrupt the buffer's addressing.
-    {S0, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    {S0, _} = pipelined_state(#{max_memory => 8_000, max_depth => 32}),
     {S1, _} = read(S0, 8, 100),
     {S2, E2} = rabbitmq_stream_s3_remote_reader_core:step(S1, deadline_expired),
     ?assertMatch(
@@ -1145,7 +1146,7 @@ spill_reaches_past_one_fragment(_Config) ->
     %% window larger than a fragment would have nowhere to go.
     FragRef = frag_ref(0, 500, 42),
     Iterator = mock_iterator([{0, 500, 42}, {100, 500, 43}, {200, 500, 44}]),
-    Opts = #{request_size => 1000, window_max => 1_000_000, max_depth => 32},
+    Opts = #{request_size => 1000, max_memory => 2_000_000, max_depth => 32},
     {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
     %% The placement pass stays inside the current fragment
     %% (`placement_pass_does_not_look_ahead`); the read that follows spills.
@@ -1161,7 +1162,7 @@ spill_stops_at_the_lookahead_cap(_Config) ->
     FragRef = frag_ref(0, 500, 42),
     Iterator = mock_iterator([{0, 500, 42}, {100, 500, 43}, {200, 500, 44}]),
     Opts = #{
-        request_size => 1000, window_max => 1_000_000, max_depth => 32, max_lookahead => 1
+        request_size => 1000, max_memory => 2_000_000, max_depth => 32, max_lookahead => 1
     },
     {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
     {S1, _} = read(S0, ?SEGMENT_HEADER_B, 3000),
@@ -1209,13 +1210,13 @@ become_local_does_not_advance_the_iterator(_Config) ->
     ?assertEqual(0, counters:get(Fetches, 1)).
 
 window_ceiling_below_the_request_size_is_clamped(_Config) ->
-    %% `prefetch_window_max` and `prefetch_request_size` are independent settings
+    %% `prefetch_max_memory` and `prefetch_request_size` are independent settings
     %% with no schema to reject a ceiling below the floor. Unclamped, every byte
     %% bound derived from the ceiling falls below one request and the reader can
     %% never issue.
     FragRef = frag_ref(0, 1_000_000, 42),
     Iterator = mock_iterator([{0, 1_000_000, 42}]),
-    Opts = #{request_size => 1000, window_max => 100},
+    Opts = #{request_size => 1000, max_memory => 200},
     {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
     ?assert(rabbitmq_stream_s3_remote_reader_core:fetch_ceiling(S0) >= 1000),
     ?assert(rabbitmq_stream_s3_remote_reader_core:memory_ceiling(S0) >= 1000),
@@ -1267,11 +1268,12 @@ next_fragment_flushes_while_current_range_streams(_Config) ->
     %% holding its bytes staged until the current fragment closes.
     FragRef = frag_ref(0, 2000, 42),
     Iterator = mock_iterator([{0, 2000, 42}, {100, 100_000, 43}]),
-    %% Buffered and in-flight bytes share one budget (`byte_ceiling/1`), so the
-    %% window_max here is the total this case needs queued, not the buffered half.
+    %% `memory_ceiling/1` bounds buffered and in-flight bytes together, so the
+    %% reach this case needs is stated as that whole bound, not the buffered
+    %% half.
     Opts = #{
         request_size => 1000,
-        window_max => 8000,
+        max_memory => 16_000,
         max_depth => 8,
         inflight_initial => 4
     },
@@ -1301,12 +1303,12 @@ served_read_frees_its_bytes_from_the_budget(_Config) ->
     Iterator = mock_iterator([{0, 100_000_000, 42}]),
     {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, #{
         request_size => 1000,
-        window_max => 1000,
+        max_memory => 2_000,
         max_depth => 32,
         inflight_initial => 1
     }),
     ?assertEqual([{8, 1007}], fragment_ranges(S0, 0)),
-    %% One range answered in full. The reserved fetch share is a guarantee, so
+    %% One range answered in full. Fetching does not consult the buffer, so
     %% the next range issues on it even though nobody has read a byte yet.
     {S1, E1} = deliver(S0, 0, pattern(8, 1000), done),
     ?assertEqual([{key(), {1008, 2007}, 0}], starts(E1)),
@@ -1321,14 +1323,12 @@ served_read_frees_its_bytes_from_the_budget(_Config) ->
 %% Derives the concurrency target from the byte reach a case asks for, so each
 %% does not have to state both. The search is off for the same reason: these
 %% cases are about what the reader does with a given concurrency, not how it
-%% arrives at one. The reach asked for is the fetch side's, and fetching
-%% reserves 3/4 of `window_max`, so the configured maximum is 4/3 of it.
+%% arrives at one.
 with_window_concurrency(Opts) ->
     RequestSize = maps:get(request_size, Opts, 4_194_304),
-    Reach = maps:get(window_max, Opts, 33_554_432),
+    Reach = maps:get(max_memory, Opts, 67_108_864) div 2,
     Derived = max(1, Reach div RequestSize),
     Opts#{
-        window_max => Reach * 4 div 3,
         inflight_initial => maps:get(inflight_initial, Opts, Derived),
         auto_tune => maps:get(auto_tune, Opts, false)
     }.
@@ -1652,7 +1652,7 @@ not_found_beyond_the_nearest_prefetch_truncates_there(_Config) ->
     %% still moves onto it without a refresh.
     FragRef = frag_ref(0, 200, 42),
     Iterator = mock_iterator([{0, 200, 42}, {100, 200, 43}, {200, 200, 44}, {300, 200, 45}]),
-    Opts = #{request_size => 1000, window_max => 1_000_000, max_depth => 32},
+    Opts = #{request_size => 1000, max_memory => 2_000_000, max_depth => 32},
     {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
     %% One request covers a whole fragment here, so one pass reaches all four.
     {S1, _} = read(S0, ?SEGMENT_HEADER_B, 3000),
@@ -1767,7 +1767,7 @@ deadline_expired_at_a_fragment_boundary_refetches_nothing(_Config) ->
     %% actually waiting on is even requested.
     FragRef = frag_ref(0, 2000, 42),
     Iterator = mock_iterator([{0, 2000, 42}, {100, 100_000, 43}]),
-    Opts = #{request_size => 1000, window_max => 4000, max_depth => 8},
+    Opts = #{request_size => 1000, max_memory => 8_000, max_depth => 8},
     {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
     %% Buffer the fragment's whole data region: [8, 2008).
     {S1, _} = deliver(S0, 0, ?SEGMENT_HEADER_B, pattern(8, 1000), done),
@@ -1870,7 +1870,7 @@ deadline_expired_drops_the_prefetched_next_fragment(_Config) ->
     %% its own.
     FragRef = frag_ref(0, 2000, 42),
     Iterator = mock_iterator([{0, 2000, 42}, {100, 100_000, 43}]),
-    Opts = #{request_size => 1000, window_max => 4000, max_depth => 8},
+    Opts = #{request_size => 1000, max_memory => 8_000, max_depth => 8},
     {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
     %% Two misses grow the window past the current fragment, so the frontier
     %% spills into the next one, whose head range then completes.
@@ -1893,7 +1893,7 @@ deadline_expired_keeps_a_404_next_fragment(_Config) ->
     %% forgetting it would spend another GET learning the same thing.
     FragRef = frag_ref(0, 2000, 42),
     Iterator = mock_iterator([{0, 2000, 42}, {100, 100_000, 43}]),
-    Opts = #{request_size => 1000, window_max => 4000, max_depth => 8},
+    Opts = #{request_size => 1000, max_memory => 8_000, max_depth => 8},
     {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
     {S1, _} = read(S0, ?SEGMENT_HEADER_B, 3000),
     {S2, _} = read(S1, ?SEGMENT_HEADER_B, 3000),
@@ -1951,7 +1951,7 @@ known_404_fragment_is_not_refetched(_Config) ->
     Opts = #{
         request_size => 1_000,
         max_depth => 8,
-        window_max => 1_000_000,
+        max_memory => 2_000_000,
         inflight_initial => 2
     },
     FragRef = frag_ref(0, 1_000_000, 42),
@@ -2039,7 +2039,7 @@ observe_effects_emitted_for_hit_miss_and_transition(_Config) ->
 %% The reasons a placement pass can stop, which the shell turns into one
 %% Prometheus counter each. They partition the passes, so a share of them is
 %% readable as "this is what governs this reader's bandwidth" - and each names
-%% the one setting that would raise it. See the core's `stall_reason/1`.
+%% the one setting that would raise it. See the core's `room/1`.
 
 %% Opts that put every bound out of reach but the one a case is about, so the
 %% reason it asserts is the reason it arranged rather than whichever bound
@@ -2048,7 +2048,7 @@ stall_opts(Overrides) ->
     maps:merge(
         #{
             request_size => 1_000,
-            window_max => 10_000_000,
+            max_memory => 20_000_000,
             max_depth => 8,
             inflight_initial => 8,
             auto_tune => false
@@ -2106,21 +2106,24 @@ serve_rate_measures_what_the_consumer_took(_Config) ->
     {S5, _} = rabbitmq_stream_s3_remote_reader_core:step(S4, {tune_tick, 1_000_000}),
     ?assertEqual(0, rabbitmq_stream_s3_remote_reader_core:serve_rate(S5)).
 
-the_buffer_cannot_take_the_fetch_share(_Config) ->
+the_buffer_cannot_lock_fetching_out(_Config) ->
     %% The budget is partitioned, not shared. Shared, every delivered byte moved
     %% from committed to buffered and stayed there, so the buffer ratcheted up
     %% and the fetch side kept only what was left - measured on the rig as a
     %% buffer holding 424 MiB of a 512 MiB budget while concurrency sat at the
     %% 22 requests it had under a budget a quarter the size.
+    %% Sized so a full buffer is most of the budget: with the buffer small
+    %% against it, a ceiling that subtracted the buffer would still clear the
+    %% target's worth and the case would pass either way.
     RequestSize = 1_000,
-    Target = 4,
+    Target = 8,
     Opts = stall_opts(#{
-        request_size => RequestSize, window_max => 64_000, inflight_initial => Target
+        request_size => RequestSize, max_memory => 20_000, inflight_initial => Target
     }),
     FragRef = frag_ref(0, 1_000_000, 42),
     Iterator = mock_iterator([{0, 1_000_000, 42}, {100, 1_000_000, 43}]),
     {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
-    %% Fetching reserves min(target x request_size, 75% of window_max); the
+    %% Fetching is capped at min(target x request_size, half of max_memory); the
     %% buffer gets the rest.
     Fetch = rabbitmq_stream_s3_remote_reader_core:fetch_ceiling(S0),
     ?assertEqual(Target * RequestSize, Fetch),
@@ -2133,41 +2136,35 @@ the_buffer_cannot_take_the_fetch_share(_Config) ->
         outstanding_ranges(S0)
     ),
     ?assert(rabbitmq_stream_s3_remote_reader_core:buffered(S1) > 0),
-    %% The fetch side never drops below its reserved share, however much the
-    %% buffer holds.
-    ?assert(
-        rabbitmq_stream_s3_remote_reader_core:fetch_ceiling(S1) >=
-            fetch_reservation(RequestSize, 64_000, Target)
-    ).
+    %% Identical, not merely no lower: the ceiling does not read the buffer, so
+    %% a bound the two shared would fail here rather than degrade quietly.
+    ?assertEqual(Fetch, rabbitmq_stream_s3_remote_reader_core:fetch_ceiling(S1)).
 
-the_fetch_side_takes_what_the_buffer_is_not_using(_Config) ->
-    %% The reservation is a floor, not a cap. A consumer that keeps up leaves
-    %% the buffer nearly empty, and holding its share back would give away that
-    %% much fetch capacity for nothing.
+the_fetch_ceiling_is_the_target_until_the_budget_is_smaller(_Config) ->
+    %% Both terms of `min(target x request_size, max_memory div 2)`, either side
+    %% of the crossover, so a change to either term is caught here.
     RequestSize = 1_000,
-    WindowMax = 64_000,
-    Target = 60,
-    Opts = stall_opts(#{
-        request_size => RequestSize,
-        window_max => WindowMax,
-        max_depth => Target,
-        inflight_initial => Target
-    }),
-    FragRef = frag_ref(0, 1_000_000, 42),
-    Iterator = mock_iterator([{0, 1_000_000, 42}, {100, 1_000_000, 43}]),
-    {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
-    %% Nothing buffered: fetching reaches past its own share, up to what the
-    %% target is worth.
-    ?assertEqual(0, rabbitmq_stream_s3_remote_reader_core:buffered(S0)),
-    Reserved = fetch_reservation(RequestSize, WindowMax, Target),
-    ?assert(rabbitmq_stream_s3_remote_reader_core:fetch_ceiling(S0) > Reserved),
-    %% Bounded by what the target is worth, not by the buffer's spare room.
-    ?assertEqual(Target * RequestSize, rabbitmq_stream_s3_remote_reader_core:fetch_ceiling(S0)).
-
-%% The share reserved for fetching: a target's worth, capped at 75% of
-%% `window_max`, floored at one request.
-fetch_reservation(RequestSize, WindowMax, Target) ->
-    max(RequestSize, min(Target * RequestSize, WindowMax * 75 div 100)).
+    MaxMemory = 128_000,
+    Half = MaxMemory div 2,
+    Ceiling = fun(Target) ->
+        Opts = stall_opts(#{
+            request_size => RequestSize,
+            max_memory => MaxMemory,
+            max_depth => Target,
+            inflight_initial => Target
+        }),
+        FragRef = frag_ref(0, 1_000_000, 42),
+        Iterator = mock_iterator([{0, 1_000_000, 42}, {100, 1_000_000, 43}]),
+        {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
+        ?assertEqual(0, rabbitmq_stream_s3_remote_reader_core:buffered(S0)),
+        rabbitmq_stream_s3_remote_reader_core:fetch_ceiling(S0)
+    end,
+    %% Below the crossover the target decides, and the budget's spare room is
+    %% not taken - the ceiling is flat in `max_memory` here.
+    ?assertEqual(60 * RequestSize, Ceiling(60)),
+    %% Above it the budget decides, however high the target goes.
+    ?assertEqual(Half, Ceiling(Half div RequestSize + 1)),
+    ?assertEqual(Half, Ceiling(1_000)).
 
 stall_target_reported_when_the_concurrency_target_binds(_Config) ->
     %% The tuner's target is the bound. This is the healthy steady state at a
@@ -2207,7 +2204,7 @@ stall_buffer_reported_when_the_consumer_is_behind(_Config) ->
     FragRef = frag_ref(0, 1_000_000, 42),
     Iterator = mock_iterator([{0, 1_000_000, 42}, {100, 1_000_000, 43}]),
     Opts = stall_opts(#{
-        request_size => 1_000, window_max => 4_000, max_depth => 8, inflight_initial => 8
+        request_size => 1_000, max_memory => 8_000, max_depth => 8, inflight_initial => 8
     }),
     {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
     %% Answer everything the reader asks for, round after round, and read none
@@ -2311,7 +2308,7 @@ pool_busy_delay_resets_once_its_range_waits_on_the_other_clock(_Config) ->
     %% was never handed back and the next genuine pool-busy waited as long as
     %% the last round had grown to - against a pool that had recovered in
     %% between.
-    {S0, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    {S0, _} = pipelined_state(#{max_memory => 8_000, max_depth => 32}),
     {S1, E1} = fail(S0, 0, 8, pool_busy),
     ?assertEqual([{set_timer, pool_busy, 25}], E1),
     %% The retry re-issues that range, and this time it fails on the network.
@@ -2330,7 +2327,7 @@ pool_busy_delay_resets_once_its_range_completes_empty(_Config) ->
     %% other door onto the fault clock: the re-issued range is not failed but
     %% answered with nothing, which backs it off just the same. Both doors have
     %% to take the pool_busy stamp off it.
-    {S0, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    {S0, _} = pipelined_state(#{max_memory => 8_000, max_depth => 32}),
     {S1, E1} = fail(S0, 0, 8, pool_busy),
     ?assertEqual([{set_timer, pool_busy, 25}], E1),
     %% The retry re-issues that range, and this time S3 closes it empty.
@@ -2575,14 +2572,14 @@ read_larger_than_the_window_is_still_served(_Config) ->
     %% The prefetch window bounds prefetch; the read in hand is not optional. A
     %% read of N bytes cannot be served while fewer than N are outstanding, so
     %% gating fetches on the window alone trapped every read larger than
-    %% `window_max`: at the ceiling `has_room/1` stayed false, `note_miss/1`
+    %% the byte bound: at the ceiling `room/1` refused, `note_miss/1`
     %% could not widen the window further, and nothing was ever issued again.
     %% Reads are chunk sized, so one chunk bigger than the window was enough.
     FragRef = frag_ref(0, 1_000_000, 42),
     Iterator = mock_iterator([{0, 1_000_000, 42}]),
     {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, #{
         request_size => 1000,
-        window_max => 2000,
+        max_memory => 4_000,
         max_depth => 8,
         inflight_initial => 2
     }),
@@ -2595,7 +2592,7 @@ read_larger_than_the_window_is_still_served(_Config) ->
     %% Exceeding the ceiling is confined to the read that needed it. Once served
     %% the floor it put under `fetch_ceiling/1` is gone, so the reader is back to
     %% the two requests its target allows, plus the one range of slack that
-    %% admitting on `has_room/1` always leaves.
+    %% admitting on `room/1` always leaves.
     {Committed, _Buffered, _} = load(S),
     ?assert(Committed =< 3 * 1000),
     %% And it is still fetching: serving an oversized read leaves the reader
@@ -2663,7 +2660,7 @@ pool_busy_retry_does_not_release_a_throttled_range(_Config) ->
     %% in for an S3 fault: with one shared timer the fault's 1s backoff was
     %% neither armed nor grown, and the pool's 25ms timer put the range S3 had
     %% just throttled straight back on the wire.
-    {S0, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    {S0, _} = pipelined_state(#{max_memory => 8_000, max_depth => 32}),
     [{0, A, _}, {0, B, _} | _] = outstanding_ranges(S0),
     {S1, E1} = fail(S0, 0, A, pool_busy),
     ?assertEqual([{set_timer, pool_busy, 25}], E1),
@@ -2691,7 +2688,7 @@ partial_throttling_does_not_reset_the_backoff(_Config) ->
     %% like to a pipelined reader. A delivery must not hand back the delay the
     %% throttled ranges just earned, or the reader retries a throttling S3 at
     %% the minimum delay for as long as anything at all is getting through.
-    {S0, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    {S0, _} = pipelined_state(#{max_memory => 8_000, max_depth => 32}),
     [{0, A, _}, {0, B, _} | _] = outstanding_ranges(S0),
     {S1, E1} = fail(S0, 0, A, slow_down),
     ?assertEqual([{set_timer, fault, 1000}], E1),
@@ -2709,7 +2706,7 @@ retry_round_in_flight_does_not_reset_the_backoff(_Config) ->
     %% under a throttling S3, some ranges of every round are answered and the
     %% rest are not, so the delay would oscillate between its first two steps
     %% for as long as the throttling lasted.
-    {S0, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    {S0, _} = pipelined_state(#{max_memory => 8_000, max_depth => 32}),
     [{0, A, _}, {0, B, _} | _] = outstanding_ranges(S0),
     {S1, [{set_timer, fault, 1000}]} = fail(S0, 0, A, slow_down),
     {S2, _} = retry(S1, fault),
@@ -2754,7 +2751,7 @@ backoff_resets_once_the_retried_range_delivers(_Config) ->
     %% The other side of the same rule: once the round has come back, the clock
     %% is reset by that very delivery, so a reader that has recovered does not
     %% carry a grown delay into its next unrelated failure.
-    {S0, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    {S0, _} = pipelined_state(#{max_memory => 8_000, max_depth => 32}),
     [{0, A, _}, {0, B, _} | _] = outstanding_ranges(S0),
     {S1, [{set_timer, fault, 1000}]} = fail(S0, 0, A, slow_down),
     {S2, _} = retry(S1, fault),
@@ -2769,7 +2766,7 @@ backoff_resets_when_the_retried_range_delivers_but_stays_queued(_Config) ->
     %% counting it as still owing the clock an answer holds the delay wherever
     %% the burst grew it. A throttling burst that recovers would then pace the
     %% next unrelated failure from seconds rather than from the minimum.
-    {S0, _} = pipelined_state(#{window_max => 4000, max_depth => 32}),
+    {S0, _} = pipelined_state(#{max_memory => 8_000, max_depth => 32}),
     [{0, A, _}, {0, B, _} | _] = outstanding_ranges(S0),
     {S1, [{set_timer, fault, 1000}]} = fail(S0, 0, B, slow_down),
     {S2, _} = retry(S1, fault),
@@ -2784,14 +2781,14 @@ backoff_resets_when_the_retried_range_delivers_but_stays_queued(_Config) ->
 degenerate_prefetch_settings_are_clamped(_Config) ->
     %% `prefetch_request_size` and `prefetch_max_depth` are plain app-env
     %% settings with no schema to reject a zero, and either one of them stops
-    %% the reader dead: a zero depth leaves `has_room/1` false however far
+    %% the reader dead: a zero depth has `room/1` refuse however far
     %% behind the consumer falls, and a zero request size asks S3 for an
     %% inverted range that it rejects and that counts nothing against the
     %% window, so the depth fills with them. Both are floored, as the window
     %% ceiling already is, so a misconfigured reader still makes progress.
     FragRef = frag_ref(0, 1_000_000, 42),
     Iterator = mock_iterator([{0, 1_000_000, 42}]),
-    Opts = #{request_size => 0, window_max => 0, max_depth => 0},
+    Opts = #{request_size => 0, max_memory => 0, max_depth => 0},
     {S0, _} = init(stream_id(), FragRef, ?SEGMENT_HEADER_B, Iterator, Opts),
     ?assertEqual([{8, 8}], fragment_ranges(S0, 0)),
     %% And it serves what it fetched rather than stalling on it.

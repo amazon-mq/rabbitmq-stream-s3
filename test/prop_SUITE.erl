@@ -1895,7 +1895,7 @@ prop_remote_reader_core_reply_bytes_exact() ->
                 end,
             Opts = #{
                 request_size => RequestSize,
-                window_max => RequestSize * 8,
+                max_memory => RequestSize * 16,
                 max_depth => MaxDepth
             },
             {S0, _} = rabbitmq_stream_s3_remote_reader_core:init(
@@ -2024,7 +2024,7 @@ prop_remote_reader_core_survives_failure_interleavings() ->
                 end,
             Opts = #{
                 request_size => RequestSize,
-                window_max => RequestSize * 8,
+                max_memory => RequestSize * 16,
                 max_depth => MaxDepth
             },
             {S0, _} = rabbitmq_stream_s3_remote_reader_core:init(
@@ -2141,7 +2141,7 @@ rrc_drains(State0, ReadFloor, {ProbeLen, RequestSize}) ->
 %% short one is anywhere near, and the property failed a core that was serving
 %% the read correctly, one round at a time.
 await_rounds(ProbeLen, RequestSize) ->
-    %% `window_max` is 8 requests in this fixture; the slack is for the miss
+    %% Fetching gets 8 requests in this fixture; the slack is for the miss
     %% that widens the window and the round the reply itself lands in.
     ProbeLen div RequestSize + 8 + 8.
 
@@ -2307,7 +2307,7 @@ prop_remote_reader_core_look_ahead_recovers() ->
             Iterator = rrc_grouped_iterator(Fragments, Failures),
             [{Offset, _, Uid} | _] = Fragments,
             FragRef = #fragment_ref{offset = Offset, uid = Uid, size = FragSize},
-            Opts = #{request_size => 1000, window_max => 8000, max_depth => 4},
+            Opts = #{request_size => 1000, max_memory => 16_000, max_depth => 4},
             {S0, _} = rabbitmq_stream_s3_remote_reader_core:init(
                 <<"prop-stream">>, FragRef, ?SEGMENT_HEADER_B, Iterator, Opts
             ),
@@ -2443,19 +2443,19 @@ prop_remote_reader_core_load_bounded() ->
                     {ok, _, It} -> It;
                     _ -> Iterator0
                 end,
-            WindowMax = RequestSize * 8,
+            MaxMemory = RequestSize * 16,
             Opts = #{
-                request_size => RequestSize, window_max => WindowMax, max_depth => MaxDepth
+                request_size => RequestSize, max_memory => MaxMemory, max_depth => MaxDepth
             },
             {S0, _} = rabbitmq_stream_s3_remote_reader_core:init(
                 <<"prop-stream">>, FragRef, 8, Iterator, Opts
             ),
             %% The fetch share is a guarantee the buffer cannot take, so the
             %% bound on everything held is `memory_ceiling/1` - twice
-            %% `window_max` - crossable by the one range `has_room/1` admits
+            %% the byte bound - crossable by the one range `room/1` admits
             %% before checking again, and floored at what the read in hand needs.
             MaxReadEnd = lists:max([0 | [O + B || {read, O, B, _} <- Events]]),
-            HeldBound = max(2 * WindowMax, MaxReadEnd) + RequestSize,
+            HeldBound = max(MaxMemory, MaxReadEnd) + RequestSize,
             check_rrc_load(Events, S0, HeldBound, MaxDepth)
         end
     ).

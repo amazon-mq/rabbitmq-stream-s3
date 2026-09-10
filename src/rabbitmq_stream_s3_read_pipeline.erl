@@ -72,7 +72,6 @@ stays four blocks: flattening them here would undo what the block queue is for.
 -record(req, {
     id :: request_id(),
     fragment :: fragment_offset(),
-    frag_ref :: #fragment_ref{},
     key :: rabbitmq_stream_s3:key(),
     range_start :: byte_offset(),
     %% Inclusive, matching the HTTP range header this becomes.
@@ -440,7 +439,6 @@ push(
     Req = #req{
         id = Id,
         fragment = Fragment,
-        frag_ref = FragRef,
         key = Key,
         range_start = Start,
         range_end = End,
@@ -566,7 +564,7 @@ buffered_end(Fragment, #pipeline{nexts = Nexts}) ->
 %% How far ahead of the consumer the reader has got, in two terms rather than
 %% one. They answer different questions - how much memory the reader is holding,
 %% against how hard it is currently fetching - and the core bounds each on its
-%% own. See its `has_room/1`.
+%% own. See its `room/1`.
 
 %% Bytes held in a buffer that the consumer has not read: the current
 %% fragment's unread run, plus everything prefetched for the fragments after it
@@ -603,7 +601,7 @@ closing frame arrives, and until then it is a request doing nothing. Counting it
 against the concurrency target would spend a slot on a response that is over,
 which at a target sized for throughput is throughput given away. What it is
 still holding is a pooled connection, and that is accounted for separately: the
-core's `has_room/1` counts every in-flight request, owing bytes or not, against
+core's `room/1` counts every in-flight request, owing bytes or not, against
 `max_depth`, which is what bounds a reader's share of the pool.
 """.
 -spec inflight_owing(pipeline()) -> non_neg_integer().
