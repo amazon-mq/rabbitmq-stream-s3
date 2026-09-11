@@ -27,7 +27,8 @@ associated file in that folder.
     check_bucket/1,
     match_async/3,
     handle_async/3,
-    cancel_async/2
+    cancel_async/2,
+    async_spans/1
 ]).
 
 % Auxiliary function for testing
@@ -223,6 +224,12 @@ handle_async({'$async', Req, Msg}, Req, undefined) ->
 -spec cancel_async(async_req(), async_state()) -> ok.
 cancel_async(_Req, _State) ->
     ok.
+
+%% There is no connection pool and no wire, so a read has none of the stages
+%% the spans divide.
+-spec async_spans(async_state()) -> rabbitmq_stream_s3_api:async_spans().
+async_spans(_State) ->
+    #{}.
 
 -spec stream_put(key(), pos_integer(), rabbitmq_stream_s3_api:request_opts()) ->
     {ok, async_state()} | {error, any()}.

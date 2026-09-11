@@ -29,7 +29,8 @@ A wrapper around the AWS S3 HTTP API.
     check_bucket/1,
     match_async/3,
     handle_async/3,
-    cancel_async/2
+    cancel_async/2,
+    async_spans/1
 ]).
 
 %% For apply/3:
@@ -146,7 +147,16 @@ Called "HTTP Verb" in S3 docs. "GET", "PUT", "HEAD", "POST", "DELETE", etc..
     slice_full => rabbitmq_stream_s3_api:range_spec(),
     %% Timer reference for request timeout. Set when a `timeout` is given in
     %% request opts. Cancelled and flushed in `finish_async/1`.
-    timer_ref => reference()
+    timer_ref => reference(),
+    %% Stage markers, set by start_async_request/6 and by the message that
+    %% reaches each stage. They split the request duration into its stages for
+    %% `async_spans/1` and say how far a timed-out request got for
+    %% `describe_stall/1`. Absent on the streaming PUT states, which share this
+    %% type but do not go through start_async_request/6.
+    req_started_at => integer(),
+    headers_at => integer() | undefined,
+    first_data_at => integer() | undefined,
+    bytes_received => non_neg_integer()
 }.
 %% Re-use the gun stream ref since it's already a reference.
 -type async_req() :: gun:stream_ref().
@@ -1006,6 +1016,18 @@ mark_first_data(#{bytes_received := Rx} = State, N) ->
 mark_first_data(State, _N) ->
     State.
 
+-spec async_spans(async_state()) -> rabbitmq_stream_s3_api:async_spans().
+async_spans(State) ->
+    %% `headers_at` rather than `first_data_at`: the response headers are the
+    %% first bytes on the wire, and they are stamped on every success path,
+    %% where `first_data_at` is not stamped when a full-object response is
+    %% being buffered for slicing.
+    Spans = #{
+        issued_at => maps:get(req_started_at, State, undefined),
+        first_byte_at => maps:get(headers_at, State, undefined)
+    },
+    maps:filter(fun(_, At) -> is_integer(At) end, Spans).
+
 %% Summarize how far a timed-out request progressed: whether response headers
 %% arrived, whether any body arrived, the elapsed time to each, and bytes
 %% received. Tolerates a state map without the diagnostic keys.
@@ -1254,7 +1276,7 @@ start_async_request(Pool, Method, Path, Headers, Body, Opts) ->
             %% NOTE: no need to wrap this in try/catch and checkin the conn
             %% since gun:request/5 cannot exit/error/throw.
             StreamRef = gun:request(Conn, Method, Path, Headers, Body),
-            %% Phase markers for timeout reporting (see `describe_stall/1`).
+            %% Stage markers (see `async_spans/1` and `describe_stall/1`).
             State = #{
                 pool => Pool,
                 conn => Conn,
@@ -2541,6 +2563,19 @@ expected_bucket_owner_test() ->
     after
         application:unset_env(rabbitmq_stream_s3, account_id)
     end.
+
+async_spans_reports_the_stages_reached_test() ->
+    ?assertEqual(
+        #{issued_at => 100, first_byte_at => 250},
+        async_spans(#{req_started_at => 100, headers_at => 250, first_data_at => 260})
+    ),
+    %% A request that was issued and then failed before any response.
+    ?assertEqual(
+        #{issued_at => 100},
+        async_spans(#{req_started_at => 100, headers_at => undefined})
+    ),
+    %% A streaming PUT state, which carries no stage markers at all.
+    ?assertEqual(#{}, async_spans(#{conn => self(), stream_ref => make_ref()})).
 
 match_async_active_request_test() ->
     Ref = make_ref(),

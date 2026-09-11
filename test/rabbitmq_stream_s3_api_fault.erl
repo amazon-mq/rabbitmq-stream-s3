@@ -50,7 +50,8 @@ passthrough to the FS backend.
     check_bucket/1,
     match_async/3,
     handle_async/3,
-    cancel_async/2
+    cancel_async/2,
+    async_spans/1
 ]).
 
 %% Test control surface
@@ -237,6 +238,7 @@ check_bucket(Opts) -> ?FS:check_bucket(Opts).
 match_async(Msg, Reqs, Cancelled) -> ?FS:match_async(Msg, Reqs, Cancelled).
 handle_async(Msg, Req, State) -> ?FS:handle_async(Msg, Req, State).
 cancel_async(Req, State) -> ?FS:cancel_async(Req, State).
+async_spans(State) -> ?FS:async_spans(State).
 
 %%----------------------------------------------------------------------------
 %% Internal

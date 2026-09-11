@@ -120,6 +120,22 @@ response) is non-definitive and a caller must not treat it as inaccessible.
     | {done_cancel, {error, any()}}
     | ignore.
 -callback cancel_async(async_req(), async_state()) -> ok.
+-doc """
+The monotonic timestamps at which an async request reached each of its stages,
+for the backend stages this module cannot see.
+
+`issued_at` is when the request went on the wire, so the time before it is the
+credential lookup, the signing and the pool checkout. `first_byte_at` is when
+the response headers arrived, so the time between the two is the store's time to
+first byte and the time after it is the body transfer.
+
+Either key may be absent when the request did not reach that stage, and a
+backend with no such stages returns an empty map.
+""".
+-callback async_spans(async_state()) -> async_spans().
+
+-type async_spans() :: #{issued_at => integer(), first_byte_at => integer()}.
+-export_type([async_spans/0]).
 
 -define(C_GET, 1).
 -define(C_GET_RANGE, 2).
@@ -142,6 +158,31 @@ response) is non-definitive and a caller must not treat it as inaccessible.
 -define(COUNTER_KEY, {?MODULE, counter}).
 
 -define(REQUEST_DURATION_BUCKETS, [10, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, infinity]).
+
+%% The spans a read is split into, each observed into its own histogram. The
+%% total is `request_duration` and the transfer is the total minus these two.
+-define(READ_SPANS, [checkout, first_byte]).
+%% Microseconds, unlike `request_duration`, which is in milliseconds. A checkout
+%% that finds an idle connection takes well under a millisecond, and the
+%% question these spans answer is whether that is where the time goes, so
+%% truncating to whole milliseconds would answer it with a column of zeroes.
+-define(READ_SPAN_BUCKETS, [
+    100,
+    250,
+    500,
+    1_000,
+    2_500,
+    5_000,
+    10_000,
+    20_000,
+    40_000,
+    80_000,
+    160_000,
+    320_000,
+    640_000,
+    1_280_000,
+    infinity
+]).
 
 backend() ->
     rabbitmq_stream_s3_config:api_backend().
@@ -167,6 +208,12 @@ init() ->
             )
         end,
         [read, write]
+    ),
+    lists:foreach(
+        fun(Span) ->
+            rabbitmq_stream_s3_histogram:new({?MODULE, read_span, Span}, ?READ_SPAN_BUCKETS)
+        end,
+        ?READ_SPANS
     ),
     ok.
 
@@ -315,21 +362,22 @@ match_async(Msg, Reqs, CancelledReqs) ->
     | {done_cancel, {error, any()}}
     | ignore.
 handle_async(Msg, Req, {StartTs, BackendState0}) ->
-    case (backend()):handle_async(Msg, Req, BackendState0) of
+    Backend = backend(),
+    case Backend:handle_async(Msg, Req, BackendState0) of
         {continue, BackendState} ->
             {continue, {StartTs, BackendState}};
         {data, Data, done} ->
             counters:add(counter(), ?C_BYTES_RECEIVED, byte_size(Data)),
-            ok = finish_async(StartTs),
+            ok = finish_async(StartTs, Backend:async_spans(BackendState0)),
             {data, Data, done};
         {data, Data, BackendState} ->
             counters:add(counter(), ?C_BYTES_RECEIVED, byte_size(Data)),
             {data, Data, {StartTs, BackendState}};
         {done, _} = Done ->
-            ok = finish_async(StartTs),
+            ok = finish_async(StartTs, Backend:async_spans(BackendState0)),
             Done;
         {done_cancel, _} = DoneCancel ->
-            ok = finish_async(StartTs),
+            ok = finish_async(StartTs, Backend:async_spans(BackendState0)),
             DoneCancel;
         ignore ->
             ignore
@@ -337,13 +385,32 @@ handle_async(Msg, Req, {StartTs, BackendState0}) ->
 
 -spec cancel_async(async_req(), async_state()) -> ok.
 cancel_async(Req, {StartTs, BackendState}) ->
-    (backend()):cancel_async(Req, BackendState),
-    ok = finish_async(StartTs).
+    Backend = backend(),
+    Backend:cancel_async(Req, BackendState),
+    ok = finish_async(StartTs, Backend:async_spans(BackendState)).
 
-finish_async(StartTs) ->
+%% The spans come from the backend state handed to the backend for the message
+%% that finished the request, so they cover the stamps taken on every earlier
+%% message. A request that finished on its first message (a response with no
+%% body, an error before any response) is missing the stage it never reached,
+%% and contributes to the total only.
+finish_async(StartTs, Spans) ->
     Ms = rabbitmq_stream_s3_util:elapsed_ms(StartTs),
     rabbitmq_stream_s3_histogram:observe({?MODULE, request_duration, read}, Ms),
+    observe_read_spans(StartTs, Spans),
     ok.
+
+observe_read_spans(StartTs, Spans) ->
+    IssuedAt = maps:get(issued_at, Spans, undefined),
+    observe_span(checkout, StartTs, IssuedAt),
+    observe_span(first_byte, IssuedAt, maps:get(first_byte_at, Spans, undefined)),
+    ok.
+
+observe_span(_Span, From, To) when From =:= undefined orelse To =:= undefined ->
+    ok;
+observe_span(Span, From, To) ->
+    Us = erlang:convert_time_unit(To - From, native, microsecond),
+    rabbitmq_stream_s3_histogram:observe({?MODULE, read_span, Span}, Us).
 
 observe(Kind, Fun) ->
     T0 = erlang:monotonic_time(),
@@ -366,10 +433,92 @@ request_duration_prometheus_format() ->
         end
      || Kind <- [read, write]
     ],
+    SpanValues = [
+        begin
+            {Buckets, Count, Sum} = rabbitmq_stream_s3_histogram:prometheus_format(
+                {?MODULE, read_span, Span},
+                fun(Us) -> Us / 1_000_000 end
+            ),
+            {[{span, Span}], Buckets, Count, Sum}
+        end
+     || Span <- ?READ_SPANS
+    ],
     #{
         request_duration_seconds => #{
             type => histogram,
             help => <<"Duration of S3 API requests in seconds">>,
             values => Values
+        },
+        read_span_duration_seconds => #{
+            type => histogram,
+            help =>
+                <<
+                    "Duration in seconds of one stage of an asynchronous S3 read: "
+                    "span=\"checkout\" is the credential lookup, signing and pool "
+                    "checkout before the request goes on the wire, span=\"first_byte\" "
+                    "is from there until the response headers arrive. The body "
+                    "transfer is request_duration_seconds minus the two."
+                >>,
+            values => SpanValues
         }
     }.
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+%% Fresh histograms per case, so each asserts what it observed rather than what
+%% it observed on top of whatever ran before it.
+read_span_test_() ->
+    {foreach,
+        fun() ->
+            lists:foreach(
+                fun(Span) ->
+                    rabbitmq_stream_s3_histogram:new(
+                        {?MODULE, read_span, Span}, ?READ_SPAN_BUCKETS
+                    )
+                end,
+                ?READ_SPANS
+            )
+        end,
+        [
+            fun observe_read_spans_splits_the_total/0,
+            fun observe_read_spans_skips_stages_not_reached/0,
+            fun observe_read_spans_records_nothing_without_an_issue_stamp/0
+        ]}.
+
+%% Each span covers its own stage and neither covers the transfer, so a read
+%% that spends 2 ms in checkout, 40 ms waiting for headers and then transfers
+%% for any length of time observes 2 ms and 40 ms.
+observe_read_spans_splits_the_total() ->
+    Start = erlang:monotonic_time(),
+    IssuedAt = Start + native(2),
+    ok = observe_read_spans(Start, #{
+        issued_at => IssuedAt, first_byte_at => IssuedAt + native(40)
+    }),
+    ?assertEqual({1, 2_000}, span_count_and_sum(checkout)),
+    ?assertEqual({1, 40_000}, span_count_and_sum(first_byte)).
+
+%% A request that failed before its response headers has a checkout to report
+%% and no time to first byte.
+observe_read_spans_skips_stages_not_reached() ->
+    Start = erlang:monotonic_time(),
+    ok = observe_read_spans(Start, #{issued_at => Start + native(3)}),
+    ?assertEqual({1, 3_000}, span_count_and_sum(checkout)),
+    ?assertEqual({0, 0}, span_count_and_sum(first_byte)).
+
+%% Nothing at all is known about a request that never left the checkout.
+observe_read_spans_records_nothing_without_an_issue_stamp() ->
+    ok = observe_read_spans(erlang:monotonic_time(), #{}),
+    ?assertEqual({0, 0}, span_count_and_sum(checkout)),
+    ?assertEqual({0, 0}, span_count_and_sum(first_byte)).
+
+native(Ms) ->
+    erlang:convert_time_unit(Ms, millisecond, native).
+
+span_count_and_sum(Span) ->
+    {_, Count, Sum} = rabbitmq_stream_s3_histogram:prometheus_format(
+        {?MODULE, read_span, Span}, fun(Us) -> Us end
+    ),
+    {Count, Sum}.
+
+-endif.

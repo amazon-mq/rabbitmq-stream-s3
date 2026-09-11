@@ -421,7 +421,8 @@ prometheus_metrics(Config) ->
         <<"rabbitmq_stream_s3_governor_submissions_received">>,
         <<"rabbitmq_stream_s3_objects_deleted">>,
         <<"rabbitmq_stream_s3_put">>,
-        <<"rabbitmq_stream_s3_request_duration_seconds_bucket">>
+        <<"rabbitmq_stream_s3_request_duration_seconds_bucket">>,
+        <<"rabbitmq_stream_s3_read_span_duration_seconds_bucket">>
     ],
     [
         ?assertMatch(

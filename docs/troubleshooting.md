@@ -28,6 +28,7 @@ At a high publish rate the replication traffic alone can dominate egress, so the
 - `rabbitmq_stream_s3_governor_pending_submissions` and `_governor_oversized_admissions` stay at zero, and the governor is `unlimited` (so the rate limiter is not pacing transfers).
 - `rabbitmq_stream_s3_transfers_in_flight`, `_governor_tasks_in_flight`, and `_active_requests` are unchanged across the drop (so upload concurrency did not collapse).
 - the connection pool has idle capacity (checkouts roughly equal checkins, and `_checkout_queued` is not climbing).
+- `rabbitmq_stream_s3_read_span_duration_seconds{span="checkout"}` and `{span="first_byte"}` are unchanged across the drop while `_request_duration_seconds{kind="read"}` lengthens (so the pool still hands out connections as fast as it did and S3 still answers as fast as it did, and the extra time is all body transfer). See [Remote read stages](./operations.md#remote-read-stages).
 
 Meanwhile the host-level signals confirm the network ceiling. On the leader node:
 

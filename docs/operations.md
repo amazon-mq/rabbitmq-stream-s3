@@ -457,6 +457,35 @@ Owned by `rabbitmq_stream_s3_api`. One counter set per node.
 
 Buckets: 10ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s, +Inf.
 
+### Remote read stages
+
+A remote read passes through three stages, and `request_duration_seconds` covers all three at once, so a change in it names no cause. These split the first two out. They are recorded for asynchronous range GETs, which is how the remote reader fetches, and not for the synchronous requests the uploader and the manifest code make.
+
+| Metric                                       | Description                                                       |
+|----------------------------------------------|-------------------------------------------------------------------|
+| `rabbitmq_stream_s3_read_span_duration_seconds{span="checkout"}`   | From the read being requested until it goes on the wire: credential lookup, signing, and the pool checkout |
+| `rabbitmq_stream_s3_read_span_duration_seconds{span="first_byte"}` | From the request going on the wire until S3's response headers arrive |
+
+Buckets: 100us, 250us, 500us, 1ms, 2.5ms, 5ms, 10ms, 20ms, 40ms, 80ms, 160ms, 320ms, 640ms, 1.28s, +Inf.
+
+The body transfer is not recorded on its own. It is `request_duration_seconds` minus the two, and dividing the bytes read by it gives per-connection bandwidth:
+
+```
+rate(rabbitmq_stream_s3_bytes_received[5m])
+  / (
+      rate(rabbitmq_stream_s3_request_duration_seconds_sum{kind="read"}[5m])
+    - sum without (span) (rate(rabbitmq_stream_s3_read_span_duration_seconds_sum[5m]))
+    )
+```
+
+What each answers:
+
+- a `checkout` above a millisecond or two means the pool is queueing checkouts or opening connections for requests that should have found an idle one. Cross-check `rabbitmq_stream_s3_checkout_queued` and `rabbitmq_stream_s3_active_requests` against the configured pool size
+- `first_byte` is S3's own latency and is not something a broker setting changes. It is a fixed cost per request, so a high value is an argument for a larger `prefetch_request_size`, which spends memory to make fewer requests
+- a low `checkout` and a low `first_byte` against a high total leave the body transfer, which is the network
+
+All three stamps are taken in the reader process, so a reader that cannot keep up with its own mailbox inflates every stage rather than showing up as its own term. Check `erlang:process_info(Pid, message_queue_len)` before reading the stages as a statement about S3.
+
 ### S3 transport (per-node)
 
 Owned by `rabbitmq_stream_s3_api_aws`.
