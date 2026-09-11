@@ -39,8 +39,20 @@ synchronous feedback is generated.
 -define(C_READ, 6).
 -define(C_TOTAL_REQUESTS, 7).
 -define(C_FATAL_ERRORS, 8).
+-define(C_INFLIGHT_TARGET, 9).
+-define(C_FETCH_RATE, 10).
+-define(C_STALL_TARGET, 11).
+-define(C_STALL_DEPTH, 12).
+-define(C_STALL_BUFFER, 13).
+-define(C_STALL_REACH, 14).
+-define(C_STALL_PEEK_FAILED, 15).
+-define(C_SERVE_RATE, 16).
+-define(C_FETCH_CEILING, 17).
+-define(C_MEMORY_CEILING, 18).
+-define(C_COMMITTED, 19).
+-define(C_BUFFERED, 20).
+-define(C_STALL_FETCH_BUDGET, 21).
 -define(COUNTER_KEY, {rabbitmq_stream_s3_remote_reader, counter}).
--define(PREFETCH_SIZING_KEY, {rabbitmq_stream_s3_remote_reader, prefetch_sizing}).
 -define(COUNTERS, [
     {buffer_hit, ?C_BUFFER_HIT, counter, "Number of reads served from the buffer"},
     {buffer_miss, ?C_BUFFER_MISS, counter, "Number of reads that had to await async data"},
@@ -51,11 +63,60 @@ synchronous feedback is generated.
     {read, ?C_READ, counter, "Number of read/4,5 calls"},
     {remote_reader_total_requests, ?C_TOTAL_REQUESTS, counter, "Number of S3 requests initiated"},
     {remote_reader_fatal_errors, ?C_FATAL_ERRORS, counter,
-        "Number of remote readers stopped by a non-retryable S3 error"}
+        "Number of remote readers stopped by a non-retryable S3 error"},
+    %% What the reader is aiming for, against `requests_in_flight` for what it
+    %% is achieving. Without both, the two questions an operator has about a slow
+    %% remote read - is the reader aiming low, or aiming high and not getting
+    %% there - are indistinguishable from outside the process.
+    {remote_reader_inflight_target, ?C_INFLIGHT_TARGET, gauge,
+        "Requests the remote reader is currently aiming to keep in flight"},
+    %% The reading the concurrency search acts on. Against `inflight_target` it
+    %% separates a target that settled low because concurrency stopped paying
+    %% from one settled on noisy samples.
+    {remote_reader_fetch_rate_bytes, ?C_FETCH_RATE, gauge,
+        "Bytes per second measured over the remote reader's last tuning sample"},
+    %% The other end of the reader, over the same sample. The pair is what says
+    %% which end the ceiling is at: a serve rate that holds flat while the fetch
+    %% side is given more concurrency puts it downstream of this reader
+    %% altogether, and no prefetch setting will move it.
+    {remote_reader_serve_rate_bytes, ?C_SERVE_RATE, gauge,
+        "Bytes per second handed to the consumer over the remote reader's last sample"},
+    %% One of these per placement pass, naming the bound that stopped it. They
+    %% partition the passes, so the shares answer "what governs this reader's
+    %% bandwidth?" - and each names the single setting that would raise it.
+    {remote_reader_prefetch_stall_target, ?C_STALL_TARGET, counter,
+        "Placement passes stopped by the concurrency target (raise it, or let auto-tune)"},
+    {remote_reader_prefetch_stall_depth, ?C_STALL_DEPTH, counter,
+        "Placement passes stopped by prefetch_max_depth"},
+    {remote_reader_prefetch_stall_fetch_budget, ?C_STALL_FETCH_BUDGET, counter,
+        "Placement passes stopped by the cap on what may be committed"},
+    {remote_reader_prefetch_stall_buffer, ?C_STALL_BUFFER, counter,
+        "Placement passes stopped by the memory ceiling: the consumer is far behind"},
+    {remote_reader_prefetch_stall_reach, ?C_STALL_REACH, counter,
+        "Placement passes with budget left but nothing to ask for: the manifest or "
+        "the look-ahead horizon ran out, which no budget would fix"},
+    {remote_reader_prefetch_stall_peek_failed, ?C_STALL_PEEK_FAILED, counter,
+        "Placement passes with budget left but a failed group fetch blocking the look-ahead"},
+    %% Each byte budget with what is held against it. Published split rather than
+    %% summed: a total pinned at its ceiling says nothing about which side is
+    %% using it, and a buffer quietly taking the fetch side's share looks
+    %% identical to a reader that is simply busy.
+    {remote_reader_fetch_ceiling_bytes, ?C_FETCH_CEILING, gauge,
+        "Bytes the remote reader may currently have committed to fetching"},
+    {remote_reader_committed_bytes, ?C_COMMITTED, gauge,
+        "Bytes the remote reader has committed to fetching and not yet received"},
+    {remote_reader_memory_ceiling_bytes, ?C_MEMORY_CEILING, gauge,
+        "Bytes the remote reader may currently hold in total, buffered and in flight"},
+    {remote_reader_buffered_bytes, ?C_BUFFERED, gauge,
+        "Bytes the remote reader holds that the consumer has not read"}
 ]).
-%% The most bucket boundaries the prefetch window histogram may have. A window
-%% many requests wide would otherwise get one time series per step it can make.
--define(PREFETCH_WINDOW_BUCKET_LIMIT, 16).
+%% The length of a sample: how often the shell closes one and hands it to
+%% the core to measure a fetch rate over.
+%%
+%% The core has no clock, so this is where time enters it. Long enough that a
+%% single slow response does not decide a sample, and short enough that a reader
+%% converges within a consumer's first seconds rather than its first minute.
+-define(TUNE_INTERVAL_MS, 200).
 
 -type hint() :: chunk_boundary | within_chunk.
 -export_type([hint/0]).
@@ -107,7 +168,27 @@ synchronous feedback is generated.
         rabbitmq_stream_s3_remote_reader_core:backoff() => {reference(), reference()}
     },
     %% Set to true when the core emits `stop`.
-    stopping = false :: boolean()
+    stopping = false :: boolean(),
+    %% When the current tuning sample opened, in monotonic micros. The core is
+    %% handed the elapsed time rather than reading a clock of its own, and it is
+    %% measured here rather than assumed from `?TUNE_INTERVAL_MS`: a busy reader
+    %% is exactly the one whose timers land late, and it is also the one whose
+    %% rate the tuner is trying to read.
+    sample_at :: integer() | undefined,
+    %% What this reader last published to each per-reader gauge, by counter
+    %% index. Every one of them is node-wide, so each is kept by adding this
+    %% reader's delta rather than writing its value - a plain write would make
+    %% the gauge mean "whichever reader ticked last", which on a node with
+    %% several consumers is not a number about anything. Summed across readers
+    %% they are the node's figures: what it is aiming for, what it is achieving,
+    %% and what it is allowed to hold.
+    %%
+    %% Held in one map rather than a field each because publishing and releasing
+    %% are two sites that have to agree about the same set: a gauge added to the
+    %% tick and forgotten in `terminate/2` leaves a node that has churned through
+    %% consumers reporting a value no reader is holding, and nothing about the
+    %% number itself would say so.
+    published = #{} :: #{pos_integer() => non_neg_integer()}
 }).
 
 %% API
@@ -119,8 +200,7 @@ synchronous feedback is generated.
     read_iodata/4,
     read_iodata/5,
     init_counters/0,
-    prefetch_sizing/0,
-    prefetch_window_prometheus_format/0
+    prefetch_sizing/0
 ]).
 
 %% gen_server
@@ -141,63 +221,15 @@ synchronous feedback is generated.
 init_counters() ->
     Cnt = seshat:new(rabbitmq_stream_s3, ?MODULE, ?COUNTERS, #{module => ?MODULE}),
     persistent_term:put(?COUNTER_KEY, Cnt),
-    Sizing = read_prefetch_sizing(),
-    persistent_term:put(?PREFETCH_SIZING_KEY, Sizing),
-    rabbitmq_stream_s3_histogram:new(?MODULE, prefetch_window_buckets(Sizing)),
     ok.
 
-%% The sizing every reader on this node runs with. Published once at boot,
-%% because the histogram boundaries are derived from it and frozen at the same
-%% moment: a reader that read the app env directly would grow its window past
-%% boundaries already fixed against the old ceiling, and every observation above
-%% it would land in +Inf. Reading both from here keeps them the same numbers, so
-%% these two keys are boot-time settings and a change to either needs a restart.
-%%
-%% Falls back to a live read for a reader started without `init_counters/0`
-%% (tests); there is no histogram to disagree with in that case.
+%% The sizing a reader starts with. `max_memory` is clamped to two requests here
+%% rather than at each use, so no caller has to handle a bound whose fetching
+%% half is below one request.
 -spec prefetch_sizing() -> {pos_integer(), pos_integer()}.
 prefetch_sizing() ->
-    persistent_term:get(?PREFETCH_SIZING_KEY, read_prefetch_sizing()).
-
-%% Clamped here rather than at each use so the boundaries and the readers cannot
-%% disagree about a ceiling configured below the floor either.
-read_prefetch_sizing() ->
     RequestSize = rabbitmq_stream_s3_config:prefetch_request_size(),
-    {RequestSize, max(RequestSize, rabbitmq_stream_s3_config:prefetch_window_max())}.
-
-%% Upper bucket boundaries follow the values the window can actually take: it
-%% starts at `prefetch_request_size`, doubles on a miss up to
-%% `prefetch_window_max` and gives a request back at a time, so it is always in
-%% `[RequestSize, WindowMax]` and moves in whole requests. Boundaries spaced by
-%% the request size therefore resolve every step it can make, and the top one
-%% is the window's ceiling, so in normal operation +Inf stays empty.
-%%
-%% They are derived from the configured sizes rather than fixed because both are
-%% settings: a fixed list would put every observation of a raised
-%% `prefetch_window_max` into +Inf, and collapse the steps of a raised
-%% `prefetch_request_size` into a handful of buckets. Where the window spans
-%% more than `?PREFETCH_WINDOW_BUCKET_LIMIT` requests the spacing is widened to
-%% keep the series count bounded; the ceiling stays a boundary either way.
-%%
-%% Takes the sizing rather than reading it, so the boundaries are derived from
-%% the same numbers the readers run with. See `prefetch_sizing/0`.
-prefetch_window_buckets({RequestSize, WindowMax}) ->
-    Steps = ceil(WindowMax / RequestSize),
-    Stride = RequestSize * ceil(Steps / ?PREFETCH_WINDOW_BUCKET_LIMIT),
-    lists:usort(lists:seq(Stride, WindowMax, Stride) ++ [WindowMax]) ++ [infinity].
-
--spec prefetch_window_prometheus_format() -> map().
-prefetch_window_prometheus_format() ->
-    {Buckets, Count, Sum} = rabbitmq_stream_s3_histogram:prometheus_format(
-        ?MODULE, fun(X) -> X end
-    ),
-    #{
-        prefetch_window_bytes => #{
-            type => histogram,
-            help => <<"Distribution of the remote reader's prefetch window in bytes">>,
-            values => [{[], Buckets, Count, Sum}]
-        }
-    }.
+    {RequestSize, max(2 * RequestSize, rabbitmq_stream_s3_config:prefetch_max_memory())}.
 
 start(Config) ->
     gen_server:start(?MODULE, Config, []).
@@ -314,9 +346,15 @@ init(
         stream = StreamId,
         cfg = Cfg,
         core = Core0,
-        reader_ref = erlang:monitor(process, Reader)
+        reader_ref = erlang:monitor(process, Reader),
+        sample_at = erlang:monotonic_time(microsecond)
     },
-    State = execute_effects(Effects, State0),
+    %% Armed whether or not the search is on. A pinned reader's target never
+    %% moves, but the rates and the byte budgets do, and those are what an
+    %% operator measuring a pinned reader is looking at.
+    _ = erlang:send_after(?TUNE_INTERVAL_MS, self(), tune_tick),
+    State1 = publish_gauges(Core0, State0),
+    State = execute_effects(Effects, State1),
     {ok, State}.
 
 handle_call(
@@ -398,6 +436,20 @@ handle_info({deadline_expired, _StaleToken}, State) ->
     %% already-queued message, so ignore the stale token rather than reset a
     %% newer read's buffer and cancel its in-flight requests.
     {noreply, State};
+handle_info(tune_tick, #state{core = Core0, sample_at = SampleAt} = State0) ->
+    %% Closes the core's measurement sample and opens the next. Unconditional and
+    %% untokened, unlike the retry timers: it carries no decision, so a tick that
+    %% arrives late or twice costs a sample's accuracy rather than correctness -
+    %% the elapsed time it carries is measured, so a late one is simply a longer
+    %% sample. A reader that has nothing in flight ticks over zero bytes.
+    Now = erlang:monotonic_time(microsecond),
+    {Core1, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
+        Core0, {tune_tick, Now - SampleAt}
+    ),
+    _ = erlang:send_after(?TUNE_INTERVAL_MS, self(), tune_tick),
+    State1 = publish_gauges(Core1, State0#state{core = Core1, sample_at = Now}),
+    State = execute_effects(Effects, State1),
+    maybe_stop(State);
 handle_info(Msg, #state{requests = Requests0, cancelled = Cancelled0} = State0) ->
     AsyncStates = #{Req => AsyncState || Req := {_, _, AsyncState} <- Requests0},
     case rabbitmq_stream_s3_api:match_async(Msg, AsyncStates, Cancelled0) of
@@ -417,7 +469,44 @@ handle_info(Msg, #state{requests = Requests0, cancelled = Cancelled0} = State0) 
 
 terminate(_Reason, State) ->
     _ = cancel_all_requests(State),
+    release_gauges(State),
     ok.
+
+%% This reader's contribution to each node-wide gauge, brought up to date in one
+%% place so that adding a gauge is one line here rather than one line at each of
+%% the sites that publish and the one that gives it back.
+publish_gauges(Core, #state{published = Published0} = State) ->
+    Values = [
+        {?C_INFLIGHT_TARGET, rabbitmq_stream_s3_remote_reader_core:inflight_target(Core)},
+        %% A sample the core declined to read (an idle tick, or the first one)
+        %% leaves the rate `undefined`. Published as zero, which is what it
+        %% measured.
+        {?C_FETCH_RATE, measured(rabbitmq_stream_s3_remote_reader_core:fetch_rate(Core))},
+        {?C_SERVE_RATE, measured(rabbitmq_stream_s3_remote_reader_core:serve_rate(Core))},
+        {?C_FETCH_CEILING, rabbitmq_stream_s3_remote_reader_core:fetch_ceiling(Core)},
+        {?C_MEMORY_CEILING, rabbitmq_stream_s3_remote_reader_core:memory_ceiling(Core)},
+        {?C_COMMITTED, rabbitmq_stream_s3_remote_reader_core:committed(Core)},
+        {?C_BUFFERED, rabbitmq_stream_s3_remote_reader_core:buffered(Core)}
+    ],
+    Published = lists:foldl(
+        fun({Ix, Value}, Acc) ->
+            counters:add(counter(), Ix, Value - maps:get(Ix, Acc, 0)),
+            Acc#{Ix => Value}
+        end,
+        Published0,
+        Values
+    ),
+    State#state{published = Published}.
+
+%% Give the node-wide gauges back what this reader was holding. Without this a
+%% node that has churned through consumers reads as aiming for a concurrency no
+%% reader is asking for, at a rate nobody is achieving.
+release_gauges(#state{published = Published}) ->
+    maps:foreach(fun(Ix, Value) -> counters:sub(counter(), Ix, Value) end, Published).
+
+%% An unread sample is zero bytes per second, which is what it measured.
+measured(undefined) -> 0;
+measured(Rate) -> Rate.
 
 format_status(#{state := #state{stream = StreamId, core = Core, from = From}} = Status) ->
     Status#{
@@ -493,9 +582,12 @@ step_and_execute(Event, #state{core = Core0} = State0) ->
 %% The connection pool hands out connections with a 100ms checkout timeout, so
 %% executing a batch of start_request effects against a saturated pool would
 %% block this process for 100ms per request while the caller's read deadline
-%% burns. Once one checkout has come back `pool_busy` the rest of the batch is
-%% reported to the core as busy without being attempted, capping the cost of a
-%% saturated pool at one checkout timeout per batch.
+%% burns. Once one checkout has come back saturated the rest of the batch is
+%% reported to the core without being attempted, capping the cost of a
+%% saturated pool at one checkout timeout per batch. The kind the first
+%% checkout came back with is what the rest are reported as: the two differ in
+%% what the core makes of them, and a batch that ends on an exhausted pool did
+%% not stop being exhausted for the ranges behind the first one.
 execute_effects(Effects, State) ->
     {State1, _PoolBusy} = execute_effects(Effects, false, State),
     State1.
@@ -535,17 +627,17 @@ execute_effect(
     };
 execute_effect({reply, _Result}, PoolBusy, State) ->
     {State, PoolBusy};
-execute_effect({observe, hit, Window}, PoolBusy, State) ->
+execute_effect({observe, hit}, PoolBusy, State) ->
     counters:add(counter(), ?C_BUFFER_HIT, 1),
-    rabbitmq_stream_s3_histogram:observe(?MODULE, Window),
     {State, PoolBusy};
-execute_effect({observe, miss, Window}, PoolBusy, State) ->
+execute_effect({observe, miss}, PoolBusy, State) ->
     counters:add(counter(), ?C_BUFFER_MISS, 1),
-    rabbitmq_stream_s3_histogram:observe(?MODULE, Window),
     {State, PoolBusy};
-execute_effect({observe, fragment_transition, Window}, PoolBusy, State) ->
+execute_effect({observe, fragment_transition}, PoolBusy, State) ->
     counters:add(counter(), ?C_FRAGMENT_TRANSITION, 1),
-    rabbitmq_stream_s3_histogram:observe(?MODULE, Window),
+    {State, PoolBusy};
+execute_effect({observe, {stall, Reason}}, PoolBusy, State) ->
+    counters:add(counter(), stall_counter(Reason), 1),
     {State, PoolBusy};
 execute_effect(
     {start_request, Id, Key, {RangeStart, _} = Range, FragOffset},
@@ -560,12 +652,12 @@ execute_effect(
             counters:add(counter(), ?C_TOTAL_REQUESTS, 1),
             Requests = Requests0#{RequestId => {Id, FragOffset, AsyncState}},
             {State#state{requests = Requests}, false};
-        {error, pool_busy} ->
+        {error, Saturation} when Saturation =:= pool_busy; Saturation =:= pool_exhausted ->
             ?LOG_DEBUG(
-                "remote_reader start_request: pool_busy key=~ts frag=~b pos=~b",
-                [Key, FragOffset, RangeStart]
+                "remote_reader start_request: ~s key=~ts frag=~b pos=~b",
+                [Saturation, Key, FragOffset, RangeStart]
             ),
-            report_pool_busy(Id, FragOffset, State);
+            report_saturation(Id, FragOffset, Saturation, State);
         {error, Reason} ->
             %% The request never reached the pool: credentials could not be
             %% obtained or the region could not be resolved, so signing failed.
@@ -581,10 +673,12 @@ execute_effect(
             ),
             report_request_error(Id, FragOffset, connection_error, false, State)
     end;
-execute_effect({start_request, Id, _Key, _Range, FragOffset}, true, State) ->
+execute_effect({start_request, Id, _Key, _Range, FragOffset}, Saturation, State) when
+    Saturation =/= false
+->
     %% A checkout in this batch has already timed out; do not spend another
     %% timeout finding out the pool is still saturated.
-    report_pool_busy(Id, FragOffset, State);
+    report_saturation(Id, FragOffset, Saturation, State);
 execute_effect({cancel_request, Id}, PoolBusy, State) ->
     {cancel_request(Id, State), PoolBusy};
 execute_effect({cancel_requests, all}, PoolBusy, State) ->
@@ -625,18 +719,29 @@ execute_effect({fatal_error, Reason}, PoolBusy, #state{stream = StreamId} = Stat
 execute_effect(stop, PoolBusy, State) ->
     {State#state{stopping = true}, PoolBusy}.
 
-report_pool_busy(Id, FragOffset, State) ->
-    report_request_error(Id, FragOffset, pool_busy, true, State).
+stall_counter(target) -> ?C_STALL_TARGET;
+stall_counter(depth) -> ?C_STALL_DEPTH;
+stall_counter(fetch_budget) -> ?C_STALL_FETCH_BUDGET;
+stall_counter(buffer) -> ?C_STALL_BUFFER;
+stall_counter(reach) -> ?C_STALL_REACH;
+stall_counter(peek_failed) -> ?C_STALL_PEEK_FAILED.
+
+%% Both kinds wait on the pool clock; they differ in what the core makes of
+%% them. See the core's `note_contention/2`. The kind is also what the rest of
+%% the batch is reported as, so it is carried rather than flattened to a flag.
+report_saturation(Id, FragOffset, Saturation, State) ->
+    report_request_error(Id, FragOffset, Saturation, Saturation, State).
 
 %% Tell the core that a range the shell was asked to start never got off the
 %% ground. An error step can ask for requests to be started (a range that owed
 %% nothing frees a depth slot for the next one), so the nested effects run with
-%% the batch's busy flag carried through: a saturated pool passes `true`, which
-%% turns any nested start into another report rather than another checkout.
+%% the batch's saturation carried through: a saturated pool passes the kind it
+%% saw, which turns any nested start into another report rather than another
+%% checkout.
 %%
-%% `PoolBusy` has to be what the shell actually saw. A start that failed before
-%% the pool was reached (credentials, region) is not evidence the pool is busy,
-%% and reporting a nested range as `pool_busy` on that path would grow
+%% `Saturation` has to be what the shell actually saw. A start that failed
+%% before the pool was reached (credentials, region) is not evidence the pool is
+%% busy, and reporting a nested range as saturated on that path would grow
 %% `pool_busy_delay` and park the range on a clock measuring something else.
 %%
 %% Recursion is bounded at one level either way. The nested range is in flight
@@ -649,11 +754,11 @@ report_pool_busy(Id, FragOffset, State) ->
 %% requests it went on to start then found the pool saturated, discarding that
 %% would leave the outer batch spending a 100ms checkout on each of its
 %% remaining ranges - the cost the short-circuit exists to cap.
-report_request_error(Id, FragOffset, Reason, PoolBusy, #state{core = Core0} = State) ->
+report_request_error(Id, FragOffset, Reason, Saturation, #state{core = Core0} = State) ->
     {Core, Effects} = rabbitmq_stream_s3_remote_reader_core:step(
         Core0, {request_error, Id, FragOffset, Reason}
     ),
-    execute_effects(Effects, PoolBusy, State#state{core = Core}).
+    execute_effects(Effects, Saturation, State#state{core = Core}).
 
 %% Rebuild the fragment iterator from the manifest cache, advancing past
 %% the given offset (the fragment known to be 404).
@@ -755,6 +860,15 @@ counter() ->
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
+%% `seshat:new/4` sizes the array from the field count and rejects a spec whose
+%% indexes are not exactly 1..N, so removing a counter without renumbering the
+%% ones after it leaves a gap and `init_counters/0` raises. That happens during
+%% plugin start, where it stops the broker booting, and no suite covers it: the
+%% error is logged rather than fatal under the test harness.
+counter_indexes_are_contiguous_test() ->
+    Indexes = lists:sort([Ix || {_Name, Ix, _Kind, _Help} <- ?COUNTERS]),
+    ?assertEqual(lists:seq(1, length(?COUNTERS)), Indexes).
+
 %% A deadline_expired carrying a token that does not match the current read's
 %% token (its read was already served, or it was superseded by a newer read)
 %% must be ignored rather than reset a newer read's buffer and cancel its
@@ -804,81 +918,9 @@ stale_retry_is_ignored_per_kind_test() ->
     ?assertEqual({noreply, State}, handle_info({retry_requests, fault, make_ref()}, State)),
     ?assert(is_map_key(pool_busy, State#state.retry_timers)).
 
-%% The histogram's boundaries have to follow the values the window can take, or
-%% it reports resolution it cannot deliver. The window moves in whole requests
-%% between `prefetch_request_size` and `prefetch_window_max`, so every step it
-%% can make needs its own bucket - and none of them may land in +Inf, which is
-%% for a window that has escaped its ceiling.
-prefetch_window_buckets_resolve_every_window_step_test() ->
-    {RequestSize, WindowMax} = Sizing = read_prefetch_sizing(),
-    Buckets = prefetch_window_buckets(Sizing),
-    Windows = lists:seq(RequestSize, WindowMax, RequestSize),
-    Observed = [bucket_of(W, Buckets) || W <- Windows],
-    ?assertEqual(length(Windows), length(lists:usort(Observed))),
-    ?assertNot(lists:member(infinity, Observed)).
-
-%% The boundaries are derived, so sizings other than the default have to hold
-%% up too: the ceiling is always the top finite boundary (nothing the window can
-%% take falls into +Inf), and a window many requests wide is spaced out rather
-%% than given a boundary per step.
-prefetch_window_buckets_follow_the_configured_sizes_test_() ->
-    Sizings = [
-        %% Default.
-        {4_194_304, 33_554_432},
-        %% A raised ceiling: fixed boundaries would have put all of it in +Inf.
-        {4_194_304, 268_435_456},
-        %% A raised request size, which is also the floor the window sits at.
-        {33_554_432, 134_217_728},
-        %% A ceiling that is not a whole number of requests.
-        {4_194_304, 30_000_000},
-        %% Degenerate: no room to grow at all.
-        {4_194_304, 4_194_304},
-        %% Degenerate: a ceiling below the floor, which the core clamps away.
-        {4_194_304, 1_048_576}
-    ],
-    [
-        {
-            lists:flatten(io_lib:format("~b/~b", [RequestSize, WindowMax])),
-            fun() ->
-                with_prefetch_config(RequestSize, WindowMax, fun() ->
-                    {_, Ceiling} = Sizing = read_prefetch_sizing(),
-                    ?assertEqual(max(RequestSize, WindowMax), Ceiling),
-                    Buckets = prefetch_window_buckets(Sizing),
-                    ?assertEqual(infinity, lists:last(Buckets)),
-                    ?assertEqual(Ceiling, lists:last(lists:droplast(Buckets))),
-                    ?assertNotEqual(infinity, bucket_of(Ceiling, Buckets)),
-                    ?assert(length(Buckets) =< ?PREFETCH_WINDOW_BUCKET_LIMIT + 1)
-                end)
-            end
-        }
-     || {RequestSize, WindowMax} <- Sizings
-    ].
-
-with_prefetch_config(RequestSize, WindowMax, Fun) ->
-    Set = fun(Key, Value) ->
-        Prev = application:get_env(rabbitmq_stream_s3, Key),
-        application:set_env(rabbitmq_stream_s3, Key, Value),
-        Prev
-    end,
-    Reset = fun
-        (Key, {ok, Value}) -> application:set_env(rabbitmq_stream_s3, Key, Value);
-        (Key, undefined) -> application:unset_env(rabbitmq_stream_s3, Key)
-    end,
-    PrevSize = Set(prefetch_request_size, RequestSize),
-    PrevMax = Set(prefetch_window_max, WindowMax),
-    try
-        Fun()
-    after
-        Reset(prefetch_request_size, PrevSize),
-        Reset(prefetch_window_max, PrevMax)
-    end.
-
-bucket_of(Value, Buckets) ->
-    hd([UB || UB <- Buckets, UB =:= infinity orelse Value =< UB]).
-
 %% Checking a connection out of a saturated pool costs a 100ms timeout, so once
-%% one request in a batch has come back pool_busy the rest must be reported to
-%% the core as busy without being attempted. Otherwise a reader pipelining N
+%% one request in a batch has come back saturated the rest must be reported to
+%% the core without being attempted. Otherwise a reader pipelining N
 %% requests blocks for N x 100ms with its caller's read deadline burning.
 pool_busy_short_circuits_the_rest_of_a_batch_test() ->
     StreamId = <<"pool-busy-test">>,
@@ -891,8 +933,15 @@ pool_busy_short_circuits_the_rest_of_a_batch_test() ->
     Iterator = rabbitmq_stream_s3_fragment_iterator:init(
         Manifest, 0, fun(_) -> {error, not_found} end
     ),
+    %% A fixed concurrency, because the subject is a batch of re-issued
+    %% requests and the search would spend several samples ramping up to one.
     {Core0, _} = rabbitmq_stream_s3_remote_reader_core:init(
-        StreamId, FragRef, ?SEGMENT_HEADER_B, Iterator, #{request_size => 1000, max_depth => 4}
+        StreamId, FragRef, ?SEGMENT_HEADER_B, Iterator, #{
+            request_size => 1000,
+            max_depth => 4,
+            auto_tune => false,
+            inflight_initial => 4
+        }
     ),
     %% Reads that cannot be served grow the prefetch window until the reader
     %% pipelines; failing every range then leaves a batch for the retry to
@@ -923,13 +972,18 @@ pool_busy_short_circuits_the_rest_of_a_batch_test() ->
     ?assert(length(Starts) > 1),
     State = #state{stream = StreamId, cfg = build_cfg(#{}), core = Core},
     %% Enter the batch as if a checkout had already timed out.
-    {State1, true} = execute_effects(Starts, true, State),
+    {State1, pool_busy} = execute_effects(Starts, pool_busy, State),
     %% No request was issued, and the core has every range queued for retry.
     ?assertEqual(#{}, State1#state.requests),
     ?assertEqual(
         [{0, Start, End} || {start_request, _, _, {Start, End}, 0} <- Starts],
         rabbitmq_stream_s3_remote_reader_core:outstanding_ranges(State1#state.core)
-    ).
+    ),
+    %% The kind survives the short-circuit. The two differ in what the core
+    %% makes of them, so reporting the rest of an exhausted batch as merely busy
+    %% would lose the contention signal for every range behind the first.
+    {State2, pool_exhausted} = execute_effects(Starts, pool_exhausted, State),
+    ?assertEqual(#{}, State2#state.requests).
 
 %% A read cannot complete faster than the tier can deliver what it asked for, so
 %% a fixed deadline caps the chunk size the remote tier can serve: past the cap

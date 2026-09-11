@@ -1734,8 +1734,19 @@ gen_rrc_event(NextReadPos) ->
         {2, ?LET(E, gen_rrc_error_event(), {E, NextReadPos})},
         {1, ?LET(Kind, oneof([fault, pool_busy]), {{retry, Kind}, NextReadPos})},
         {1, ?LET(E, gen_rrc_iterator_refreshed_event(), {E, NextReadPos})},
+        {1, ?LET(E, gen_rrc_tune_tick_event(), {E, NextReadPos})},
         {1, {deadline_expired, NextReadPos}}
     ]).
+
+%% Closing a sample is an event like any other, and without it in the sequence
+%% the concurrency search is never fuzzed: `inflight_target` holds wherever it
+%% started, so `tune/2`, `retarget/2` and `note_contention/2` never run against
+%% a state any of the other events built. The elapsed time is generated too,
+%% because it is half of the rate the search reads - a tick is the one event
+%% carrying time into the core, and the sample it closes is whatever the events
+%% before it delivered.
+gen_rrc_tune_tick_event() ->
+    ?LET(ElapsedUs, range(1, 1_000_000), {tune_tick, ElapsedUs}).
 
 gen_rrc_read_event(NextReadPos) ->
     ?LET(
@@ -1759,7 +1770,16 @@ gen_rrc_error_event() ->
     ?LET(
         {Reason, Which},
         {
-            oneof([timeout, slow_down, connection_error, stream_error, internal_error, pool_busy]),
+            oneof([
+                timeout,
+                slow_down,
+                connection_error,
+                stream_error,
+                internal_error,
+                pool_busy,
+                pool_exhausted,
+                not_found
+            ]),
             range(0, 7)
         },
         {fail, Which, Reason}
@@ -1875,7 +1895,7 @@ prop_remote_reader_core_reply_bytes_exact() ->
                 end,
             Opts = #{
                 request_size => RequestSize,
-                window_max => RequestSize * 8,
+                max_memory => RequestSize * 16,
                 max_depth => MaxDepth
             },
             {S0, _} = rabbitmq_stream_s3_remote_reader_core:init(
@@ -2004,7 +2024,7 @@ prop_remote_reader_core_survives_failure_interleavings() ->
                 end,
             Opts = #{
                 request_size => RequestSize,
-                window_max => RequestSize * 8,
+                max_memory => RequestSize * 16,
                 max_depth => MaxDepth
             },
             {S0, _} = rabbitmq_stream_s3_remote_reader_core:init(
@@ -2083,13 +2103,24 @@ run_rrc_failure_steps([{Rot, Outcomes, LenWant} | Steps], S0, ReadFloor, Probe) 
 %% never served.
 %%
 %% The rounds are capped so a wedge fails the property instead of hanging the
-%% suite. The cap is generous: with no reads to advance the consumer, the buffer
-%% fills to the prefetch window within a few rounds and the core stops issuing,
-%% so a healthy queue empties in about `window_max / request_size` of them.
--define(RRC_DRAIN_ROUNDS, 64).
+%% suite rather than because any particular number of them is meaningful.
+-define(LOOK_AHEAD_ROUNDS, 96).
+
+%% How many rounds the drain is allowed. A round answers every range outstanding
+%% at its start, so at `max_depth` 1 it moves one request size, and the queue
+%% only empties once the reader has both served the read it is holding and
+%% filled the read-ahead behind it. Both scale with the request size, so a fixed
+%% cap cannot cover them.
+%%
+%% 4000 is the longest read the failure-step generator produces, so the first
+%% term is the rounds that read needs on its own at this request size. 16 covers
+%% the byte ceiling at the fixture's sizing, and 8 is slack for the rounds a
+%% miss and its retry cost.
+drain_rounds(RequestSize) ->
+    4000 div RequestSize + 16 + 8.
 
 rrc_drains(State0, ReadFloor, {ProbeLen, RequestSize}) ->
-    case rrc_drain(State0, ?RRC_DRAIN_ROUNDS) of
+    case rrc_drain(State0, drain_rounds(RequestSize)) of
         false ->
             false;
         {ok, State0b} ->
@@ -2110,7 +2141,7 @@ rrc_drains(State0, ReadFloor, {ProbeLen, RequestSize}) ->
 %% short one is anywhere near, and the property failed a core that was serving
 %% the read correctly, one round at a time.
 await_rounds(ProbeLen, RequestSize) ->
-    %% `window_max` is 8 requests in this fixture; the slack is for the miss
+    %% Fetching gets 8 requests in this fixture; the slack is for the miss
     %% that widens the window and the round the reply itself lands in.
     ProbeLen div RequestSize + 8 + 8.
 
@@ -2246,13 +2277,12 @@ rrc_ranges_disjoint([]) ->
 %% may push the reader past its window.
 %% Every property above this one drives a single-fragment manifest whose group
 %% fun returns `{error, not_found}`, so the look-ahead can only ever answer
-%% `end_of_manifest`: `next_peek = failed` - the state a transient group fetch
-%% leaves behind, and the state the reader has to climb back out of - was
-%% unreachable in all 500 iterations of each of them. That is why a stranded
-%% memo survived several reviews. This fixture puts every fragment after the
-%% first behind a group node and lets the generator decide how many of those
-%% fetches fail, so the region is reachable and the invariants checked inside
-%% `step/2` apply to it like anywhere else.
+%% `end_of_manifest`, leaving `peek_tail = failed` unreachable in all 500
+%% iterations of each of them. That is the state a transient group fetch leaves
+%% behind and the one the reader has to climb back out of. This fixture puts
+%% every fragment after the first behind a group node and lets the generator
+%% decide how many of those fetches fail, so the region is reachable and the
+%% invariants checked inside `step/2` apply to it like anywhere else.
 %%
 %% The oracle is the recovery, because the failure is not a crash: a reader
 %% carrying a stranded memo keeps serving the fragment it is on and stops only
@@ -2277,7 +2307,7 @@ prop_remote_reader_core_look_ahead_recovers() ->
             Iterator = rrc_grouped_iterator(Fragments, Failures),
             [{Offset, _, Uid} | _] = Fragments,
             FragRef = #fragment_ref{offset = Offset, uid = Uid, size = FragSize},
-            Opts = #{request_size => 1000, window_max => 8000, max_depth => 4},
+            Opts = #{request_size => 1000, max_memory => 16_000, max_depth => 4},
             {S0, _} = rabbitmq_stream_s3_remote_reader_core:init(
                 <<"prop-stream">>, FragRef, ?SEGMENT_HEADER_B, Iterator, Opts
             ),
@@ -2285,18 +2315,32 @@ prop_remote_reader_core_look_ahead_recovers() ->
             %% lasts. Iterator refreshes are dropped: the generator builds them
             %% around a single-fragment manifest of its own, which would replace
             %% this fixture with one that has nothing to look ahead to.
-            S1 = run_rrc_events([E || E <- Events, not is_rrc_refresh(E)], S0),
+            %%
+            %% 404s go with them, because they are the other half of the same
+            %% thing. A 404 on the current fragment parks the reader on
+            %% `{refresh_iterator, _}` by design - it cannot know which fragment
+            %% to move to until the shell tells it - so a sequence containing
+            %% one asks this property whether the reader recovers from a state
+            %% whose recovery is an effect this fixture never honours. The
+            %% answer is no, and it is the right answer. What a 404 does to the
+            %% reader is the core suite's subject, and the other two properties
+            %% over this generator still fuzz it.
+            Chaos = [E || E <- Events, not is_rrc_refresh(E), not is_rrc_not_found(E)],
+            S1 = run_rrc_events(Chaos, S0),
             %% Phase 2: S3 is healthy and the read the shell was waiting on has
             %% expired.
             counters:put(Failures, 1, 0),
             {S2, _} = rabbitmq_stream_s3_remote_reader_core:step(S1, deadline_expired),
             ReadFloor = rabbitmq_stream_s3_remote_reader_core:read_position(S2),
-            rrc_looks_ahead_again(S2, ReadFloor, ?RRC_DRAIN_ROUNDS)
+            rrc_looks_ahead_again(S2, ReadFloor, ?LOOK_AHEAD_ROUNDS)
         end
     ).
 
 is_rrc_refresh({iterator_refreshed, _}) -> true;
 is_rrc_refresh(_Event) -> false.
+
+is_rrc_not_found({fail, _Which, not_found}) -> true;
+is_rrc_not_found(_Event) -> false.
 
 %% A round answers everything outstanding and reads, which is what walks the
 %% consumer to the end of the fragment and puts the frontier where it has to
@@ -2399,28 +2443,39 @@ prop_remote_reader_core_load_bounded() ->
                     {ok, _, It} -> It;
                     _ -> Iterator0
                 end,
-            WindowMax = RequestSize * 8,
+            MaxMemory = RequestSize * 16,
             Opts = #{
-                request_size => RequestSize, window_max => WindowMax, max_depth => MaxDepth
+                request_size => RequestSize, max_memory => MaxMemory, max_depth => MaxDepth
             },
             {S0, _} = rabbitmq_stream_s3_remote_reader_core:init(
                 <<"prop-stream">>, FragRef, 8, Iterator, Opts
             ),
-            %% `read_pos` is never negative, so the most any pending read can
-            %% ask for is the furthest byte any read in the sequence reaches.
+            %% The fetch share is a guarantee the buffer cannot take, so the
+            %% bound on everything held is `memory_ceiling/1` - twice
+            %% the byte bound - crossable by the one range `room/1` admits
+            %% before checking again, and floored at what the read in hand needs.
             MaxReadEnd = lists:max([0 | [O + B || {read, O, B, _} <- Events]]),
-            MaxOutstanding = max(WindowMax, MaxReadEnd) + RequestSize,
-            check_rrc_load(Events, S0, MaxOutstanding, MaxDepth)
+            HeldBound = max(MaxMemory, MaxReadEnd) + RequestSize,
+            check_rrc_load(Events, S0, HeldBound, MaxDepth)
         end
     ).
 
-check_rrc_load([], _State, _MaxOutstanding, _MaxDepth) ->
+check_rrc_load([], _State, _HeldBound, _MaxDepth) ->
     true;
-check_rrc_load([Event | Rest], State0, MaxOutstanding, MaxDepth) ->
+check_rrc_load([Event | Rest], State0, HeldBound, MaxDepth) ->
     State = run_rrc_events([Event], State0),
-    {Outstanding, InFlight} = rabbitmq_stream_s3_remote_reader_core:load(State),
-    Outstanding =< MaxOutstanding andalso InFlight =< MaxDepth andalso
-        check_rrc_load(Rest, State, MaxOutstanding, MaxDepth).
+    {Committed, Buffered, InFlight} = rabbitmq_stream_s3_remote_reader_core:load(State),
+    case Committed + Buffered =< HeldBound andalso InFlight =< MaxDepth of
+        true ->
+            check_rrc_load(Rest, State, HeldBound, MaxDepth);
+        false ->
+            ct:pal(
+                "load bound violated after ~p: committed=~p buffered=~p held=~p "
+                "bound=~p inflight=~p max_depth=~p",
+                [Event, Committed, Buffered, Committed + Buffered, HeldBound, InFlight, MaxDepth]
+            ),
+            false
+    end.
 
 %% =========================================================================
 %% Read buffer (block queue) properties
@@ -2546,7 +2601,9 @@ apply_rp_op({fail, Which}, P0, Got, _FragSize) ->
 apply_rp_op(release, P0, Got, _FragSize) ->
     {rabbitmq_stream_s3_read_pipeline:release(fault, P0), Got};
 apply_rp_op(ready, P0, Got, _FragSize) ->
-    {_Specs, P} = rabbitmq_stream_s3_read_pipeline:ready(8, P0),
+    %% Both bounds at 8: this model is about the queue's bookkeeping across
+    %% re-issue, not about which of the two concurrency bounds binds first.
+    {_Specs, P} = rabbitmq_stream_s3_read_pipeline:ready(8, 8, P0),
     {P, Got};
 apply_rp_op({read, Len}, P0, Got, _FragSize) ->
     ReadPos = rabbitmq_stream_s3_read_pipeline:read_position(P0),

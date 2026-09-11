@@ -6493,12 +6493,30 @@
       },
       "fieldConfig": {
         "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
-            "scaleDistribution": {
-              "type": "linear"
+            "axisBorderShow": false,
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "gradientMode": "opacity",
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
             }
           },
-          "unit": "s"
+          "min": 0,
+          "unit": "bytes"
         },
         "overrides": []
       },
@@ -6510,49 +6528,137 @@
       },
       "id": 132,
       "options": {
-        "calculate": false,
-        "color": {
-          "exponent": 0.5,
-          "fill": "dark-orange",
-          "mode": "scheme",
-          "reverse": false,
-          "scale": "exponential",
-          "scheme": "Oranges",
-          "steps": 64
-        },
-        "exemplars": {
-          "color": "rgba(255,0,255,0.7)"
-        },
-        "filterValues": {
-          "le": 1e-09
-        },
         "legend": {
-          "show": true
-        },
-        "rowsFrame": {
-          "layout": "auto"
+          "calcs": [
+            "mean",
+            "max",
+            "min",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         },
         "tooltip": {
-          "mode": "single",
-          "showColorScale": false,
-          "yHistogram": false
-        },
-        "yAxis": {
-          "axisPlacement": "left",
-          "reverse": false,
-          "unit": "bytes"
+          "mode": "multi"
         }
       },
       "targets": [
         {
-          "expr": "sum by(le) (rate(rabbitmq_stream_s3_prefetch_window_bytes_bucket[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
-          "format": "heatmap",
-          "legendFormat": "{{le}}",
+          "expr": "sum by(rabbitmq_node) (rabbitmq_stream_s3_remote_reader_buffered_bytes * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "{{rabbitmq_node}} buffered",
           "refId": "A"
+        },
+        {
+          "expr": "sum by(rabbitmq_node) (rabbitmq_stream_s3_remote_reader_committed_bytes * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "{{rabbitmq_node}} committed",
+          "refId": "B"
+        },
+        {
+          "expr": "sum by(rabbitmq_node) (rabbitmq_stream_s3_remote_reader_fetch_ceiling_bytes * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "{{rabbitmq_node}} fetch ceiling",
+          "refId": "C"
+        },
+        {
+          "expr": "sum by(rabbitmq_node) (rabbitmq_stream_s3_remote_reader_memory_ceiling_bytes * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "{{rabbitmq_node}} memory ceiling",
+          "refId": "D"
         }
       ],
-      "title": "Prefetch window distribution",
-      "type": "heatmap"
+      "title": "Reader bytes against their ceilings",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "gradientMode": "opacity",
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "min": 0,
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 167
+      },
+      "id": 133,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "min",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum (rate(rabbitmq_stream_s3_remote_reader_prefetch_stall_target[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "target",
+          "refId": "A"
+        },
+        {
+          "expr": "sum (rate(rabbitmq_stream_s3_remote_reader_prefetch_stall_depth[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "depth",
+          "refId": "B"
+        },
+        {
+          "expr": "sum (rate(rabbitmq_stream_s3_remote_reader_prefetch_stall_fetch_budget[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "fetch_budget",
+          "refId": "C"
+        },
+        {
+          "expr": "sum (rate(rabbitmq_stream_s3_remote_reader_prefetch_stall_buffer[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "buffer",
+          "refId": "D"
+        },
+        {
+          "expr": "sum (rate(rabbitmq_stream_s3_remote_reader_prefetch_stall_reach[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "reach",
+          "refId": "E"
+        },
+        {
+          "expr": "sum (rate(rabbitmq_stream_s3_remote_reader_prefetch_stall_peek_failed[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})",
+          "legendFormat": "peek_failed",
+          "refId": "F"
+        }
+      ],
+      "title": "Why readers are not fetching / s",
+      "type": "timeseries"
     },
     {
       "datasource": {

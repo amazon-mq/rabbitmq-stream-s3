@@ -337,14 +337,26 @@ transfer_failed_status_map_retriable_resubmits(_Config) ->
     ?assertMatch([{resubmit_transfer, Ref, _, _, _, 1}], Effects).
 
 transfer_failed_pool_busy_retriable_resubmits(_Config) ->
-    %% A saturated upload pool surfaces as {error, pool_busy}, which
-    %% classify_transfer delivers to the core as the bare atom pool_busy (issue
-    %% #332). It must be classified transient (resubmit_transfer), not fatal
-    %% (resubmit_transfer_delayed).
-    {S0, _} = init_core(),
-    {S1, Ref, _} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(meta(0, 100), S0),
-    {_S2, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(Ref, pool_busy, S1),
-    ?assertMatch([{resubmit_transfer, Ref, _, _, _, 1}], Effects).
+    %% A saturated upload pool surfaces as {error, pool_busy} or {error,
+    %% pool_exhausted}, which classify_transfer delivers to the core as the bare
+    %% atom (issue #332). Both must be classified transient
+    %% (resubmit_transfer), not fatal (resubmit_transfer_delayed): the
+    %% distinction between them is about whether the pool has room to grow into,
+    %% which is the remote reader's concern, and `is_retriable/1` makes anything
+    %% it does not name fatal.
+    lists:foreach(
+        fun(Reason) ->
+            {S0, _} = init_core(),
+            {S1, Ref, _} = rabbitmq_stream_s3_replica_reader_core:fragment_cut(
+                meta(0, 100), S0
+            ),
+            {_S2, Effects} = rabbitmq_stream_s3_replica_reader_core:transfer_failed(
+                Ref, Reason, S1
+            ),
+            ?assertMatch([{resubmit_transfer, Ref, _, _, _, 1}], Effects)
+        end,
+        [pool_busy, pool_exhausted]
+    ).
 
 transfer_failed_stream_error_retriable_resubmits(_Config) ->
     %% A pooled upload connection torn down with the PUT stream checked out.

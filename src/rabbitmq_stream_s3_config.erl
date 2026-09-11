@@ -28,8 +28,10 @@ lives here. Callers use these functions instead of calling
     general_pool_min_size/0,
     general_pool_max_size/0,
     prefetch_request_size/0,
-    prefetch_window_max/0,
+    prefetch_max_memory/0,
     prefetch_max_depth/0,
+    prefetch_auto_tune/0,
+    prefetch_inflight_initial/0,
     fragment_target_size/0,
     persist_threshold/0,
     persist_interval_ms/0,
@@ -64,6 +66,8 @@ lives here. Callers use these functions instead of calling
 ]).
 
 -define(APP, rabbitmq_stream_s3).
+
+-define(MEMORY_REQUESTS, 64).
 
 %% The API backend module. Defaults to the AWS implementation.
 -spec api_backend() -> module().
@@ -153,8 +157,8 @@ general_pool_max_size() ->
 %%
 %% A single S3 connection transfers at roughly 40 MB/s whatever range size is
 %% asked of it, so a remote reader's bandwidth is set by how many range GETs it
-%% runs concurrently. Request size is fixed and the prefetch window is what
-%% adapts; see rabbitmq_stream_s3_remote_reader_core.
+%% runs concurrently. Request size is fixed and what adapts is how many run at
+%% once; see rabbitmq_stream_s3_remote_reader_core.
 %% ------------------------------------------------------------------
 
 %% Bytes per range GET. Large enough to amortise time-to-first-byte over the
@@ -163,17 +167,72 @@ general_pool_max_size() ->
 prefetch_request_size() ->
     application:get_env(?APP, prefetch_request_size, 4_194_304).
 
-%% Ceiling on how far ahead of the consumer a reader fetches, and so on its
-%% memory: it holds or has outstanding at most this plus one request.
--spec prefetch_window_max() -> pos_integer().
-prefetch_window_max() ->
-    application:get_env(?APP, prefetch_window_max, 33_554_432).
+%% Bytes one remote reader may hold, buffered and in flight together.
+%%
+%% Half of it is what fetching may commit and the other half is the buffer's,
+%% and fetching does not consult the buffer - so the worst case, and this bound,
+%% is a full fetch ceiling on top of a buffer holding as much. That is
+%% substantial per reader, and small against what a node streaming at these
+%% rates is already holding.
+%%
+%% The default counts requests because half of it is spent on them: a flat size
+%% would buy fewer at a larger request size. At the default request size it is
+%% 256 MiB, 32 requests of fetching against 128 MiB of buffer.
+-spec prefetch_max_memory() -> pos_integer().
+prefetch_max_memory() ->
+    application:get_env(?APP, prefetch_max_memory, ?MEMORY_REQUESTS * prefetch_request_size()).
 
-%% Most range GETs one reader may have in flight. Also its share of the general
-%% connection pool.
+%% The most range GETs one reader may ever have in flight - a ceiling, not the
+%% operating point. What a reader runs at is searched for from measured
+%% throughput, or `prefetch_inflight_initial` when `prefetch_auto_tune` is off.
+%%
+%% Set generously for that reason. It bounds a reader's share of the general
+%% pool, and a pool that cannot serve a checkout surfaces as `pool_busy` or
+%% `pool_exhausted`, so a ceiling above what the pool can serve costs a backoff,
+%% not a stall.
 -spec prefetch_max_depth() -> pos_integer().
 prefetch_max_depth() ->
-    application:get_env(?APP, prefetch_max_depth, 8).
+    application:get_env(?APP, prefetch_max_depth, 64).
+
+%% Whether a reader searches for its concurrency or runs at a fixed one.
+%%
+%% On, because the right concurrency is not a property of the configuration. The
+%% same reader wants materially different concurrency against a store that has a
+%% round trip to hide behind and one that does not, and against a cold
+%% connection pool and a warm one, so no static setting is right for all of them.
+%%
+%% The failure mode to know about is drift. The search hill-climbs on a rate it
+%% measures over one sample, so variance between samples can let a target past the
+%% peak record a new best by chance, which ratchets the anchor it holds upward.
+%% Past the peak the throughput curve is shallow, so drifting along it costs
+%% little next to running at a fixed setting that is wrong for the store the
+%% reader actually has.
+%%
+%% On also keeps a reader's attach cost proportional to what its consumer asks
+%% for: the search starts at one request, so a client that reads a message and
+%% stops never pays for concurrency it did not use.
+%%
+%% Off, a reader runs at `prefetch_inflight_initial` for its whole life, from the
+%% first pass inside `init/1`. That is the way back if the search is ever the
+%% wrong call for a workload, and it is what to set before reporting a throughput
+%% number that has to be reproducible.
+-spec prefetch_auto_tune() -> boolean().
+prefetch_auto_tune() ->
+    application:get_env(?APP, prefetch_auto_tune, true).
+
+%% How many range GETs a reader keeps in flight when `prefetch_auto_tune` is
+%% off, which it is not by default.
+%%
+%% With the search on this is not consulted at all: a reader starts at one
+%% request and the ramp doubles it into an operating point within a second of
+%% sustained reading, so what a reader runs at is measured rather than
+%% configured, and `prefetch_max_depth` is the only bound on it. What this sets
+%% is the fixed concurrency a reader runs at with the search turned off, which
+%% is why it is sized for a consumer reading faster than the local tier can
+%% serve it rather than for the smallest useful reader.
+-spec prefetch_inflight_initial() -> pos_integer().
+prefetch_inflight_initial() ->
+    application:get_env(?APP, prefetch_inflight_initial, 32).
 
 %% Target byte size at which the replica reader cuts a fragment for upload.
 -spec fragment_target_size() -> pos_integer().
@@ -374,8 +433,10 @@ defaults_test_() ->
         ?_assertEqual(2, general_pool_min_size()),
         ?_assertEqual(200, general_pool_max_size()),
         ?_assertEqual(4_194_304, prefetch_request_size()),
-        ?_assertEqual(33_554_432, prefetch_window_max()),
-        ?_assertEqual(8, prefetch_max_depth()),
+        ?_assertEqual(268_435_456, prefetch_max_memory()),
+        ?_assertEqual(64, prefetch_max_depth()),
+        ?_assertEqual(true, prefetch_auto_tune()),
+        ?_assertEqual(32, prefetch_inflight_initial()),
         ?_assertEqual(?MAX_FRAGMENT_SIZE_B, fragment_target_size()),
         ?_assertEqual(5, persist_threshold()),
         ?_assertEqual(2000, persist_interval_ms()),
@@ -412,6 +473,25 @@ configured_test_() ->
         fun(_) ->
             application:set_env(rabbitmq_stream_s3, bucket, <<"my-bucket">>),
             ?_assertEqual(<<"my-bucket">>, bucket())
+        end
+    ]}.
+
+default_memory_follows_the_request_size_test_() ->
+    {foreach, fun() -> ok end, fun(_) -> application:unset_env(?APP, prefetch_request_size) end, [
+        fun(_) ->
+            application:set_env(?APP, prefetch_request_size, 16_777_216),
+            [
+                ?_assertEqual(?MEMORY_REQUESTS, prefetch_max_memory() div 16_777_216),
+                ?_assertEqual(268_435_456 * 4, prefetch_max_memory())
+            ]
+        end,
+        fun(_) ->
+            %% A configured bound stands at any request size.
+            application:set_env(?APP, prefetch_request_size, 16_777_216),
+            application:set_env(?APP, prefetch_max_memory, 268_435_456),
+            Configured = prefetch_max_memory(),
+            application:unset_env(?APP, prefetch_max_memory),
+            ?_assertEqual(268_435_456, Configured)
         end
     ]}.
 

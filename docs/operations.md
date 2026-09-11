@@ -204,6 +204,46 @@ stream_s3.max_transfer_bytes_per_sec = unlimited
 stream_s3.max_transfer_burst_bytes = 10485760
 ```
 
+### Tuning the remote read path
+
+These bound what one consumer reading from S3 may fetch. What a reader runs at is searched for from the throughput it measures, so most of them are ceilings rather than operating points.
+
+```ini
+# Bytes per range GET. Fixed rather than adaptive: a single S3 connection
+# transfers at roughly the same rate whatever range size is asked of it, so
+# what scales a reader's bandwidth is the number of requests in flight
+# rather than their size. Note that max_memory below defaults to a multiple
+# of this, so raising it raises a reader's memory bound in step unless
+# max_memory is also set. Default: 4 MiB.
+stream_s3.prefetch.request_size = 4194304
+
+# Bytes one reader may hold, buffered and in flight together. Half of it is
+# what fetching may commit and the other half is the buffer's. The fetching
+# half is spent on requests, so it allows max_memory / 2 / request_size of
+# them. Default: 64 x request_size, so 256 MiB at the default request size.
+stream_s3.prefetch.max_memory = 268435456
+
+# The most range GETs one reader may have in flight. A ceiling rather than
+# the operating point, and also a reader's share of the HTTP connection
+# pool.
+# Type: positive integer. Default: 64.
+stream_s3.prefetch.max_depth = 64
+
+# Whether a reader searches for its concurrency from the throughput it
+# measures. Off, every reader runs at inflight_initial for its whole life,
+# which is what to set before taking a throughput measurement that has to be
+# reproducible.
+# Type: boolean. Default: true.
+stream_s3.prefetch.auto_tune = true
+
+# Requests in flight a reader runs at with auto_tune off. Not consulted
+# while the search is on.
+# Type: positive integer. Default: 32.
+stream_s3.prefetch.inflight_initial = 32
+```
+
+All five are read when a reader starts, which is when a consumer begins reading the remote tier. Changing one leaves readers already running on the values they started with, so a consumer part-way through a backlog keeps its old sizing until it reattaches.
+
 ### Read-path integrity
 
 ```ini
@@ -496,20 +536,36 @@ Owned by `rabbitmq_stream_s3_remote_reader`. One counter set per node, summed ac
 | `rabbitmq_stream_s3_read`                              | counter | Number of reads                                                   |
 | `rabbitmq_stream_s3_remote_reader_total_requests`      | counter | S3 requests initiated                                             |
 | `rabbitmq_stream_s3_remote_reader_fatal_errors`        | counter | Remote readers stopped by a non-retryable S3 error                |
+| `rabbitmq_stream_s3_remote_reader_inflight_target`     | gauge   | Requests a remote reader is aiming to keep in flight               |
+| `rabbitmq_stream_s3_remote_reader_fetch_rate_bytes`    | gauge   | Bytes/s S3 delivered over the last sample                          |
+| `rabbitmq_stream_s3_remote_reader_serve_rate_bytes`    | gauge   | Bytes/s handed to the consumer over the last sample                |
+| `rabbitmq_stream_s3_remote_reader_committed_bytes`     | gauge   | Bytes asked of S3 and not yet received                             |
+| `rabbitmq_stream_s3_remote_reader_fetch_ceiling_bytes` | gauge   | Bytes a reader may currently have committed to fetching            |
+| `rabbitmq_stream_s3_remote_reader_buffered_bytes`      | gauge   | Bytes held that the consumer has not read                          |
+| `rabbitmq_stream_s3_remote_reader_memory_ceiling_bytes`| gauge   | Bytes a reader may hold in total, buffered and in flight           |
 
-### Prefetch window histogram
+### Why a reader is not fetching harder
 
-| Metric                              | Description                                                       |
-|-------------------------------------|-------------------------------------------------------------------|
-| `rabbitmq_stream_s3_prefetch_window_bytes_bucket`      | Distribution of the remote reader's prefetch window                |
+Every placement pass ends on exactly one bound and increments one counter, so
+their shares say what governs a reader. Each names the setting that would raise
+it, except the last two, which no setting raises.
 
-The boundaries are derived from the configured sizes at boot: the window moves in whole requests between `prefetch_request_size` and `prefetch_window_max`, so they are spaced by the request size up to the window cap. At the default sizing that is 4, 8, 12, 16, 20, 24, 28, 32 MiB and `+Inf`. The top finite boundary is always the window cap, so `+Inf` stays empty in normal operation. A window that spans more than 16 requests is spaced out rather than given a boundary per step, which bounds the number of series.
+| Metric                                                          | The bound that stopped the pass                          |
+|-----------------------------------------------------------------|----------------------------------------------------------|
+| `rabbitmq_stream_s3_remote_reader_prefetch_stall_target`        | The concurrency target; raise `prefetch_max_depth`, or let the search find it |
+| `rabbitmq_stream_s3_remote_reader_prefetch_stall_depth`         | `prefetch_max_depth` itself                              |
+| `rabbitmq_stream_s3_remote_reader_prefetch_stall_fetch_budget`  | Half `prefetch_max_memory`, the cap on what may be committed |
+| `rabbitmq_stream_s3_remote_reader_prefetch_stall_buffer`        | The memory ceiling: the consumer is far behind           |
+| `rabbitmq_stream_s3_remote_reader_prefetch_stall_reach`         | Nothing left to ask for - the manifest or look-ahead ran out |
+| `rabbitmq_stream_s3_remote_reader_prefetch_stall_peek_failed`   | A look-ahead group fetch is failing                      |
 
-Because the boundaries are fixed at boot, both settings are read at boot too, and readers started later keep running with the sizing the node booted with. Changing either one takes effect on restart.
+An idle reader emits none of these: a reader with no read in hand and nothing
+outstanding is finished rather than stalled.
 
-This metric replaces `rabbitmq_stream_s3_read_size_bytes_bucket`, which no longer exists. Panels and alerts that name the old metric go blank rather than error, so they have to be repointed by hand; the bundled Grafana dashboard already is.
-
-The window grows on a miss and shrinks on sustained hits, so it reads as a load signal rather than a health one. A window pinned at its ceiling while `rabbitmq_stream_s3_buffer_miss` still climbs means consumers are outrunning the remote tier: prefetch has grown as far as it is allowed to and reads are still waiting on S3. A window sitting at its floor means the reader is staying ahead of its consumers and has given back every request it took.
+Read `committed_bytes` against `fetch_ceiling_bytes` and `buffered_bytes`
+against `memory_ceiling_bytes` to see which side of the budget is saturated.
+The two are bounded independently, so a reader can be at one and far from the
+other; summed they cannot say which.
 
 ## Dashboards
 
@@ -537,7 +593,15 @@ The pipeline gauges (`rabbitmq_stream_s3_bytes_in_assembly`, `rabbitmq_stream_s3
 
 S3 supports at least 3,500 PUT/POST/DELETE and 5,500 GET requests per second per partitioned prefix and scales automatically under sustained load. Each fragment is one PUT, so even very high stream throughput produces few PUTs per second. The realistic concern is GETs from many consumers reading old data on the same stream simultaneously. S3's automatic scaling handles sustained load but a sudden burst on a previously idle stream may see brief throttling.
 
-Each remote reader issues fixed-size range GETs (`prefetch_request_size`, 4 MiB) and runs up to `prefetch_max_depth` (8) of them concurrently, so a lagging consumer's request rate is bounded by its depth rather than by its throughput. Lowering the depth trades a consumer's catch-up rate for a lower request rate and fewer pooled connections.
+Each remote reader issues fixed-size range GETs (`prefetch_request_size`, 4 MiB) and runs up to `prefetch_max_depth` (64) of them concurrently, so a lagging consumer's request rate is bounded by its depth rather than by its throughput. Lowering the depth trades a consumer's catch-up rate for a lower request rate and fewer pooled connections.
+
+That is a ceiling rather than what a reader runs at. Concurrency is searched for from measured throughput: a reader starts at one request and the search doubles it while the rate keeps answering, so a consumer that reads a little and stops never reaches the ceiling. `rabbitmq_stream_s3_remote_reader_inflight_target` is where a reader's current target can be read, and budgeting from the ceiling rather than from that gauge overstates the request rate of every reader that is not saturated. Setting `prefetch_auto_tune = false` pins every reader at `prefetch_inflight_initial` instead.
+
+### Remote reader memory
+
+A remote reader may hold up to `prefetch_max_memory`, 256 MiB at the default. Half of it is what fetching may commit and the other half is the buffer's, and fetching does not consult the buffer, so the worst case is a full fetch ceiling on top of a buffer holding as much. Budget that per consumer reading the remote tier rather than per stream. A consumer served by local disk has no remote reader at all, and one that catches up to the local tier stops using the one it had.
+
+`rabbitmq_stream_s3_remote_reader_buffered_bytes` and `rabbitmq_stream_s3_remote_reader_committed_bytes` sum to what a node's readers hold now, against `rabbitmq_stream_s3_remote_reader_memory_ceiling_bytes` for what they are allowed to hold. A reader sitting at that ceiling is one whose consumer is behind rather than one that is misconfigured; lowering `prefetch_max_memory` trades those consumers' catch-up rate for the memory.
 
 ### Local disk and page cache
 

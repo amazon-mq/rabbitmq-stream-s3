@@ -15,7 +15,7 @@ with the runtime once reads are served from it:
   underlying writable binary (the runtime pins it when the sub-binary is
   copied into a message), so the next append copies the entire window rather
   than appending in place. In steady state nearly every delivery re-copies
-  the whole prefetch window (up to `prefetch_window_max`, 32 MiB).
+  the whole buffer (up to half of `prefetch_max_memory`).
 - A reply sub-binary keeps the entire window generation alive in the
   consumer's heap: a ~300-byte chunk-header read can pin the whole window
   until the consumer process happens to collect garbage.
