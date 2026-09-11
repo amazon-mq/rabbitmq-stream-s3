@@ -201,7 +201,8 @@ run_one() ->
                     "target_final=~b target_max=~b "
                     "msgq_avg=~.1f msgq_max=~b reds_per_s=~.2fM elapsed=~.2f "
                     "miss=~b req=~b timeouts=~b queued=~b "
-                    "stall=t~b/d~b/f~b/b~b/r~b committed=~bM/~bM buffered=~bM/~bM~n",
+                    "stall=t~b/d~b/f~b/b~b/r~b committed=~bM/~bM buffered=~bM/~bM "
+                    "checkout=~.2fms ttfb=~.2fms transfer=~.2fms~n",
                     [
                         Depth,
                         MemoryMiB,
@@ -229,7 +230,10 @@ run_one() ->
                         trunc(maps:get(committed_mean, R)) div 1_048_576,
                         trunc(maps:get(fetch_ceiling_mean, R)) div 1_048_576,
                         trunc(maps:get(buffered_mean, R)) div 1_048_576,
-                        trunc(maps:get(memory_ceiling_mean, R)) div 1_048_576
+                        trunc(maps:get(memory_ceiling_mean, R)) div 1_048_576,
+                        maps:get(checkout_ms, maps:get(spans, R)),
+                        maps:get(first_byte_ms, maps:get(spans, R)),
+                        maps:get(transfer_ms, maps:get(spans, R))
                     ]
                 );
             _ ->
@@ -517,9 +521,11 @@ measure(#{fragments := {Stream, [First | _] = Fragments}, opts := Opts} = Args) 
     Sampler = spawn_link(fun() -> sample_loop(Reader, []) end),
     put(drain_limit, env_int("S3B_DRAIN_MIBS", 0)),
     put(drain_started, erlang:monotonic_time(microsecond)),
+    Spans0 = read_spans(),
     T0 = erlang:monotonic_time(millisecond),
     Bytes = drain(Reader, maps:get(budget, Args), 0),
     T1 = erlang:monotonic_time(millisecond),
+    Spans = span_means_ms(Spans0, read_spans()),
     Sampler ! {stop, self()},
     InFlight =
         receive
@@ -564,6 +570,7 @@ measure(#{fragments := {Stream, [First | _] = Fragments}, opts := Opts} = Args) 
         fetch_ceiling_mean => mean([F || {_, F, _, _} <- Bytes4]),
         buffered_mean => mean([B || {_, _, B, _} <- Bytes4]),
         memory_ceiling_mean => mean([B || {_, _, _, B} <- Bytes4]),
+        spans => Spans,
         counters => counters(),
         reds_per_s =>
             case Reds of
@@ -668,6 +675,48 @@ byte_gauges() ->
 %% two want different fixes.
 target_gauge() ->
     gauge(<<"remote_reader_inflight_target">>).
+
+%% What a read spent before the request went on the wire, waiting for S3's first
+%% byte, and transferring the body. A run that comes out slow at a concurrency
+%% the search should have found is either paying for connections or waiting on
+%% the store, and the total alone cannot say which.
+%%
+%% `{Count, SumSeconds}` per stage. Taken either side of the drain and
+%% subtracted, because the histograms are cumulative and a sweep runs every
+%% scenario in one VM.
+read_spans() ->
+    Format = rabbitmq_stream_s3_api:request_duration_prometheus_format(),
+    #{
+        checkout => count_and_sum(Format, read_span_duration_seconds, {span, checkout}),
+        first_byte => count_and_sum(Format, read_span_duration_seconds, {span, first_byte}),
+        total => count_and_sum(Format, request_duration_seconds, {kind, read})
+    }.
+
+%% A label that is gone matches nothing and the match fails, for the same reason
+%% `gauge/1` raises on a name it cannot find.
+count_and_sum(Format, Metric, Label) ->
+    #{values := Values} = maps:get(Metric, Format),
+    [{_, _, Count, Sum}] = [V || {Labels, _, _, _} = V <- Values, lists:member(Label, Labels)],
+    {Count, Sum}.
+
+%% The transfer is not measured directly: it is what the total has left once the
+%% other two stages are taken out of it.
+span_means_ms(Before, After) ->
+    Mean = fun(Stage) ->
+        {Count0, Sum0} = maps:get(Stage, Before),
+        {Count, Sum} = maps:get(Stage, After),
+        case Count - Count0 of
+            0 -> 0.0;
+            N -> (Sum - Sum0) * 1000 / N
+        end
+    end,
+    Checkout = Mean(checkout),
+    FirstByte = Mean(first_byte),
+    #{
+        checkout_ms => Checkout,
+        first_byte_ms => FirstByte,
+        transfer_ms => Mean(total) - Checkout - FirstByte
+    }.
 
 %% Zero when nothing is registered yet, but an error when the registry is up
 %% and the name is not in it: a renamed metric otherwise reads as a column of

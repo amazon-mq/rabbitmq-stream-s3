@@ -484,7 +484,7 @@ What each answers:
 - `first_byte` is S3's own latency and is not something a broker setting changes. It is a fixed cost per request, so a high value is an argument for a larger `prefetch_request_size`, which spends memory to make fewer requests
 - a low `checkout` and a low `first_byte` against a high total leave the body transfer, which is the network
 
-All three stamps are taken in the reader process, so a reader that cannot keep up with its own mailbox inflates every stage rather than showing up as its own term. Check `erlang:process_info(Pid, message_queue_len)` before reading the stages as a statement about S3.
+All three stamps are taken in the reader process, so a reader that cannot keep up with its own mailbox inflates every stage rather than showing up as its own term. `checkout` is the one to be careful with: it covers a `gen_server:call` to the pool, and the selective receive that waits for the reply has to scan the mailbox, so a backed-up reader reads as a slow pool. Check `erlang:process_info(Pid, message_queue_len)` before reading the stages as a statement about S3 or about the pool.
 
 ### S3 transport (per-node)
 

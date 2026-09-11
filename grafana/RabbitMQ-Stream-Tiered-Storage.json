@@ -4895,12 +4895,82 @@
       "type": "timeseries"
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Mean time a remote read spent in each of its stages. The three stack to the mean read duration: checkout is the pool and the signing, first byte is S3, and the rest is the body transfer. All three are stamped in the reader process, so a reader that cannot keep up with its mailbox raises every band - checkout most of all, since it waits on a call to the pool.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 40,
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
+          "min": 0,
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 121
+      },
+      "id": 134,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "(sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_read_span_duration_seconds_sum{span=\"checkout\"}[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})) / (sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_request_duration_seconds_count{kind=\"read\"}[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"}))",
+          "legendFormat": "{{rabbitmq_node}} checkout",
+          "refId": "A"
+        },
+        {
+          "expr": "(sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_read_span_duration_seconds_sum{span=\"first_byte\"}[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})) / (sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_request_duration_seconds_count{kind=\"read\"}[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"}))",
+          "legendFormat": "{{rabbitmq_node}} first byte",
+          "refId": "B"
+        },
+        {
+          "expr": "((sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_request_duration_seconds_sum{kind=\"read\"}[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})) - (sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_read_span_duration_seconds_sum{span=\"checkout\"}[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"})) - (sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_read_span_duration_seconds_sum{span=\"first_byte\"}[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"}))) / (sum by(rabbitmq_node) (rate(rabbitmq_stream_s3_request_duration_seconds_count{kind=\"read\"}[$__rate_interval]) * on(instance, job) group_left(rabbitmq_cluster, rabbitmq_node) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", rabbitmq_endpoint=\"$endpoint\"}))",
+          "legendFormat": "{{rabbitmq_node}} transfer",
+          "refId": "C"
+        }
+      ],
+      "title": "Read time by stage",
+      "type": "timeseries"
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 121
+        "y": 130
       },
       "id": 105,
       "title": "Log Reader",
@@ -4935,7 +5005,7 @@
         "h": 4,
         "w": 12,
         "x": 0,
-        "y": 122
+        "y": 131
       },
       "id": 106,
       "options": {
@@ -4988,7 +5058,7 @@
         "h": 4,
         "w": 12,
         "x": 12,
-        "y": 122
+        "y": 131
       },
       "id": 107,
       "options": {
@@ -5201,7 +5271,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 126
+        "y": 135
       },
       "id": 108,
       "options": {
@@ -5424,7 +5494,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 126
+        "y": 135
       },
       "id": 109,
       "options": {
@@ -5647,7 +5717,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 135
+        "y": 144
       },
       "id": 110,
       "options": {
@@ -5870,7 +5940,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 135
+        "y": 144
       },
       "id": 111,
       "options": {
@@ -6108,7 +6178,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 144
+        "y": 153
       },
       "id": 112,
       "options": {
@@ -6143,7 +6213,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 153
+        "y": 162
       },
       "id": 104,
       "title": "Remote Reader",
@@ -6191,7 +6261,7 @@
         "h": 4,
         "w": 12,
         "x": 0,
-        "y": 154
+        "y": 163
       },
       "id": 40,
       "options": {
@@ -6244,7 +6314,7 @@
         "h": 4,
         "w": 12,
         "x": 12,
-        "y": 154
+        "y": 163
       },
       "id": 41,
       "options": {
@@ -6457,7 +6527,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 158
+        "y": 167
       },
       "id": 127,
       "options": {
@@ -6524,7 +6594,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 158
+        "y": 167
       },
       "id": 132,
       "options": {
@@ -6606,7 +6676,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 167
+        "y": 176
       },
       "id": 133,
       "options": {
@@ -6849,7 +6919,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 167
+        "y": 176
       },
       "id": 44,
       "options": {
@@ -7067,7 +7137,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 176
+        "y": 185
       },
       "id": 43,
       "options": {
@@ -7285,7 +7355,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 176
+        "y": 185
       },
       "id": 45,
       "options": {
@@ -7323,7 +7393,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 185
+        "y": 194
       },
       "id": 128,
       "title": "HTTP Connection Pools",
@@ -7528,7 +7598,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 186
+        "y": 195
       },
       "id": 129,
       "options": {
@@ -7762,7 +7832,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 186
+        "y": 195
       },
       "id": 130,
       "options": {
@@ -7991,7 +8061,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 195
+        "y": 204
       },
       "id": 131,
       "options": {
