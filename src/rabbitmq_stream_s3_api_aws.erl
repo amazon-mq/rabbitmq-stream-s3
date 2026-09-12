@@ -32,10 +32,7 @@ A wrapper around the AWS S3 HTTP API.
 ]).
 
 %% For the pool. Not to be called by anyone else.
--export([hostname/0, note_request_started/0, note_request_finished/0]).
-
-%% For the auth backend, which signs the host this module derives.
--export([hostname/1]).
+-export([endpoint/0, note_request_started/0, note_request_finished/0]).
 
 -ifdef(TEST).
 %% For tests that need to observe the counters this module owns, including the
@@ -248,7 +245,7 @@ stream_put(Key, ContentLength, Opts0) when is_binary(Key) andalso is_map(Opts0) 
         body => no_body,
         opts => Opts0#{stream_payload => true}
     },
-    case rabbitmq_stream_s3_auth:authorize(Req, Headers0) of
+    case authorize_request(Req, Headers0) of
         {ok, Headers} ->
             Pool = ?UPLOAD_POOL,
             %% active_requests is owned by the pool and moved on the checkout
@@ -917,7 +914,7 @@ request(Method, Path, Headers0, Body, Opts) when
         is_map(Opts)
 ->
     Req = #{method => Method, path => Path, body => Body, opts => Opts},
-    case rabbitmq_stream_s3_auth:authorize(Req, Headers0) of
+    case authorize_request(Req, Headers0) of
         {ok, Headers} ->
             %% active_requests is owned by the pool, tied to the checkout that
             %% request1/5 does below (see note_request_started/0).
@@ -1007,7 +1004,7 @@ postprocess_response(_) ->
 
 request_async(Method, Path, Headers0, Body, Opts) ->
     Req = #{method => Method, path => Path, body => Body, opts => Opts},
-    case rabbitmq_stream_s3_auth:authorize(Req, Headers0) of
+    case authorize_request(Req, Headers0) of
         {ok, Headers} ->
             Pool = ?GENERAL_POOL,
             start_async_request(Pool, Method, Path, Headers, Body, Opts);
@@ -1046,16 +1043,46 @@ maybe_set_timer(#{timeout := Timeout}, StreamRef, State) ->
 maybe_set_timer(_Opts, _StreamRef, State) ->
     State.
 
--spec hostname() -> {ok, binary()} | {error, any()}.
-hostname() ->
+-doc """
+The endpoint host, without the bucket.
+
+The connection pool connects to this host, and TLS verifies it. Requests use
+virtual-hosted addressing, so the bucket is a subdomain of it. See
+`request_host/0`.
+""".
+-spec endpoint() -> {ok, binary()} | {error, any()}.
+endpoint() ->
     case rabbitmq_stream_s3_auth_aws:region() of
-        {ok, Region} -> {ok, hostname(Region)};
+        {ok, Region} -> {ok, derived_endpoint(Region)};
         {error, _} = Err -> Err
     end.
 
--spec hostname(Region :: binary()) -> binary().
-hostname(Region) ->
+-spec derived_endpoint(Region :: binary()) -> binary().
+derived_endpoint(Region) ->
     <<"s3.", Region/binary, $., (tld(Region))/binary>>.
+
+%% The bucket as a subdomain of the endpoint. This goes in `host`, so a
+%% signature covers it.
+-spec request_host() -> {ok, binary()} | {error, any()}.
+request_host() ->
+    case endpoint() of
+        {ok, Endpoint} ->
+            {ok, <<(rabbitmq_stream_s3_config:bucket())/binary, $., Endpoint/binary>>};
+        {error, _} = Err ->
+            Err
+    end.
+
+%% This client decides where a request goes, not the auth backend. It sets
+%% `host` here, and the backend signs the host it receives.
+-spec authorize_request(rabbitmq_stream_s3_auth:request(), req_headers()) ->
+    {ok, req_headers()} | {error, any()}.
+authorize_request(Req, Headers) ->
+    case request_host() of
+        {ok, Host} ->
+            rabbitmq_stream_s3_auth:authorize(Req, Headers#{<<"host">> => Host});
+        {error, _} = Err ->
+            Err
+    end.
 
 -spec tld(Region :: binary()) -> binary().
 tld(Region) ->
@@ -1531,6 +1558,31 @@ async_slice_mode_buffers_data_test() ->
     {continue, S} = handle_async({gun_data, C, R, nofin, <<"23">>}, R, State0),
     ?assertEqual([<<"23">>, <<"01">>], maps:get(data, S)),
     ?assertEqual(4, maps:get(pending_bytes, S)).
+
+derived_endpoint_test() ->
+    ?assertEqual(<<"s3.us-east-1.amazonaws.com">>, derived_endpoint(<<"us-east-1">>)),
+    %% Partitions outside the default TLD.
+    ?assertEqual(<<"s3.cn-north-1.amazonaws.com.cn">>, derived_endpoint(<<"cn-north-1">>)).
+
+request_host_puts_the_bucket_under_the_endpoint_test() ->
+    Region = persistent_term:get(rabbitmq_stream_s3_api_aws_region, undefined),
+    Bucket = application:get_env(rabbitmq_stream_s3, bucket),
+    persistent_term:put(rabbitmq_stream_s3_api_aws_region, <<"us-east-1">>),
+    ok = application:set_env(rabbitmq_stream_s3, bucket, <<"examplebucket">>),
+    try
+        %% The pool connects to the endpoint. Only the request carries the bucket.
+        ?assertEqual({ok, <<"s3.us-east-1.amazonaws.com">>}, endpoint()),
+        ?assertEqual({ok, <<"examplebucket.s3.us-east-1.amazonaws.com">>}, request_host())
+    after
+        case Bucket of
+            undefined -> application:unset_env(rabbitmq_stream_s3, bucket);
+            {ok, B} -> application:set_env(rabbitmq_stream_s3, bucket, B)
+        end,
+        case Region of
+            undefined -> persistent_term:erase(rabbitmq_stream_s3_api_aws_region);
+            _ -> persistent_term:put(rabbitmq_stream_s3_api_aws_region, Region)
+        end
+    end.
 
 delete_many_body_test() ->
     ?assertEqual(

@@ -541,7 +541,7 @@ Opens a connection to S3 in the configured region.
 -spec open() -> {ok, pid()} | {error, any()}.
 open() ->
     %% NOTE: unfortunately, `inet:hostname()` is a string not a binary.
-    case rabbitmq_stream_s3_api_aws:hostname() of
+    case rabbitmq_stream_s3_api_aws:endpoint() of
         {ok, HostBin} ->
             Host = binary_to_list(HostBin),
             Opts = #{

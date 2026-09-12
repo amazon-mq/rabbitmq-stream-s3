@@ -239,7 +239,7 @@ cancel_timer(TRef) -> erlang:cancel_timer(TRef, [{async, true}, {info, false}]).
 %% Region is required to build the request host and to sign requests, so a
 %% failure here cannot be papered over: callers must surface it. We return a
 %% tagged tuple (rather than the bare binary) so the failure propagates as a
-%% clean {error, _} through hostname/0 and sign_headers/8 instead of crashing
+%% clean {error, _} through endpoint/0 and sign_headers/8 instead of crashing
 %% the calling worker with a badarg on binary construction. Once a region is
 %% known (from config or a successful IMDS lookup) it is cached in
 %% persistent_term and never expires, so this only ever fails transiently before
@@ -578,12 +578,12 @@ authorize(#{method := Method, path := Path, body := Body, opts := Opts}, Headers
 sign_headers(Headers, AccessKey, SecretKey, SecurityToken, Method, Path, Body, Opts) ->
     case region() of
         {ok, Region} ->
-            Bucket = rabbitmq_stream_s3_config:bucket(),
-            Host = <<Bucket/binary, $., (rabbitmq_stream_s3_api_aws:hostname(Region))/binary>>,
             {ok,
                 sign_headers(
                     calendar:universal_time(),
-                    Host,
+                    %% The client addressed the request. The signature covers
+                    %% the host it chose, not one derived again here.
+                    maps:get(<<"host">>, Headers),
                     Region,
                     Headers,
                     AccessKey,
@@ -929,7 +929,9 @@ authorize_dispatches_through_auth_behaviour_test() ->
         Req = #{method => <<"GET">>, path => <<"/test.txt">>, body => <<>>, opts => #{}},
         %% Through the dispatcher rather than this module directly: the
         %% behaviour wiring is what is under test, not the signing.
-        {ok, Headers} = rabbitmq_stream_s3_auth:authorize(Req, #{}),
+        {ok, Headers} = rabbitmq_stream_s3_auth:authorize(
+            Req, #{<<"host">> => <<"examplebucket.s3.us-east-1.amazonaws.com">>}
+        ),
         ?assertEqual(
             <<"examplebucket.s3.us-east-1.amazonaws.com">>, maps:get(<<"host">>, Headers)
         ),
