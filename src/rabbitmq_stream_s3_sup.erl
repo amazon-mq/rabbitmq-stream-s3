@@ -46,10 +46,13 @@ init([]) ->
     rabbitmq_stream_s3_registry:init(),
     rabbitmq_stream_s3_manifest:init(),
     SupFlags = #{strategy => one_for_one, intensity => 3, period => 5},
-    CredentialServer = #{
-        id => rabbitmq_stream_s3_api_aws,
+    %% The API backend starts what it needs: its counters, and the auth backend
+    %% that signs its requests. A backend that needs nothing returns `ignore`.
+    ApiBackend = rabbitmq_stream_s3_config:api_backend(),
+    ApiBackendServer = #{
+        id => ApiBackend,
         type => worker,
-        start => {rabbitmq_stream_s3_api_aws, start_link, []}
+        start => {ApiBackend, start_link, []}
     },
     BucketMonitor = #{
         id => rabbitmq_stream_s3_bucket_monitor,
@@ -114,7 +117,7 @@ init([]) ->
         start => {rabbitmq_stream_s3_gc_scheduler, start_link, []}
     },
     Procs = [
-        CredentialServer,
+        ApiBackendServer,
         BucketMonitor,
         ManifestCache,
         Reaper,

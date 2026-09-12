@@ -14,6 +14,7 @@ lives here. Callers use these functions instead of calling
 
 -export([
     api_backend/0,
+    auth_backend/0,
     account_id/0,
     aws_access_key/0,
     aws_secret_key/0,
@@ -73,6 +74,12 @@ lives here. Callers use these functions instead of calling
 -spec api_backend() -> module().
 api_backend() ->
     application:get_env(?APP, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_aws).
+
+%% The auth backend module. Only an API backend with requests to authorize reads
+%% it. The filesystem backend never does.
+-spec auth_backend() -> module().
+auth_backend() ->
+    application:get_env(?APP, rabbitmq_stream_s3_auth, rabbitmq_stream_s3_auth_aws).
 
 %% AWS credentials. Return `undefined` when not configured (instance role is used).
 -spec aws_access_key() -> binary() | undefined.
@@ -422,6 +429,7 @@ kms_encryption_context() ->
 defaults_test_() ->
     [
         ?_assertEqual(rabbitmq_stream_s3_api_aws, api_backend()),
+        ?_assertEqual(rabbitmq_stream_s3_auth_aws, auth_backend()),
         ?_assertEqual(undefined, aws_access_key()),
         ?_assertEqual(undefined, aws_secret_key()),
         ?_assertEqual(undefined, aws_security_token()),

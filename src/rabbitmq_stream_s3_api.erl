@@ -120,6 +120,14 @@ response) is non-definitive and a caller must not treat it as inaccessible.
     | {done_cancel, {error, any()}}
     | ignore.
 -callback cancel_async(async_req(), async_state()) -> ok.
+-doc """
+Start whatever the backend needs supervised, or `ignore` when it needs nothing.
+
+The supervisor lists this backend unconditionally. A backend that reaches no
+network returns `ignore`, and so does one whose auth scheme holds no refreshable
+state.
+""".
+-callback start_link() -> {ok, pid()} | ignore | {error, term()}.
 
 -define(C_GET, 1).
 -define(C_GET_RANGE, 2).
