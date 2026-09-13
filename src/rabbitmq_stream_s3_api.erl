@@ -39,7 +39,9 @@ file-system operations. Use that in non-unit tests.
     request_duration_prometheus_format/0
 ]).
 
--export([backend/0]).
+%% For rabbitmq_stream_s3_api_aws_pool, so that it does not resolve a backend
+%% module of its own.
+-export([needs_http_pool/0, endpoint/0]).
 
 -type key() :: rabbitmq_stream_s3:key().
 -export_type([key/0]).
@@ -128,6 +130,20 @@ network returns `ignore`, and so does one whose auth scheme holds no refreshable
 state.
 """.
 -callback start_link() -> {ok, pid()} | ignore | {error, term()}.
+-doc """
+The host `rabbitmq_stream_s3_api_aws_pool` connects to for this backend.
+
+The host only. The port and TLS describe how the client reaches a host, not what
+the store's API is, so the HTTP client configures those.
+
+A backend that implements this needs connection pools. A backend that reaches no
+network, such as the filesystem one, implements nothing here and gets no pool.
+
+`{error, _}` means the host is not known yet, not that it never will be. An IMDS
+lookup that has not succeeded returns this, so the pool retries.
+""".
+-callback endpoint() -> {ok, Host :: binary()} | {error, any()}.
+-optional_callbacks([endpoint/0]).
 
 -define(C_GET, 1).
 -define(C_GET_RANGE, 2).
@@ -153,6 +169,24 @@ state.
 
 backend() ->
     rabbitmq_stream_s3_config:api_backend().
+
+-doc """
+Whether the configured backend needs `rabbitmq_stream_s3_api_aws_pool` running.
+
+A backend that implements `endpoint/0` has a host to connect to. This covers the
+filesystem backend and the fault-injecting wrapper around it without naming
+either.
+""".
+-spec needs_http_pool() -> boolean().
+needs_http_pool() ->
+    Backend = backend(),
+    _ = code:ensure_loaded(Backend),
+    erlang:function_exported(Backend, endpoint, 0).
+
+%% The `endpoint/0` callback documents this.
+-spec endpoint() -> {ok, Host :: binary()} | {error, any()}.
+endpoint() ->
+    (backend()):endpoint().
 
 counter() ->
     persistent_term:get(?COUNTER_KEY).

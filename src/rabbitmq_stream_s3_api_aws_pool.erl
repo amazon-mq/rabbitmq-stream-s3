@@ -3,14 +3,17 @@
 
 -module(rabbitmq_stream_s3_api_aws_pool).
 -moduledoc """
-A pool of connections to S3.
+A pool of connections to the object store.
 
-This plugin makes requests to S3 very often. A pool helps reduce wasted TLS
-handshakes.
+This plugin sends requests to the remote tier very often. A pool removes most of
+the TLS handshakes.
 
-This module can be used to spawn independent pools. Writes take longer than
-reads because they upload tens of megabytes, so separating the writer pool from
-the reader pool avoids reader starvation.
+This module can start independent pools. A write takes longer than a read,
+because it uploads tens of megabytes. A separate writer pool therefore keeps
+writes from starving the readers.
+
+The configured API backend supplies the host, so one pool serves whichever store
+the plugin uses.
 """.
 
 -include_lib("kernel/include/logger.hrl").
@@ -200,8 +203,10 @@ start_link(Name, Config) ->
 
 init(#{min_size := MinSize, max_size := MaxSize, name := Name} = Config) ->
     logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_STREAM_S3}),
-    case rabbitmq_stream_s3_api:backend() of
-        rabbitmq_stream_s3_api_aws ->
+    case rabbitmq_stream_s3_api:needs_http_pool() of
+        false ->
+            ignore;
+        true ->
             Cnt = seshat:new(rabbitmq_stream_s3, Name, ?COUNTERS, #{
                 module => ?MODULE,
                 pool => Name
@@ -214,9 +219,7 @@ init(#{min_size := MinSize, max_size := MaxSize, name := Name} = Config) ->
                 open_fun = maps:get(open_fun, Config, fun open/0),
                 usable_fun = maps:get(usable_fun, Config, fun usable/1),
                 close_fun = maps:get(close_fun, Config, fun gun:close/1)
-            }};
-        _ ->
-            ignore
+            }}
     end.
 
 handle_call(
@@ -260,18 +263,18 @@ handle_call(Request, From, State) ->
 
 %% Record a connection as checked out and account the request. `add_checkout`
 %% and `del_checkout` are the only two places `checkouts`/`checkouts_rev` change,
-%% so api_aws's `active_requests` gauge - one in-flight request per checkout,
+%% so the transport's `active_requests` gauge - one in-flight request per checkout,
 %% shared across every pool and therefore incremented rather than derived - is
 %% welded to the map and cannot drift from it, whichever way the checkout ends.
 add_checkout(Conn, MRef, #?MODULE{checkouts = Checkouts, checkouts_rev = CheckoutsRev} = State) ->
-    ok = rabbitmq_stream_s3_api_aws:note_request_started(),
+    ok = rabbitmq_stream_s3_http:note_request_started(),
     State#?MODULE{
         checkouts = Checkouts#{Conn => MRef},
         checkouts_rev = CheckoutsRev#{MRef => Conn}
     }.
 
 del_checkout(Conn, MRef, #?MODULE{checkouts = Checkouts, checkouts_rev = CheckoutsRev} = State) ->
-    ok = rabbitmq_stream_s3_api_aws:note_request_finished(),
+    ok = rabbitmq_stream_s3_http:note_request_finished(),
     State#?MODULE{
         checkouts = maps:remove(Conn, Checkouts),
         checkouts_rev = maps:remove(MRef, CheckoutsRev)
@@ -530,23 +533,28 @@ grow(N, #?MODULE{monitors = Monitors0, created = Created0, open_fun = OpenFun} =
             },
             grow(N - 1, State);
         {error, Reason} ->
-            ?LOG_WARNING("Failed to open S3 connection: ~0p", [Reason]),
+            ?LOG_WARNING("Failed to open object store connection: ~0p", [Reason]),
             erlang:send_after(1_000, self(), grow),
             State0
     end.
 
 -doc """
-Opens a connection to S3 in the configured region.
+Opens a connection to the configured object store.
+
+The backend says which host; the port and whether to use TLS are this client's
+own configuration. The host is asked for per connection rather than cached: it
+can be unavailable at startup (an IMDS region lookup that has not succeeded yet)
+and become available later.
 """.
 -spec open() -> {ok, pid()} | {error, any()}.
 open() ->
     %% NOTE: unfortunately, `inet:hostname()` is a string not a binary.
-    case rabbitmq_stream_s3_api_aws:endpoint() of
+    case rabbitmq_stream_s3_api:endpoint() of
         {ok, HostBin} ->
             Host = binary_to_list(HostBin),
             Opts = #{
                 transport => tls,
-                %% AWS S3 only supports HTTP/1.1.
+                %% The object store APIs this plugin talks to are HTTP/1.1.
                 protocols => [http],
                 tls_opts => [
                     {verify, verify_peer},
@@ -586,8 +594,8 @@ open() ->
             },
             gun:open(Host, 443, Opts);
         {error, _} = Err ->
-            %% Region is not yet known (e.g. IMDS lookup not yet successful).
-            %% Surface a clean error rather than crashing the pool.
+            %% The endpoint is not yet known (e.g. IMDS lookup not yet
+            %% successful). Surface a clean error rather than crashing the pool.
             Err
     end.
 
@@ -848,11 +856,11 @@ active_requests_balanced_across_checkout_ends_test() ->
         end
     end).
 
-%% Give Fun a reader for api_aws's active_requests gauge, which this module
-%% moves but api_aws owns. Delegating keeps the counter's key, size and indices
+%% Give Fun a reader for http module's active_requests gauge, which this module
+%% moves but http module owns. Delegating keeps the counter's key, size and indices
 %% in the one module that defines them.
 with_active_requests_counter(Fun) ->
-    rabbitmq_stream_s3_api_aws:with_counter(fun(Read) ->
+    rabbitmq_stream_s3_http:with_counter(fun(Read) ->
         Fun(fun() -> Read(active_requests) end)
     end).
 
