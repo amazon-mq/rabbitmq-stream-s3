@@ -26,6 +26,7 @@ lives here. Callers use these functions instead of calling
     aws_region/0,
     aws_region_endpoints/0,
     endpoint/0,
+    streaming_upload/0,
     bucket/0,
     api_fs_data_dir/0,
     upload_pool_min_size/0,
@@ -150,6 +151,16 @@ aws_region_endpoints() ->
 -spec endpoint() -> binary() | undefined.
 endpoint() ->
     application:get_env(?APP, endpoint, undefined).
+
+%% How a fragment's body is sent.
+%%
+%% `chunked` streams it as one PUT using S3's aws-chunked encoding with a
+%% trailing checksum: a single request that never buffers more than a chunk.
+%% `multipart` sends it as an upload of several ordinary PUTs, for stores that
+%% do not implement that S3 extension.
+-spec streaming_upload() -> chunked | multipart.
+streaming_upload() ->
+    application:get_env(?APP, streaming_upload, chunked).
 
 %% Required. Crashes with badmatch if not configured.
 -spec bucket() -> binary().
@@ -472,6 +483,7 @@ defaults_test_() ->
         ?_assertEqual(undefined, account_id()),
         ?_assertEqual(#{}, aws_region_endpoints()),
         ?_assertEqual(undefined, endpoint()),
+        ?_assertEqual(chunked, streaming_upload()),
         ?_assertEqual(undefined, api_fs_data_dir()),
         ?_assertEqual(0, upload_pool_min_size()),
         ?_assertEqual(20, upload_pool_max_size()),
@@ -512,6 +524,15 @@ defaults_test_() ->
         ?_assertEqual(undefined, kms_key_id()),
         ?_assertEqual(#{}, kms_encryption_context())
     ].
+
+streaming_upload_is_configurable_test() ->
+    try
+        ?assertEqual(chunked, streaming_upload()),
+        ok = application:set_env(?APP, streaming_upload, multipart),
+        ?assertEqual(multipart, streaming_upload())
+    after
+        application:unset_env(?APP, streaming_upload)
+    end.
 
 auth_backend_is_configurable_test() ->
     try

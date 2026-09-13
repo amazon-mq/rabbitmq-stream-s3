@@ -40,6 +40,9 @@ A wrapper around the AWS S3 HTTP API.
 -export([with_counter/1]).
 -endif.
 
+%% S3 requires at least 5 MiB per part, except the last, and caps an upload at
+%% 10,000 parts. 8 MiB clears that floor and bounds what an uploader holds.
+-define(MULTIPART_PART_BYTES, 8388608).
 -define(GENERAL_POOL, rabbitmq_stream_s3_general_pool).
 -define(UPLOAD_POOL, rabbitmq_stream_s3_upload_pool).
 %% How long the read path waits for a pooled connection before returning
@@ -229,7 +232,13 @@ put(Key, Data, Opts) when is_binary(Key) andalso is_map(Opts) ->
     end.
 
 -spec stream_put(key(), pos_integer(), request_opts()) -> {ok, async_state()} | {error, any()}.
-stream_put(Key, ContentLength, Opts0) when is_binary(Key) andalso is_map(Opts0) ->
+stream_put(Key, ContentLength, Opts) when is_binary(Key) andalso is_map(Opts) ->
+    case rabbitmq_stream_s3_config:streaming_upload() of
+        chunked -> chunked_stream_put(Key, ContentLength, Opts);
+        multipart -> multipart_stream_put(Key, Opts)
+    end.
+
+chunked_stream_put(Key, ContentLength, Opts0) ->
     Method = <<"PUT">>,
     Path = key_to_path(Key),
     EncodedLength = aws_chunked_encoded_length(ContentLength),
@@ -256,6 +265,7 @@ stream_put(Key, ContentLength, Opts0) when is_binary(Key) andalso is_map(Opts0) 
                     inc(?C_TOTAL_REQUESTS, 1),
                     StreamRef = gun:headers(Conn, Method, Path, Headers),
                     State = #{
+                        mode => chunked,
                         pool => Pool,
                         conn => Conn,
                         stream_ref => StreamRef,
@@ -278,7 +288,10 @@ stream_data(#{data := PendingData0, pending_bytes := PendingBytes0} = State0, Da
     PendingData = [PendingData0, Data],
     PendingBytes = PendingBytes0 + iolist_size(Data),
     State = State0#{data := PendingData, pending_bytes := PendingBytes},
-    flush_chunks(State).
+    case State of
+        #{mode := chunked} -> flush_chunks(State);
+        #{mode := multipart} -> flush_parts(State)
+    end.
 
 flush_chunks(
     #{
@@ -296,6 +309,10 @@ flush_chunks(State) ->
     State.
 
 -spec stream_finish(async_state(), non_neg_integer()) -> ok | {error, any()}.
+stream_finish(#{mode := multipart} = State, _Crc32) ->
+    %% A multipart object's ETag is not a digest of its bytes, so there is no
+    %% aggregate checksum to send. Each part carries content-md5 instead.
+    multipart_stream_finish(State);
 stream_finish(
     #{
         conn := Conn,
@@ -331,11 +348,179 @@ stream_finish(
         finish_async(State)
     end.
 
+%% -------------------------------------------------------------------------
+%% Internal: multipart upload
+%% -------------------------------------------------------------------------
+
+multipart_stream_put(Key, Opts) ->
+    Path = key_to_path(Key),
+    case request(<<"POST">>, <<Path/binary, "?uploads=">>, sse_headers(Key), <<>>, Opts) of
+        {ok, #{status := 200, body := Body}} ->
+            case decode_upload_id(Body) of
+                <<>> ->
+                    {error, no_upload_id};
+                UploadId ->
+                    {ok, #{
+                        mode => multipart,
+                        path => Path,
+                        upload_id => UploadId,
+                        part_number => 1,
+                        %% Newest first. multipart_complete/1 reverses it.
+                        parts => [],
+                        data => [],
+                        pending_bytes => 0,
+                        opts => Opts
+                    }}
+            end;
+        {ok, #{status := _} = Other} ->
+            log_unexpected_status(?FUNCTION_NAME, Other, Key),
+            {error, Other};
+        {error, _} = Err ->
+            Err
+    end.
+
+%% stream_data/2 returns a state, not a result. A failed part latches here, and
+%% stream_finish/2 reports it.
+flush_parts(#{failed := _} = State) ->
+    State#{data := [], pending_bytes := 0};
+%% The remainder stays buffered. Only the last part of an upload can be under
+%% the minimum size.
+flush_parts(#{pending_bytes := PendingBytes, data := PendingData} = State0) when
+    PendingBytes >= ?MULTIPART_PART_BYTES
+->
+    <<Part:?MULTIPART_PART_BYTES/binary, Rest/binary>> = iolist_to_binary(PendingData),
+    case upload_part(State0, Part) of
+        {ok, State} ->
+            flush_parts(State#{data := [Rest], pending_bytes := byte_size(Rest)});
+        {error, Reason} ->
+            State0#{failed => Reason, data := [], pending_bytes := 0}
+    end;
+flush_parts(State) ->
+    State.
+
+upload_part(
+    #{path := Path, upload_id := UploadId, part_number := PartNumber, parts := Parts, opts := Opts} =
+        State,
+    Part
+) ->
+    Query = <<
+        "?partNumber=",
+        (integer_to_binary(PartNumber))/binary,
+        "&uploadId=",
+        (uri_string:quote(UploadId))/binary
+    >>,
+    %% content-md5, not an x-amz checksum header. It is the one integrity
+    %% mechanism every S3-compatible store implements.
+    Headers = #{<<"content-md5">> => base64:encode(crypto:hash(md5, Part))},
+    case request(<<"PUT">>, <<Path/binary, Query/binary>>, Headers, Part, Opts) of
+        {ok, #{status := 200, headers := RespHeaders}} ->
+            case proplists:get_value(<<"etag">>, RespHeaders) of
+                undefined ->
+                    {error, no_etag};
+                ETag ->
+                    {ok, State#{
+                        part_number := PartNumber + 1, parts := [{PartNumber, ETag} | Parts]
+                    }}
+            end;
+        {ok, #{status := _} = Other} ->
+            log_unexpected_status(?FUNCTION_NAME, Other),
+            {error, Other};
+        {error, _} = Err ->
+            Err
+    end.
+
+multipart_stream_finish(#{failed := Reason} = State) ->
+    ok = stream_abort(State),
+    {error, Reason};
+multipart_stream_finish(#{data := PendingData} = State0) ->
+    %% Unconditional. An upload needs at least one part, so an empty fragment
+    %% still sends one.
+    case upload_part(State0, iolist_to_binary(PendingData)) of
+        {ok, State} ->
+            multipart_complete(State);
+        {error, Reason} ->
+            ok = stream_abort(State0),
+            {error, Reason}
+    end.
+
+multipart_complete(#{parts := Parts} = State) ->
+    Body = complete_multipart_body(lists:reverse(Parts)),
+    case multipart_request(<<"POST">>, State, Body, #{}) of
+        %% A completion can fail with 200 and an <Error> body. The store sends
+        %% the status before it finishes assembling the object.
+        {ok, #{status := 200, body := RespBody}} ->
+            case decode_complete_result(RespBody) of
+                ok ->
+                    ok;
+                {error, Code} ->
+                    ok = stream_abort(State),
+                    {error, {complete_multipart_upload, Code}}
+            end;
+        {ok, #{status := _} = Other} ->
+            log_unexpected_status(?FUNCTION_NAME, Other),
+            ok = stream_abort(State),
+            {error, Other};
+        {error, _} = Err ->
+            ok = stream_abort(State),
+            normalize_transport_error(Err)
+    end.
+
+multipart_request(Method, #{path := Path, upload_id := UploadId, opts := Opts}, Body, Headers) ->
+    Query = <<"?uploadId=", (uri_string:quote(UploadId))/binary>>,
+    request(Method, <<Path/binary, Query/binary>>, Headers, Body, Opts).
+
+-spec decode_upload_id(binary()) -> binary().
+decode_upload_id(Body) ->
+    try xmerl_scan:string(binary_to_list(Body), [{allow_entities, false}]) of
+        {#xmlElement{name = 'InitiateMultipartUploadResult', content = Content}, _} ->
+            child_text('UploadId', Content);
+        _ ->
+            <<>>
+    catch
+        _:_ -> <<>>
+    end.
+
+%% Anything that is not a recognizable error document reads as `ok`. This
+%% matches how the other paths treat a plain 200.
+-spec decode_complete_result(binary()) -> ok | {error, binary()}.
+decode_complete_result(Body) ->
+    try xmerl_scan:string(binary_to_list(Body), [{allow_entities, false}]) of
+        {#xmlElement{name = 'Error', content = Content}, _} ->
+            {error, child_text('Code', Content)};
+        _ ->
+            ok
+    catch
+        _:_ -> ok
+    end.
+
+-spec complete_multipart_body([{pos_integer(), binary()}]) -> binary().
+complete_multipart_body(Parts) ->
+    Content = [
+        #xmlElement{
+            name = 'Part',
+            content = [
+                #xmlElement{
+                    name = 'PartNumber',
+                    content = [#xmlText{value = integer_to_list(PartNumber)}]
+                },
+                #xmlElement{name = 'ETag', content = [#xmlText{value = binary_to_list(ETag)}]}
+            ]
+        }
+     || {PartNumber, ETag} <- Parts
+    ],
+    Doc = #xmlElement{name = 'CompleteMultipartUpload', content = Content},
+    iolist_to_binary(xmerl:export_simple([Doc], xmerl_xml, [])).
+
 send_chunk(Conn, StreamRef, Chunk) when is_binary(Chunk) ->
     Size = byte_size(Chunk),
     gun:data(Conn, StreamRef, nofin, [integer_to_binary(Size, 16), <<"\r\n">>, Chunk, <<"\r\n">>]).
 
 -spec stream_abort(async_state()) -> ok.
+stream_abort(#{mode := multipart} = State) ->
+    %% Not merely tidying: an abandoned upload's parts stay billable until it is
+    %% aborted. A failure here leaves only an orphan for GC.
+    _ = multipart_request(<<"DELETE">>, State, <<>>, #{}),
+    ok;
 stream_abort(#{conn := Conn} = State) ->
     %% The streaming PUT body was only partially sent, so this HTTP/1.1
     %% connection is mid-request and cannot be reused. Close it without checking
@@ -1566,6 +1751,56 @@ async_slice_mode_buffers_data_test() ->
     {continue, S} = handle_async({gun_data, C, R, nofin, <<"23">>}, R, State0),
     ?assertEqual([<<"23">>, <<"01">>], maps:get(data, S)),
     ?assertEqual(4, maps:get(pending_bytes, S)).
+
+decode_upload_id_test() ->
+    Body =
+        <<
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            "<InitiateMultipartUploadResult><Bucket>b</Bucket><Key>k</Key>"
+            "<UploadId>VXBsb2FkIElEIGZvciA2aWWpbmcncyBteS1tb3ZpZS5tMnRz</UploadId>"
+            "</InitiateMultipartUploadResult>"
+        >>,
+    ?assertEqual(<<"VXBsb2FkIElEIGZvciA2aWWpbmcncyBteS1tb3ZpZS5tMnRz">>, decode_upload_id(Body)),
+    %% A response without an upload id must not be mistaken for one: the caller
+    %% turns an empty id into an error rather than uploading parts nowhere.
+    ?assertEqual(<<>>, decode_upload_id(<<"<Error><Code>AccessDenied</Code></Error>">>)),
+    ?assertEqual(<<>>, decode_upload_id(<<"not xml">>)).
+
+decode_complete_result_test() ->
+    ?assertEqual(
+        ok,
+        decode_complete_result(
+            <<"<CompleteMultipartUploadResult><ETag>\"x\"</ETag></CompleteMultipartUploadResult>">>
+        )
+    ),
+    %% The case this exists for: 200 carrying a failure.
+    ?assertEqual(
+        {error, <<"InternalError">>},
+        decode_complete_result(<<"<Error><Code>InternalError</Code></Error>">>)
+    ),
+    %% Anything unrecognisable counts as success, as a bare 200 does elsewhere.
+    ?assertEqual(ok, decode_complete_result(<<"not xml">>)).
+
+complete_multipart_body_test() ->
+    ?assertEqual(
+        <<
+            "<?xml version=\"1.0\"?><CompleteMultipartUpload>"
+            "<Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part>"
+            "<Part><PartNumber>2</PartNumber><ETag>\"b\"</ETag></Part>"
+            "</CompleteMultipartUpload>"
+        >>,
+        complete_multipart_body([{1, <<"\"a\"">>}, {2, <<"\"b\"">>}])
+    ).
+
+multipart_state_after_a_failed_part_test() ->
+    %% Once a part fails there is nothing to report it to until stream_finish/2,
+    %% so the state must stop accumulating rather than buffer a whole fragment.
+    State = flush_parts(#{
+        mode => multipart, failed => some_reason, data => [<<"buffered">>], pending_bytes => 8
+    }),
+    ?assertEqual(0, maps:get(pending_bytes, State)),
+    ?assertEqual([], maps:get(data, State)),
+    ?assertEqual(some_reason, maps:get(failed, State)).
 
 derived_endpoint_test() ->
     ?assertEqual(<<"s3.us-east-1.amazonaws.com">>, derived_endpoint(<<"us-east-1">>)),

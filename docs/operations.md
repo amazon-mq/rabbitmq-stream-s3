@@ -35,11 +35,24 @@ The default is `amazonaws.com`, and the China, US intelligence community, and Eu
 ```ini
 stream_s3.bucket = my-rabbitmq-streams-bucket
 stream_s3.endpoint = storage.googleapis.com
+stream_s3.streaming_upload = multipart
 ```
 
 `stream_s3.region` is not needed alongside an endpoint. An endpoint host carries no region to match, so nothing is looked up from EC2 instance metadata - that would describe the instance rather than the store - and the region falls back to `auto`, the convention S3-compatible stores settled on for a credential scope with no region to name. Set it only if your store requires a particular scope.
 
 Google Cloud Storage support is partial. See [object-store-portability.md](./object-store-portability.md) for what works, what does not, and the remaining work.
+
+### Upload encoding
+
+`stream_s3.streaming_upload` selects how a fragment's body is sent. `chunked`, the default, streams it as a single PUT using S3's aws-chunked encoding. `multipart` sends it as several ordinary PUTs.
+
+aws-chunked is an S3 extension, and most other stores reject it, so set `multipart` for anything that is not S3 or an S3-compatible store that implements it:
+
+```ini
+stream_s3.streaming_upload = multipart
+```
+
+Multipart costs several requests per fragment instead of one, and an uploader holds a whole part rather than a chunk, so leave it at `chunked` where the store supports it.
 
 ### Authorization scheme
 

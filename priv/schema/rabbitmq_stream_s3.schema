@@ -54,6 +54,15 @@ fun(Conf) ->
     end
 end}.
 
+%% streaming_upload - how a fragment's body is sent. `chunked`, the default,
+%% streams it as one PUT using S3's aws-chunked encoding with a trailing
+%% checksum. `multipart` sends it as several ordinary PUTs, for stores that do
+%% not implement that S3 extension.
+
+{mapping, "stream_s3.streaming_upload", "rabbitmq_stream_s3.streaming_upload", [
+    {datatype, {enum, [chunked, multipart]}}
+]}.
+
 %% auth - how requests to the object store are authorized. `aws` signs them with
 %% AWS SigV4 and is what S3 wants. `bearer` sends an OAuth2 access token fetched
 %% from the cloud's metadata server, for Google Cloud Storage and Azure Blob.
