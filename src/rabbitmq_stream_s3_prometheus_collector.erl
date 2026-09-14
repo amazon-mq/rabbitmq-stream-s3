@@ -74,19 +74,6 @@ collect_mf(Registry, Callback) ->
             )
         end,
         rabbitmq_stream_s3_api:request_duration_prometheus_format()
-    ),
-    maps:foreach(
-        fun(Name, #{type := Type, help := Help, values := Values}) ->
-            Callback(
-                create_mf(
-                    <<(?METRIC_NAME_PREFIX)/binary, (atom_to_binary(Name))/binary>>,
-                    Help,
-                    Type,
-                    Values
-                )
-            )
-        end,
-        rabbitmq_stream_s3_remote_reader:prefetch_window_prometheus_format()
     ).
 
 %% ------------------------------------------------------------------

@@ -463,7 +463,9 @@ stream_put(Key, ContentLength, Opts0) when is_binary(Key) andalso is_map(Opts0) 
                                 timeout => maps:get(timeout, Opts0, 60_000)
                             },
                             {ok, State};
-                        {error, pool_busy} = Err ->
+                        {error, Saturation} = Err when
+                            Saturation =:= pool_busy; Saturation =:= pool_exhausted
+                        ->
                             Err
                     end;
                 {error, _} = Err ->
@@ -1263,7 +1265,9 @@ start_async_request(Pool, Method, Path, Headers, Body, Opts) ->
                 bytes_received => 0
             },
             {ok, StreamRef, maybe_set_timer(Opts, StreamRef, State)};
-        {error, pool_busy} = Err ->
+        {error, Saturation} = Err when
+            Saturation =:= pool_busy; Saturation =:= pool_exhausted
+        ->
             Err
     end.
 
@@ -2196,6 +2200,10 @@ normalize_transport_error_test() ->
     %% Everything else passes through untouched.
     ?assertEqual({error, timeout}, normalize_transport_error({error, timeout})),
     ?assertEqual({error, not_found}, normalize_transport_error({error, not_found})),
+    %% The saturation kinds in particular: the remote reader's look-ahead reads
+    %% them by name off a failed group fetch to pick which clock to retry on.
+    ?assertEqual({error, pool_busy}, normalize_transport_error({error, pool_busy})),
+    ?assertEqual({error, pool_exhausted}, normalize_transport_error({error, pool_exhausted})),
     ?assertEqual(
         {error, #{status => 403}}, normalize_transport_error({error, #{status => 403}})
     ),

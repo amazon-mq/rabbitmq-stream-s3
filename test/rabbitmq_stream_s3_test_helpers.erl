@@ -591,3 +591,60 @@ collect_log(Ref, Acc) ->
         {captured_log, Ref, Bin} -> collect_log(Ref, [Bin | Acc])
     after 0 -> iolist_to_binary(lists:reverse(Acc))
     end.
+
+%% ------------------------------------------------------------------
+%% Manifest and fragment iterator construction
+%%
+%% Shared by `remote_reader_core_SUITE` and `remote_reader_s3_bench`:
+%% both drive `rabbitmq_stream_s3_remote_reader_core` directly, which needs a
+%% fragment iterator, and there is no reason for two copies of the manifest
+%% encoding to drift apart.
+%% ------------------------------------------------------------------
+
+-doc "A fragment reference, the shape the read core navigates by.".
+-spec frag_ref(osiris:offset(), non_neg_integer(), non_neg_integer()) -> #fragment_ref{}.
+frag_ref(Offset, Size, Uid) ->
+    #fragment_ref{offset = Offset, uid = Uid, size = Size}.
+
+-doc """
+A fragment iterator over `Specs` (the `build_manifest/1` tree spec), already
+advanced past the first entry.
+
+The advance matches what `find_position` in the log reader does before handing
+the iterator to the core, so the iterator points at the *next* fragment - ready
+for prefetch and forward navigation - exactly as it does in production.
+
+Takes the tree spec rather than a flat fragment list so that a caller can put
+fragments behind group nodes, which is what makes the look-ahead's synchronous
+group GET reachable.
+""".
+-spec mock_iterator([tree_spec()]) -> rabbitmq_stream_s3_fragment_iterator:iterator().
+mock_iterator(Specs) ->
+    mock_iterator(Specs, fun(GetGroup) -> GetGroup end).
+
+-doc """
+As `mock_iterator/1`, but with the manifest's own group-fetch fun passed
+through `WrapGetGroup` first.
+
+Descending into a group node is a synchronous S3 GET in production, so a caller
+that wants to count those, charge latency for them, or fail them passes a
+wrapper rather than replacing the fun and having to rebuild the group index by
+hand.
+""".
+-spec mock_iterator(
+    [tree_spec()],
+    fun(
+        (rabbitmq_stream_s3_fragment_iterator:get_group_fun()) ->
+            rabbitmq_stream_s3_fragment_iterator:get_group_fun()
+    )
+) ->
+    rabbitmq_stream_s3_fragment_iterator:iterator().
+mock_iterator(Specs, WrapGetGroup) ->
+    {#manifest{first_offset = FirstOffset} = Manifest, GetGroupFun} = build_manifest(Specs),
+    Iterator = rabbitmq_stream_s3_fragment_iterator:init(
+        Manifest, FirstOffset, WrapGetGroup(GetGroupFun)
+    ),
+    case rabbitmq_stream_s3_fragment_iterator:next(Iterator) of
+        {ok, _, It} -> It;
+        _ -> Iterator
+    end.

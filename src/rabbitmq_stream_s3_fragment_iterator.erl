@@ -14,7 +14,8 @@ as it descends into branches.
 -export([
     init/3,
     next/1,
-    all_refs/2
+    all_refs/2,
+    with_get_group_fun/2
 ]).
 
 -export_type([
@@ -57,6 +58,20 @@ init(#manifest{entries = Entries, first_offset = FirstOffset}, Offset, GetGroupF
         get_group_fun = GetGroupFun,
         start_offset = StartOffset
     }.
+
+-doc """
+Replace how this iterator fetches group objects, keeping its position.
+
+An iterator outlives the operation that created it: offset resolution builds
+one and hands it to the remote reader, which then walks it for the rest of the
+read. What a failed group fetch should cost differs between the two. Resolution
+is the consumer's read being set up and has nothing to do but wait, while the
+reader walks ahead speculatively inside a process that is meanwhile serving
+reads, so a descent that blocks is a reader that is not serving.
+""".
+-spec with_get_group_fun(iterator(), get_group_fun()) -> iterator().
+with_get_group_fun(#iterator{} = It, GetGroupFun) when is_function(GetGroupFun, 1) ->
+    It#iterator{get_group_fun = GetGroupFun}.
 
 -doc """
 Return the next fragment entry and advance the iterator.

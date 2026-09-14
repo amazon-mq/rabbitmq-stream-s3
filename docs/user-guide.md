@@ -24,7 +24,7 @@ Once positioned, the consumer reads forward through the stream.
 
 **Reading from local disk** has the same performance as a stream without tiered storage.
 
-**Reading from S3** is served by a prefetch mechanism that adapts to the consumer's read rate. When the consumer reads quickly, the broker fetches larger chunks of data ahead of time. When the consumer slows down, prefetch sizes shrink. This keeps throughput high without wasting memory or bandwidth.
+**Reading from S3** is served by a prefetch mechanism that adapts to the consumer's read rate. The broker fetches fixed-size ranges of the stream ahead of the consumer's position, and adjusts how many of them it fetches at once from the throughput it measures. A consumer reading hard gets many in flight; one that reads a little and stops never asks for more than it used. This keeps throughput high without wasting memory or bandwidth.
 
 **Transition from remote to local** happens automatically. As the consumer catches up to data that still exists on local disk, reading switches over without interruption.
 

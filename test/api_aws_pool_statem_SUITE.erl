@@ -96,8 +96,11 @@ one_process_may_hold_several_checkouts(_Config) ->
         ?assertEqual(3, map_size(Checkouts)),
         ?assertEqual(0, length(Available)),
         %% The pool is now saturated, and the same process asking for a fourth
-        %% waits and then reports it busy rather than being served twice over.
-        ?assertEqual({error, pool_busy}, checkout()),
+        %% waits and then reports it rather than being served twice over. At
+        %% `max_size` with nothing available that is `pool_exhausted`: the pool
+        %% has nothing left to open, so this is not a caller waiting out growth
+        %% it provoked.
+        ?assertEqual({error, pool_exhausted}, checkout()),
         [ok = rabbitmq_stream_s3_api_aws_pool:checkin(?POOL, Conn) || Conn <- Conns],
         ?assert(invariant_ok()),
         #{checkouts := Checkouts1, available := Available1} = test_inspect(),
