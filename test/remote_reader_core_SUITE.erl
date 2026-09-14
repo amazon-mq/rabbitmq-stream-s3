@@ -128,6 +128,8 @@ all() ->
         next_fragment_peek_is_fetched_once,
         failed_group_peek_is_retried_on_the_backoff,
         failed_group_peek_is_not_retried_on_the_pool_clock,
+        pool_failed_group_peek_is_retried_on_the_pool_clock,
+        pool_exhausted_group_peek_is_retried_on_the_pool_clock,
         failed_group_peek_arms_its_own_retry,
         group_fetch_failure_keeps_the_ranges_in_flight,
         read_larger_than_the_window_is_still_served,
@@ -211,7 +213,12 @@ mock_iterator_failing_group(FragEntries, {GroupOffset, _, GroupUid}) ->
     end.
 
 %% As `mock_iterator_failing_group/2`, but counting the attempts.
-mock_iterator_counting_failing_group(FragEntries, {GroupOffset, _, GroupUid}, Counter) ->
+mock_iterator_counting_failing_group(FragEntries, GroupRef, Counter) ->
+    mock_iterator_counting_failing_group(FragEntries, GroupRef, Counter, slow_down).
+
+%% `Reason` is what the group fetch fails with, which is what decides the clock
+%% the core retries it on.
+mock_iterator_counting_failing_group(FragEntries, {GroupOffset, _, GroupUid}, Counter, Reason) ->
     GroupEntry = ?ENTRY(GroupOffset, 0, 0, ?MANIFEST_KIND_GROUP, 0, GroupUid),
     FirstOffset = element(1, hd(FragEntries)),
     Manifest = #manifest{
@@ -221,7 +228,7 @@ mock_iterator_counting_failing_group(FragEntries, {GroupOffset, _, GroupUid}, Co
     },
     GetGroupFun = fun(_) ->
         counters:add(Counter, 1, 1),
-        {error, slow_down}
+        {error, Reason}
     end,
     Iterator0 = rabbitmq_stream_s3_fragment_iterator:init(Manifest, FirstOffset, GetGroupFun),
     case rabbitmq_stream_s3_fragment_iterator:next(Iterator0) of
@@ -2511,13 +2518,17 @@ failed_group_peek_is_retried_on_the_backoff(_Config) ->
     ?assertEqual(2, counters:get(Fetches, 1)).
 
 failed_group_peek_is_not_retried_on_the_pool_clock(_Config) ->
-    %% The `pool_busy` clock runs 25-500ms and fires for as long as the pool has
-    %% no free connection, which says nothing about whether the group object can
-    %% be fetched. Clearing the memo on it re-attempted the fetch up to 40x more
-    %% often than the fault backoff it is paced by, and `arm_peek_retry/4` could
-    %% not slow it down because the fault timer it arms was already pending.
-    %% Every attempt is a synchronous group GET inside the core, so it blocks
-    %% the reader while the caller's read deadline burns.
+    %% A store error says the group object could not be fetched, which the
+    %% `pool_busy` clock knows nothing about: it runs 25-500ms and fires for as
+    %% long as the pool has no free connection. Clearing the memo on it
+    %% re-attempted the fetch up to 40x more often than the fault backoff it is
+    %% paced by, and `arm_peek_retry/4` could not slow it down because the fault
+    %% timer it arms was already pending. Every attempt is a synchronous group
+    %% GET inside the core, so it blocks the reader while the caller's read
+    %% deadline burns.
+    %%
+    %% A descent that failed *because* of the pool is the other way round; see
+    %% `pool_failed_group_peek_is_retried_on_the_pool_clock`.
     Fetches = counters:new(1, []),
     Iterator = mock_iterator_counting_failing_group([{0, 1000, 42}], {2000, 0, 7}, Fetches),
     {S0, _} = init(stream_id(), frag_ref(0, 1000, 42), ?SEGMENT_HEADER_B, Iterator, #{
@@ -2537,6 +2548,45 @@ failed_group_peek_is_not_retried_on_the_pool_clock(_Config) ->
     %% The clock the retry is paced by still clears it.
     {_S3, _} = retry(S2, fault),
     ?assertEqual(2, counters:get(Fetches, 1)).
+
+pool_failed_group_peek_is_retried_on_the_pool_clock(_Config) ->
+    %% A descent that could not get a connection never asked the store anything,
+    %% so there is nothing to back off from: what it is waiting for is a free
+    %% connection, which is what the pool clock paces. On the fault clock a
+    %% reader at a fragment boundary would sit out a growing backoff, up to 30s,
+    %% for a condition that clears in milliseconds.
+    Fetches = counters:new(1, []),
+    Iterator = mock_iterator_counting_failing_group(
+        [{0, 1000, 42}], {2000, 0, 7}, Fetches, pool_busy
+    ),
+    {S0, _} = init(stream_id(), frag_ref(0, 1000, 42), ?SEGMENT_HEADER_B, Iterator, #{
+        request_size => 4000
+    }),
+    {S1, E1} = deliver(S0, 0, ?SEGMENT_HEADER_B, pattern(8, 100), continue),
+    ?assertEqual(1, counters:get(Fetches, 1)),
+    ?assertEqual([{set_timer, pool_busy, 25}], [E || {set_timer, _, _} = E <- E1]),
+    %% The fault clock is not what this memo waits on, so its round does not
+    %% clear it.
+    {S2, _} = retry(S1, fault),
+    ?assertEqual(1, counters:get(Fetches, 1)),
+    %% The pool clock does, and the re-attempt fails the same way, so the next
+    %% round is armed at the grown pool delay rather than a fault one.
+    {_S3, E3} = retry(S2, pool_busy),
+    ?assertEqual(2, counters:get(Fetches, 1)),
+    ?assertEqual([{set_timer, pool_busy, 50}], [E || {set_timer, _, _} = E <- E3]).
+
+pool_exhausted_group_peek_is_retried_on_the_pool_clock(_Config) ->
+    %% The two saturation kinds are the same wait for this purpose: neither
+    %% reached the store.
+    Fetches = counters:new(1, []),
+    Iterator = mock_iterator_counting_failing_group(
+        [{0, 1000, 42}], {2000, 0, 7}, Fetches, pool_exhausted
+    ),
+    {S0, _} = init(stream_id(), frag_ref(0, 1000, 42), ?SEGMENT_HEADER_B, Iterator, #{
+        request_size => 4000
+    }),
+    {_S1, E1} = deliver(S0, 0, ?SEGMENT_HEADER_B, pattern(8, 100), continue),
+    ?assertEqual([{set_timer, pool_busy, 25}], [E || {set_timer, _, _} = E <- E1]).
 
 failed_group_peek_arms_its_own_retry(_Config) ->
     %% Nothing else arms a timer on this path: the ranges already queued are

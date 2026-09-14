@@ -271,6 +271,14 @@ stop(Pid) ->
 %% timeout and invert the ordering.
 -define(READ_TIMEOUT_MARGIN_MS, 5_000).
 
+%% How long the look-ahead will wait for a connection before giving up on a
+%% group fetch and letting the core retry it. Short because the wait is spent
+%% inside the reader process, which is meanwhile serving reads, and because a
+%% saturated pool is what the wait discovers - the core's pool clock is the
+%% cheaper place to wait for that to clear. The same figure a range GET's own
+%% checkout uses, for the same reason.
+-define(LOOK_AHEAD_GROUP_TIMEOUT_MS, 100).
+
 %% Reads come back as iodata: the reader holds its window as the blocks S3
 %% delivered, and a range spanning two of them is a list of two rather than a
 %% copy of the range. `read/4,5` flattens that for callers that need a single
@@ -340,7 +348,7 @@ init(
     Opts = maps:get(opts, Config, #{}),
     Cfg = build_cfg(Opts),
     {Core0, Effects} = rabbitmq_stream_s3_remote_reader_core:init(
-        StreamId, FragRef, Pos, Iterator, Opts
+        StreamId, FragRef, Pos, look_ahead_iterator(StreamId, Iterator), Opts
     ),
     State0 = #state{
         stream = StreamId,
@@ -783,9 +791,11 @@ refresh_iterator(StreamId, NotFoundOffset) ->
 refresh_iterator1(
     StreamId, NotFoundOffset, #manifest{first_offset = First, next_offset = Next} = Manifest
 ) ->
-    GetGroupFun = rabbitmq_stream_s3_manifest:get_group_fun(StreamId),
+    %% This refresh runs in the reader, so its walk is on the same critical path
+    %% the look-ahead is, and the iterator it produces is the one the look-ahead
+    %% then walks. Both want the probing fetch rather than the patient one.
     Iterator0 = rabbitmq_stream_s3_fragment_iterator:init(
-        Manifest, NotFoundOffset, GetGroupFun
+        Manifest, NotFoundOffset, look_ahead_group_fun(StreamId)
     ),
     %% Advance past the 404'd fragment.
     Iterator =
@@ -816,6 +826,27 @@ maybe_stop(State) ->
 
 build_cfg(Opts) ->
     #cfg{request_timeout_ms = maps:get(request_timeout_ms, Opts, 15_000)}.
+
+%% Re-arm an iterator built elsewhere for the walking this process does with it.
+%%
+%% Offset resolution builds the iterator and hands it over inside the location,
+%% with a group fetch that waits out a full checkout and retries twice - right
+%% there, where the consumer's read is being set up and there is nothing else to
+%% do with the time. From here the same walk is speculative and happens inside
+%% the process that serves reads, so the same fetch would block a reader that
+%% has work to do for as long as the pool stays saturated.
+look_ahead_iterator(StreamId, Iterator) ->
+    rabbitmq_stream_s3_fragment_iterator:with_get_group_fun(
+        Iterator, look_ahead_group_fun(StreamId)
+    ).
+
+%% One attempt. A descent that cannot get a connection has learned what it
+%% needed to: the core arms the pool clock and asks again, which is both cheaper
+%% than waiting here and quicker to notice that the pool has freed up.
+look_ahead_group_fun(StreamId) ->
+    rabbitmq_stream_s3_manifest:get_group_fun(StreamId, #{
+        timeout => ?LOOK_AHEAD_GROUP_TIMEOUT_MS, retries => 0
+    }).
 
 cancel_all_requests(#state{requests = Requests, cancelled = Cancelled0} = State) ->
     maps:foreach(

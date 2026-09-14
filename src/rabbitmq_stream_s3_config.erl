@@ -162,7 +162,7 @@ general_pool_max_size() ->
 %% ------------------------------------------------------------------
 
 %% Bytes per range GET. Large enough to amortise time-to-first-byte over the
-%% transfer, small enough that a window is several requests wide.
+%% transfer, small enough that the fetch budget is several requests wide.
 -spec prefetch_request_size() -> pos_integer().
 prefetch_request_size() ->
     application:get_env(?APP, prefetch_request_size, 4_194_304).
@@ -189,7 +189,9 @@ prefetch_max_memory() ->
 %% Set generously for that reason. It bounds a reader's share of the general
 %% pool, and a pool that cannot serve a checkout surfaces as `pool_busy` or
 %% `pool_exhausted`, so a ceiling above what the pool can serve costs a backoff,
-%% not a stall.
+%% not a stall. That holds for the look-ahead's group GETs as well as for range
+%% GETs: both give up on a short checkout and are retried on the pool clock,
+%% which is what keeps a saturated pool from reading as a failing store.
 -spec prefetch_max_depth() -> pos_integer().
 prefetch_max_depth() ->
     application:get_env(?APP, prefetch_max_depth, 64).

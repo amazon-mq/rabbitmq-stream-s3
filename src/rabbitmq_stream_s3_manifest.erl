@@ -27,6 +27,7 @@ fragments (via tree-branch-like "group" objects, for large enough streams).
     is_well_formed/1,
     assert_well_formed/1,
     get_group_fun/1,
+    get_group_fun/2,
     get_cached_group_fun/1,
     clear_group_cache/2,
     evict_group_cache/1,
@@ -38,6 +39,12 @@ fragments (via tree-branch-like "group" objects, for large enough streams).
 %% stream_id(), value is {#group_ref{}, entries()}. Avoids re-downloading
 %% the same immutable group object on every retention evaluation cycle.
 -define(FIRST_GROUPS, rabbitmq_stream_s3_manifest_first_groups).
+
+%% What a group fetch costs a caller that is prepared to wait for it. The
+%% timeout is per attempt and is spent in the pool checkout when the pool is
+%% saturated, so the worst case is the two multiplied plus the sleeps between.
+-define(GROUP_FETCH_TIMEOUT_MS, 5_000).
+-define(GROUP_FETCH_RETRIES, 2).
 
 -doc "Create the first-group cache ETS table.".
 -spec init() -> ok.
@@ -274,8 +281,28 @@ Always downloads fresh from S3.
 """.
 -spec get_group_fun(stream_id()) -> rabbitmq_stream_s3_fragment_iterator:get_group_fun().
 get_group_fun(StreamId) ->
+    get_group_fun(StreamId, #{}).
+
+-doc """
+`get_group_fun/1` with the cost of a failed fetch under the caller's control.
+
+`timeout` is the per-attempt request timeout, which for a saturated pool is how
+long the checkout waits before reporting `pool_busy`, and `retries` is how many
+further attempts to make. The defaults suit a caller for which the fetch is the
+work: wait, and try again, because there is nothing else to do with the time.
+
+A caller that is probing rather than fetching wants the opposite. The remote
+reader's look-ahead runs inside the reader process with a consumer's read
+deadline going, so a descent that blocks is a reader that is not serving. It
+asks for one short attempt and retries on its own clock instead.
+""".
+-spec get_group_fun(stream_id(), #{timeout => timeout(), retries => non_neg_integer()}) ->
+    rabbitmq_stream_s3_fragment_iterator:get_group_fun().
+get_group_fun(StreamId, Opts) when is_map(Opts) ->
+    Timeout = maps:get(timeout, Opts, ?GROUP_FETCH_TIMEOUT_MS),
+    Retries = maps:get(retries, Opts, ?GROUP_FETCH_RETRIES),
     fun(#group_ref{kind = Kind} = GroupRef) ->
-        fetch_group(StreamId, Kind, GroupRef)
+        fetch_group(StreamId, Kind, GroupRef, Timeout, Retries)
     end.
 
 -doc """
@@ -302,11 +329,11 @@ get_cached_group_fun(StreamId) ->
     end.
 
 fetch_group(StreamId, Kind, #group_ref{} = GroupRef) ->
-    fetch_group(StreamId, Kind, GroupRef, 2).
+    fetch_group(StreamId, Kind, GroupRef, ?GROUP_FETCH_TIMEOUT_MS, ?GROUP_FETCH_RETRIES).
 
-fetch_group(StreamId, Kind, #group_ref{} = GroupRef, Retries) ->
+fetch_group(StreamId, Kind, #group_ref{} = GroupRef, Timeout, Retries) ->
     Key = rabbitmq_stream_s3:group_key(StreamId, GroupRef),
-    case rabbitmq_stream_s3_api:get(Key, #{}) of
+    case rabbitmq_stream_s3_api:get(Key, #{timeout => Timeout}) of
         {ok, Data} ->
             HeaderSize = group_header_size(Kind),
             <<_Header:HeaderSize/binary, Entries/binary>> = Data,
@@ -317,7 +344,7 @@ fetch_group(StreamId, Kind, #group_ref{} = GroupRef, Retries) ->
             Err;
         {error, _} ->
             timer:sleep(100),
-            fetch_group(StreamId, Kind, GroupRef, Retries - 1)
+            fetch_group(StreamId, Kind, GroupRef, Timeout, Retries - 1)
     end.
 
 -doc """

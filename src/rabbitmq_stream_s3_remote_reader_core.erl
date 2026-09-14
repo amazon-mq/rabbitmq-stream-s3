@@ -158,9 +158,16 @@ and transitions immediately if available, or signals that more data is needed.
 
     %% What the iterator said when it was last walked past the end of `peeks`.
     %% `unknown` means it has not been asked; `none` that the manifest ends
-    %% there; `failed` that the group fetch failed transiently, which is not an
-    %% answer to keep but is a reason not to ask again until a retry timer fires.
-    peek_tail = unknown :: unknown | none | failed,
+    %% there; `{failed, Backoff}` that the group fetch failed transiently, which
+    %% is not an answer to keep but is a reason not to ask again until that
+    %% clock's retry timer fires.
+    %%
+    %% The clock is carried rather than fixed because the two failures want
+    %% different waits. A pool that could not spare a connection clears in
+    %% milliseconds and the descent that found out costs one short checkout, so
+    %% the pool clock asks again soon. Anything else is the store, where asking
+    %% again soon is what the fault clock's growing backoff exists to prevent.
+    peek_tail = unknown :: unknown | none | {failed, backoff()},
 
     %% The backoff kinds whose retry timer is armed and has not fired yet.
     %% Without this a batch of N failing requests would arm N timers and drive N
@@ -599,13 +606,13 @@ step_(State0, {iterator_refreshed, Iterator}) ->
             {Local, [
                 {cancel_timers, all}, {reply, {become_local, current_fragment_offset(Local)}}
             ]};
-        {error, {group_fetch_failed, _Reason}} ->
+        {error, {group_fetch_failed, Reason}} ->
             %% A group object could not be fetched while advancing the
-            %% refreshed iterator. Transient S3 error, not end of manifest:
-            %% retry rather than routing to a local tier that may lack the
-            %% data. The refresh was asked for by a pending read, and the retry
-            %% re-serves it, so it asks for the refresh again.
-            retry_group_fetch(Cancelled)
+            %% refreshed iterator. Transient, not end of manifest: retry rather
+            %% than routing to a local tier that may lack the data. The refresh
+            %% was asked for by a pending read, and the retry re-serves it, so
+            %% it asks for the refresh again.
+            retry_group_fetch(peek_backoff(Reason), Cancelled)
     end.
 
 %% A 404 for a fragment other than the one being read. Its ranges are dropped
@@ -750,10 +757,10 @@ try_serve(#state{pending = #pending{offset = Offset, bytes = Bytes}} = State) ->
         {refresh_iterator, State1} ->
             %% Iterator exhausted. Refresh past current fragment.
             {State1, [{refresh_iterator, current_fragment_offset(State1)}]};
-        {group_fetch_failed, State1} ->
+        {group_fetch_failed, Backoff, State1} ->
             %% A group fetch failed transiently while advancing. Retry rather
             %% than becoming local.
-            retry_group_fetch(State1)
+            retry_group_fetch(Backoff, State1)
     end.
 
 %% ------------------------------------------------------------------
@@ -797,14 +804,14 @@ try_peeked_transition(#state{peeks = Peeks0, peek_tail = Tail0} = State0) ->
             {await, State};
         none ->
             {refresh_iterator, State};
-        failed ->
+        {failed, Backoff} ->
             %% A group object referenced by the manifest could not be fetched.
-            %% This is a transient S3 error, not the end of the manifest (a
-            %% group deleted by retention surfaces as `not_found`, which the
-            %% iterator skips). The group is part of the remote tier we are
-            %% reading, so becoming local here would risk serving missing or
-            %% wrong data (Tier overlap). Retry instead.
-            {group_fetch_failed, State}
+            %% This is a transient error, not the end of the manifest (a group
+            %% deleted by retention surfaces as `not_found`, which the iterator
+            %% skips). The group is part of the remote tier we are reading, so
+            %% becoming local here would risk serving missing or wrong data
+            %% (Tier overlap). Retry instead, on the clock the failure earned.
+            {group_fetch_failed, Backoff, State}
     end.
 
 %% A group object could not be fetched (a transient S3 error). Keep the pending
@@ -815,8 +822,8 @@ try_peeked_transition(#state{peeks = Peeks0, peek_tail = Tail0} = State0) ->
 %% where the shell has already cancelled them. The failure is in advancing the
 %% iterator, which says nothing about the fragment GETs already on the wire, and
 %% cancelling one closes its pooled connection.
-retry_group_fetch(State) ->
-    arm_retry(fault, State).
+retry_group_fetch(Backoff, State) ->
+    arm_retry(Backoff, State).
 
 %% ------------------------------------------------------------------
 %% Internal: fragment navigation
@@ -854,10 +861,10 @@ not_found_refresh(#state{peeks = Peeks0, peek_tail = Tail0} = State0) ->
             {State, [{refresh_iterator, NotFoundOffset}]};
         none ->
             {State, [{refresh_iterator, current_fragment_offset(State)}]};
-        failed ->
+        {failed, Backoff} ->
             %% Probing the next entry hit a transient group fetch error. Retry
             %% rather than becoming local.
-            retry_group_fetch(State)
+            retry_group_fetch(Backoff, State)
     end.
 
 %% Moves to the fragment being prefetched, resetting what this module tracks
@@ -1086,8 +1093,8 @@ observe_stall(State, Stall) ->
 %% re-attempt arms one. A pass that never reached the look-ahead must not arm:
 %% it asked nothing of S3, and an armed clock is what suppresses the next
 %% attempt.
-arm_peek_retry(failed, true, State, Effects) ->
-    {State1, RetryEffects} = arm_retry(fault, State),
+arm_peek_retry({failed, Backoff}, true, State, Effects) ->
+    {State1, RetryEffects} = arm_retry(Backoff, State),
     {State1, Effects ++ RetryEffects};
 arm_peek_retry(_Peek, _Attempted, State, Effects) ->
     {State, Effects}.
@@ -1121,9 +1128,9 @@ extend_frontier(State, Peeks0, Tail0, Attempted0, Acc) ->
                     %% Room to fetch, but nothing to fetch: the reader is limited
                     %% by its reach rather than by any budget. A look-ahead that
                     %% failed is called out separately because it is transient -
-                    %% a group GET that errored, retried on the fault clock -
-                    %% where a plain `reach` is the manifest or the horizon, and
-                    %% the two want opposite responses.
+                    %% a group GET that errored, retried on a clock - where a
+                    %% plain `reach` is the manifest or the horizon, and the two
+                    %% want opposite responses.
                     %% Only when this pass tried to extend the look-ahead. A
                     %% `failed` tail left by an earlier pass says nothing about
                     %% why this one found nothing: the walk may have stopped at
@@ -1131,7 +1138,7 @@ extend_frontier(State, Peeks0, Tail0, Attempted0, Acc) ->
                     %% `reach`. Same pair `arm_peek_retry/4` decides on.
                     Stall =
                         case {Tail, Attempted0 orelse Attempted} of
-                            {failed, true} -> peek_failed;
+                            {{failed, _}, true} -> peek_failed;
                             _ -> reach
                         end,
                     {State, Peeks, Tail, Attempted0 orelse Attempted, Stall, lists:reverse(Acc)}
@@ -1311,16 +1318,32 @@ extend_peeks(State, Peeks, Tail) ->
         false -> extend_peeks_(State, Peeks, Tail)
     end.
 
-extend_peeks_(#state{timers = Timers}, Peeks, failed) when is_map_key(fault, Timers) ->
-    {Peeks, failed, false};
-extend_peeks_(State, Peeks, Tail) when Tail =:= unknown; Tail =:= failed ->
+extend_peeks_(#state{timers = Timers}, Peeks, {failed, Backoff} = Tail) when
+    is_map_key(Backoff, Timers)
+->
+    {Peeks, Tail, false};
+extend_peeks_(State, Peeks, unknown) ->
+    peek_walk(State, Peeks);
+extend_peeks_(State, Peeks, {failed, _}) ->
+    peek_walk(State, Peeks);
+extend_peeks_(_State, Peeks, none) ->
+    {Peeks, none, false}.
+
+peek_walk(State, Peeks) ->
     case rabbitmq_stream_s3_fragment_iterator:next(peek_iterator(State, Peeks)) of
         {ok, FragRef, Advanced} -> {Peeks ++ [{FragRef, Advanced}], unknown, true};
         end_of_manifest -> {Peeks, none, true};
-        {error, {group_fetch_failed, _}} -> {Peeks, failed, true}
-    end;
-extend_peeks_(_State, Peeks, none) ->
-    {Peeks, none, false}.
+        {error, {group_fetch_failed, Reason}} -> {Peeks, {failed, peek_backoff(Reason)}, true}
+    end.
+
+%% A descent that failed because the pool had no connection to spare says
+%% nothing about the store: the object was never asked for. That clears on the
+%% timescale a checkout does, so it goes on the pool clock rather than earning
+%% the fault clock's backoff.
+peek_backoff(Reason) when Reason =:= pool_busy; Reason =:= pool_exhausted ->
+    pool_busy;
+peek_backoff(_Reason) ->
+    fault.
 
 %% The iterator to walk forward from: the one advanced past the last fragment
 %% already looked ahead to, or the reader's own when none has been.

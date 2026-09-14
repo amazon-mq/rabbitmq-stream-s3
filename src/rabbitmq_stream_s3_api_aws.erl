@@ -2200,6 +2200,10 @@ normalize_transport_error_test() ->
     %% Everything else passes through untouched.
     ?assertEqual({error, timeout}, normalize_transport_error({error, timeout})),
     ?assertEqual({error, not_found}, normalize_transport_error({error, not_found})),
+    %% The saturation kinds in particular: the remote reader's look-ahead reads
+    %% them by name off a failed group fetch to pick which clock to retry on.
+    ?assertEqual({error, pool_busy}, normalize_transport_error({error, pool_busy})),
+    ?assertEqual({error, pool_exhausted}, normalize_transport_error({error, pool_exhausted})),
     ?assertEqual(
         {error, #{status => 403}}, normalize_transport_error({error, #{status => 403}})
     ),
