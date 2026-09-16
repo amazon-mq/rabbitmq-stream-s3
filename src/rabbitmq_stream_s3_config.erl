@@ -18,6 +18,9 @@ lives here. Callers use these functions instead of calling
     bearer_provider/0,
     bearer_resource/0,
     bearer_client_id/0,
+    azure_account/0,
+    azure_account_key/0,
+    azure_api_version/0,
     account_id/0,
     aws_access_key/0,
     aws_secret_key/0,
@@ -104,6 +107,27 @@ bearer_resource() ->
 -spec bearer_client_id() -> binary() | undefined.
 bearer_client_id() ->
     application:get_env(?APP, bearer_client_id, undefined).
+
+%% The Azure storage account the container lives in. Part of the request host
+%% for a real account and, for the emulator, the first segment of every path;
+%% either way the Shared Key signature covers it.
+-spec azure_account() -> binary() | undefined.
+azure_account() ->
+    application:get_env(?APP, azure_account, undefined).
+
+%% The storage account key, base64 as Azure presents it. Only used by
+%% rabbitmq_stream_s3_auth_azure, and only when static credentials are allowed:
+%% it grants full access to the account and does not rotate.
+-spec azure_account_key() -> binary() | undefined.
+azure_account_key() ->
+    application:get_env(?APP, azure_account_key, undefined).
+
+%% The Azure Blob REST API version every request declares. Pinned rather than
+%% tracking the newest: a version is a contract about response shapes, and the
+%% one named here is what the client's parsing was written against.
+-spec azure_api_version() -> binary().
+azure_api_version() ->
+    application:get_env(?APP, azure_api_version, <<"2021-08-06">>).
 
 %% AWS credentials. Return `undefined` when not configured (instance role is used).
 -spec aws_access_key() -> binary() | undefined.
@@ -475,6 +499,9 @@ defaults_test_() ->
         ?_assertEqual(gcp, bearer_provider()),
         ?_assertEqual(<<"https://storage.azure.com/">>, bearer_resource()),
         ?_assertEqual(undefined, bearer_client_id()),
+        ?_assertEqual(undefined, azure_account()),
+        ?_assertEqual(undefined, azure_account_key()),
+        ?_assertEqual(<<"2021-08-06">>, azure_api_version()),
         ?_assertEqual(undefined, aws_access_key()),
         ?_assertEqual(undefined, aws_secret_key()),
         ?_assertEqual(undefined, aws_security_token()),

@@ -45,6 +45,7 @@ store this plugin uses, and
     finish_async_close/1,
     cancel_request_timer/1,
     normalize_transport_error/1,
+    compose_query/1,
     range_specifier/1,
     slice_range/2,
     start_timeout_window/1,
@@ -99,7 +100,10 @@ Called "HTTP Verb" in S3 docs. "GET", "PUT", "HEAD", "POST", "DELETE", etc..
     status := pos_integer(),
     %% TODO: why is gun:resp_headers() not exported?
     headers := [{binary(), binary()}],
-    body => binary()
+    %% Always present, empty when the response carried no body, so that a client
+    %% matching on `body` reads a zero-length object as the empty object it is
+    %% rather than as an unexpected response.
+    body := binary()
 }.
 %% Map keys must be lowercase.
 -type req_headers() :: #{binary() => binary()}.
@@ -252,7 +256,7 @@ await_response(Conn, StreamRef, Timeout) ->
     T1 = start_timeout_window(Timeout),
     case gun:await(Conn, StreamRef, Timeout) of
         {response, fin, Status, RespHeaders} ->
-            Response = #{status => Status, headers => RespHeaders},
+            Response = #{status => Status, headers => RespHeaders, body => <<>>},
             postprocess_response(Response),
             {ok, Response};
         {response, nofin, Status, RespHeaders} ->
@@ -697,6 +701,32 @@ flush_timer(TimerRef, StreamRef) ->
     end.
 
 %%---------------------------------------------------------------------------
+%% Query strings
+%%---------------------------------------------------------------------------
+
+-doc """
+Encode query parameters with strict percent-encoding.
+
+`uri_string:compose_query/1` writes a space as `+`, which is the
+form-urlencoded convention rather than the URI one. A bare `+` in a query is
+then ambiguous - Azure reads it as a space, AWS reads it as a plus - and a
+signature computed by decoding it one way is rejected by a service that decodes
+it the other. Encoding a space as `%20` and a plus as `%2B` leaves nothing to
+interpret.
+
+Parameters are written in the order given; a scheme that signs a canonical query
+sorts them first.
+""".
+-spec compose_query([{binary(), binary()}]) -> binary().
+compose_query(Params) ->
+    iolist_to_binary(
+        lists:join($&, [
+            [uri_string:quote(Name), $=, uri_string:quote(Value)]
+         || {Name, Value} <- Params
+        ])
+    ).
+
+%%---------------------------------------------------------------------------
 %% Ranges
 %%---------------------------------------------------------------------------
 
@@ -830,6 +860,14 @@ without_counter(Fun) ->
             _ -> persistent_term:put(?COUNTER_KEY, Previous)
         end
     end.
+
+compose_query_test() ->
+    ?assertEqual(<<"a=1&b=2">>, compose_query([{<<"a">>, <<"1">>}, {<<"b">>, <<"2">>}])),
+    %% The point of the function: a space is %20 and a plus is %2B, so neither
+    %% can be mistaken for the other.
+    ?assertEqual(<<"prefix=a%20b%2Bc%3Dd">>, compose_query([{<<"prefix">>, <<"a b+c=d">>}])),
+    ?assertEqual(<<"prefix=">>, compose_query([{<<"prefix">>, <<>>}])),
+    ?assertEqual(<<>>, compose_query([])).
 
 status_reason_test() ->
     ?assertEqual(not_found, status_reason(404, [])),

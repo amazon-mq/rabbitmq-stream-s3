@@ -84,6 +84,40 @@ preference: organizations can disable GCS interoperability HMAC keys with
 Shared Key on storage accounts. Where either applies, `bearer` is the only way
 in.
 
+### Azure Blob Storage
+
+Azure Blob is not S3-compatible, so it is a separate backend rather than an endpoint override. Select it with `stream_s3.api`:
+
+```ini
+stream_s3.api = azure
+stream_s3.azure.account = mystorageaccount
+stream_s3.bucket = my-rabbitmq-streams-container
+stream_s3.auth = bearer
+stream_s3.bearer.provider = azure
+```
+
+`stream_s3.bucket` names the container. Requests go to `<account>.blob.core.windows.net` over TLS on port 443; the container is a path segment, not a subdomain. The container must already exist - the plugin never creates one.
+
+`stream_s3.endpoint` replaces the `blob.core.windows.net` suffix for a sovereign cloud (`blob.core.chinacloudapi.cn`, `blob.core.usgovcloudapi.net`), keeping the account as a subdomain of it.
+
+#### Azure authorization
+
+A managed identity (`stream_s3.auth = bearer`) is the better choice and is described above. Where there is none - outside Azure, or against the emulator - `stream_s3.auth = azure` signs each request with the storage account key:
+
+```ini
+stream_s3.auth = azure
+stream_s3.azure.account_key = <the storage account key>
+stream_s3.allow_static_credentials = true
+```
+
+The key grants full access to the account, is stored in plaintext on disk and never rotates, so it sits behind the same `allow_static_credentials` opt-in as static AWS keys and is ignored without it. Microsoft recommends disallowing Shared Key on storage accounts, which makes a managed identity the only way in where that is set.
+
+#### Differences from S3 worth knowing
+
+- **Fragments upload as blocks.** Azure has no trailing checksum, so a fragment is sent as several `Put Block` requests each covered by a `content-md5`, then committed with one `Put Block List`. The fragment's CRC32 is recorded on the blob as `x-ms-meta-crc32`. `stream_s3.streaming_upload` does not apply.
+- **Deletes are one request per key.** Azure has no multi-object delete, so the reaper and GC pay a request per object rather than one per thousand.
+- **`stream_s3.account_id` and KMS settings do not apply.** They send `x-amz-` headers that Azure does not take; Azure encrypts at rest unconditionally.
+
 ### Credentials
 
 The plugin resolves AWS credentials in this order:

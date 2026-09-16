@@ -54,6 +54,23 @@ fun(Conf) ->
     end
 end}.
 
+%% api - which object store API the remote tier speaks. `aws` is the S3 API,
+%% which Google Cloud Storage and other S3-compatible stores also accept.
+%% `azure` is the Azure Blob REST API, which is a different protocol.
+
+{mapping, "stream_s3.api", "rabbitmq_stream_s3.rabbitmq_stream_s3_api", [
+    {datatype, {enum, [aws, azure]}}
+]}.
+
+{translation, "rabbitmq_stream_s3.rabbitmq_stream_s3_api",
+fun(Conf) ->
+    case cuttlefish:conf_get("stream_s3.api", Conf, undefined) of
+        undefined -> cuttlefish:unset();
+        aws       -> rabbitmq_stream_s3_api_aws;
+        azure     -> rabbitmq_stream_s3_api_azure
+    end
+end}.
+
 %% streaming_upload - how a fragment's body is sent. `chunked`, the default,
 %% streams it as one PUT using S3's aws-chunked encoding with a trailing
 %% checksum. `multipart` sends it as several ordinary PUTs, for stores that do
@@ -66,9 +83,11 @@ end}.
 %% auth - how requests to the object store are authorized. `aws` signs them with
 %% AWS SigV4 and is what S3 wants. `bearer` sends an OAuth2 access token fetched
 %% from the cloud's metadata server, for Google Cloud Storage and Azure Blob.
+%% `azure` signs them with an Azure storage account key, for an Azure Blob
+%% deployment that has no managed identity to fetch a token from.
 
 {mapping, "stream_s3.auth", "rabbitmq_stream_s3.rabbitmq_stream_s3_auth", [
-    {datatype, {enum, [aws, bearer]}}
+    {datatype, {enum, [aws, bearer, azure]}}
 ]}.
 
 {translation, "rabbitmq_stream_s3.rabbitmq_stream_s3_auth",
@@ -76,7 +95,58 @@ fun(Conf) ->
     case cuttlefish:conf_get("stream_s3.auth", Conf, undefined) of
         undefined -> cuttlefish:unset();
         aws       -> rabbitmq_stream_s3_auth_aws;
-        bearer    -> rabbitmq_stream_s3_auth_bearer
+        bearer    -> rabbitmq_stream_s3_auth_bearer;
+        azure     -> rabbitmq_stream_s3_auth_azure
+    end
+end}.
+
+%% azure.account - the Azure storage account the container lives in. Required
+%% when stream_s3.api is azure: it is part of the request host, and part of what
+%% a Shared Key signature covers.
+
+{mapping, "stream_s3.azure.account", "rabbitmq_stream_s3.azure_account", [
+    {datatype, binary}
+]}.
+
+{translation, "rabbitmq_stream_s3.azure_account",
+fun(Conf) ->
+    case cuttlefish:conf_get("stream_s3.azure.account", Conf, undefined) of
+        undefined -> cuttlefish:unset();
+        Value     -> Value
+    end
+end}.
+
+%% azure.account_key - the storage account key, as Azure presents it. Read only
+%% when stream_s3.auth is azure, and ignored unless
+%% stream_s3.allow_static_credentials is set to true: the key is long-lived,
+%% stored in plaintext on disk, never rotated, and grants full access to the
+%% account. Prefer a managed identity (stream_s3.auth = bearer).
+
+{mapping, "stream_s3.azure.account_key", "rabbitmq_stream_s3.azure_account_key", [
+    {datatype, binary}
+]}.
+
+{translation, "rabbitmq_stream_s3.azure_account_key",
+fun(Conf) ->
+    case cuttlefish:conf_get("stream_s3.azure.account_key", Conf, undefined) of
+        undefined -> cuttlefish:unset();
+        Value     -> Value
+    end
+end}.
+
+%% azure.api_version - the Azure Blob REST API version every request declares.
+%% The default is the version the client's request and response handling was
+%% written against; set this only to satisfy a service that does not accept it.
+
+{mapping, "stream_s3.azure.api_version", "rabbitmq_stream_s3.azure_api_version", [
+    {datatype, binary}
+]}.
+
+{translation, "rabbitmq_stream_s3.azure_api_version",
+fun(Conf) ->
+    case cuttlefish:conf_get("stream_s3.azure.api_version", Conf, undefined) of
+        undefined -> cuttlefish:unset();
+        Value     -> Value
     end
 end}.
 
