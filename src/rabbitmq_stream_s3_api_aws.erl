@@ -1049,12 +1049,20 @@ The endpoint host, without the bucket.
 The connection pool connects to this host, and TLS verifies it. Requests use
 virtual-hosted addressing, so the bucket is a subdomain of it. See
 `request_host/0`.
+
+A store whose endpoint carries no region configures this host directly.
+Otherwise it is derived from the region.
 """.
 -spec endpoint() -> {ok, binary()} | {error, any()}.
 endpoint() ->
-    case rabbitmq_stream_s3_auth_aws:region() of
-        {ok, Region} -> {ok, derived_endpoint(Region)};
-        {error, _} = Err -> Err
+    case rabbitmq_stream_s3_config:endpoint() of
+        undefined ->
+            case rabbitmq_stream_s3_auth_aws:region() of
+                {ok, Region} -> {ok, derived_endpoint(Region)};
+                {error, _} = Err -> Err
+            end;
+        Endpoint ->
+            {ok, Endpoint}
     end.
 
 -spec derived_endpoint(Region :: binary()) -> binary().
@@ -1623,6 +1631,24 @@ decode_delete_errors_test() ->
         <<"<?xml version=\"1.0\" encoding=\"UTF-8\"?><Other><Key>a</Key></Other>">>,
     ?assertEqual([], decode_delete_errors(Unexpected)),
     ok.
+
+configured_endpoint_replaces_the_derived_one_test() ->
+    Bucket = application:get_env(rabbitmq_stream_s3, bucket),
+    ok = application:set_env(rabbitmq_stream_s3, bucket, <<"examplebucket">>),
+    try
+        ok = application:set_env(rabbitmq_stream_s3, endpoint, <<"storage.googleapis.com">>),
+        %% The endpoint replaces the derived host, region included. A store
+        %% reached this way has one host with no region in it.
+        ?assertEqual({ok, <<"storage.googleapis.com">>}, endpoint()),
+        %% Addressing stays virtual-hosted, so the bucket is still a subdomain.
+        ?assertEqual({ok, <<"examplebucket.storage.googleapis.com">>}, request_host())
+    after
+        application:unset_env(rabbitmq_stream_s3, endpoint),
+        case Bucket of
+            undefined -> application:unset_env(rabbitmq_stream_s3, bucket);
+            {ok, B} -> application:set_env(rabbitmq_stream_s3, bucket, B)
+        end
+    end.
 
 match_async_active_request_test() ->
     Ref = make_ref(),

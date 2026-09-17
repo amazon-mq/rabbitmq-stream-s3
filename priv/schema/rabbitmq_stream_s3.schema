@@ -36,6 +36,78 @@ fun(Conf) ->
     end
 end}.
 
+%% endpoint - the object store endpoint host, without the bucket. Replaces the
+%% `s3.<region>.<tld>` host derived from stream_s3.region, for stores whose
+%% endpoint does not carry a region. Addressing stays virtual-hosted, so
+%% requests go to `<bucket>.<endpoint>`. For Google Cloud Storage's XML API set
+%% this to storage.googleapis.com.
+
+{mapping, "stream_s3.endpoint", "rabbitmq_stream_s3.endpoint", [
+    {datatype, binary}
+]}.
+
+{translation, "rabbitmq_stream_s3.endpoint",
+fun(Conf) ->
+    case cuttlefish:conf_get("stream_s3.endpoint", Conf, undefined) of
+        undefined -> cuttlefish:unset();
+        Value     -> Value
+    end
+end}.
+
+%% auth - how requests to the object store are authorized. `aws` signs them with
+%% AWS SigV4 and is what S3 wants. `bearer` sends an OAuth2 access token fetched
+%% from the cloud's metadata server, for Google Cloud Storage and Azure Blob.
+
+{mapping, "stream_s3.auth", "rabbitmq_stream_s3.rabbitmq_stream_s3_auth", [
+    {datatype, {enum, [aws, bearer]}}
+]}.
+
+{translation, "rabbitmq_stream_s3.rabbitmq_stream_s3_auth",
+fun(Conf) ->
+    case cuttlefish:conf_get("stream_s3.auth", Conf, undefined) of
+        undefined -> cuttlefish:unset();
+        aws       -> rabbitmq_stream_s3_auth_aws;
+        bearer    -> rabbitmq_stream_s3_auth_bearer
+    end
+end}.
+
+%% bearer.provider - which cloud's metadata server issues the token. Only read
+%% when stream_s3.auth is bearer.
+
+{mapping, "stream_s3.bearer.provider", "rabbitmq_stream_s3.bearer_provider", [
+    {datatype, {enum, [gcp, azure]}}
+]}.
+
+%% bearer.resource - the Azure resource (audience) the token is requested for.
+%% Azure only: on GCP the token is scoped by the instance's service account.
+
+{mapping, "stream_s3.bearer.resource", "rabbitmq_stream_s3.bearer_resource", [
+    {datatype, binary}
+]}.
+
+{translation, "rabbitmq_stream_s3.bearer_resource",
+fun(Conf) ->
+    case cuttlefish:conf_get("stream_s3.bearer.resource", Conf, undefined) of
+        undefined -> cuttlefish:unset();
+        Value     -> Value
+    end
+end}.
+
+%% bearer.client_id - client ID of a user-assigned Azure managed identity. When
+%% unset, the system-assigned identity is used.
+
+{mapping, "stream_s3.bearer.client_id", "rabbitmq_stream_s3.bearer_client_id", [
+    {datatype, binary}
+]}.
+
+{translation, "rabbitmq_stream_s3.bearer_client_id",
+fun(Conf) ->
+    case cuttlefish:conf_get("stream_s3.bearer.client_id", Conf, undefined) of
+        undefined -> cuttlefish:unset();
+        Value     -> Value
+    end
+end}.
+
 %% access_key_id - static AWS access key ID. Ignored unless
 %% stream_s3.allow_static_credentials is set to true.
 

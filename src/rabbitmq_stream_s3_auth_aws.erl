@@ -33,6 +33,9 @@ and the S3 client needs it to derive a regional host.
 %% we use a token just as it expires.
 -define(TTL_SECONDS_BUFFER, 5).
 -define(REGION_KEY, rabbitmq_stream_s3_api_aws_region).
+%% Credential-scope region for an S3-compatible store whose endpoint carries no
+%% region. `auto` is the convention such stores use. See region/0.
+-define(UNSCOPED_SIGNING_REGION, <<"auto">>).
 
 -record(container_creds_req, {host, port, path, conn, stream_ref}).
 
@@ -236,19 +239,29 @@ schedule_refresh({error, _}, #state{refresh_timer = OldTimer} = State) ->
 cancel_timer(undefined) -> ok;
 cancel_timer(TRef) -> erlang:cancel_timer(TRef, [{async, true}, {info, false}]).
 
-%% Region is required to build the request host and to sign requests, so a
-%% failure here cannot be papered over: callers must surface it. We return a
-%% tagged tuple (rather than the bare binary) so the failure propagates as a
-%% clean {error, _} through endpoint/0 and sign_headers/8 instead of crashing
-%% the calling worker with a badarg on binary construction. Once a region is
-%% known (from config or a successful IMDS lookup) it is cached in
-%% persistent_term and never expires, so this only ever fails transiently before
-%% the first successful lookup.
+%% The region fills the SigV4 credential scope. The client also derives an
+%% endpoint from it when configuration names none. A caller must therefore
+%% surface a failure here.
+%%
+%% This returns a tagged tuple, not a bare binary, so the failure propagates as
+%% {error, _} through endpoint/0 and sign_headers/8. A bare binary would crash
+%% the calling worker with a badarg on binary construction.
+%%
+%% A known region (from configuration or a successful IMDS lookup) is cached in
+%% persistent_term and never expires. This can only fail before the first
+%% successful lookup.
 -spec region() -> {ok, binary()} | {error, any()}.
 region() ->
     case persistent_term:get(?REGION_KEY, undefined) of
         undefined ->
-            safe_call(refresh_region, 15_000);
+            case rabbitmq_stream_s3_config:endpoint() of
+                undefined ->
+                    safe_call(refresh_region, 15_000);
+                _ ->
+                    %% An endpoint host has no region to match. An IMDS lookup
+                    %% would describe this instance, not the store.
+                    {ok, ?UNSCOPED_SIGNING_REGION}
+            end;
         Region ->
             {ok, Region}
     end.
@@ -951,6 +964,56 @@ authorize_dispatches_through_auth_behaviour_test() ->
             undefined -> application:unset_env(rabbitmq_stream_s3, bucket);
             {ok, B} -> application:set_env(rabbitmq_stream_s3, bucket, B)
         end,
+        case Region of
+            undefined -> persistent_term:erase(?REGION_KEY);
+            _ -> persistent_term:put(?REGION_KEY, Region)
+        end
+    end.
+
+signs_the_host_it_is_given_test() ->
+    Region = persistent_term:get(?REGION_KEY, undefined),
+    persistent_term:erase(?REGION_KEY),
+    try
+        ok = application:set_env(rabbitmq_stream_s3, endpoint, <<"storage.googleapis.com">>),
+        Host = <<"examplebucket.storage.googleapis.com">>,
+        {ok, #{<<"host">> := Signed, <<"authorization">> := Authorization}} = sign_headers(
+            #{<<"host">> => Host},
+            <<"GOOG1EEXAMPLE">>,
+            <<"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY">>,
+            undefined,
+            <<"GET">>,
+            <<"/test.txt">>,
+            <<>>,
+            #{}
+        ),
+        %% The caller's host is signed as-is, not replaced by a derived one.
+        ?assertEqual(Host, Signed),
+        ?assertMatch({_, _}, binary:match(Authorization, <<"host">>)),
+        %% Interop HMAC keys sign with the s3 service name, so the scope shape
+        %% is unchanged apart from the region. The date is today's, so match
+        %% only the fixed part of the scope.
+        ?assertMatch({_, _}, binary:match(Authorization, <<"/auto/s3/aws4_request">>))
+    after
+        application:unset_env(rabbitmq_stream_s3, endpoint),
+        case Region of
+            undefined -> persistent_term:erase(?REGION_KEY);
+            _ -> persistent_term:put(?REGION_KEY, Region)
+        end
+    end.
+
+region_defaults_to_auto_with_endpoint_test() ->
+    Region = persistent_term:get(?REGION_KEY, undefined),
+    persistent_term:erase(?REGION_KEY),
+    try
+        ok = application:set_env(rabbitmq_stream_s3, endpoint, <<"storage.googleapis.com">>),
+        %% Without this, an unset region would send the caller into a blocking
+        %% IMDS lookup whose answer describes the instance, not the store.
+        ?assertEqual({ok, <<"auto">>}, region()),
+        %% An explicitly configured region still wins.
+        persistent_term:put(?REGION_KEY, <<"europe-west1">>),
+        ?assertEqual({ok, <<"europe-west1">>}, region())
+    after
+        application:unset_env(rabbitmq_stream_s3, endpoint),
         case Region of
             undefined -> persistent_term:erase(?REGION_KEY);
             _ -> persistent_term:put(?REGION_KEY, Region)

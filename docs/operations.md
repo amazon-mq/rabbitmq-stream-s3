@@ -28,6 +28,49 @@ stream_s3.region_endpoints.us-east-1 = amazonaws.com
 
 The default is `amazonaws.com`, and the China, US intelligence community, and European Sovereign Cloud partitions are already mapped, so an override is only needed for a domain you resolve yourself. To reach S3-compatible storage, pick such a domain and point `<bucket>.s3.<region>.<tld>` at your endpoint: `stream_s3.region = jepsen` with `stream_s3.region_endpoints.jepsen = local` gives the host `s3.jepsen.local`. See [`jepsen/jepsen.streams3/src/jepsen/streams3/db.clj`](../jepsen/jepsen.streams3/src/jepsen/streams3/db.clj) for a working MinIO configuration.
 
+### Non-AWS endpoints
+
+`stream_s3.endpoint` sets the endpoint host directly, replacing the `s3.<region>.<tld>` host derived from the region. Use it for stores whose endpoint carries no region. Addressing stays virtual-hosted, so requests go to `<bucket>.<endpoint>` over TLS on port 443, and the bucket must therefore resolve as a subdomain of the endpoint.
+
+```ini
+stream_s3.bucket = my-rabbitmq-streams-bucket
+stream_s3.endpoint = storage.googleapis.com
+```
+
+`stream_s3.region` is not needed alongside an endpoint. An endpoint host carries no region to match, so nothing is looked up from EC2 instance metadata - that would describe the instance rather than the store - and the region falls back to `auto`, the convention S3-compatible stores settled on for a credential scope with no region to name. Set it only if your store requires a particular scope.
+
+Google Cloud Storage support is partial. See [object-store-portability.md](./object-store-portability.md) for what works, what does not, and the remaining work.
+
+### Authorization scheme
+
+`stream_s3.auth` selects how requests are authorized. The default, `aws`, signs
+them with SigV4 and is what S3 and any S3-compatible store taking HMAC keys
+want. `bearer` sends an OAuth2 access token fetched from the cloud's metadata
+server, for Google Cloud Storage and Azure Blob.
+
+```ini
+stream_s3.auth = bearer
+stream_s3.bearer.provider = gcp
+```
+
+On GCP the token is scoped by the service account attached to the instance, so
+nothing further is needed. On Azure, `stream_s3.bearer.resource` sets the
+resource the token is requested for (default `https://storage.azure.com/`) and
+`stream_s3.bearer.client_id` selects a user-assigned managed identity; leave it
+unset to use the system-assigned one.
+
+```ini
+stream_s3.auth = bearer
+stream_s3.bearer.provider = azure
+stream_s3.bearer.client_id = 00000000-0000-0000-0000-000000000000
+```
+
+Bearer tokens avoid long-lived static secrets entirely, which matters beyond
+preference: organizations can disable GCS interoperability HMAC keys with
+`constraints/storage.restrictAuthTypes`, and Microsoft recommends disallowing
+Shared Key on storage accounts. Where either applies, `bearer` is the only way
+in.
+
 ### Credentials
 
 The plugin resolves AWS credentials in this order:

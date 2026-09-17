@@ -15,6 +15,9 @@ lives here. Callers use these functions instead of calling
 -export([
     api_backend/0,
     auth_backend/0,
+    bearer_provider/0,
+    bearer_resource/0,
+    bearer_client_id/0,
     account_id/0,
     aws_access_key/0,
     aws_secret_key/0,
@@ -22,6 +25,7 @@ lives here. Callers use these functions instead of calling
     allow_static_credentials/0,
     aws_region/0,
     aws_region_endpoints/0,
+    endpoint/0,
     bucket/0,
     api_fs_data_dir/0,
     upload_pool_min_size/0,
@@ -76,10 +80,29 @@ api_backend() ->
     application:get_env(?APP, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_aws).
 
 %% The auth backend module. Only an API backend with requests to authorize reads
-%% it. The filesystem backend never does.
+%% it. The filesystem backend never does. The default is SigV4, which S3 wants.
+%% Set it to rabbitmq_stream_s3_auth_bearer for GCS or Azure Blob.
 -spec auth_backend() -> module().
 auth_backend() ->
     application:get_env(?APP, rabbitmq_stream_s3_auth, rabbitmq_stream_s3_auth_aws).
+
+%% Which cloud's metadata server rabbitmq_stream_s3_auth_bearer asks for a
+%% token. Only consulted when that backend is selected.
+-spec bearer_provider() -> gcp | azure.
+bearer_provider() ->
+    application:get_env(?APP, bearer_provider, gcp).
+
+%% The Azure resource (audience) the token is requested for. Azure only: GCP
+%% scopes the token from the service account attached to the instance.
+-spec bearer_resource() -> binary().
+bearer_resource() ->
+    application:get_env(?APP, bearer_resource, <<"https://storage.azure.com/">>).
+
+%% Client ID of a user-assigned managed identity. When `undefined`, Azure uses
+%% the system-assigned identity.
+-spec bearer_client_id() -> binary() | undefined.
+bearer_client_id() ->
+    application:get_env(?APP, bearer_client_id, undefined).
 
 %% AWS credentials. Return `undefined` when not configured (instance role is used).
 -spec aws_access_key() -> binary() | undefined.
@@ -119,6 +142,14 @@ aws_region() ->
 -spec aws_region_endpoints() -> #{binary() => binary()}.
 aws_region_endpoints() ->
     application:get_env(?APP, aws_region_endpoints, #{}).
+
+%% The object store endpoint host, without the bucket. When set it replaces the
+%% `s3.<region>.<tld>` host derived from the region, for stores whose endpoint
+%% does not carry a region: Google Cloud Storage is `storage.googleapis.com`.
+%% Addressing stays virtual-hosted, so the request host is `<bucket>.<endpoint>`.
+-spec endpoint() -> binary() | undefined.
+endpoint() ->
+    application:get_env(?APP, endpoint, undefined).
 
 %% Required. Crashes with badmatch if not configured.
 -spec bucket() -> binary().
@@ -430,6 +461,9 @@ defaults_test_() ->
     [
         ?_assertEqual(rabbitmq_stream_s3_api_aws, api_backend()),
         ?_assertEqual(rabbitmq_stream_s3_auth_aws, auth_backend()),
+        ?_assertEqual(gcp, bearer_provider()),
+        ?_assertEqual(<<"https://storage.azure.com/">>, bearer_resource()),
+        ?_assertEqual(undefined, bearer_client_id()),
         ?_assertEqual(undefined, aws_access_key()),
         ?_assertEqual(undefined, aws_secret_key()),
         ?_assertEqual(undefined, aws_security_token()),
@@ -437,6 +471,7 @@ defaults_test_() ->
         ?_assertEqual(undefined, aws_region()),
         ?_assertEqual(undefined, account_id()),
         ?_assertEqual(#{}, aws_region_endpoints()),
+        ?_assertEqual(undefined, endpoint()),
         ?_assertEqual(undefined, api_fs_data_dir()),
         ?_assertEqual(0, upload_pool_min_size()),
         ?_assertEqual(20, upload_pool_max_size()),
@@ -477,6 +512,14 @@ defaults_test_() ->
         ?_assertEqual(undefined, kms_key_id()),
         ?_assertEqual(#{}, kms_encryption_context())
     ].
+
+auth_backend_is_configurable_test() ->
+    try
+        ok = application:set_env(?APP, rabbitmq_stream_s3_auth, rabbitmq_stream_s3_auth_bearer),
+        ?assertEqual(rabbitmq_stream_s3_auth_bearer, auth_backend())
+    after
+        application:unset_env(?APP, rabbitmq_stream_s3_auth)
+    end.
 
 configured_test_() ->
     {foreach, fun() -> ok end, fun(_) -> application:unset_env(rabbitmq_stream_s3, bucket) end, [
