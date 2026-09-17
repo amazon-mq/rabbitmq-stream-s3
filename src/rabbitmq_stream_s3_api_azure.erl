@@ -632,9 +632,15 @@ and the endpoint are therefore the same value, and this module needs no
 """.
 -spec endpoint() -> {ok, binary()} | {error, any()}.
 endpoint() ->
-    case rabbitmq_stream_s3_config:azure_account() of
-        undefined -> {error, no_azure_account};
-        Account -> {ok, <<Account/binary, $., (configured_endpoint())/binary>>}
+    Suffix = configured_endpoint(),
+    case rabbitmq_stream_s3_config:azure_path_style() of
+        true ->
+            {ok, Suffix};
+        false ->
+            case rabbitmq_stream_s3_config:azure_account() of
+                undefined -> {error, no_azure_account};
+                Account -> {ok, <<Account/binary, $., Suffix/binary>>}
+            end
     end.
 
 configured_endpoint() ->
@@ -643,11 +649,20 @@ configured_endpoint() ->
         Endpoint -> Endpoint
     end.
 
-%% `/<container>`. The account is in the host, not the path, so every request
-%% path starts here.
+%% `/<container>`, and under the account when the account is addressed by path
+%% rather than by host. Every request path starts here.
 -spec container_path() -> binary().
 container_path() ->
-    <<$/, (rabbitmq_stream_s3_config:bucket())/binary>>.
+    Container = rabbitmq_stream_s3_config:bucket(),
+    case rabbitmq_stream_s3_config:azure_path_style() of
+        false ->
+            <<$/, Container/binary>>;
+        true ->
+            case rabbitmq_stream_s3_config:azure_account() of
+                undefined -> <<$/, Container/binary>>;
+                Account -> <<$/, Account/binary, $/, Container/binary>>
+            end
+    end.
 
 -spec key_to_path(key()) -> binary().
 key_to_path(Key) ->
@@ -674,6 +689,16 @@ endpoint_is_the_account_host_test() ->
             ?assertEqual({ok, <<"acct.blob.core.chinacloudapi.cn">>}, endpoint())
         end
     ),
+    %% Path style connects to the endpoint itself. The account moves into the
+    %% path.
+    with_config(
+        [
+            {azure_account, <<"devstoreaccount1">>},
+            {endpoint, <<"127.0.0.1">>},
+            {azure_path_style, true}
+        ],
+        fun() -> ?assertEqual({ok, <<"127.0.0.1">>}, endpoint()) end
+    ),
     %% Without an account there is no host to derive, and saying so beats
     %% connecting to "blob.core.windows.net" and reporting an opaque failure.
     ?assertEqual({error, no_azure_account}, endpoint()).
@@ -683,7 +708,17 @@ key_to_path_test() ->
         ?assertEqual(<<"/streams/a/b.segment">>, key_to_path(<<"a/b.segment">>)),
         %% Separators survive quoting. Everything else that needs it is quoted.
         ?assertEqual(<<"/streams/a%20b/c">>, key_to_path(<<"a b/c">>))
-    end).
+    end),
+    with_config(
+        [
+            {bucket, <<"streams">>},
+            {azure_account, <<"devstoreaccount1">>},
+            {azure_path_style, true}
+        ],
+        fun() ->
+            ?assertEqual(<<"/devstoreaccount1/streams/a/b">>, key_to_path(<<"a/b">>))
+        end
+    ).
 
 block_ids_are_equal_length_test() ->
     %% Azure rejects a block list whose ids are not all the same length, which a

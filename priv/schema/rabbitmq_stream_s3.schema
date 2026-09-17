@@ -54,6 +54,21 @@ fun(Conf) ->
     end
 end}.
 
+%% http.port and http.tls - the port the connection pools dial and whether they
+%% use TLS. These describe how the store is reached rather than what its API is,
+%% so they belong to the HTTP client and apply to every backend. Defaults are
+%% HTTPS on 443, which is every production object store. Only change them for a
+%% local emulator, such as Azurite on 10000 over plain HTTP.
+
+{mapping, "stream_s3.http.port", "rabbitmq_stream_s3.http_port", [
+    {datatype, integer},
+    {validators, ["non_zero_positive_integer"]}
+]}.
+
+{mapping, "stream_s3.http.tls", "rabbitmq_stream_s3.http_tls", [
+    {datatype, {enum, [true, false]}}
+]}.
+
 %% api - which object store API the remote tier speaks. `aws` is the S3 API,
 %% which Google Cloud Storage and other S3-compatible stores also accept.
 %% `azure` is the Azure Blob REST API, which is a different protocol.
@@ -133,6 +148,14 @@ fun(Conf) ->
         Value     -> Value
     end
 end}.
+
+%% azure.path_style - address the account as the first path segment instead of
+%% as a subdomain of the endpoint. What the Azurite emulator serves; a real
+%% storage account does not need it.
+
+{mapping, "stream_s3.azure.path_style", "rabbitmq_stream_s3.azure_path_style", [
+    {datatype, {enum, [true, false]}}
+]}.
 
 %% azure.api_version - the Azure Blob REST API version every request declares.
 %% The default is the version the client's request and response handling was

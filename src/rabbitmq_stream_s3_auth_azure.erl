@@ -8,7 +8,8 @@ Azure Shared Key authorization.
 Signs each request with the storage account's key. Azure Blob accepts this
 scheme where no managed identity can supply a token.
 `rabbitmq_stream_s3_auth_bearer` is the better choice on an Azure VM. This
-backend reaches a storage account from anywhere else.
+backend reaches a storage account from anywhere else, and the Azurite emulator
+accepts it.
 
 This is SigV4's smaller relative: an HMAC-SHA256 over a canonical description of
 the request. Two differences matter:
@@ -16,7 +17,8 @@ the request. Two differences matter:
 - The description is a fixed list of headers by position, not a negotiated
   signed-headers set. A header the string omits is not covered at all.
 - The account name belongs to the canonicalized resource, not to a credential
-  scope.
+  scope. An emulator that puts the account in the URL path therefore signs the
+  same string a real account does.
 
 The key is a long-lived plaintext secret with full access to the account. It
 therefore sits behind the same `stream_s3.allow_static_credentials` opt-in as
@@ -135,9 +137,9 @@ trim(Value) ->
 -doc """
 `/<account><path>` followed by one sorted, URL-decoded line per query parameter.
 
-`Path` is the request target, so it carries the query string. The account is
-prepended to it, which is the service's rule and not a property of how the
-request was addressed.
+`Path` is the request target, so it carries the query string and, against an
+emulator, the account as its first segment. The account is prepended either way:
+the emulator's path form is what the service signs, not a variation on it.
 """.
 -spec canonicalized_resource(binary(), binary()) -> binary().
 canonicalized_resource(Path, Account) ->
@@ -317,6 +319,12 @@ canonicalized_resource_test() ->
     ?assertEqual(
         <<"/acct/c\ninclude:metadata,snapshots">>,
         canonicalized_resource(<<"/c?include=snapshots&include=metadata">>, <<"acct">>)
+    ),
+    %% Against the emulator the account is also the first path segment, and it
+    %% is still prepended.
+    ?assertEqual(
+        <<"/devstoreaccount1/devstoreaccount1/c/b">>,
+        canonicalized_resource(<<"/devstoreaccount1/c/b">>, <<"devstoreaccount1">>)
     ).
 
 canonicalized_headers_test() ->

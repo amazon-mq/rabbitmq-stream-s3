@@ -118,6 +118,23 @@ The key grants full access to the account, is stored in plaintext on disk and ne
 - **Deletes are one request per key.** Azure has no multi-object delete, so the reaper and GC pay a request per object rather than one per thousand.
 - **`stream_s3.account_id` and KMS settings do not apply.** They send `x-amz-` headers that Azure does not take; Azure encrypts at rest unconditionally.
 
+#### Against the Azurite emulator
+
+Azurite serves the real protocol over plain HTTP with the account in the path, which is what `stream_s3.azure.path_style` and the `stream_s3.http.*` settings are for. Only use this locally: without TLS, the account key crosses the network in the clear.
+
+```ini
+stream_s3.api = azure
+stream_s3.auth = azure
+stream_s3.azure.account = devstoreaccount1
+stream_s3.azure.account_key = <the well-known Azurite development key>
+stream_s3.azure.path_style = true
+stream_s3.endpoint = 127.0.0.1
+stream_s3.http.port = 10000
+stream_s3.http.tls = false
+stream_s3.allow_static_credentials = true
+stream_s3.bucket = streams
+```
+
 ### Credentials
 
 The plugin resolves AWS credentials in this order:

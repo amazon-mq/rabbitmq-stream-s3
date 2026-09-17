@@ -541,10 +541,12 @@ grow(N, #?MODULE{monitors = Monitors0, created = Created0, open_fun = OpenFun} =
 -doc """
 Opens a connection to the configured object store.
 
-The backend says which host; the port and whether to use TLS are this client's
-own configuration. The host is asked for per connection rather than cached: it
-can be unavailable at startup (an IMDS region lookup that has not succeeded yet)
-and become available later.
+The backend names the host. The port and TLS are this client's own
+configuration.
+
+This reads the host per connection and does not cache it. The host can be
+unavailable at startup, when an IMDS region lookup has not yet succeeded, and
+become available later.
 """.
 -spec open() -> {ok, pid()} | {error, any()}.
 open() ->
@@ -553,7 +555,7 @@ open() ->
         {ok, HostBin} ->
             Host = binary_to_list(HostBin),
             Opts = #{
-                transport => tls,
+                transport => transport(),
                 %% The object store APIs this plugin talks to are HTTP/1.1.
                 protocols => [http],
                 tls_opts => [
@@ -592,11 +594,17 @@ open() ->
                 %% has not been made.
                 retry => 0
             },
-            gun:open(Host, 443, Opts);
+            gun:open(Host, rabbitmq_stream_s3_config:http_port(), Opts);
         {error, _} = Err ->
             %% The endpoint is not yet known (e.g. IMDS lookup not yet
             %% successful). Surface a clean error rather than crashing the pool.
             Err
+    end.
+
+transport() ->
+    case rabbitmq_stream_s3_config:http_tls() of
+        true -> tls;
+        false -> tcp
     end.
 
 take_available(

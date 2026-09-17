@@ -5,16 +5,35 @@
 -moduledoc """
 Integration tests for the Azure Blob backend.
 
-Runs against a real storage account, and skips itself when none is configured,
-so it is safe to have in the default run.
+Runs against Azurite, Microsoft's Blob emulator, or against a real storage
+account. The suite skips itself when neither is reachable, so it is safe to have
+in the default run.
+
+## Against Azurite
+
+Azurite speaks the real protocol over plain HTTP with Shared Key
+authorization, which is what makes the whole backend testable without an Azure
+subscription:
+
+```sh
+npm install azurite
+npx azurite-blob --blobHost 127.0.0.1 --blobPort 10000 --location /tmp/azurite
+```
+
+The suite then finds it on the default port with the well-known development
+account, and needs no configuration. Point it elsewhere with `AZURITE_HOST` and
+`AZURITE_PORT`.
+
+## Against a real storage account
 
 Set `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_KEY` and `AZURE_STORAGE_CONTAINER`.
 The container must already exist: the plugin never creates one, and neither does
-this suite. The account key needs no special role; it is the account's master
-key.
+this suite outside the emulator. The account key needs no special role; it is
+the account's master key.
 
 Requests go to `<account>.blob.core.windows.net` over TLS, so this exercises the
-addressing a deployment uses.
+addressing a deployment uses, which the emulator - where the account is a path
+segment - does not.
 """.
 
 -compile([export_all, nowarn_export_all]).
@@ -23,6 +42,12 @@ addressing a deployment uses.
 -include_lib("eunit/include/eunit.hrl").
 
 -define(M, rabbitmq_stream_s3_api_azure).
+%% The account and key Azurite serves by default, published by Microsoft for
+%% exactly this purpose. Not a credential.
+-define(AZURITE_ACCOUNT, <<"devstoreaccount1">>).
+-define(AZURITE_KEY,
+    <<"Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==">>
+).
 
 all() ->
     [{group, integration}].
@@ -75,6 +100,9 @@ end_per_group(integration, Config) ->
 end_per_group(_, Config) ->
     Config.
 
+%% A real account is preferred when configured, because it is the addressing a
+%% deployment actually uses; the emulator is the fallback that makes the suite
+%% run anywhere.
 target() ->
     case
         {
@@ -95,9 +123,39 @@ target() ->
                 {bucket, list_to_binary(Container)}
             ]};
         _ ->
+            azurite_target()
+    end.
+
+azurite_target() ->
+    Host = list_to_binary(os:getenv("AZURITE_HOST", "127.0.0.1")),
+    Port = list_to_integer(os:getenv("AZURITE_PORT", "10000")),
+    case is_listening(Host, Port) of
+        true ->
+            {ok, [
+                {rabbitmq_stream_s3_api, ?M},
+                {rabbitmq_stream_s3_auth, rabbitmq_stream_s3_auth_azure},
+                {azure_account, ?AZURITE_ACCOUNT},
+                {azure_account_key, ?AZURITE_KEY},
+                {azure_path_style, true},
+                {allow_static_credentials, true},
+                {endpoint, Host},
+                {http_port, Port},
+                {http_tls, false},
+                {bucket, <<"rabbitmq-stream-s3-ct">>}
+            ]};
+        false ->
             {skip,
-                "No storage account is configured. Skipping this group is OK! See the "
-                "moduledoc for how to run it."}
+                "Neither a storage account nor Azurite is configured. Skipping this group "
+                "is OK! See the moduledoc for how to run it."}
+    end.
+
+is_listening(Host, Port) ->
+    case gen_tcp:connect(binary_to_list(Host), Port, [{active, false}], 1_000) of
+        {ok, Sock} ->
+            ok = gen_tcp:close(Sock),
+            true;
+        {error, _} ->
+            false
     end.
 
 %% Unlinked: init_per_group runs in a process Common Test discards, and a linked
@@ -300,17 +358,31 @@ small_page(Prefix) ->
     ),
     ?M:decode_enumeration_results(Body).
 
-%% The plugin never creates a container, and neither does this suite: the
-%% operator is expected to have one, so a failure here is a configuration
-%% problem worth seeing rather than working around.
+%% The plugin never creates a container. Against the emulator the suite makes
+%% its own; against a real account the operator is expected to have one, and a
+%% failure here is a configuration problem worth seeing.
 ensure_container() ->
     case ?M:check_bucket(#{}) of
-        ok -> ok;
-        {error, _} = Err -> ct:fail({check_bucket_failed, Err})
+        ok ->
+            ok;
+        {error, no_such_bucket} ->
+            case raw(<<"PUT">>, <<(container_path())/binary, "?restype=container">>) of
+                {ok, #{status := Status}} when Status =:= 201; Status =:= 409 -> ok;
+                Other -> ct:fail({create_container_failed, Other})
+            end;
+        {error, _} = Err ->
+            ct:fail({check_bucket_failed, Err})
     end.
 
 container_path() ->
-    <<$/, (application:get_env(rabbitmq_stream_s3, bucket, <<>>))/binary>>.
+    Container = application:get_env(rabbitmq_stream_s3, bucket, <<>>),
+    case application:get_env(rabbitmq_stream_s3, azure_path_style, false) of
+        false ->
+            <<$/, Container/binary>>;
+        true ->
+            Account = application:get_env(rabbitmq_stream_s3, azure_account, <<>>),
+            <<$/, Account/binary, $/, Container/binary>>
+    end.
 
 %% A signed request for the container operations the backend does not implement.
 raw(Method, Path) ->

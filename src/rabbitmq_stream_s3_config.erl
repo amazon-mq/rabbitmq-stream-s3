@@ -20,6 +20,7 @@ lives here. Callers use these functions instead of calling
     bearer_client_id/0,
     azure_account/0,
     azure_account_key/0,
+    azure_path_style/0,
     azure_api_version/0,
     account_id/0,
     aws_access_key/0,
@@ -29,6 +30,8 @@ lives here. Callers use these functions instead of calling
     aws_region/0,
     aws_region_endpoints/0,
     endpoint/0,
+    http_port/0,
+    http_tls/0,
     streaming_upload/0,
     bucket/0,
     api_fs_data_dir/0,
@@ -122,6 +125,13 @@ azure_account() ->
 azure_account_key() ->
     application:get_env(?APP, azure_account_key, undefined).
 
+%% Address the container as a path segment under the endpoint rather than the
+%% account as a subdomain of it. The Azurite emulator serves this form, and a
+%% storage account behind a path-routing proxy needs it.
+-spec azure_path_style() -> boolean().
+azure_path_style() ->
+    application:get_env(?APP, azure_path_style, false).
+
 %% The Azure Blob REST API version every request declares. Pinned rather than
 %% tracking the newest: a version is a contract about response shapes, and the
 %% one named here is what the client's parsing was written against.
@@ -175,6 +185,20 @@ aws_region_endpoints() ->
 -spec endpoint() -> binary() | undefined.
 endpoint() ->
     application:get_env(?APP, endpoint, undefined).
+
+%% The port the connection pools connect to. This describes how the client
+%% reaches the store, not what its API is, so it belongs to the HTTP client and
+%% not to a backend. Only set it for a local emulator, or for a proxy that puts
+%% the store on another port.
+-spec http_port() -> inet:port_number().
+http_port() ->
+    application:get_env(?APP, http_port, 443).
+
+%% Whether the connection pools use TLS. Only turn this off for a local
+%% emulator: every request carries credentials.
+-spec http_tls() -> boolean().
+http_tls() ->
+    application:get_env(?APP, http_tls, true).
 
 %% How a fragment's body is sent.
 %%
@@ -501,6 +525,7 @@ defaults_test_() ->
         ?_assertEqual(undefined, bearer_client_id()),
         ?_assertEqual(undefined, azure_account()),
         ?_assertEqual(undefined, azure_account_key()),
+        ?_assertEqual(false, azure_path_style()),
         ?_assertEqual(<<"2021-08-06">>, azure_api_version()),
         ?_assertEqual(undefined, aws_access_key()),
         ?_assertEqual(undefined, aws_secret_key()),
@@ -510,6 +535,8 @@ defaults_test_() ->
         ?_assertEqual(undefined, account_id()),
         ?_assertEqual(#{}, aws_region_endpoints()),
         ?_assertEqual(undefined, endpoint()),
+        ?_assertEqual(443, http_port()),
+        ?_assertEqual(true, http_tls()),
         ?_assertEqual(chunked, streaming_upload()),
         ?_assertEqual(undefined, api_fs_data_dir()),
         ?_assertEqual(0, upload_pool_min_size()),
