@@ -409,11 +409,20 @@ committed_offset(#?MODULE{mode = #remote{shared = Shared}}) ->
 committed_offset(#?MODULE{mode = Local}) ->
     osiris_log:committed_offset(Local).
 
-%% The remote reader monitors the log reader process and stops when it exits,
-%% so no explicit close is needed.
-close(#?MODULE{mode = #remote{}}) ->
+%% Stop the reader this state owns. The reader also monitors the process that
+%% created it and stops when that exits, but that only covers the process going
+%% away: a caller may close one reader and open another while it is still alive,
+%% and `rabbit_stream_queue` does exactly that on a `stream_local_member_change`
+%% - it reads the offset, closes, and re-inits there. Leaving the reader running
+%% for those made a consumer's readers accumulate for the life of its
+%% connection, each holding up to `prefetch_max_memory`.
+%%
+%% `stop/1` is a cast, so this does not wait, and a cast to a reader that has
+%% already stopped is a no-op - which is what makes it safe on the paths that
+%% stopped it before becoming local.
+close(#?MODULE{mode = #remote{pid = Pid}}) ->
     counters:add(counter(), ?C_REMOTE_CLOSE, 1),
-    ok;
+    ok = rabbitmq_stream_s3_remote_reader:stop(Pid);
 close(#?MODULE{mode = Local}) ->
     counters:add(counter(), ?C_LOCAL_CLOSE, 1),
     ok = osiris_log:close(Local).

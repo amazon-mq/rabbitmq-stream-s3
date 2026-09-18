@@ -58,6 +58,7 @@ groups() ->
     [
         {single_node, [], [
             read_from_remote_first,
+            close_stops_the_remote_reader,
             send_file_from_remote_tier,
             read_from_remote_first_large_filter,
             read_across_fragment_boundaries,
@@ -859,3 +860,32 @@ corrupt_first_fragment(Config) ->
     <<Pre:Pos/binary, Byte:8, Post/binary>> = Bin,
     Corrupted = <<Pre/binary, (Byte bxor 16#FF):8, Post/binary>>,
     ok = file:write_file(First, Corrupted).
+
+%% `close/1` owns the remote reader process, so closing a reader has to stop it.
+%% The reader monitors the process that created it and stops when that exits,
+%% which covers a consumer disconnecting but not a caller that closes one reader
+%% and opens another while still alive. `rabbit_stream_queue` does exactly that
+%% on a `stream_local_member_change`, so a reader left running there survives
+%% for the life of the connection holding up to `prefetch_max_memory`.
+%%
+%% Asserting on a disconnect would pass without the fix; this closes an
+%% explicitly-held state instead. See amazon-mq/rabbitmq-stream-s3#374.
+close_stops_the_remote_reader(Config) ->
+    Writer = start_writer(Config, #{fragment_target_size => 1000}),
+    write_sequential(Writer, 200, 5),
+
+    ReaderCfg = reader_config(Writer, Config),
+    #{shared := Shared} = ReaderCfg,
+    ?awaitMatch([S] when S > 0, list_segment_offsets(Config), 1000),
+    ?awaitMatch(F when F > 0, osiris_log_shared:first_chunk_id(Shared), 1000),
+
+    {ok, Reader} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg),
+    ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader)),
+    Pid = rabbitmq_stream_s3_log_reader:remote_pid(Reader),
+    ?assert(is_pid(Pid)),
+    ?assert(is_process_alive(Pid)),
+
+    ok = rabbitmq_stream_s3_log_reader:close(Reader),
+
+    %% `stop/1` is a cast, so the exit is asynchronous.
+    ?awaitMatch(false, is_process_alive(Pid), 5000).
