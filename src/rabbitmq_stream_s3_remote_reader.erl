@@ -234,9 +234,12 @@ prefetch_sizing() ->
 start(Config) ->
     gen_server:start(?MODULE, Config, []).
 
-%% Asynchronous, fire-and-forget stop. The reader also monitors its consumer
-%% and stops on its own when the consumer exits; this reclaims it eagerly on a
-%% become_local transition so it does not linger for the consumer's lifetime.
+%% Asynchronous, fire-and-forget stop. The reader also monitors its consumer and
+%% stops on its own when the consumer exits; this reclaims it eagerly instead of
+%% leaving it to linger for the consumer's lifetime. Called from two places, and
+%% the second is the one that matters: a `become_local` transition, and
+%% `log_reader:close/1`, since a caller may close one reader and open another
+%% while the consumer it belongs to is still running.
 stop(Pid) ->
     gen_server:cast(Pid, stop).
 

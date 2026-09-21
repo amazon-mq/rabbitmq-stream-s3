@@ -879,11 +879,22 @@ close_stops_the_remote_reader(Config) ->
     ?awaitMatch([S] when S > 0, list_segment_offsets(Config), 1000),
     ?awaitMatch(F when F > 0, osiris_log_shared:first_chunk_id(Shared), 1000),
 
-    {ok, Reader} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg),
-    ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader)),
-    Pid = rabbitmq_stream_s3_log_reader:remote_pid(Reader),
+    {ok, Reader0} = rabbitmq_stream_s3_log_reader:init_offset_reader(first, ReaderCfg),
+    ?assertEqual(remote, rabbitmq_stream_s3_log_reader:mode(Reader0)),
+    Pid = rabbitmq_stream_s3_log_reader:remote_pid(Reader0),
     ?assert(is_pid(Pid)),
     ?assert(is_process_alive(Pid)),
+
+    %% Read first, so the reader being closed is one that has served a consumer
+    %% rather than one still sitting on the fragment it opened at. The offset
+    %% the production trigger closes at is always mid-stream, and a reader
+    %% stopped only while it is still at its opening fragment would leak for
+    %% every real consumer while passing this case.
+    {ok, _Header, _Iter, Reader} = rabbitmq_stream_s3_log_reader:chunk_iterator(
+        Reader0, 1, undefined
+    ),
+    ?assert(rabbitmq_stream_s3_log_reader:next_offset(Reader) > 0),
+    ?assertEqual(Pid, rabbitmq_stream_s3_log_reader:remote_pid(Reader)),
 
     ok = rabbitmq_stream_s3_log_reader:close(Reader),
 

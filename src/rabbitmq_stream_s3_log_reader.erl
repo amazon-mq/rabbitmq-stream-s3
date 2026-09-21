@@ -418,8 +418,11 @@ committed_offset(#?MODULE{mode = Local}) ->
 %% connection, each holding up to `prefetch_max_memory`.
 %%
 %% `stop/1` is a cast, so this does not wait, and a cast to a reader that has
-%% already stopped is a no-op - which is what makes it safe on the paths that
-%% stopped it before becoming local.
+%% already stopped is a no-op. That matters on the paths where a reader is
+%% stopped before this runs: a `become_local` transition hands back a local
+%% state and so takes the clause below, but one that fails to build the local
+%% reader keeps the remote state, and a channel terminating after such a failure
+%% closes it again.
 close(#?MODULE{mode = #remote{pid = Pid}}) ->
     counters:add(counter(), ?C_REMOTE_CLOSE, 1),
     ok = rabbitmq_stream_s3_remote_reader:stop(Pid);
