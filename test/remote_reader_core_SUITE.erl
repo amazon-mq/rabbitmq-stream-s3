@@ -36,6 +36,7 @@ all() ->
         tuner_returns_to_the_best_target_it_found,
         tuner_backs_off_on_contention,
         tuner_stays_within_its_bounds,
+        tuner_stops_where_the_budget_stops,
         exhausted_pool_is_contention_but_a_growing_one_is_not,
         tuner_off_pins_the_target_where_it_started,
         tuner_moves_the_target_from_what_the_tick_measured,
@@ -783,6 +784,32 @@ exhausted_pool_is_contention_but_a_growing_one_is_not(_Config) ->
     {S4, _} = fail(S3, 0, Start, pool_exhausted),
     {S5, _} = tick(S4, 100_000),
     ?assertEqual(6, inflight_target(S5)).
+
+%% The search must not climb past the concurrency the fetch budget can express.
+%% `fetch_ceiling/1` is `min(Target * request_size, max_memory div 2)`, so once
+%% the target is worth more than half of `max_memory` the knob is disconnected:
+%% raising it changes no budget and gates nothing, every sample up there is flat
+%% by construction, and `classify/2` answers a flat sample by stepping further
+%% the way it was already going. The target then drifts to `max_depth` through
+%% ground it cannot get a reading from, and reports a concurrency the reader
+%% never attempts. See amazon-mq/rabbitmq-stream-s3#373.
+%%
+%% 64_000 of memory at 1000-byte requests gives the fetch half 32_000, so 32
+%% requests is everything it can express, well below the `max_depth` of 64 that
+%% the ramp would otherwise double into.
+tuner_stops_where_the_budget_stops(_Config) ->
+    S = tuner_state(#{request_size => 1000, max_memory => 64_000, max_depth => 64}),
+    ?assertEqual(1, inflight_target(S)),
+    Climb = rates(S, [1000, 2000, 4000, 8000, 16_000, 32_000, 64_000, 128_000]),
+    ?assertEqual([2, 4, 8, 16, 32, 32, 32], Climb),
+    %% And the ceiling it settles on is the one the budget can spend: at the
+    %% final target the fetch ceiling is exactly the fetch half, so a further
+    %% step would buy nothing.
+    Settled = lists:foldl(fun(R, Acc) -> tune(R, Acc) end, S, [
+        1000, 2000, 4000, 8000, 16_000, 32_000, 64_000, 128_000
+    ]),
+    ?assertEqual(32, inflight_target(Settled)),
+    ?assertEqual(32_000, rabbitmq_stream_s3_remote_reader_core:fetch_ceiling(Settled)).
 
 tuner_stays_within_its_bounds(_Config) ->
     %% `max_depth` is the ceiling the search may not cross, and one request is

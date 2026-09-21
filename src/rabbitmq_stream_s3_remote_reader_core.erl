@@ -1208,6 +1208,26 @@ fetch_ceiling(
 ) ->
     max(min(Target * RequestSize, MaxMemory div 2), pending_need(State)).
 
+%% The highest target the fetch budget can express, which is the ceiling the
+%% concurrency search may climb to. Above it `fetch_ceiling/1` is pinned at the
+%% fetch half whatever the target says, so raising the target changes no budget
+%% and gates nothing: samples up there are flat by construction, and `classify/2`
+%% answers a flat sample by stepping further the way it was already going. The
+%% search would drift to `max_depth` through ground it cannot get a reading from
+%% and report a concurrency the reader never attempts.
+%%
+%% Derived here rather than written into `retarget/2` so that the fetch half
+%% appears once. `fetch_ceiling/1` is the only other place that halves
+%% `max_memory`, and if that split ever stops being half the two must not drift.
+%%
+%% `max_depth` still applies: this is the budget's limit, not a replacement for
+%% the resource cap, and whichever is lower binds. Floored at one because a
+%% budget smaller than a single request must still let one be issued, or `room/1`
+%% refuses forever and nothing is ever fetched.
+-spec expressible_target(#cfg{}) -> pos_integer().
+expressible_target(#cfg{request_size = RequestSize, max_memory = MaxMemory}) ->
+    max(1, (MaxMemory div 2) div RequestSize).
+
 %% Everything the reader may hold, buffered or in flight. The configured bound
 %% itself, which the read in hand is the only thing that lifts.
 -spec memory_ceiling(state()) -> non_neg_integer().
@@ -1617,11 +1637,23 @@ tune(
             end
     end.
 
-%% Clamped to the configured ceiling, and never below one: a target of zero
-%% has `room/1` refuse however far behind the consumer falls, so nothing
-%% would ever be requested again.
-retarget(Target, #state{cfg = #cfg{max_depth = MaxDepth}} = State) ->
-    State#state{inflight_target = max(1, min(MaxDepth, Target))}.
+%% Clamped to the lower of the two ceilings that bind a target, and never below
+%% one: a target of zero has `room/1` refuse however far behind the consumer
+%% falls, so nothing would ever be requested again.
+%%
+%% The two ceilings answer different questions. `max_depth` is the resource cap,
+%% a reader's share of the connection pool. `expressible_target/1` is what the
+%% fetch budget can actually spend, and without it the search climbs into a range
+%% where the target moves but no budget does; see that function for why a sample
+%% taken up there reads as flat.
+%%
+%% Only the search is clamped here. A target pinned by `prefetch_inflight_initial`
+%% with `prefetch_auto_tune` off is set directly at init and left alone, because
+%% silently lowering a figure an operator set would hide the misconfiguration
+%% rather than report it.
+retarget(Target, #state{cfg = #cfg{max_depth = MaxDepth} = Cfg} = State) ->
+    Ceiling = min(MaxDepth, expressible_target(Cfg)),
+    State#state{inflight_target = max(1, min(Ceiling, Target))}.
 
 %% Proportional, not one at a time. The ramp can leave the search a long way
 %% from the peak - doubling overshoots by up to half of where it lands, and
