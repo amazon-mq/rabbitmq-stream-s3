@@ -552,7 +552,7 @@ it, except the last two, which no setting raises.
 
 | Metric                                                          | The bound that stopped the pass                          |
 |-----------------------------------------------------------------|----------------------------------------------------------|
-| `rabbitmq_stream_s3_remote_reader_prefetch_stall_target`        | The concurrency target; raise `prefetch_max_depth`, or let the search find it |
+| `rabbitmq_stream_s3_remote_reader_prefetch_stall_target`        | The concurrency target. The search will not raise it past what the fetch budget can spend, which at the defaults is lower than `prefetch_max_depth`, so raise half `prefetch_max_memory` first and `prefetch_max_depth` only if the depth cap is what binds |
 | `rabbitmq_stream_s3_remote_reader_prefetch_stall_depth`         | `prefetch_max_depth` itself                              |
 | `rabbitmq_stream_s3_remote_reader_prefetch_stall_fetch_budget`  | Half `prefetch_max_memory`, the cap on what may be committed |
 | `rabbitmq_stream_s3_remote_reader_prefetch_stall_buffer`        | The memory ceiling: the consumer is far behind           |

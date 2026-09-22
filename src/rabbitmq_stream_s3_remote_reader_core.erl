@@ -1220,13 +1220,23 @@ fetch_ceiling(
 %% appears once. `fetch_ceiling/1` is the only other place that halves
 %% `max_memory`, and if that split ever stops being half the two must not drift.
 %%
+%% Rounded up, because `room_for_bytes/1` stalls only once committed has reached
+%% the ceiling: it admits a range while committed is still below the half, so the
+%% budget is worth `ceil` of the division rather than `div`. Rounding down would
+%% pin the target one request under what the reader can run at whenever the half
+%% is not a whole number of requests, and make the target the binding bound
+%% instead of the budget. `prop_SUITE`'s `HeldBound` states the same overshoot.
+%%
+%% Rounding up costs no memory: `fetch_ceiling/1` still governs the bytes and
+%% already permits that one range, whatever the target says.
+%%
 %% `max_depth` still applies: this is the budget's limit, not a replacement for
-%% the resource cap, and whichever is lower binds. Floored at one because a
-%% budget smaller than a single request must still let one be issued, or `room/1`
-%% refuses forever and nothing is ever fetched.
+%% the resource cap, and whichever is lower binds. Floored at one so the spec
+%% holds on its own rather than by relying on `build_cfg/1`, which already floors
+%% `max_memory` at two requests, and on `retarget/2`'s own floor.
 -spec expressible_target(#cfg{}) -> pos_integer().
 expressible_target(#cfg{request_size = RequestSize, max_memory = MaxMemory}) ->
-    max(1, (MaxMemory div 2) div RequestSize).
+    max(1, ((MaxMemory div 2) + RequestSize - 1) div RequestSize).
 
 %% Everything the reader may hold, buffered or in flight. The configured bound
 %% itself, which the read in hand is the only thing that lifts.
@@ -1455,6 +1465,10 @@ note_miss(State0) ->
 %% single S3 connection transfers at roughly one rate whatever range size is
 %% asked of it.
 %%
+%% Two ceilings bound it, and `retarget/2` enforces the lower: `#cfg.max_depth`,
+%% the resource cap on a reader's share of the pool, and `expressible_target/1`,
+%% what the fetch budget can spend. Neither is the operating point.
+%%
 %% Searched rather than configured, because the answer is not a property of the
 %% configuration: the same reader against the same store wants different
 %% concurrency with a cold connection pool and a warm one. Past the peak,
@@ -1549,6 +1563,13 @@ tune(
     Rate,
     #state{tune_phase = ramp, inflight_target = Target, prev_rate = Prev, cfg = Cfg} = State
 ) ->
+    %% The ceiling the ramp is doubling towards, which is the one `retarget/2`
+    %% enforces. Computed here because a guard cannot call a function, and it has
+    %% to be this rather than `max_depth`: with the budget's limit lower, a guard
+    %% on `max_depth` alone can never hold, so a still-improving ramp at the
+    %% ceiling would take the `false` branch and halve away from a target it is
+    %% about to climb back to.
+    RampCeiling = min(Cfg#cfg.max_depth, expressible_target(Cfg)),
     case improved(Rate, Prev) of
         false ->
             %% Doubling stopped paying. The peak is between here and half of
@@ -1557,7 +1578,7 @@ tune(
             retarget(max(1, Target div 2), State#state{
                 tune_phase = climb, probe_dir = up, prev_rate = undefined
             });
-        true when Target >= Cfg#cfg.max_depth ->
+        true when Target >= RampCeiling ->
             %% Still paying, but there is nowhere left to double into. Hold at
             %% the ceiling and search from there rather than halving away from
             %% a rate that was still improving - the ceiling may well be the

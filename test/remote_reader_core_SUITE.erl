@@ -794,22 +794,26 @@ exhausted_pool_is_contention_but_a_growing_one_is_not(_Config) ->
 %% ground it cannot get a reading from, and reports a concurrency the reader
 %% never attempts. See amazon-mq/rabbitmq-stream-s3#373.
 %%
-%% 64_000 of memory at 1000-byte requests gives the fetch half 32_000, so 32
-%% requests is everything it can express, well below the `max_depth` of 64 that
-%% the ramp would otherwise double into.
+%% 65_000 of memory at 1000-byte requests gives the fetch half 32_500, which is
+%% deliberately not a whole number of requests. `room_for_bytes/1` stalls only
+%% once committed has reached the ceiling, so it admits a range while committed
+%% is still under 32_500: the budget is worth 33 requests, not 32. A ceiling
+%% computed by truncating would clamp to 32 and make the target, rather than the
+%% budget, the bound - so the exact-multiple case cannot show that error and this
+%% one can. Both are well below the `max_depth` of 64 the ramp would otherwise
+%% double into.
 tuner_stops_where_the_budget_stops(_Config) ->
-    S = tuner_state(#{request_size => 1000, max_memory => 64_000, max_depth => 64}),
+    S = tuner_state(#{request_size => 1000, max_memory => 65_000, max_depth => 64}),
     ?assertEqual(1, inflight_target(S)),
     Climb = rates(S, [1000, 2000, 4000, 8000, 16_000, 32_000, 64_000, 128_000]),
-    ?assertEqual([2, 4, 8, 16, 32, 32, 32], Climb),
-    %% And the ceiling it settles on is the one the budget can spend: at the
-    %% final target the fetch ceiling is exactly the fetch half, so a further
-    %% step would buy nothing.
-    Settled = lists:foldl(fun(R, Acc) -> tune(R, Acc) end, S, [
-        1000, 2000, 4000, 8000, 16_000, 32_000, 64_000, 128_000
-    ]),
-    ?assertEqual(32, inflight_target(Settled)),
-    ?assertEqual(32_000, rabbitmq_stream_s3_remote_reader_core:fetch_ceiling(Settled)).
+    ?assertEqual([2, 4, 8, 16, 32, 33, 33], Climb),
+    %% An exact multiple clamps to exactly that many requests, with no rounding
+    %% to hide a truncation either way.
+    Exact = tuner_state(#{request_size => 1000, max_memory => 64_000, max_depth => 64}),
+    ?assertEqual(
+        [2, 4, 8, 16, 32, 32, 32],
+        rates(Exact, [1000, 2000, 4000, 8000, 16_000, 32_000, 64_000, 128_000])
+    ).
 
 tuner_stays_within_its_bounds(_Config) ->
     %% `max_depth` is the ceiling the search may not cross, and one request is
@@ -818,7 +822,9 @@ tuner_stays_within_its_bounds(_Config) ->
     Up = rates(tuner_state(#{max_depth => 12}), [1000, 2000, 4000, 8000, 16_000]),
     ?assertEqual([2, 4, 8, 12], Up),
     %% Coming back down is asserted as the sequence it walks rather than as a
-    %% range. `retarget/2` clamps every write to `[1, max_depth]`, so a range
+    %% range. `retarget/2` clamps every write to `[1, min(max_depth,
+    %% expressible_target)]` - here the former, since this fixture's budget is far
+    %% larger than its depth cap - so a range
     %% check is a test of that clamp and of nothing else: it holds whatever the
     %% steps in between do, including with `step_target/2` inverted or the
     %% return-to-best arm deleted.
