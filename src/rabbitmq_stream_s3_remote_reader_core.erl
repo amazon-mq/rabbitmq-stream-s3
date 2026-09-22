@@ -1208,8 +1208,15 @@ fetch_ceiling(
 ) ->
     max(min(Target * RequestSize, MaxMemory div 2), pending_need(State)).
 
-%% The highest target the fetch budget can express, which is the ceiling the
-%% concurrency search may climb to. Above it `fetch_ceiling/1` is pinned at the
+%% The highest target the fetch budget can express with no read in hand, which is
+%% the ceiling the concurrency search may climb to. Reads it: `fetch_ceiling/1` is
+%% also floored at `pending_need/1`, so a read larger than the fetch half lifts
+%% the byte budget above what this returns and the reader then issues that read's
+%% ranges a target's worth at a time. That serialises an oversized read rather
+%% than refusing it, and reaching it needs a chunk larger than half
+%% `prefetch_max_memory`.
+%%
+%% Above this target `fetch_ceiling/1` is pinned at the
 %% fetch half whatever the target says, so raising the target changes no budget
 %% and gates nothing: samples up there are flat by construction, and `classify/2`
 %% answers a flat sample by stepping further the way it was already going. The
@@ -1474,7 +1481,6 @@ note_miss(State0) ->
 %% concurrency with a cold connection pool and a warm one. Past the peak,
 %% throughput falls away as requests queue rather than run, so this searches for
 %% a maximum and treats the fall-off as the signal to come back down.
-%% `#cfg.max_depth` is the ceiling, not the operating point.
 %%
 %% The search starts at one request so what a reader fetches stays proportional
 %% to what its consumer has asked for: starting at the operating point would

@@ -84,7 +84,7 @@ Several ranges are fetched at once. A single S3 connection transfers at roughly 
 
 New ranges are issued at the fetch frontier while a byte budget and a depth cap allow. `prefetch_max_memory` (256 MiB) is split between the two things a reader holds bytes for: half is what fetching may commit, and the rest is the buffer's. `prefetch_max_depth` (64) is the ceiling on requests in flight, not the operating point.
 
-The fetching half is in bytes but it is spent on requests, so it allows half of `prefetch_max_memory` divided by `prefetch_request_size` of them. Delivered bandwidth is therefore that half over one request's duration, and a connection's transfer rate is roughly fixed, so the default counts requests rather than bytes: a flat one would deliver less as the request size grew.
+The fetching half is in bytes but it is spent on requests, so it allows half of `prefetch_max_memory` divided by `prefetch_request_size` of them, rounded up: a range is admitted while what is committed is still under the half, so the last one crosses it. Delivered bandwidth is therefore that half over one request's duration, and a connection's transfer rate is roughly fixed, so the default counts requests rather than bytes: a flat one would deliver less as the request size grew.
 
 The search will not climb past what that half can spend. Above it the target buys no budget and gates nothing, so every sample there is flat whatever the concurrency, and a search reading flat samples walks the target up through ground it cannot measure. `prefetch_max_depth` still caps requests in flight, so the target is bound by whichever of the two is lower, and at the shipped defaults that is the budget: 32 requests against a depth cap of 64.
 

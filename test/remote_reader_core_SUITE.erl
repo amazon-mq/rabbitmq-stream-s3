@@ -805,15 +805,17 @@ exhausted_pool_is_contention_but_a_growing_one_is_not(_Config) ->
 tuner_stops_where_the_budget_stops(_Config) ->
     S = tuner_state(#{request_size => 1000, max_memory => 65_000, max_depth => 64}),
     ?assertEqual(1, inflight_target(S)),
-    Climb = rates(S, [1000, 2000, 4000, 8000, 16_000, 32_000, 64_000, 128_000]),
-    ?assertEqual([2, 4, 8, 16, 32, 33, 33], Climb),
+    %% The list runs two samples past the ceiling on purpose. Reaching it is what
+    %% the clamp does; staying there is what the ramp's hold arm does, and that
+    %% arm has to be guarded on this ceiling rather than on `max_depth`. Guarded
+    %% on `max_depth` the first seven targets are identical and the eighth halves
+    %% to 16, so a shorter list cannot tell the two apart.
+    Rates = [1000, 2000, 4000, 8000, 16_000, 32_000, 64_000, 128_000, 128_000, 128_000],
+    ?assertEqual([2, 4, 8, 16, 32, 33, 33, 33, 33], rates(S, Rates)),
     %% An exact multiple clamps to exactly that many requests, with no rounding
     %% to hide a truncation either way.
     Exact = tuner_state(#{request_size => 1000, max_memory => 64_000, max_depth => 64}),
-    ?assertEqual(
-        [2, 4, 8, 16, 32, 32, 32],
-        rates(Exact, [1000, 2000, 4000, 8000, 16_000, 32_000, 64_000, 128_000])
-    ).
+    ?assertEqual([2, 4, 8, 16, 32, 32, 32, 32, 32], rates(Exact, Rates)).
 
 tuner_stays_within_its_bounds(_Config) ->
     %% `max_depth` is the ceiling the search may not cross, and one request is
