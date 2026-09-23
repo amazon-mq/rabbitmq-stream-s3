@@ -75,7 +75,7 @@ S3 supports at least 3,500 PUT/COPY/POST/DELETE and 5,500 GET/HEAD requests per 
 
 **Uploads:** At 64 MiB per fragment, even very high throughput produces few PUTs per second. The upload path is unlikely to approach this limit.
 
-**Downloads:** Each consumer's remote reader issues GET requests. Ranges are 4 MiB and several are in flight at once, so a single consumer catching up at full speed can issue on the order of a hundred GETs/sec, bounded by `stream_s3.prefetch.max_depth`. Many consumers reading from S3 on the same stream increase the aggregate request rate. S3's automatic scaling handles sustained load, but a sudden burst of consumers on a previously idle stream may see brief throttling before scaling takes effect. When throttled, consumers see reduced throughput (slower delivery) but no errors or data loss. The broker retries automatically and throughput recovers as S3 scales.
+**Downloads:** Each consumer's remote reader issues GET requests. Ranges are 4 MiB and several are in flight at once, so a single consumer catching up at full speed can issue on the order of a hundred GETs/sec, bounded by whichever is lower of `stream_s3.prefetch.max_depth` and what the fetch half of `stream_s3.prefetch.max_memory` can spend, which is 32 requests at the defaults. Many consumers reading from S3 on the same stream increase the aggregate request rate. S3's automatic scaling handles sustained load, but a sudden burst of consumers on a previously idle stream may see brief throttling before scaling takes effect. When throttled, consumers see reduced throughput (slower delivery) but no errors or data loss. The broker retries automatically and throughput recovers as S3 scales.
 
 ### Local disk and page cache
 

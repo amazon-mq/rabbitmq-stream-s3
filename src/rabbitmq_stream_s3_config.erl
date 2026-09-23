@@ -228,7 +228,9 @@ prefetch_auto_tune() ->
 %% With the search on this is not consulted at all: a reader starts at one
 %% request and the ramp doubles it into an operating point within a second of
 %% sustained reading, so what a reader runs at is measured rather than
-%% configured, and `prefetch_max_depth` is the only bound on it. What this sets
+%% configured. Two settings bound it: `prefetch_max_depth`, and what the fetch
+%% half of `prefetch_max_memory` can spend, which at the shipped defaults is the
+%% lower of the two. What this sets
 %% is the fixed concurrency a reader runs at with the search turned off, which
 %% is why it is sized for a consumer reading faster than the local tier can
 %% serve it rather than for the smallest useful reader.

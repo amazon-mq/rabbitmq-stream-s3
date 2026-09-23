@@ -552,7 +552,7 @@ it, except the last two, which no setting raises.
 
 | Metric                                                          | The bound that stopped the pass                          |
 |-----------------------------------------------------------------|----------------------------------------------------------|
-| `rabbitmq_stream_s3_remote_reader_prefetch_stall_target`        | The concurrency target; raise `prefetch_max_depth`, or let the search find it |
+| `rabbitmq_stream_s3_remote_reader_prefetch_stall_target`        | The concurrency target. The search will not raise it past what the fetch budget can spend, which at the defaults is lower than `prefetch_max_depth`, so raise half `prefetch_max_memory` first and `prefetch_max_depth` only if the depth cap is what binds |
 | `rabbitmq_stream_s3_remote_reader_prefetch_stall_depth`         | `prefetch_max_depth` itself                              |
 | `rabbitmq_stream_s3_remote_reader_prefetch_stall_fetch_budget`  | Half `prefetch_max_memory`, the cap on what may be committed |
 | `rabbitmq_stream_s3_remote_reader_prefetch_stall_buffer`        | The memory ceiling: the consumer is far behind           |
@@ -595,7 +595,7 @@ The pipeline gauges (`rabbitmq_stream_s3_bytes_in_assembly`, `rabbitmq_stream_s3
 
 S3 supports at least 3,500 PUT/POST/DELETE and 5,500 GET requests per second per partitioned prefix and scales automatically under sustained load. Each fragment is one PUT, so even very high stream throughput produces few PUTs per second. The realistic concern is GETs from many consumers reading old data on the same stream simultaneously. S3's automatic scaling handles sustained load but a sudden burst on a previously idle stream may see brief throttling.
 
-Each remote reader issues fixed-size range GETs (`prefetch_request_size`, 4 MiB) and runs up to `prefetch_max_depth` (64) of them concurrently, so a lagging consumer's request rate is bounded by its depth rather than by its throughput. Lowering the depth trades a consumer's catch-up rate for a lower request rate and fewer pooled connections.
+Each remote reader issues fixed-size range GETs (`prefetch_request_size`, 4 MiB) and runs several of them concurrently, so a lagging consumer's request rate is bounded by that concurrency rather than by its throughput. Two settings bound it and the lower one wins: `prefetch_max_depth` (64), and what the fetch half of `prefetch_max_memory` can spend, which is half of it divided by the request size and rounds to 32 at the defaults. So the per-reader ceiling ships at 32, and lowering `prefetch_max_depth` to anything at or above 32 changes nothing. Lowering whichever binds trades a consumer's catch-up rate for a lower request rate and fewer pooled connections.
 
 That is a ceiling rather than what a reader runs at. Concurrency is searched for from measured throughput: a reader starts at one request and the search doubles it while the rate keeps answering, so a consumer that reads a little and stops never reaches the ceiling. `rabbitmq_stream_s3_remote_reader_inflight_target` is where a reader's current target can be read, and budgeting from the ceiling rather than from that gauge overstates the request rate of every reader that is not saturated. Setting `prefetch_auto_tune = false` pins every reader at `prefetch_inflight_initial` instead.
 

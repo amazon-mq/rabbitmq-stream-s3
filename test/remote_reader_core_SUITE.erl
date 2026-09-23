@@ -36,6 +36,7 @@ all() ->
         tuner_returns_to_the_best_target_it_found,
         tuner_backs_off_on_contention,
         tuner_stays_within_its_bounds,
+        tuner_stops_where_the_budget_stops,
         exhausted_pool_is_contention_but_a_growing_one_is_not,
         tuner_off_pins_the_target_where_it_started,
         tuner_moves_the_target_from_what_the_tick_measured,
@@ -784,6 +785,38 @@ exhausted_pool_is_contention_but_a_growing_one_is_not(_Config) ->
     {S5, _} = tick(S4, 100_000),
     ?assertEqual(6, inflight_target(S5)).
 
+%% The search must not climb past the concurrency the fetch budget can express.
+%% `fetch_ceiling/1` is `min(Target * request_size, max_memory div 2)`, so once
+%% the target is worth more than half of `max_memory` the knob is disconnected:
+%% raising it changes no budget and gates nothing, every sample up there is flat
+%% by construction, and `classify/2` answers a flat sample by stepping further
+%% the way it was already going. The target then drifts to `max_depth` through
+%% ground it cannot get a reading from, and reports a concurrency the reader
+%% never attempts. See amazon-mq/rabbitmq-stream-s3#373.
+%%
+%% 65_000 of memory at 1000-byte requests gives the fetch half 32_500, which is
+%% deliberately not a whole number of requests. `room_for_bytes/1` stalls only
+%% once committed has reached the ceiling, so it admits a range while committed
+%% is still under 32_500: the budget is worth 33 requests, not 32. A ceiling
+%% computed by truncating would clamp to 32 and make the target, rather than the
+%% budget, the bound - so the exact-multiple case cannot show that error and this
+%% one can. Both are well below the `max_depth` of 64 the ramp would otherwise
+%% double into.
+tuner_stops_where_the_budget_stops(_Config) ->
+    S = tuner_state(#{request_size => 1000, max_memory => 65_000, max_depth => 64}),
+    ?assertEqual(1, inflight_target(S)),
+    %% The list runs two samples past the ceiling on purpose. Reaching it is what
+    %% the clamp does; staying there is what the ramp's hold arm does, and that
+    %% arm has to be guarded on this ceiling rather than on `max_depth`. Guarded
+    %% on `max_depth` the first seven targets are identical and the eighth halves
+    %% to 16, so a shorter list cannot tell the two apart.
+    Rates = [1000, 2000, 4000, 8000, 16_000, 32_000, 64_000, 128_000, 128_000, 128_000],
+    ?assertEqual([2, 4, 8, 16, 32, 33, 33, 33, 33], rates(S, Rates)),
+    %% An exact multiple clamps to exactly that many requests, with no rounding
+    %% to hide a truncation either way.
+    Exact = tuner_state(#{request_size => 1000, max_memory => 64_000, max_depth => 64}),
+    ?assertEqual([2, 4, 8, 16, 32, 32, 32, 32, 32], rates(Exact, Rates)).
+
 tuner_stays_within_its_bounds(_Config) ->
     %% `max_depth` is the ceiling the search may not cross, and one request is
     %% the floor: at zero `room/1` refuses however far behind the consumer
@@ -791,7 +824,9 @@ tuner_stays_within_its_bounds(_Config) ->
     Up = rates(tuner_state(#{max_depth => 12}), [1000, 2000, 4000, 8000, 16_000]),
     ?assertEqual([2, 4, 8, 12], Up),
     %% Coming back down is asserted as the sequence it walks rather than as a
-    %% range. `retarget/2` clamps every write to `[1, max_depth]`, so a range
+    %% range. `retarget/2` clamps every write to `[1, min(max_depth,
+    %% expressible_target)]` - here the former, since this fixture's budget is far
+    %% larger than its depth cap - so a range
     %% check is a test of that clamp and of nothing else: it holds whatever the
     %% steps in between do, including with `step_target/2` inverted or the
     %% return-to-best arm deleted.

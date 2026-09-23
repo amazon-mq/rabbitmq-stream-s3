@@ -1208,6 +1208,43 @@ fetch_ceiling(
 ) ->
     max(min(Target * RequestSize, MaxMemory div 2), pending_need(State)).
 
+%% The highest target the fetch budget can express with no read in hand, which is
+%% the ceiling the concurrency search may climb to. Reads it: `fetch_ceiling/1` is
+%% also floored at `pending_need/1`, so a read larger than the fetch half lifts
+%% the byte budget above what this returns and the reader then issues that read's
+%% ranges a target's worth at a time. That serialises an oversized read rather
+%% than refusing it, and reaching it needs a chunk larger than half
+%% `prefetch_max_memory`.
+%%
+%% Above this target `fetch_ceiling/1` is pinned at the
+%% fetch half whatever the target says, so raising the target changes no budget
+%% and gates nothing: samples up there are flat by construction, and `classify/2`
+%% answers a flat sample by stepping further the way it was already going. The
+%% search would drift to `max_depth` through ground it cannot get a reading from
+%% and report a concurrency the reader never attempts.
+%%
+%% Derived here rather than written into `retarget/2` so that the fetch half
+%% appears once. `fetch_ceiling/1` is the only other place that halves
+%% `max_memory`, and if that split ever stops being half the two must not drift.
+%%
+%% Rounded up, because `room_for_bytes/1` stalls only once committed has reached
+%% the ceiling: it admits a range while committed is still below the half, so the
+%% budget is worth `ceil` of the division rather than `div`. Rounding down would
+%% pin the target one request under what the reader can run at whenever the half
+%% is not a whole number of requests, and make the target the binding bound
+%% instead of the budget. `prop_SUITE`'s `HeldBound` states the same overshoot.
+%%
+%% Rounding up costs no memory: `fetch_ceiling/1` still governs the bytes and
+%% already permits that one range, whatever the target says.
+%%
+%% `max_depth` still applies: this is the budget's limit, not a replacement for
+%% the resource cap, and whichever is lower binds. Floored at one so the spec
+%% holds on its own rather than by relying on `build_cfg/1`, which already floors
+%% `max_memory` at two requests, and on `retarget/2`'s own floor.
+-spec expressible_target(#cfg{}) -> pos_integer().
+expressible_target(#cfg{request_size = RequestSize, max_memory = MaxMemory}) ->
+    max(1, ((MaxMemory div 2) + RequestSize - 1) div RequestSize).
+
 %% Everything the reader may hold, buffered or in flight. The configured bound
 %% itself, which the read in hand is the only thing that lifts.
 -spec memory_ceiling(state()) -> non_neg_integer().
@@ -1435,12 +1472,15 @@ note_miss(State0) ->
 %% single S3 connection transfers at roughly one rate whatever range size is
 %% asked of it.
 %%
+%% Two ceilings bound it, and `retarget/2` enforces the lower: `#cfg.max_depth`,
+%% the resource cap on a reader's share of the pool, and `expressible_target/1`,
+%% what the fetch budget can spend. Neither is the operating point.
+%%
 %% Searched rather than configured, because the answer is not a property of the
 %% configuration: the same reader against the same store wants different
 %% concurrency with a cold connection pool and a warm one. Past the peak,
 %% throughput falls away as requests queue rather than run, so this searches for
 %% a maximum and treats the fall-off as the signal to come back down.
-%% `#cfg.max_depth` is the ceiling, not the operating point.
 %%
 %% The search starts at one request so what a reader fetches stays proportional
 %% to what its consumer has asked for: starting at the operating point would
@@ -1529,6 +1569,13 @@ tune(
     Rate,
     #state{tune_phase = ramp, inflight_target = Target, prev_rate = Prev, cfg = Cfg} = State
 ) ->
+    %% The ceiling the ramp is doubling towards, which is the one `retarget/2`
+    %% enforces. Computed here because a guard cannot call a function, and it has
+    %% to be this rather than `max_depth`: with the budget's limit lower, a guard
+    %% on `max_depth` alone can never hold, so a still-improving ramp at the
+    %% ceiling would take the `false` branch and halve away from a target it is
+    %% about to climb back to.
+    RampCeiling = min(Cfg#cfg.max_depth, expressible_target(Cfg)),
     case improved(Rate, Prev) of
         false ->
             %% Doubling stopped paying. The peak is between here and half of
@@ -1537,7 +1584,7 @@ tune(
             retarget(max(1, Target div 2), State#state{
                 tune_phase = climb, probe_dir = up, prev_rate = undefined
             });
-        true when Target >= Cfg#cfg.max_depth ->
+        true when Target >= RampCeiling ->
             %% Still paying, but there is nowhere left to double into. Hold at
             %% the ceiling and search from there rather than halving away from
             %% a rate that was still improving - the ceiling may well be the
@@ -1617,11 +1664,23 @@ tune(
             end
     end.
 
-%% Clamped to the configured ceiling, and never below one: a target of zero
-%% has `room/1` refuse however far behind the consumer falls, so nothing
-%% would ever be requested again.
-retarget(Target, #state{cfg = #cfg{max_depth = MaxDepth}} = State) ->
-    State#state{inflight_target = max(1, min(MaxDepth, Target))}.
+%% Clamped to the lower of the two ceilings that bind a target, and never below
+%% one: a target of zero has `room/1` refuse however far behind the consumer
+%% falls, so nothing would ever be requested again.
+%%
+%% The two ceilings answer different questions. `max_depth` is the resource cap,
+%% a reader's share of the connection pool. `expressible_target/1` is what the
+%% fetch budget can actually spend, and without it the search climbs into a range
+%% where the target moves but no budget does; see that function for why a sample
+%% taken up there reads as flat.
+%%
+%% Only the search is clamped here. A target pinned by `prefetch_inflight_initial`
+%% with `prefetch_auto_tune` off is set directly at init and left alone, because
+%% silently lowering a figure an operator set would hide the misconfiguration
+%% rather than report it.
+retarget(Target, #state{cfg = #cfg{max_depth = MaxDepth} = Cfg} = State) ->
+    Ceiling = min(MaxDepth, expressible_target(Cfg)),
+    State#state{inflight_target = max(1, min(Ceiling, Target))}.
 
 %% Proportional, not one at a time. The ramp can leave the search a long way
 %% from the peak - doubling overshoots by up to half of where it lands, and
