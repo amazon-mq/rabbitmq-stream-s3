@@ -89,4 +89,5 @@ Cover to cover. Follow the developer track, then continue with:
 
 - [GLOSSARY.md](./GLOSSARY.md): alphabetical definitions of all terms used in these docs
 - [scale.md](./scale.md): how far the design scales and what limits you in practice
+- [object-store-portability.md](./object-store-portability.md): how far the backend behaviour abstracts the remote tier, and what non-AWS object stores cost
 - [investigations/](./investigations/): one-off analyses that informed design decisions

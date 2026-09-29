@@ -164,14 +164,12 @@ init_per_testcase(_Testcase, Config) ->
     application:ensure_all_started(gun),
     application:ensure_all_started(seshat),
     _ = seshat:new_group(rabbitmq_stream_s3),
-    %% Establish our own precondition: rabbitmq_stream_s3_api_aws:init/1 only
-    %% starts (returns {ok, _}) when the configured backend is the AWS one,
-    %% otherwise it returns `ignore`. This suite does not use
-    %% rabbitmq_stream_s3_cth, but other suites that do leave the shared CT
-    %% node's app env set to the FS backend (see rabbitmq_stream_s3_cth:
-    %% pre_init_per_suite/3). In a full `make ct` run that leaked value would
-    %% make start_link/0 return `ignore`. Set the backend explicitly so the
-    %% suite is self-contained regardless of run order.
+    %% Establish our own precondition: the connection pools return `ignore`
+    %% from init/1 when the configured backend is the filesystem one. This suite
+    %% does not use rabbitmq_stream_s3_cth, but other suites that do leave the
+    %% shared CT node's app env set to the FS backend (see
+    %% rabbitmq_stream_s3_cth: pre_init_per_suite/3). Set the backend explicitly
+    %% so the suite is self-contained regardless of run order.
     ok = application:set_env(
         rabbitmq_stream_s3, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_aws
     ),
@@ -299,9 +297,9 @@ container_credentials(_Config) ->
         %% init_per_testcase before this env var was set, so reload_config/0 is
         %% needed to pick up the container credentials source. (The ETS table is
         %% protected and owned by the server, so the test cannot poke it directly.)
-        ok = rabbitmq_stream_s3_api_aws:reload_config(),
+        ok = rabbitmq_stream_s3_auth_aws:reload_config(),
         {ok, <<"AKIAIOSFODNN7EXAMPLE">>, <<"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY">>,
-            <<"test-session-token">>} = rabbitmq_stream_s3_api_aws:get_credentials()
+            <<"test-session-token">>} = rabbitmq_stream_s3_auth_aws:get_credentials()
     after
         os:unsetenv("AWS_CONTAINER_CREDENTIALS_FULL_URI")
     end.

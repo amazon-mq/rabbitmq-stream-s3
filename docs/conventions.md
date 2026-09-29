@@ -38,7 +38,7 @@ A gauge whose value is a pure function of process state should be published from
 
 `rabbitmq_stream_s3_governor:derive_gauges/1` is the reference shape: one function, called on every callback return that can change what it reports. See the Derived gauges section of that module's moduledoc.
 
-Where a gauge spans several processes it cannot be derived from any one of them, and inc/dec is the only option. Then weld both edges to the single state mutation they mirror, so an edge cannot be added without the counter following: api_aws's `active_requests` counts one in-flight request per pool checkout across every pool, and its two edges live in `rabbitmq_stream_s3_api_aws_pool:add_checkout/3` and `del_checkout/3`, the only two places the `checkouts` maps change. Keep the counter's key, size, and indices private to the module that defines `?COUNTERS`, and reach it from elsewhere (including tests in other modules) through an exported accessor keyed by metric name rather than a restated index.
+Where a gauge spans several processes it cannot be derived from any one of them, and inc/dec is the only option. Then weld both edges to the single state mutation they mirror, so an edge cannot be added without the counter following: rabbitmq_stream_s3_http's `active_requests` counts one in-flight request per pool checkout across every pool, and its two edges live in `rabbitmq_stream_s3_api_aws_pool:add_checkout/3` and `del_checkout/3`, the only two places the `checkouts` maps change. Keep the counter's key, size, and indices private to the module that defines `?COUNTERS`, and reach it from elsewhere (including tests in other modules) through an exported accessor keyed by metric name rather than a restated index.
 
 ## Cold-state test dimension
 

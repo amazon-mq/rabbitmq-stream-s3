@@ -27,7 +27,8 @@ associated file in that folder.
     check_bucket/1,
     match_async/3,
     handle_async/3,
-    cancel_async/2
+    cancel_async/2,
+    start_link/0
 ]).
 
 % Auxiliary function for testing
@@ -192,6 +193,11 @@ list(Prefix, _Continuation, _Opts) when is_binary(Prefix) ->
 %% The file-system backend's "bucket" is its data directory. It is accessible
 %% when the directory exists or can be created, mirroring the on-demand
 %% directory creation that stream_put/3 performs.
+-doc "Nothing to supervise: this backend is file I/O and authorizes nothing.".
+-spec start_link() -> ignore.
+start_link() ->
+    ignore.
+
 -spec check_bucket(rabbitmq_stream_s3_api:request_opts()) ->
     ok | {error, no_such_bucket | access_denied | term()}.
 check_bucket(_Opts) ->

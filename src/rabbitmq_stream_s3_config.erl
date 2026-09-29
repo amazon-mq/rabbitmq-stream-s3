@@ -14,6 +14,14 @@ lives here. Callers use these functions instead of calling
 
 -export([
     api_backend/0,
+    auth_backend/0,
+    bearer_provider/0,
+    bearer_resource/0,
+    bearer_client_id/0,
+    azure_account/0,
+    azure_account_key/0,
+    azure_path_style/0,
+    azure_api_version/0,
     account_id/0,
     aws_access_key/0,
     aws_secret_key/0,
@@ -21,6 +29,10 @@ lives here. Callers use these functions instead of calling
     allow_static_credentials/0,
     aws_region/0,
     aws_region_endpoints/0,
+    endpoint/0,
+    http_port/0,
+    http_tls/0,
+    streaming_upload/0,
     bucket/0,
     api_fs_data_dir/0,
     upload_pool_min_size/0,
@@ -74,6 +86,59 @@ lives here. Callers use these functions instead of calling
 api_backend() ->
     application:get_env(?APP, rabbitmq_stream_s3_api, rabbitmq_stream_s3_api_aws).
 
+%% The auth backend module. Only an API backend with requests to authorize reads
+%% it. The filesystem backend never does. The default is SigV4, which S3 wants.
+%% Set it to rabbitmq_stream_s3_auth_bearer for GCS or Azure Blob.
+-spec auth_backend() -> module().
+auth_backend() ->
+    application:get_env(?APP, rabbitmq_stream_s3_auth, rabbitmq_stream_s3_auth_aws).
+
+%% Which cloud's metadata server rabbitmq_stream_s3_auth_bearer asks for a
+%% token. Only consulted when that backend is selected.
+-spec bearer_provider() -> gcp | azure.
+bearer_provider() ->
+    application:get_env(?APP, bearer_provider, gcp).
+
+%% The Azure resource (audience) the token is requested for. Azure only: GCP
+%% scopes the token from the service account attached to the instance.
+-spec bearer_resource() -> binary().
+bearer_resource() ->
+    application:get_env(?APP, bearer_resource, <<"https://storage.azure.com/">>).
+
+%% Client ID of a user-assigned managed identity. When `undefined`, Azure uses
+%% the system-assigned identity.
+-spec bearer_client_id() -> binary() | undefined.
+bearer_client_id() ->
+    application:get_env(?APP, bearer_client_id, undefined).
+
+%% The Azure storage account the container lives in. Part of the request host
+%% for a real account and, for the emulator, the first segment of every path;
+%% either way the Shared Key signature covers it.
+-spec azure_account() -> binary() | undefined.
+azure_account() ->
+    application:get_env(?APP, azure_account, undefined).
+
+%% The storage account key, base64 as Azure presents it. Only used by
+%% rabbitmq_stream_s3_auth_azure, and only when static credentials are allowed:
+%% it grants full access to the account and does not rotate.
+-spec azure_account_key() -> binary() | undefined.
+azure_account_key() ->
+    application:get_env(?APP, azure_account_key, undefined).
+
+%% Address the container as a path segment under the endpoint rather than the
+%% account as a subdomain of it. The Azurite emulator serves this form, and a
+%% storage account behind a path-routing proxy needs it.
+-spec azure_path_style() -> boolean().
+azure_path_style() ->
+    application:get_env(?APP, azure_path_style, false).
+
+%% The Azure Blob REST API version every request declares. Pinned rather than
+%% tracking the newest: a version is a contract about response shapes, and the
+%% one named here is what the client's parsing was written against.
+-spec azure_api_version() -> binary().
+azure_api_version() ->
+    application:get_env(?APP, azure_api_version, <<"2021-08-06">>).
+
 %% AWS credentials. Return `undefined` when not configured (instance role is used).
 -spec aws_access_key() -> binary() | undefined.
 aws_access_key() ->
@@ -112,6 +177,38 @@ aws_region() ->
 -spec aws_region_endpoints() -> #{binary() => binary()}.
 aws_region_endpoints() ->
     application:get_env(?APP, aws_region_endpoints, #{}).
+
+%% The object store endpoint host, without the bucket. When set it replaces the
+%% `s3.<region>.<tld>` host derived from the region, for stores whose endpoint
+%% does not carry a region: Google Cloud Storage is `storage.googleapis.com`.
+%% Addressing stays virtual-hosted, so the request host is `<bucket>.<endpoint>`.
+-spec endpoint() -> binary() | undefined.
+endpoint() ->
+    application:get_env(?APP, endpoint, undefined).
+
+%% The port the connection pools connect to. This describes how the client
+%% reaches the store, not what its API is, so it belongs to the HTTP client and
+%% not to a backend. Only set it for a local emulator, or for a proxy that puts
+%% the store on another port.
+-spec http_port() -> inet:port_number().
+http_port() ->
+    application:get_env(?APP, http_port, 443).
+
+%% Whether the connection pools use TLS. Only turn this off for a local
+%% emulator: every request carries credentials.
+-spec http_tls() -> boolean().
+http_tls() ->
+    application:get_env(?APP, http_tls, true).
+
+%% How a fragment's body is sent.
+%%
+%% `chunked` streams it as one PUT using S3's aws-chunked encoding with a
+%% trailing checksum: a single request that never buffers more than a chunk.
+%% `multipart` sends it as an upload of several ordinary PUTs, for stores that
+%% do not implement that S3 extension.
+-spec streaming_upload() -> chunked | multipart.
+streaming_upload() ->
+    application:get_env(?APP, streaming_upload, chunked).
 
 %% Required. Crashes with badmatch if not configured.
 -spec bucket() -> binary().
@@ -424,6 +521,14 @@ kms_encryption_context() ->
 defaults_test_() ->
     [
         ?_assertEqual(rabbitmq_stream_s3_api_aws, api_backend()),
+        ?_assertEqual(rabbitmq_stream_s3_auth_aws, auth_backend()),
+        ?_assertEqual(gcp, bearer_provider()),
+        ?_assertEqual(<<"https://storage.azure.com/">>, bearer_resource()),
+        ?_assertEqual(undefined, bearer_client_id()),
+        ?_assertEqual(undefined, azure_account()),
+        ?_assertEqual(undefined, azure_account_key()),
+        ?_assertEqual(false, azure_path_style()),
+        ?_assertEqual(<<"2021-08-06">>, azure_api_version()),
         ?_assertEqual(undefined, aws_access_key()),
         ?_assertEqual(undefined, aws_secret_key()),
         ?_assertEqual(undefined, aws_security_token()),
@@ -431,6 +536,10 @@ defaults_test_() ->
         ?_assertEqual(undefined, aws_region()),
         ?_assertEqual(undefined, account_id()),
         ?_assertEqual(#{}, aws_region_endpoints()),
+        ?_assertEqual(undefined, endpoint()),
+        ?_assertEqual(443, http_port()),
+        ?_assertEqual(true, http_tls()),
+        ?_assertEqual(chunked, streaming_upload()),
         ?_assertEqual(undefined, api_fs_data_dir()),
         ?_assertEqual(0, upload_pool_min_size()),
         ?_assertEqual(20, upload_pool_max_size()),
@@ -471,6 +580,23 @@ defaults_test_() ->
         ?_assertEqual(undefined, kms_key_id()),
         ?_assertEqual(#{}, kms_encryption_context())
     ].
+
+streaming_upload_is_configurable_test() ->
+    try
+        ?assertEqual(chunked, streaming_upload()),
+        ok = application:set_env(?APP, streaming_upload, multipart),
+        ?assertEqual(multipart, streaming_upload())
+    after
+        application:unset_env(?APP, streaming_upload)
+    end.
+
+auth_backend_is_configurable_test() ->
+    try
+        ok = application:set_env(?APP, rabbitmq_stream_s3_auth, rabbitmq_stream_s3_auth_bearer),
+        ?assertEqual(rabbitmq_stream_s3_auth_bearer, auth_backend())
+    after
+        application:unset_env(?APP, rabbitmq_stream_s3_auth)
+    end.
 
 configured_test_() ->
     {foreach, fun() -> ok end, fun(_) -> application:unset_env(rabbitmq_stream_s3, bucket) end, [
