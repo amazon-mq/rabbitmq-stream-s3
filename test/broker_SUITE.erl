@@ -347,7 +347,7 @@ prometheus_metrics(Config) ->
     %% Aggregate gauges from the replica reader appear with no labels
     %% (the labelless fold of per-stream values).
     AggregateGauges = [
-        <<"rabbitmq_stream_s3_manifest_next_offset">>,
+        <<"rabbitmq_stream_s3_manifest_first_timestamp_ms">>,
         <<"rabbitmq_stream_s3_remote_bytes">>,
         <<"rabbitmq_stream_s3_remote_messages">>
     ],
@@ -358,6 +358,20 @@ prometheus_metrics(Config) ->
             #{metric => M}
         )
      || M <- AggregateGauges
+    ],
+
+    %% Offsets of different streams cannot be combined, so they are only
+    %% emitted on the per-object endpoint.
+    [
+        ?assertMatch(
+            nomatch,
+            re:run(Default, <<"^", M/binary, "[ {]">>, [{capture, none}, multiline]),
+            #{metric => M}
+        )
+     || M <- [
+            <<"rabbitmq_stream_s3_manifest_first_offset">>,
+            <<"rabbitmq_stream_s3_manifest_next_offset">>
+        ]
     ],
 
     %% Per-stream pipeline gauges are also folded into labelless aggregates.
@@ -451,7 +465,8 @@ prometheus_metrics(Config) ->
             <<"rabbitmq_stream_s3_bytes_persisted_total">>,
             <<"rabbitmq_stream_s3_bytes_in_assembly">>,
             <<"rabbitmq_stream_s3_bytes_in_transfer">>,
-            <<"rabbitmq_stream_s3_bytes_in_persist">>
+            <<"rabbitmq_stream_s3_bytes_in_persist">>,
+            <<"rabbitmq_stream_s3_manifest_next_offset">>
         ]
     ],
 
