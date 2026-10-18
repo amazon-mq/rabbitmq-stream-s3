@@ -472,6 +472,7 @@ prometheus_metrics(Config) ->
             <<"rabbitmq_stream_s3_bytes_in_assembly">>,
             <<"rabbitmq_stream_s3_bytes_in_transfer">>,
             <<"rabbitmq_stream_s3_bytes_in_persist">>,
+            <<"rabbitmq_stream_s3_manifest_first_offset">>,
             <<"rabbitmq_stream_s3_manifest_next_offset">>
         ]
     ],
