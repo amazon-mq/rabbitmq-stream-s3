@@ -231,7 +231,7 @@ returned by the functional core module.
     manifest_next_offset => none,
     %% 0 marks an empty remote tier, so empty streams are skipped.
     manifest_first_timestamp_ms => min_nonzero,
-    %% Any stalled stream makes the aggregate non-zero.
+    %% Non-zero when any stream is stalled, except on a first fragment at 0.
     upload_stalled_offset => max
 }).
 
