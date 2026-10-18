@@ -158,7 +158,7 @@ fold_gauge(sum, Values) ->
 fold_gauge(max, Values) ->
     lists:max(Values);
 fold_gauge(min_nonzero, Values) ->
-    case [V || V <- Values, V =/= 0] of
+    case [V || V <- Values, V /= 0] of
         [] -> 0;
         NonZero -> lists:min(NonZero)
     end.
