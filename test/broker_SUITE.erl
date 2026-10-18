@@ -327,8 +327,14 @@ plugin_disable_reenable(Config) ->
 
 prometheus_metrics(Config) ->
     QName = <<"prometheus_test_stream">>,
+    %% Never published to, so its remote tier stays empty. It shares the
+    %% writer node with `QName`, which is the case the per-stream folds have
+    %% to get right: one stream with data next to one without.
+    EmptyQName = <<"prometheus_test_empty_stream">>,
+    ClientLocal = [{<<"x-queue-leader-locator">>, longstr, <<"client-local">>}],
     Ch = rabbit_ct_client_helpers:open_channel(Config),
-    stream_declare(Ch, QName),
+    stream_declare(Ch, QName, ClientLocal),
+    stream_declare(Ch, EmptyQName, ClientLocal),
     #'confirm.select_ok'{} = amqp_channel:call(Ch, #'confirm.select'{}),
 
     Payload = binary:copy(<<0>>, 600),
@@ -470,7 +476,37 @@ prometheus_metrics(Config) ->
         ]
     ],
 
+    %% `manifest_first_timestamp_ms` folds with `min_nonzero`: the aggregate
+    %% is the oldest record across streams that have one, so the empty stream
+    %% must not pull it to 0.
+    ?assertEqual(
+        WriterNode, maps:get(writer_node, get_stream_info(Config, EmptyQName))
+    ),
+    FirstTs = <<"rabbitmq_stream_s3_manifest_first_timestamp_ms">>,
+    %% Precondition: this node reports both an empty stream and one with data.
+    %% Without both the fold below is not being exercised.
+    {Populated, Empty} = ?awaitMatch(
+        {P, E} when is_float(P) andalso P > 0 andalso E == 0,
+        begin
+            Body = scrape(Config, WriterNode, "/metrics/per-object"),
+            {
+                per_stream_value(Body, FirstTs, QName),
+                per_stream_value(Body, FirstTs, EmptyQName)
+            }
+        end,
+        30000
+    ),
+    ct:pal("first timestamp: ~ts=~p, ~ts=~p", [QName, Populated, EmptyQName, Empty]),
+    PerStream = per_stream_values(scrape(Config, WriterNode, "/metrics/per-object"), FirstTs),
+    Expected = lists:min([V || V <- PerStream, V > 0]),
+    Aggregate = aggregate_value(scrape(Config, WriterNode, "/metrics"), FirstTs),
+    ?assert(
+        Aggregate == Expected,
+        #{aggregate => Aggregate, expected => Expected, per_stream => PerStream}
+    ),
+
     amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
+    amqp_channel:call(Ch, #'queue.delete'{queue = EmptyQName}),
     rabbit_ct_client_helpers:close_channel(Ch),
     ok.
 
@@ -509,6 +545,36 @@ scrape(Config, Node, Path) ->
     URI = lists:flatten(io_lib:format("http://localhost:~b~ts", [Port, Path])),
     {ok, {{_, 200, _}, _, Body}} = httpc:request(get, {URI, []}, [], []),
     iolist_to_binary(Body).
+
+%% The value of `Metric` for one stream on a per-object scrape, or `undefined`.
+per_stream_value(Body, Metric, QName) ->
+    Re = <<"^", Metric/binary, "\\{[^}]*queue=\"", QName/binary, "\"[^}]*\\} (\\S+)$">>,
+    case re:run(Body, Re, [{capture, all_but_first, binary}, multiline]) of
+        {match, [V]} -> to_number(V);
+        nomatch -> undefined
+    end.
+
+%% Every per-stream value of `Metric` on a per-object scrape.
+per_stream_values(Body, Metric) ->
+    Re = <<"^", Metric/binary, "\\{[^}]*queue=\"[^}]*\\} (\\S+)$">>,
+    case re:run(Body, Re, [global, {capture, all_but_first, binary}, multiline]) of
+        {match, Vs} -> [to_number(V) || [V] <- Vs];
+        nomatch -> []
+    end.
+
+%% The labelless aggregate of `Metric` on a default `/metrics` scrape.
+aggregate_value(Body, Metric) ->
+    {match, [V]} = re:run(
+        Body, <<"^", Metric/binary, " (\\S+)$">>, [{capture, all_but_first, binary}, multiline]
+    ),
+    to_number(V).
+
+to_number(B) ->
+    try
+        binary_to_float(B)
+    catch
+        error:badarg -> binary_to_integer(B)
+    end.
 
 %% -------------------------------------------------------------------
 %% Helpers

@@ -184,58 +184,61 @@ is_per_stream(_) ->
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
+%% Fixtures are floats because `seshat:format/2` emits every value as one,
+%% zeros included; an integer fixture hides type-exact comparisons.
 aggregate_per_stream_gauge_drops_per_stream_labels_test() ->
     Values = #{
-        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q1\",vhost=\"/\"">> => 5,
-        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q2\",vhost=\"/\"">> => 7
+        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q1\",vhost=\"/\"">> => 5.0,
+        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q2\",vhost=\"/\"">> => 7.0
     },
-    ?assertEqual(#{<<>> => 12}, aggregate_per_stream(Values, gauge, sum)).
+    ?assertEqual(#{<<>> => 12.0}, aggregate_per_stream(Values, gauge, sum)).
 
 aggregate_per_stream_gauge_keeps_aggregates_test() ->
-    Values = #{<<"module=\"rabbitmq_stream_s3_governor\"">> => 42},
+    Values = #{<<"module=\"rabbitmq_stream_s3_governor\"">> => 42.0},
     ?assertEqual(
-        #{<<"module=\"rabbitmq_stream_s3_governor\"">> => 42},
+        #{<<"module=\"rabbitmq_stream_s3_governor\"">> => 42.0},
         aggregate_per_stream(Values, gauge, sum)
     ).
 
 aggregate_per_stream_gauge_mixed_test() ->
     Values = #{
-        <<"module=\"rabbitmq_stream_s3_governor\"">> => 100,
-        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q1\",vhost=\"/\"">> => 5,
-        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q2\",vhost=\"/\"">> => 7
+        <<"module=\"rabbitmq_stream_s3_governor\"">> => 100.0,
+        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q1\",vhost=\"/\"">> => 5.0,
+        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q2\",vhost=\"/\"">> => 7.0
     },
     Out = aggregate_per_stream(Values, gauge, sum),
     %% Aggregate carries empty label, kept values keep their original labels.
     ?assertEqual(2, map_size(Out)),
-    ?assertEqual(100, maps:get(<<"module=\"rabbitmq_stream_s3_governor\"">>, Out)),
-    ?assertEqual(12, maps:get(<<>>, Out)).
+    ?assertEqual(100.0, maps:get(<<"module=\"rabbitmq_stream_s3_governor\"">>, Out)),
+    ?assertEqual(12.0, maps:get(<<>>, Out)).
 
 aggregate_per_stream_gauge_max_test() ->
     Values = #{
-        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q1\",vhost=\"/\"">> => 5,
-        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q2\",vhost=\"/\"">> => 7
+        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q1\",vhost=\"/\"">> => 5.0,
+        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q2\",vhost=\"/\"">> => 7.0
     },
-    ?assertEqual(#{<<>> => 7}, aggregate_per_stream(Values, gauge, max)).
+    ?assertEqual(#{<<>> => 7.0}, aggregate_per_stream(Values, gauge, max)).
 
 aggregate_per_stream_gauge_min_nonzero_test() ->
     Values = #{
-        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q1\",vhost=\"/\"">> => 0,
-        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q2\",vhost=\"/\"">> => 7,
-        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q3\",vhost=\"/\"">> => 5
+        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q1\",vhost=\"/\"">> => 0.0,
+        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q2\",vhost=\"/\"">> => 7.0,
+        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q3\",vhost=\"/\"">> => 5.0
     },
-    ?assertEqual(#{<<>> => 5}, aggregate_per_stream(Values, gauge, min_nonzero)),
+    ?assertEqual(#{<<>> => 5.0}, aggregate_per_stream(Values, gauge, min_nonzero)),
     AllZero = #{
-        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q1\",vhost=\"/\"">> => 0
+        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q1\",vhost=\"/\"">> => 0.0
     },
-    ?assertEqual(#{<<>> => 0}, aggregate_per_stream(AllZero, gauge, min_nonzero)).
+    #{<<>> := Zero} = aggregate_per_stream(AllZero, gauge, min_nonzero),
+    ?assert(Zero == 0).
 
 aggregate_per_stream_gauge_none_test() ->
     Values = #{
-        <<"module=\"rabbitmq_stream_s3_governor\"">> => 100,
-        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q1\",vhost=\"/\"">> => 5
+        <<"module=\"rabbitmq_stream_s3_governor\"">> => 100.0,
+        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q1\",vhost=\"/\"">> => 5.0
     },
     ?assertEqual(
-        #{<<"module=\"rabbitmq_stream_s3_governor\"">> => 100},
+        #{<<"module=\"rabbitmq_stream_s3_governor\"">> => 100.0},
         aggregate_per_stream(Values, gauge, none)
     ).
 
@@ -243,31 +246,31 @@ aggregate_per_stream_counter_drops_per_stream_test() ->
     %% Counters: per-stream entries are dropped entirely. The labelless
     %% aggregate comes from the node-level shadow (no queue label).
     Values = #{
-        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q1\",vhost=\"/\"">> => 5,
-        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q2\",vhost=\"/\"">> => 7
+        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q1\",vhost=\"/\"">> => 5.0,
+        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q2\",vhost=\"/\"">> => 7.0
     },
     ?assertEqual(#{}, aggregate_per_stream(Values, counter)).
 
 aggregate_per_stream_counter_keeps_node_level_test() ->
     %% Node-level shadow has no queue label and passes through unchanged.
-    Values = #{<<"module=\"rabbitmq_stream_s3_replica_reader\"">> => 12},
+    Values = #{<<"module=\"rabbitmq_stream_s3_replica_reader\"">> => 12.0},
     ?assertEqual(
-        #{<<"module=\"rabbitmq_stream_s3_replica_reader\"">> => 12},
+        #{<<"module=\"rabbitmq_stream_s3_replica_reader\"">> => 12.0},
         aggregate_per_stream(Values, counter)
     ).
 
 aggregate_per_stream_counter_mixed_test() ->
     Values = #{
-        <<"module=\"rabbitmq_stream_s3_governor\"">> => 100,
-        <<"module=\"rabbitmq_stream_s3_replica_reader\"">> => 12,
-        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q1\",vhost=\"/\"">> => 5,
-        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q2\",vhost=\"/\"">> => 7
+        <<"module=\"rabbitmq_stream_s3_governor\"">> => 100.0,
+        <<"module=\"rabbitmq_stream_s3_replica_reader\"">> => 12.0,
+        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q1\",vhost=\"/\"">> => 5.0,
+        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q2\",vhost=\"/\"">> => 7.0
     },
     Out = aggregate_per_stream(Values, counter),
     %% Per-stream entries dropped, two node-level entries pass through.
     ?assertEqual(2, map_size(Out)),
-    ?assertEqual(100, maps:get(<<"module=\"rabbitmq_stream_s3_governor\"">>, Out)),
-    ?assertEqual(12, maps:get(<<"module=\"rabbitmq_stream_s3_replica_reader\"">>, Out)).
+    ?assertEqual(100.0, maps:get(<<"module=\"rabbitmq_stream_s3_governor\"">>, Out)),
+    ?assertEqual(12.0, maps:get(<<"module=\"rabbitmq_stream_s3_replica_reader\"">>, Out)).
 
 is_per_stream_test() ->
     ?assert(is_per_stream(<<"queue=\"foo\"">>)),
