@@ -28,6 +28,113 @@ stream_s3.region_endpoints.us-east-1 = amazonaws.com
 
 The default is `amazonaws.com`, and the China, US intelligence community, and European Sovereign Cloud partitions are already mapped, so an override is only needed for a domain you resolve yourself. To reach S3-compatible storage, pick such a domain and point `<bucket>.s3.<region>.<tld>` at your endpoint: `stream_s3.region = jepsen` with `stream_s3.region_endpoints.jepsen = local` gives the host `s3.jepsen.local`. See [`jepsen/jepsen.streams3/src/jepsen/streams3/db.clj`](../jepsen/jepsen.streams3/src/jepsen/streams3/db.clj) for a working MinIO configuration.
 
+### Non-AWS endpoints
+
+`stream_s3.endpoint` sets the endpoint host directly, replacing the `s3.<region>.<tld>` host derived from the region. Use it for stores whose endpoint carries no region. Addressing stays virtual-hosted, so requests go to `<bucket>.<endpoint>` over TLS on port 443, and the bucket must therefore resolve as a subdomain of the endpoint.
+
+```ini
+stream_s3.bucket = my-rabbitmq-streams-bucket
+stream_s3.endpoint = storage.googleapis.com
+stream_s3.streaming_upload = multipart
+```
+
+`stream_s3.region` is not needed alongside an endpoint. An endpoint host carries no region to match, so nothing is looked up from EC2 instance metadata - that would describe the instance rather than the store - and the region falls back to `auto`, the convention S3-compatible stores settled on for a credential scope with no region to name. Set it only if your store requires a particular scope.
+
+Google Cloud Storage support is partial. See [object-store-portability.md](./object-store-portability.md) for what works, what does not, and the remaining work.
+
+### Upload encoding
+
+`stream_s3.streaming_upload` selects how a fragment's body is sent. `chunked`, the default, streams it as a single PUT using S3's aws-chunked encoding. `multipart` sends it as several ordinary PUTs.
+
+aws-chunked is an S3 extension, and most other stores reject it, so set `multipart` for anything that is not S3 or an S3-compatible store that implements it:
+
+```ini
+stream_s3.streaming_upload = multipart
+```
+
+Multipart costs several requests per fragment instead of one, and an uploader holds a whole part rather than a chunk, so leave it at `chunked` where the store supports it.
+
+### Authorization scheme
+
+`stream_s3.auth` selects how requests are authorized. The default, `aws`, signs
+them with SigV4 and is what S3 and any S3-compatible store taking HMAC keys
+want. `bearer` sends an OAuth2 access token fetched from the cloud's metadata
+server, for Google Cloud Storage and Azure Blob.
+
+```ini
+stream_s3.auth = bearer
+stream_s3.bearer.provider = gcp
+```
+
+On GCP the token is scoped by the service account attached to the instance, so
+nothing further is needed. On Azure, `stream_s3.bearer.resource` sets the
+resource the token is requested for (default `https://storage.azure.com/`) and
+`stream_s3.bearer.client_id` selects a user-assigned managed identity; leave it
+unset to use the system-assigned one.
+
+```ini
+stream_s3.auth = bearer
+stream_s3.bearer.provider = azure
+stream_s3.bearer.client_id = 00000000-0000-0000-0000-000000000000
+```
+
+Bearer tokens avoid long-lived static secrets entirely, which matters beyond
+preference: organizations can disable GCS interoperability HMAC keys with
+`constraints/storage.restrictAuthTypes`, and Microsoft recommends disallowing
+Shared Key on storage accounts. Where either applies, `bearer` is the only way
+in.
+
+### Azure Blob Storage
+
+Azure Blob is not S3-compatible, so it is a separate backend rather than an endpoint override. Select it with `stream_s3.api`:
+
+```ini
+stream_s3.api = azure
+stream_s3.azure.account = mystorageaccount
+stream_s3.bucket = my-rabbitmq-streams-container
+stream_s3.auth = bearer
+stream_s3.bearer.provider = azure
+```
+
+`stream_s3.bucket` names the container. Requests go to `<account>.blob.core.windows.net` over TLS on port 443; the container is a path segment, not a subdomain. The container must already exist - the plugin never creates one.
+
+`stream_s3.endpoint` replaces the `blob.core.windows.net` suffix for a sovereign cloud (`blob.core.chinacloudapi.cn`, `blob.core.usgovcloudapi.net`), keeping the account as a subdomain of it.
+
+#### Azure authorization
+
+A managed identity (`stream_s3.auth = bearer`) is the better choice and is described above. Where there is none - outside Azure, or against the emulator - `stream_s3.auth = azure` signs each request with the storage account key:
+
+```ini
+stream_s3.auth = azure
+stream_s3.azure.account_key = <the storage account key>
+stream_s3.allow_static_credentials = true
+```
+
+The key grants full access to the account, is stored in plaintext on disk and never rotates, so it sits behind the same `allow_static_credentials` opt-in as static AWS keys and is ignored without it. Microsoft recommends disallowing Shared Key on storage accounts, which makes a managed identity the only way in where that is set.
+
+#### Differences from S3 worth knowing
+
+- **Fragments upload as blocks.** Azure has no trailing checksum, so a fragment is sent as several `Put Block` requests each covered by a `content-md5`, then committed with one `Put Block List`. The fragment's CRC32 is recorded on the blob as `x-ms-meta-crc32`. `stream_s3.streaming_upload` does not apply.
+- **Deletes are one request per key.** Azure has no multi-object delete, so the reaper and GC pay a request per object rather than one per thousand.
+- **`stream_s3.account_id` and KMS settings do not apply.** They send `x-amz-` headers that Azure does not take; Azure encrypts at rest unconditionally.
+
+#### Against the Azurite emulator
+
+Azurite serves the real protocol over plain HTTP with the account in the path, which is what `stream_s3.azure.path_style` and the `stream_s3.http.*` settings are for. Only use this locally: without TLS, the account key crosses the network in the clear.
+
+```ini
+stream_s3.api = azure
+stream_s3.auth = azure
+stream_s3.azure.account = devstoreaccount1
+stream_s3.azure.account_key = <the well-known Azurite development key>
+stream_s3.azure.path_style = true
+stream_s3.endpoint = 127.0.0.1
+stream_s3.http.port = 10000
+stream_s3.http.tls = false
+stream_s3.allow_static_credentials = true
+stream_s3.bucket = streams
+```
+
 ### Credentials
 
 The plugin resolves AWS credentials in this order:
