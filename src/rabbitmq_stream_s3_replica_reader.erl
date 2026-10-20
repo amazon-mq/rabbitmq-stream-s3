@@ -23,7 +23,7 @@ returned by the functional core module.
 -export([force_fragment_cut/1, force_fragment_cut/2]).
 -export([resolve_stream_id/2]).
 -export([identity_formatter/1]).
--export([counter_fields/0, init_counters/0]).
+-export([counter_fields/0, gauge_aggregations/0, init_counters/0]).
 -export([
     init/1,
     handle_call/3,
@@ -216,10 +216,24 @@ returned by the functional core module.
 %% holds the cluster-cumulative value (one counter ref per node, no
 %% per-stream label). Each `inc/3` call writes both refs in lockstep.
 %%
-%% The shadow only contains counter-typed fields; gauges aggregate
-%% naturally (sum across streams) on the default endpoint and don't
-%% need a shadow.
+%% The shadow only contains counter-typed fields; gauges are folded
+%% across streams on the default endpoint (see ?GAUGE_AGGREGATIONS) and
+%% don't need a shadow.
 -define(NODE_COUNTERS, [F || {_, _, counter, _} = F <- ?STREAM_COUNTERS]).
+
+%% How the prometheus collector folds each per-stream gauge into the
+%% labelless aggregate on the default `/metrics` endpoint. Gauges not
+%% listed here are summed. Offsets of different streams cannot be
+%% compared, so they are only emitted on `/metrics/per-object`.
+-define(GAUGE_AGGREGATIONS, #{
+    last_persist_timestamp_ms => max,
+    manifest_first_offset => none,
+    manifest_next_offset => none,
+    %% 0 marks an empty remote tier, so empty streams are skipped.
+    manifest_first_timestamp_ms => min_nonzero,
+    %% Non-zero when any stream is stalled, except on a first fragment at 0.
+    upload_stalled_offset => max
+}).
 
 -define(NODE_COUNTER_KEY, {?MODULE, node_counter}).
 
@@ -1884,6 +1898,17 @@ counter_fields() ->
     ?STREAM_COUNTERS.
 
 -doc """
+How each per-stream gauge is folded into the labelless aggregate on the
+default `/metrics` endpoint. Gauges missing from the map are summed.
+
+`none` means that the gauge is only emitted on `/metrics/per-object`.
+`min_nonzero` skips streams that report 0 and yields 0 when all of them do.
+""".
+-spec gauge_aggregations() -> #{atom() => sum | min_nonzero | max | none}.
+gauge_aggregations() ->
+    ?GAUGE_AGGREGATIONS.
+
+-doc """
 Initialise the node-level shadow counter set.
 
 Called once at plugin start from `rabbitmq_stream_s3_api:init/0`. The
@@ -2545,6 +2570,10 @@ on_remote_retention_deleted(Refs, StreamId, State) ->
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
+
+gauge_aggregations_name_gauges_test() ->
+    Gauges = [Name || {Name, _, gauge, _} <- ?STREAM_COUNTERS],
+    ?assertEqual([], maps:keys(?GAUGE_AGGREGATIONS) -- Gauges).
 
 %% A fresh-random uid can collide with the immediately-prior commit's uid at the
 %% same epoch, so the "old" manifest ref maps to the same S3 key as the manifest

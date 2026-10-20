@@ -309,7 +309,7 @@ The plugin exposes its metrics via Prometheus through the existing `rabbitmq_pro
 
 | Endpoint                   | Use it for                                                                         |
 |----------------------------|------------------------------------------------------------------------------------|
-| `/metrics`                 | Default scrape target. Per-stream gauges are summed into per-node aggregates. Per-stream counters are not summed (this would violate Prometheus monotonicity when streams are deleted); their cluster-wide value is published as a node-level shadow counter with a `module=` label. |
+| `/metrics`                 | Default scrape target. Per-stream gauges are combined into per-node aggregates, see below. Per-stream counters are not summed (this would violate Prometheus monotonicity when streams are deleted); their cluster-wide value is published as a node-level shadow counter with a `module=` label. |
 | `/metrics/per-object`      | Per-stream metrics with `queue=` and `vhost=` labels. Cardinality scales with stream count, so scrape less often. |
 
 The plugin's metrics follow the same convention as core RabbitMQ: aggregate metrics on the default endpoint, per-object metrics on the per-object endpoint. Dashboards built against the default endpoint do not break when the cluster grows to many streams.
@@ -317,6 +317,16 @@ The plugin's metrics follow the same convention as core RabbitMQ: aggregate metr
 ### Metric prefix and labels
 
 All metrics use the `rabbitmq_stream_s3_` prefix. Per-module metrics carry a `module` label identifying the source. Per-stream metrics on `/metrics/per-object` add `vhost=` and `queue=` labels. The aggregate values on `/metrics` carry no per-stream label.
+
+Most per-stream gauges are summed into their aggregate on `/metrics`. The exceptions are the gauges whose sum has no meaning:
+
+| Metric                                           | Aggregate on `/metrics`                                      |
+|--------------------------------------------------|--------------------------------------------------------------|
+| `rabbitmq_stream_s3_last_persist_timestamp_ms`   | Maximum: the most recent persist of any stream               |
+| `rabbitmq_stream_s3_manifest_first_timestamp_ms` | Minimum over non-empty streams, or 0 when all are empty      |
+| `rabbitmq_stream_s3_upload_stalled_offset`       | Maximum: non-zero when any stream is stalled past its first fragment |
+| `rabbitmq_stream_s3_manifest_first_offset`       | Not emitted: offsets of different streams cannot be compared |
+| `rabbitmq_stream_s3_manifest_next_offset`        | Not emitted: offsets of different streams cannot be compared |
 
 ### Replica reader (per-stream, also aggregated on default endpoint)
 
@@ -336,7 +346,7 @@ Owned by `rabbitmq_stream_s3_replica_reader`. Each writer-node replica reader ow
 | `rabbitmq_stream_s3_mega_groups_created`               | counter | Mega-group manifest objects uploaded                              |
 | `rabbitmq_stream_s3_roots_created`                     | counter | Root manifest objects uploaded (one per successful persist)       |
 | `rabbitmq_stream_s3_transfers_in_flight`               | gauge   | Fragments cut and submitted that have not yet completed           |
-| `rabbitmq_stream_s3_upload_stalled_offset`             | gauge   | Offset at which the pipeline is stalled on a non-transient error, or 0 when not stalled |
+| `rabbitmq_stream_s3_upload_stalled_offset`             | gauge   | Offset at which the pipeline is stalled on a non-transient error, or 0 when not stalled. A stall on a stream's first fragment also reads 0, since that fragment starts at offset 0; the stalled-pipeline alert below catches it through its retry clause |
 
 #### Pipeline (drain to persist)
 

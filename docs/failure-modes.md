@@ -77,7 +77,7 @@ Both profiles apply equal jitter (the delay is uniformly distributed in `[delay/
 Discarding remote manifest and restarting from the local log.
 ```
 
-`rabbitmq_stream_s3_remote_tier_ahead_recoveries` increments. The manifest's `rabbitmq_stream_s3_manifest_next_offset` resets to the local log's first offset. (This is the inverse of the "Segment deleted before upload" case below, which fires `rabbitmq_stream_s3_local_log_ahead_recoveries`: there the local log's first offset is *ahead of* the manifest; here the manifest's next offset is *beyond* the local log's last offset.)
+`rabbitmq_stream_s3_remote_tier_ahead_recoveries` increments. The manifest's `rabbitmq_stream_s3_manifest_next_offset` resets to the local log's first offset; it is a per-stream gauge, so read it on `/metrics/per-object`. (This is the inverse of the "Segment deleted before upload" case below, which fires `rabbitmq_stream_s3_local_log_ahead_recoveries`: there the local log's first offset is *ahead of* the manifest; here the manifest's next offset is *beyond* the local log's last offset.)
 
 **Mitigation.** None. The replica reader handles this automatically on startup.
 

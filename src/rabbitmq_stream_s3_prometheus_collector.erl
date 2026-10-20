@@ -11,9 +11,10 @@ The plugin maintains two kinds of seshat counter sets:
   module's identity is carried by the `module` label. These are emitted
   on every endpoint.
 - Per-stream counters (one ref per replica reader, labels include
-  `vhost` and `queue`): emitted as a fold-and-sum aggregate on the
+  `vhost` and `queue`): folded into a labelless aggregate on the
   default `/metrics` endpoint and emitted with full labels on
-  `/metrics/per-object`.
+  `/metrics/per-object`. Gauges are folded with the function named in
+  `rabbitmq_stream_s3_replica_reader:gauge_aggregations/0`.
 
 The two sets are distinguished in seshat output by the presence of the
 `queue` label.
@@ -60,7 +61,12 @@ deregister_cleanup(_) ->
 collect_mf(Registry, Callback) ->
     PerObject = (Registry =:= ?REGISTRY_PER_OBJECT),
     Seshat = seshat:format(rabbitmq_stream_s3, #{labels => as_binary}),
-    emit_seshat(Seshat, PerObject, Callback),
+    Aggregations = maps:fold(
+        fun(Name, Aggregation, Acc) -> Acc#{atom_to_binary(Name) => Aggregation} end,
+        #{},
+        rabbitmq_stream_s3_replica_reader:gauge_aggregations()
+    ),
+    emit_seshat(Seshat, PerObject, Aggregations, Callback),
     %% Histograms are not per-stream so they pass through unchanged.
     maps:foreach(
         fun(Name, #{type := Type, help := Help, values := Values}) ->
@@ -90,19 +96,26 @@ collect_mf(Registry, Callback) ->
 %%   alongside any node-level entries. Both kinds pass through unchanged.
 %% - On the default endpoint, behaviour depends on the metric type.
 %%   Gauges fold per-stream values into a single labelless aggregate
+%%   with the function from `Aggregations`, summing by default
 %%   (entries without a queue label pass through unchanged). Counters
 %%   drop per-stream entries entirely; the cluster-wide cumulative value
 %%   appears via the node-level shadow counter (which has no queue label
 %%   and is thus emitted unchanged). This preserves Prometheus
 %%   monotonicity when streams are deleted: summing per-stream counters
 %%   would drop on deletion and look like a counter reset.
-emit_seshat(Seshat, PerObject, Callback) ->
+emit_seshat(Seshat, PerObject, Aggregations, Callback) ->
     maps:foreach(
         fun(Name, #{type := Type, help := Help, values := Values}) ->
             Out =
-                case PerObject of
-                    true -> Values;
-                    false -> aggregate_per_stream(Values, Type)
+                case {PerObject, Type} of
+                    {true, _} ->
+                        Values;
+                    {false, gauge} ->
+                        aggregate_per_stream(
+                            Values, gauge, maps:get(Name, Aggregations, sum)
+                        );
+                    {false, counter} ->
+                        aggregate_per_stream(Values, counter)
                 end,
             Callback(
                 create_mf(
@@ -116,33 +129,44 @@ emit_seshat(Seshat, PerObject, Callback) ->
         Seshat
     ).
 
-%% Gauge: sum per-stream entries into a labelless aggregate. Entries
-%% without a queue label pass through unchanged.
-%%
+%% Gauge: fold per-stream entries into a labelless aggregate with the
+%% given function, or drop them for `none`. Entries without a queue
+%% label pass through unchanged.
+aggregate_per_stream(Values, gauge, Aggregation) when is_map(Values) ->
+    {PerStream, KeptValues} =
+        maps:fold(
+            fun(Labels, Value, {Acc, Kept}) ->
+                case is_per_stream(Labels) of
+                    true -> {[Value | Acc], Kept};
+                    false -> {Acc, Kept#{Labels => Value}}
+                end
+            end,
+            {[], #{}},
+            Values
+        ),
+    case {PerStream, Aggregation} of
+        {[], _} ->
+            KeptValues;
+        {_, none} ->
+            KeptValues;
+        _ ->
+            KeptValues#{<<>> => fold_gauge(Aggregation, PerStream)}
+    end.
+
+fold_gauge(sum, Values) ->
+    lists:sum(Values);
+fold_gauge(max, Values) ->
+    lists:max(Values);
+fold_gauge(min_nonzero, Values) ->
+    case [V || V <- Values, V /= 0] of
+        [] -> 0;
+        NonZero -> lists:min(NonZero)
+    end.
+
 %% Counter: drop per-stream entries entirely. The labelless aggregate
 %% comes from the node-level shadow counter (which has no queue label
 %% and so passes through). Summing per-stream counters would violate
 %% Prometheus monotonicity when streams are deleted.
-aggregate_per_stream(Values, gauge) when is_map(Values) ->
-    {PerStreamSum, PerStreamCount, KeptValues} =
-        maps:fold(
-            fun(Labels, Value, {Sum, Count, Kept}) ->
-                case is_per_stream(Labels) of
-                    true ->
-                        {Sum + Value, Count + 1, Kept};
-                    false ->
-                        {Sum, Count, Kept#{Labels => Value}}
-                end
-            end,
-            {0, 0, #{}},
-            Values
-        ),
-    case PerStreamCount of
-        0 ->
-            KeptValues;
-        _ ->
-            KeptValues#{<<>> => PerStreamSum}
-    end;
 aggregate_per_stream(Values, counter) when is_map(Values) ->
     maps:filter(
         fun(Labels, _) -> not is_per_stream(Labels) end,
@@ -160,61 +184,93 @@ is_per_stream(_) ->
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
+%% Fixtures are floats because `seshat:format/2` emits every value as one,
+%% zeros included; an integer fixture hides type-exact comparisons.
 aggregate_per_stream_gauge_drops_per_stream_labels_test() ->
     Values = #{
-        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q1\",vhost=\"/\"">> => 5,
-        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q2\",vhost=\"/\"">> => 7
+        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q1\",vhost=\"/\"">> => 5.0,
+        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q2\",vhost=\"/\"">> => 7.0
     },
-    ?assertEqual(#{<<>> => 12}, aggregate_per_stream(Values, gauge)).
+    ?assertEqual(#{<<>> => 12.0}, aggregate_per_stream(Values, gauge, sum)).
 
 aggregate_per_stream_gauge_keeps_aggregates_test() ->
-    Values = #{<<"module=\"rabbitmq_stream_s3_governor\"">> => 42},
+    Values = #{<<"module=\"rabbitmq_stream_s3_governor\"">> => 42.0},
     ?assertEqual(
-        #{<<"module=\"rabbitmq_stream_s3_governor\"">> => 42},
-        aggregate_per_stream(Values, gauge)
+        #{<<"module=\"rabbitmq_stream_s3_governor\"">> => 42.0},
+        aggregate_per_stream(Values, gauge, sum)
     ).
 
 aggregate_per_stream_gauge_mixed_test() ->
     Values = #{
-        <<"module=\"rabbitmq_stream_s3_governor\"">> => 100,
-        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q1\",vhost=\"/\"">> => 5,
-        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q2\",vhost=\"/\"">> => 7
+        <<"module=\"rabbitmq_stream_s3_governor\"">> => 100.0,
+        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q1\",vhost=\"/\"">> => 5.0,
+        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q2\",vhost=\"/\"">> => 7.0
     },
-    Out = aggregate_per_stream(Values, gauge),
+    Out = aggregate_per_stream(Values, gauge, sum),
     %% Aggregate carries empty label, kept values keep their original labels.
     ?assertEqual(2, map_size(Out)),
-    ?assertEqual(100, maps:get(<<"module=\"rabbitmq_stream_s3_governor\"">>, Out)),
-    ?assertEqual(12, maps:get(<<>>, Out)).
+    ?assertEqual(100.0, maps:get(<<"module=\"rabbitmq_stream_s3_governor\"">>, Out)),
+    ?assertEqual(12.0, maps:get(<<>>, Out)).
+
+aggregate_per_stream_gauge_max_test() ->
+    Values = #{
+        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q1\",vhost=\"/\"">> => 5.0,
+        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q2\",vhost=\"/\"">> => 7.0
+    },
+    ?assertEqual(#{<<>> => 7.0}, aggregate_per_stream(Values, gauge, max)).
+
+aggregate_per_stream_gauge_min_nonzero_test() ->
+    Values = #{
+        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q1\",vhost=\"/\"">> => 0.0,
+        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q2\",vhost=\"/\"">> => 7.0,
+        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q3\",vhost=\"/\"">> => 5.0
+    },
+    ?assertEqual(#{<<>> => 5.0}, aggregate_per_stream(Values, gauge, min_nonzero)),
+    AllZero = #{
+        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q1\",vhost=\"/\"">> => 0.0
+    },
+    #{<<>> := Zero} = aggregate_per_stream(AllZero, gauge, min_nonzero),
+    ?assert(Zero == 0).
+
+aggregate_per_stream_gauge_none_test() ->
+    Values = #{
+        <<"module=\"rabbitmq_stream_s3_governor\"">> => 100.0,
+        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q1\",vhost=\"/\"">> => 5.0
+    },
+    ?assertEqual(
+        #{<<"module=\"rabbitmq_stream_s3_governor\"">> => 100.0},
+        aggregate_per_stream(Values, gauge, none)
+    ).
 
 aggregate_per_stream_counter_drops_per_stream_test() ->
     %% Counters: per-stream entries are dropped entirely. The labelless
     %% aggregate comes from the node-level shadow (no queue label).
     Values = #{
-        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q1\",vhost=\"/\"">> => 5,
-        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q2\",vhost=\"/\"">> => 7
+        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q1\",vhost=\"/\"">> => 5.0,
+        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q2\",vhost=\"/\"">> => 7.0
     },
     ?assertEqual(#{}, aggregate_per_stream(Values, counter)).
 
 aggregate_per_stream_counter_keeps_node_level_test() ->
     %% Node-level shadow has no queue label and passes through unchanged.
-    Values = #{<<"module=\"rabbitmq_stream_s3_replica_reader\"">> => 12},
+    Values = #{<<"module=\"rabbitmq_stream_s3_replica_reader\"">> => 12.0},
     ?assertEqual(
-        #{<<"module=\"rabbitmq_stream_s3_replica_reader\"">> => 12},
+        #{<<"module=\"rabbitmq_stream_s3_replica_reader\"">> => 12.0},
         aggregate_per_stream(Values, counter)
     ).
 
 aggregate_per_stream_counter_mixed_test() ->
     Values = #{
-        <<"module=\"rabbitmq_stream_s3_governor\"">> => 100,
-        <<"module=\"rabbitmq_stream_s3_replica_reader\"">> => 12,
-        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q1\",vhost=\"/\"">> => 5,
-        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q2\",vhost=\"/\"">> => 7
+        <<"module=\"rabbitmq_stream_s3_governor\"">> => 100.0,
+        <<"module=\"rabbitmq_stream_s3_replica_reader\"">> => 12.0,
+        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q1\",vhost=\"/\"">> => 5.0,
+        <<"module=\"rabbitmq_stream_s3_replica_reader\",queue=\"q2\",vhost=\"/\"">> => 7.0
     },
     Out = aggregate_per_stream(Values, counter),
     %% Per-stream entries dropped, two node-level entries pass through.
     ?assertEqual(2, map_size(Out)),
-    ?assertEqual(100, maps:get(<<"module=\"rabbitmq_stream_s3_governor\"">>, Out)),
-    ?assertEqual(12, maps:get(<<"module=\"rabbitmq_stream_s3_replica_reader\"">>, Out)).
+    ?assertEqual(100.0, maps:get(<<"module=\"rabbitmq_stream_s3_governor\"">>, Out)),
+    ?assertEqual(12.0, maps:get(<<"module=\"rabbitmq_stream_s3_replica_reader\"">>, Out)).
 
 is_per_stream_test() ->
     ?assert(is_per_stream(<<"queue=\"foo\"">>)),
