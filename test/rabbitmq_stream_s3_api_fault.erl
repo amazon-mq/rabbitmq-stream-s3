@@ -37,6 +37,7 @@ passthrough to the FS backend.
 
 %% rabbitmq_stream_s3_api behaviour
 -export([
+    start_link/0,
     get/2,
     get_range/3,
     get_range_async/3,
@@ -145,6 +146,10 @@ reorder(KeyPat, DelayMs) ->
 %%----------------------------------------------------------------------------
 %% Behaviour callbacks
 %%----------------------------------------------------------------------------
+
+%% Delegates like every other operation: the wrapped backend decides.
+start_link() ->
+    rabbitmq_stream_s3_api_fs:start_link().
 
 get(Key, Opts) -> with_faults(get, Key, fun() -> ?FS:get(Key, Opts) end).
 
